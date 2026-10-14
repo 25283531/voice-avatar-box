@@ -77,6 +77,9 @@ def api(pathname: str, method: str = "GET", body=None, allow_404=False, retries:
                 raw = r.stdout.decode("utf-8", "replace")
                 nl = raw.rfind("\n")
                 text, code = raw[:nl], raw[nl + 1:].strip()
+                # 204 / 空 body 是成功（如 workflow_dispatch）
+                if code in ("200", "201", "204") and not text.strip():
+                    return {"ok": True, "status": int(code)}
                 try:
                     j = json.loads(text)
                 except Exception:
@@ -139,8 +142,7 @@ def cmd_log(args):
         if j["conclusion"] in (None, "success"):
             continue
         print(f"\n===== {j['name']}  ({j['conclusion']}) =====")
-        raw = api(f"{API}/actions/jobs/{j['id']}/logs")
-        # logs 接口返回 text/plain（且带 302），单独用 curl 取
+        # logs 接口返回 302 + text/plain，不能用 api()（会当成非 JSON 报错），单独用 curl -L 取
         out = subprocess.run([
             "curl", "-sSL", "--http1.1", "-m", "120",
             "-H", f"Authorization: Bearer {TOKEN}",

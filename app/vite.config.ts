@@ -156,7 +156,8 @@ export default async ({ command, mode }) => {
       hmr: true,
       port: Number.parseInt(VITE_APP_PORT, 10),
       // 仅 H5 端生效，其他端不生效（其他端走build，不走devServer)
-      proxy: JSON.parse(VITE_APP_PROXY)
+      // 不用 JSON.parse：env 缺失时 JSON.parse(undefined) 会让整个 vite 配置加载失败
+      proxy: VITE_APP_PROXY === 'true' || VITE_APP_PROXY === '1'
         ? {
             [VITE_APP_PROXY_PREFIX]: {
               target: VITE_SERVER_BASEURL,
