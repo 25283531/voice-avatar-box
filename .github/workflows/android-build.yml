@@ -156,11 +156,12 @@ jobs:
           ANDROID_STORE_PASSWORD: ${{ secrets.ANDROID_STORE_PASSWORD }}
           ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
           ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+          # 走环境变量而不是直接内插进 shell，避免 dispatch 输入被当成命令执行
+          VNAME: ${{ inputs.version_name || '1.0.0' }}
+          VCODE: ${{ inputs.version_code || '100' }}
         run: |
           set -e
           chmod +x gradlew
-          VNAME="${{ inputs.version_name || '1.0.0' }}"
-          VCODE="${{ inputs.version_code || '100' }}"
           ./gradlew --no-daemon --stacktrace assembleRelease \
             -PVERSION_NAME="$VNAME" -PVERSION_CODE="$VCODE"
           ls -lh app/build/outputs/apk/release/
