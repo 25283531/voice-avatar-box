@@ -1,0 +1,267 @@
+name: app-pack
+
+# 手机端原生包：Android APK + iOS IPA（uni-app 云打包，走 HBuilderX Linux CLI）
+#
+# 一次触发同时产出 APK 与 IPA，本地不需要 HBuilderX / Android Studio / Xcode。
+#
+# 一次性前置条件：
+#   1. DCloud 账号（https://dev.dcloud.net.cn 免费注册），并把 appid 换成自己创建的应用
+#      （当前 manifest 用的是小智的 __UNI__36A515E，云打包会校验归属）
+#   2. Settings → Secrets and variables → Actions：
+#        DCLOUD_USERNAME / DCLOUD_PASSWORD                必填
+#        ANDROID_KEYSTORE_BASE64 + ANDROID_KEY_ALIAS + ANDROID_KEYSTORE_PASSWORD + ANDROID_STORE_PASSWORD
+#                                                         可选（自有证书，不配则用 DCloud 公共证书）
+#        IOS_P12_BASE64 / IOS_P12_PASSWORD / IOS_PROFILE_BASE64   iOS 必填（Apple 开发者证书）
+#
+# 触发：Actions → app-pack → Run workflow；或发 Release 自动跑
+on:
+  workflow_dispatch:
+    inputs:
+      platform:
+        description: 打包平台
+        type: choice
+        options: [android, ios, both]
+        default: both
+      android_package:
+        description: Android 包名
+        type: string
+        default: com.250886.voicebox
+      android_cert:
+        description: Android 证书（public=DCloud 公共证书，self=自有证书）
+        type: choice
+        options: [public, self]
+        default: public
+      ios_bundle:
+        description: iOS Bundle ID
+        type: string
+        default: com.250886.voicebox
+      uni_appid:
+        description: 'uni-app appid（形如 __UNI__XXXXXXX，留空用 env/.env 里的值）'
+        type: string
+        default: ''
+
+env:
+  HX_VERSION: '4.87.2025121004'
+  HX_TAR: HBuilderX.4.87.2025121004.linux_x64.full.tar.gz
+  NODE_VERSION: '20'
+  PNPM_VERSION: '10.10.0'
+  HUSKY: '0'
+
+jobs:
+  android:
+    name: Android APK
+    if: inputs.platform != 'ios'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: ${{ env.PNPM_VERSION }}
+          run_install: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+          cache-dependency-path: app/pnpm-lock.yaml
+
+      - name: 安装依赖（云打包要编译 App 资源，需要 node_modules）
+        working-directory: app
+        run: pnpm install --frozen-lockfile --registry https://registry.npmjs.org
+
+      - name: 覆盖 appid（可选）
+        if: inputs.uni_appid != ''
+        working-directory: app
+        run: sed -i "s#^VITE_UNI_APPID *= *.*#VITE_UNI_APPID = '${{ inputs.uni_appid }}'#" env/.env
+
+      - name: 缓存 HBuilderX CLI
+        id: hx
+        uses: actions/cache@v4
+        with:
+          path: ~/hbuilderx
+          key: hbuilderx-cli-${{ env.HX_VERSION }}
+
+      - name: 下载 HBuilderX Linux CLI
+        if: steps.hx.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p ~/hbuilderx
+          curl -sSL -o /tmp/hx.tar.gz "https://download1.dcloud.net.cn/download/$HX_TAR"
+          tar -xzf /tmp/hx.tar.gz -C ~/hbuilderx
+          ls ~/hbuilderx
+
+      - name: 安装无头运行环境
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq xvfb libgtk-3-0 libnss3 libxss1 libasound2 \
+            libgbm1 libatk-bridge2.0-0 libcups2 libdrm2 libxkbcommon0 \
+            libxcomposite1 libxdamage1 libxrandr2 libpango-1.0-0 libcairo2
+
+      - name: 云打包（Android）
+        working-directory: ~/hbuilderx/HBuilderX
+        env:
+          DCLOUD_USERNAME: ${{ secrets.DCLOUD_USERNAME }}
+          DCLOUD_PASSWORD: ${{ secrets.DCLOUD_PASSWORD }}
+          KS_B64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          KS_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          KS_PASS: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          STORE_PASS: ${{ secrets.ANDROID_STORE_PASSWORD }}
+          PKG: ${{ inputs.android_package || 'com.250886.voicebox' }}
+          CERT_SELF: ${{ inputs.android_cert }}
+        run: |
+          set -e
+          if [ "$CERT_SELF" = "self" ]; then
+            [ -n "$KS_B64" ] || { echo "::error::缺少 secret ANDROID_KEYSTORE_BASE64"; exit 1; }
+            echo "$KS_B64" | base64 -d > "$RUNNER_TEMP/app.keystore"
+            TYPE=0; CERTFILE="$RUNNER_TEMP/app.keystore"
+          else
+            TYPE=1; CERTFILE=""
+          fi
+          cat > "$RUNNER_TEMP/pack.json" <<JSON
+          {
+            "project": "app",
+            "platform": "android",
+            "iscustom": false,
+            "safemode": false,
+            "android": {
+              "packagename": "$PKG",
+              "androidpacktype": "$TYPE",
+              "certalias": "$KS_ALIAS",
+              "certfile": "$CERTFILE",
+              "certpassword": "$KS_PASS",
+              "storepassword": "$STORE_PASS"
+            }
+          }
+          JSON
+          echo "----- pack.json -----"; cat "$RUNNER_TEMP/pack.json"
+          [ -n "$DCLOUD_USERNAME" ] || { echo "::error::缺少 secret DCLOUD_USERNAME / DCLOUD_PASSWORD"; exit 1; }
+
+          xvfb-run -a ./cli open || ./cli open
+          sleep 5
+          ./cli user login --global true --username "$DCLOUD_USERNAME" --password "$DCLOUD_PASSWORD"
+          ./cli user info
+          ./cli project open --path "$GITHUB_WORKSPACE/app"
+          ./cli pack --config "$RUNNER_TEMP/pack.json" 2>&1 | tee "$RUNNER_TEMP/pack.log"
+          ./cli app quit || true
+
+      - name: 收集 APK
+        working-directory: app
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/out"
+          find unpackage -name "*.apk" -exec cp {} "$GITHUB_WORKSPACE/out/" \;
+          ls -lh "$GITHUB_WORKSPACE/out"
+          if [ -z "$(ls -A "$GITHUB_WORKSPACE/out")" ]; then
+            echo "::error::未找到 APK，云端若返回下载链接见上一步日志"
+            exit 1
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: elder-app-android
+          path: out/*.apk
+          retention-days: 30
+
+  ios:
+    name: iOS IPA
+    if: inputs.platform != 'android'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: ${{ env.PNPM_VERSION }}
+          run_install: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+          cache-dependency-path: app/pnpm-lock.yaml
+
+      - name: 安装依赖
+        working-directory: app
+        run: pnpm install --frozen-lockfile --registry https://registry.npmjs.org
+
+      - name: 覆盖 appid（可选）
+        if: inputs.uni_appid != ''
+        working-directory: app
+        run: sed -i "s#^VITE_UNI_APPID *= *.*#VITE_UNI_APPID = '${{ inputs.uni_appid }}'#" env/.env
+
+      - name: 缓存 HBuilderX CLI
+        id: hx
+        uses: actions/cache@v4
+        with:
+          path: ~/hbuilderx
+          key: hbuilderx-cli-${{ env.HX_VERSION }}
+
+      - name: 下载 HBuilderX Linux CLI
+        if: steps.hx.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p ~/hbuilderx
+          curl -sSL -o /tmp/hx.tar.gz "https://download1.dcloud.net.cn/download/$HX_TAR"
+          tar -xzf /tmp/hx.tar.gz -C ~/hbuilderx
+
+      - name: 安装无头运行环境
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq xvfb libgtk-3-0 libnss3 libxss1 libasound2 \
+            libgbm1 libatk-bridge2.0-0 libcups2 libdrm2 libxkbcommon0
+
+      - name: 云打包（iOS）
+        working-directory: ~/hbuilderx/HBuilderX
+        env:
+          DCLOUD_USERNAME: ${{ secrets.DCLOUD_USERNAME }}
+          DCLOUD_PASSWORD: ${{ secrets.DCLOUD_PASSWORD }}
+          P12_B64: ${{ secrets.IOS_P12_BASE64 }}
+          P12_PASS: ${{ secrets.IOS_P12_PASSWORD }}
+          PROFILE_B64: ${{ secrets.IOS_PROFILE_BASE64 }}
+          BUNDLE: ${{ inputs.ios_bundle || 'com.250886.voicebox' }}
+        run: |
+          set -e
+          if [ -z "$P12_B64" ] || [ -z "$PROFILE_B64" ]; then
+            echo "::error::iOS 打包需要 Apple 开发者证书：IOS_P12_BASE64 / IOS_P12_PASSWORD / IOS_PROFILE_BASE64"
+            exit 1
+          fi
+          echo "$P12_B64" | base64 -d > "$RUNNER_TEMP/ios.p12"
+          echo "$PROFILE_B64" | base64 -d > "$RUNNER_TEMP/ios.mobileprovision"
+          cat > "$RUNNER_TEMP/pack.json" <<JSON
+          {
+            "project": "app",
+            "platform": "ios",
+            "iscustom": false,
+            "safemode": false,
+            "ios": {
+              "bundle": "$BUNDLE",
+              "supporteddevice": "iPhone,iPad",
+              "profile": "$RUNNER_TEMP/ios.mobileprovision",
+              "certfile": "$RUNNER_TEMP/ios.p12",
+              "certpassword": "$P12_PASS"
+            }
+          }
+          JSON
+          echo "----- pack.json -----"; cat "$RUNNER_TEMP/pack.json"
+
+          xvfb-run -a ./cli open || ./cli open
+          sleep 5
+          ./cli user login --global true --username "$DCLOUD_USERNAME" --password "$DCLOUD_PASSWORD"
+          ./cli project open --path "$GITHUB_WORKSPACE/app"
+          ./cli pack --config "$RUNNER_TEMP/pack.json" 2>&1 | tee "$RUNNER_TEMP/pack.log"
+          ./cli app quit || true
+
+      - name: 收集 IPA
+        working-directory: app
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/out"
+          find unpackage -name "*.ipa" -exec cp {} "$GITHUB_WORKSPACE/out/" \;
+          ls -lh "$GITHUB_WORKSPACE/out"
+          if [ -z "$(ls -A "$GITHUB_WORKSPACE/out")" ]; then
+            echo "::error::未找到 IPA，云端若返回下载链接见上一步日志"
+            exit 1
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: elder-app-ios
+          path: out/*.ipa
+          retention-days: 30

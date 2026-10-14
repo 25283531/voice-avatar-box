@@ -28,6 +28,19 @@ REPO_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 API_BASE = "/repos/25283531/voice-avatar-box"
 EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
 CACHE = os.path.join(tempfile.gettempdir(), "gh_push_blobs.json")
+STATE = os.path.join(tempfile.gettempdir(), "gh_push_state.json")
+
+# 改动路径 -> 需要触发的工作流（与各工作流里的 paths 过滤保持一致）
+WORKFLOW_PATHS = {
+    "server-ci.yml": ("server/", "tools/", ".github/workflows/server-ci.yml"),
+    "docker-build.yml": ("server/", ".github/workflows/docker-build.yml"),
+    "app-build.yml": ("app/", ".github/workflows/app-build.yml"),
+}
+WORKFLOW_INPUTS = {
+    "server-ci.yml": None,
+    "docker-build.yml": {"publish": False, "tag": "latest"},   # 自检，不推镜像
+    "app-build.yml": {"platform": "all"},
+}
 
 get_token()
 
@@ -89,6 +102,28 @@ def save_cache(known: set) -> None:
     json.dump(sorted(known), open(CACHE, "w", encoding="utf-8"))
 
 
+def load_state() -> dict:
+    if os.path.exists(STATE):
+        try:
+            return json.load(open(STATE, encoding="utf-8"))
+        except Exception:
+            pass
+    return {}
+
+
+def save_state(state: dict) -> None:
+    json.dump(state, open(STATE, "w", encoding="utf-8"))
+
+
+def pick_workflows(changed: list) -> dict:
+    """按改动路径挑出需要触发的工作流（增量触发，避免每次全跑）。"""
+    picked = {}
+    for wf, prefixes in WORKFLOW_PATHS.items():
+        if any(p.startswith(prefixes) for p in changed):
+            picked[wf] = WORKFLOW_INPUTS[wf]
+    return picked
+
+
 # ------------------------------------------------------------------ 推送
 def push_commit(sha: str, known: set, parent_override=None, use_cache=False):
     import base64
@@ -138,6 +173,9 @@ def main():
     ap.add_argument("--branch", default=None)
     ap.add_argument("--tag", default=None)
     ap.add_argument("--no-cache", action="store_true", help="忽略已上传 blob 缓存，全量重传")
+    # GitHub 的 push 事件本身就能按 paths 增量触发工作流，默认不再手动 dispatch
+    ap.add_argument("--trigger", action="store_true",
+                    help="推送后按改动路径手动 dispatch 受影响的工作流（默认不触发）")
     args = ap.parse_args()
 
     me = api("/user")
@@ -205,6 +243,34 @@ def main():
             "type": "commit", "tagger": read_commit(parent)["committer"]})
         api(f"{API_BASE}/git/refs", "POST", {"ref": f"refs/tags/{args.tag}", "sha": tagobj["sha"]})
         print(f"refs/tags/{args.tag} 已创建", flush=True)
+
+    # ---------------------------------------------------------------- 增量触发
+    # 通过 API 更新 ref 不会触发 push 事件，这里按「本次实际改动的文件」只触发受影响的工作流
+    state = load_state()
+    old = state.get("last_pushed_sha")
+    try:
+        changed = git(["diff", "--name-only", f"{old}..{local}"]).split() if old \
+            else git(["ls-files"]).split()
+    except RuntimeError:
+        changed = git(["ls-files"]).split()
+    state["last_pushed_sha"] = git(["rev-parse", local]).strip()
+    save_state(state)
+
+    picked = pick_workflows(changed)
+    print(f"\n本次改动 {len(changed)} 个文件", flush=True)
+    if not args.trigger:
+        # 默认不 dispatch：GitHub 的 push 事件已按各工作流自己的 paths 做增量触发
+        hit = "、".join(picked) if picked else "（未命中任何工作流，不会触发）"
+        print(f"  GitHub 按 paths 自动增量触发 -> {hit}", flush=True)
+        print("  如需手动触发用 --trigger", flush=True)
+    elif not picked:
+        print("  未命中任何工作流的 paths → 不触发", flush=True)
+    else:
+        print(f"  手动触发：{', '.join(picked)}", flush=True)
+        for wf, inputs in picked.items():
+            api(f"{API_BASE}/actions/workflows/{wf}/dispatches", "POST",
+                {"ref": branch, **({"inputs": inputs} if inputs else {})})
+            print(f"  ✓ {wf}", flush=True)
 
     print(f"\n完成：https://github.com/25283531/voice-avatar-box/tree/{branch}", flush=True)
 
