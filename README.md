@@ -34,6 +34,10 @@
 | `server-ci.yml` | push/PR 改动 `server/`、`tools/`；可手动 | 安装依赖跑 `tools/smoke_server.py`（21 项业务闭环）+ Dockerfile 语法检查 |
 | `docker-build.yml` | push/PR 改动 `server/`；可手动 | 构建镜像 → 起容器校验 `/api/health`；手动触发勾选 `publish` 才推送 `ghcr.io/25283531/voice-avatar-box` |
 | `app-build.yml` | push/PR 改动 `app/`；可手动 | 构建 H5 / 微信小程序并上传产物；校验后端地址已内联 |
+| `app-pack.yml` | 手动（或发 Release） | **一次产出 Android APK + iOS IPA**（uni-app 云打包，HBuilderX Linux CLI） |
+
+增量触发：每个工作流都带 `paths` 过滤，推送只跑受影响的那条
+（例如只改 `docs/` 或 `firmware/` 不会触发任何构建；改 `tools/` 只跑 `server-ci`）。
 
 手动产出最终产物：**Actions → 对应工作流 → Run workflow**。
 
@@ -77,8 +81,26 @@ pnpm build:mp-weixin   # 产物 app/dist/build/mp-weixin，用微信开发者工
 ```
 
 - 后端地址固定 `https://voice.250886.xyz`（`app/env/.env` 的 `VITE_ELDER_BASEURL`）
-- Android / iOS 原生包请用 HBuilderX「发行 → 原生App云打包」，不走 CI
 - 页面入口：`src/pages/elder/`（绑定设备、提醒列表与编辑、统计、形象选择）
+
+### Android APK / iOS IPA（CI 一次出包，本地不用装 HBuilderX）
+
+`app-pack.yml` 用 HBuilderX Linux CLI 走 uni-app 云打包，一次触发同时产出 APK 与 IPA。
+
+需要一次性地在 **Settings → Secrets and variables → Actions** 里配置：
+
+| Secret | 用途 | 必需 |
+| --- | --- | --- |
+| `DCLOUD_USERNAME` / `DCLOUD_PASSWORD` | DCloud 账号（[dev.dcloud.net.cn](https://dev.dcloud.net.cn) 免费注册），云打包强制登录 | ✅ |
+| `ANDROID_KEYSTORE_BASE64` / `ANDROID_KEY_ALIAS` / `ANDROID_KEYSTORE_PASSWORD` / `ANDROID_STORE_PASSWORD` | 自有签名证书；不配则用 DCloud 公共证书（可安装，不上架商店） | 可选 |
+| `IOS_P12_BASE64` / `IOS_P12_PASSWORD` / `IOS_PROFILE_BASE64` | Apple 开发者证书（p12 + mobileprovision） | iOS ✅ |
+
+另外：manifest 里的 appid 目前是小智的 `__UNI__36A515E`，云打包会校验归属，
+需要在 DCloud 后台创建自己的应用，把 `app/env/.env` 的 `VITE_UNI_APPID` 换掉
+（也可在 Run workflow 时填 `uni_appid` 临时覆盖）。
+
+跑一次：**Actions → app-pack → Run workflow → platform 选 `both`**，
+产物在 Artifacts：`elder-app-android`（APK）、`elder-app-ios`（IPA）。
 
 ## 固件
 

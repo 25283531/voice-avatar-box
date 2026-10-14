@@ -257,7 +257,11 @@ def main():
     save_state(state)
 
     picked = pick_workflows(changed)
-    print(f"\n本次改动 {len(changed)} 个文件", flush=True)
+    if old:
+        print(f"\n本次改动 {len(changed)} 个文件：{', '.join(changed[:8])}"
+              f"{' ...' if len(changed) > 8 else ''}", flush=True)
+    else:
+        print("\n（首次推送，无基线可比对，增量范围交给 GitHub 的 paths 过滤判断）", flush=True)
     if not args.trigger:
         # 默认不 dispatch：GitHub 的 push 事件已按各工作流自己的 paths 做增量触发
         hit = "、".join(picked) if picked else "（未命中任何工作流，不会触发）"
