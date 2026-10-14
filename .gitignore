@@ -49,3 +49,9 @@ Thumbs.db
 *.jks
 *.p12
 *.mobileprovision
+
+# 签名证书（私钥，绝不入库）
+*.keystore
+*.jks
+*.p12
+*.mobileprovision

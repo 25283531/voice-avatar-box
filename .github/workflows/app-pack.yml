@@ -33,10 +33,10 @@ on:
         type: string
         default: com.elder.companion
       android_cert:
-        description: Android 证书来源
+        description: '证书：cloud=DCloud 云端证书（推荐，需 appid 归自己）/ public=DCloud 公共证书 / self=自有 keystore'
         type: choice
-        options: [public, self]
-        default: public
+        options: [cloud, public, self]
+        default: cloud
       version_name:
         description: 版本名
         type: string
@@ -138,9 +138,11 @@ jobs:
           KS_B64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
         run: |
           set -e
-          if [ "$CERT_SELF" = "self" ]; then
-            echo "$KS_B64" | base64 -d > /tmp/app.keystore
-            python -c "
+          case "$CERT_SELF" in
+            self)
+              [ -n "$KS_B64" ] || { echo "::error::缺少自有证书 secrets（ANDROID_KEYSTORE_BASE64 等）"; exit 1; }
+              echo "$KS_B64" | base64 -d > /tmp/app.keystore
+              python -c "
           import json, os
           cfg = {'project': os.path.join(os.environ['GITHUB_WORKSPACE'], 'app'), 'platform': 'android', 'safemode': False,
                  'android': {'packagename': os.environ['PACKAGENAME'], 'androidpacktype': '0',
@@ -148,14 +150,25 @@ jobs:
                              'certpassword': os.environ['KS_PASS'], 'storepassword': os.environ['STORE_PASS']}}
           json.dump(cfg, open('/tmp/pack-android.json', 'w'), ensure_ascii=False, indent=2)
           "
-          else
-            python -c "
+              ;;
+            public)
+              python -c "
           import json, os
           cfg = {'project': os.path.join(os.environ['GITHUB_WORKSPACE'], 'app'), 'platform': 'android', 'safemode': False,
                  'android': {'packagename': os.environ['PACKAGENAME'], 'androidpacktype': '1'}}
           json.dump(cfg, open('/tmp/pack-android.json', 'w'), ensure_ascii=False, indent=2)
           "
-          fi
+              ;;
+            *)
+              # cloud：DCloud 云端证书（与该 appid 绑定，不需要上传 keystore）
+              python -c "
+          import json, os
+          cfg = {'project': os.path.join(os.environ['GITHUB_WORKSPACE'], 'app'), 'platform': 'android', 'safemode': False,
+                 'android': {'packagename': os.environ['PACKAGENAME'], 'androidpacktype': '3'}}
+          json.dump(cfg, open('/tmp/pack-android.json', 'w'), ensure_ascii=False, indent=2)
+          "
+              ;;
+          esac
           cat /tmp/pack-android.json
 
       - name: 云打包（Android）
