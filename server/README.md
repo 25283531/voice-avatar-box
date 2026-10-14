@@ -11,7 +11,8 @@ cp .env.example .env          # 修改 ELDER_JWT_SECRET
 docker compose up -d          # 启动 MySQL + 业务后端
 ```
 
-打开 <http://localhost:8080> 进入管理后台，默认账号 `admin` / `admin123`（**登录后立即改密码**）。
+打开 <http://localhost:8064> 进入管理后台，默认账号 `admin` / `admin123`（**登录后立即改密码**）。
+容器内监听 8080，对外只发布 8064（`ELDER_HTTP_PORT` 可改）。
 
 连带语音链路一起起（可选，需联网拉官方镜像）：
 
@@ -20,7 +21,7 @@ docker compose --profile xiaozhi up -d
 #  8000  小智 WebSocket 语音通道
 #  8002  小智智控台
 #  8003  OTA / 视觉分析
-#  8080  本服务（业务面 + 管理后台）
+#  8064  本服务（业务面 + 管理后台，容器内 8080）
 ```
 
 ## 2. 本地开发（不依赖 Docker）
