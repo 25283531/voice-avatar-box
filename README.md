@@ -34,6 +34,7 @@
 | `server-ci.yml` | push/PR 改动 `server/`、`tools/`；可手动 | 安装依赖跑 `tools/smoke_server.py`（21 项业务闭环）+ Dockerfile 语法检查 |
 | `docker-build.yml` | push/PR 改动 `server/`；可手动 | 构建镜像 → 起容器校验 `/api/health`；手动触发勾选 `publish` 才推送 `ghcr.io/25283531/voice-avatar-box` |
 | `app-build.yml` | push/PR 改动 `app/`；可手动 | 构建 H5 / 微信小程序并上传产物；校验后端地址已内联 |
+| `app-pack.yml` | **可手动**（Actions → Run workflow）/ 发 Release | **一次产出 Android APK + iOS IPA**（HBuilderX Linux CLI 云打包，云端编译，无需本地 IDE） |
 | `app-pack.yml` | 手动（或发 Release） | **一次产出 Android APK + iOS IPA**（uni-app 云打包，HBuilderX Linux CLI） |
 
 增量触发：每个工作流都带 `paths` 过滤，推送只跑受影响的那条
