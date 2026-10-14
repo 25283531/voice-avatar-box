@@ -120,8 +120,13 @@ jobs:
       - name: 安装无头运行环境
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq xvfb libgtk-3-0 libnss3 libxss1 libasound2 \
-            libgbm1 libatk-bridge2.0-0 libcups2 libdrm2 libxkbcommon0
+          # 逐个装：Ubuntu 24.04 上 libasound2 已改名 libasound2t64，
+          # 一次性装会让整条命令因一个包失败（exit 100）
+          for p in xvfb libgtk-3-0 libnss3 libxss1 libgbm1 libatk-bridge2.0-0 \
+                   libcups2 libdrm2 libxkbcommon0 libasound2t64 libasound2; do
+            sudo apt-get install -y -qq "$p" >/dev/null 2>&1 || echo "skip $p"
+          done
+          which xvfb-run
 
       - name: 生成打包配置
         env:
