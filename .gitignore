@@ -43,3 +43,9 @@ Thumbs.db
 .idea/
 .vscode/
 *.swp
+
+# 签名证书（私钥，绝不能入库）
+*.keystore
+*.jks
+*.p12
+*.mobileprovision
