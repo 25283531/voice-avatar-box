@@ -11,7 +11,8 @@
 | 路径 | 说明 |
 | --- | --- |
 | `server/` | FastAPI 业务后端 + WEB 管理后台（单页，离线可用）+ Docker 部署文件 |
-| `app/` | 手机端（uni-app v3 + Vue3，复用 xiaozhi `manager-mobile`），出 H5 / 微信小程序 / App |
+| `app/` | 手机端（uni-app v3 + Vue3，复用 xiaozhi `manager-mobile`），出 H5 / 微信小程序 |
+| `android/` | Android 原生壳工程（WebView + `WebViewAssetLoader`），把 H5 打成 APK，不依赖 DCloud |
 | `firmware/` | ESP32-S3 固件（`components/elder` 为本项目新增组件，编译前需合入 xiaozhi 源码树） |
 | `tools/` | 辅助脚本：`smoke_server.py` 后端冒烟、`make_firmware.py` 合并烧录 bin、`idfwin.py` / `winrun.py` Windows 下的 IDF 包装 |
 | `docs/` | 烧录指南、手机 APP 开发说明 |
@@ -34,8 +35,8 @@
 | `server-ci.yml` | push/PR 改动 `server/`、`tools/`；可手动 | 安装依赖跑 `tools/smoke_server.py`（21 项业务闭环）+ Dockerfile 语法检查 |
 | `docker-build.yml` | push/PR 改动 `server/`；可手动 | 构建镜像 → 起容器校验 `/api/health`；手动触发勾选 `publish` 才推送 `ghcr.io/25283531/voice-avatar-box` |
 | `app-build.yml` | push/PR 改动 `app/`；可手动 | 构建 H5 / 微信小程序并上传产物；校验后端地址已内联 |
-| `app-pack.yml` | **可手动**（Actions → Run workflow）/ 发 Release | **一次产出 Android APK + iOS IPA**（HBuilderX Linux CLI 云打包，云端编译，无需本地 IDE） |
-| `app-pack.yml` | 手动（或发 Release） | **一次产出 Android APK + iOS IPA**（uni-app 云打包，HBuilderX Linux CLI） |
+| `android-build.yml` | push/PR 改动 `app/`、`android/`；可手动 / 发 Release | **一次产出可安装的 Android APK**（H5 + WebView 壳，全程在 runner 内，不用 DCloud 账号） |
+| `app-pack.yml` | 可手动 / 发 Release | 备选：uni-app 云打包出 APK（需要 DCloud 账号 + 实名认证，免费额度每月 5 次） |
 
 增量触发：每个工作流都带 `paths` 过滤，推送只跑受影响的那条
 （例如只改 `docs/` 或 `firmware/` 不会触发任何构建；改 `tools/` 只跑 `server-ci`）。
@@ -44,6 +45,7 @@
 
 - `docker-build`：勾选 `publish`、填 `tag`（如 `v0.1.0`）→ 推送镜像，产物在 ghcr 包列表
 - `app-build`：选 `both` / `h5` / `mp-weixin` → 产物在 Actions 运行页的 Artifacts
+- `android-build`：填版本号 → 产物 Artifacts 里的 `elder-app-android-apk`
 
 ## 服务器部署
 
@@ -84,24 +86,35 @@ pnpm build:mp-weixin   # 产物 app/dist/build/mp-weixin，用微信开发者工
 - 后端地址固定 `https://voice.250886.xyz`（`app/env/.env` 的 `VITE_ELDER_BASEURL`）
 - 页面入口：`src/pages/elder/`（绑定设备、提醒列表与编辑、统计、形象选择）
 
-### Android APK / iOS IPA（CI 一次出包，本地不用装 HBuilderX）
+### Android APK（CI 一次出包，不依赖 DCloud）
 
-`app-pack.yml` 用 HBuilderX Linux CLI 走 uni-app 云打包，一次触发同时产出 APK 与 IPA。
+`android-build.yml` 的流程：构建 H5（`VITE_APP_PUBLIC_BASE=./`，资源走相对路径）
+→ 拷进 `android/app/src/main/assets/web` → Gradle 打 Release 包 → 上传 APK。
 
-需要一次性地在 **Settings → Secrets and variables → Actions** 里配置：
+页面由 `android/app/src/main/java/com/elder/companion/MainActivity.kt` 里的 WebView 承载，
+用 `androidx.webkit.WebViewAssetLoader` 把 assets 映射成虚拟域 `https://elder.local/assets/web/index.html`
+——这样页面有正常 origin，`localStorage` 与跨域请求行为和线上 H5 完全一致。
 
-| Secret | 用途 | 必需 |
-| --- | --- | --- |
-| `DCLOUD_USERNAME` / `DCLOUD_PASSWORD` | DCloud 账号（[dev.dcloud.net.cn](https://dev.dcloud.net.cn) 免费注册），云打包强制登录 | ✅ |
-| `ANDROID_KEYSTORE_BASE64` / `ANDROID_KEY_ALIAS` / `ANDROID_KEYSTORE_PASSWORD` / `ANDROID_STORE_PASSWORD` | 自有签名证书；不配则用 DCloud 公共证书（可安装，不上架商店） | 可选 |
-| `IOS_P12_BASE64` / `IOS_P12_PASSWORD` / `IOS_PROFILE_BASE64` | Apple 开发者证书（p12 + mobileprovision） | iOS ✅ |
+之所以不走 uni-app 云打包：uni-app 的 App 端原生运行时是 DCloud 闭源 AAR，只有云打包能出 APK，
+而且 HBuilderX 3.9+ 起强制要求登录 + 绑定手机号 + 实名认证，免费账号每月仅 5 次配额。
+本项目手机端不依赖 App 原生能力（唯一用到 `plus.runtime.restart()` 的地方已有 H5 降级分支），
+所以 WebView 壳即可完整运行，构建也完全在 GitHub Actions 里完成。
 
-另外：manifest 里的 appid 目前是小智的 `__UNI__36A515E`，云打包会校验归属，
-需要在 DCloud 后台创建自己的应用，把 `app/env/.env` 的 `VITE_UNI_APPID` 换掉
-（也可在 Run workflow 时填 `uni_appid` 临时覆盖）。
+签名（Secret，可选；不配会自动回落到 debug 签名，依然可安装）：
 
-跑一次：**Actions → app-pack → Run workflow → platform 选 `both`**，
-产物在 Artifacts：`elder-app-android`（APK）、`elder-app-ios`（IPA）。
+| Secret | 用途 |
+| --- | --- |
+| `ANDROID_KEYSTORE_BASE64` | 证书文件 base64（当前这份实际是 PKCS12，Gradle 会按文件 magic 自动识别） |
+| `ANDROID_KEY_ALIAS` | 别名，当前 `__uni__g9c80343` |
+| `ANDROID_KEY_PASSWORD` / `ANDROID_STORE_PASSWORD` | 密钥与密钥库口令 |
+
+跑一次：**Actions → android-build → Run workflow**，
+产物在 Artifacts：`elder-app-android-apk`。
+
+> iOS：没有 Apple 开发者证书（p12 + mobileprovision 缺一不可），暂不支持。
+
+> 备选路径 `app-pack.yml`（uni-app 云打包）仍在，需要 `DCLOUD_USERNAME` / `DCLOUD_PASSWORD`
+> 两个 Secret，且该账号必须已在 DCloud 注册并实名。
 
 ## 固件
 

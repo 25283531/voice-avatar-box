@@ -177,7 +177,7 @@ jobs:
           DCLOUD_PASSWORD: ${{ secrets.DCLOUD_PASSWORD }}
         run: |
           set -e
-          if [ -z "$DCLOUD_USERNAME" ]; then
+          if [ -z "$DCLOUD_USERNAME" ] || [ -z "$DCLOUD_PASSWORD" ]; then
             echo "::error::缺少 secrets DCLOUD_USERNAME / DCLOUD_PASSWORD（云打包必须登录 DCloud 账号）"
             exit 1
           fi
@@ -187,18 +187,52 @@ jobs:
           cd "$HXB"
           xvfb-run -a ./cli open || true
           sleep 8
-          ./cli user login --username "$DCLOUD_USERNAME" --password "$DCLOUD_PASSWORD"
+
+          # ---- 登录：cli 登录失败时仍返回 0，必须自己看输出 ----
+          ./cli user login --username "$DCLOUD_USERNAME" --password "$DCLOUD_PASSWORD" 2>&1 | tee /tmp/dcloud-login.log
+          if grep -qiE "not been registered|FAILED|错误|失败|error" /tmp/dcloud-login.log \
+             && ! grep -qiE ":OK|成功|success" /tmp/dcloud-login.log; then
+            echo "::error::DCloud 账号登录失败（见上面 cli 输出）。"
+            echo "::error::请到 https://account.dcloud.net.cn/ 用同一账号密码登录确认；"
+            echo "::error::DCLOUD_USERNAME 必须是 DCloud 的登录名（邮箱 / 手机号 / 用户名），不是任意邮箱。"
+            exit 1
+          fi
+
           ./cli project open --path "$GITHUB_WORKSPACE/app"
+
+          # ---- 打包：云端排队 3~15 分钟，cli 持续输出进度，最后给下载链接 ----
+          set +e
           ./cli pack --config /tmp/pack-android.json 2>&1 | tee /tmp/pack-android.log
+          set -e
           ./cli app quit || true
 
+          if grep -qiE "user not login|未登录|请先登录" /tmp/pack-android.log; then
+            echo "::error::打包未真正执行：DCloud 账号处于未登录状态"
+            exit 1
+          fi
+
       - name: 收集 APK
-        working-directory: app
         run: |
+          set -e
           mkdir -p "$GITHUB_WORKSPACE/out"
-          find unpackage -name "*.apk" -exec cp {} "$GITHUB_WORKSPACE/out/" \; || true
-          ls -lh "$GITHUB_WORKSPACE/out" || true
-          test -n "$(ls -A "$GITHUB_WORKSPACE/out")" || { echo "未找到 apk，见上一步打包日志"; exit 1; }
+          # 渠道一：本地产物（安心打包 safemode=true / 离线打包）
+          find "$GITHUB_WORKSPACE/app/unpackage" -name "*.apk" \
+            -exec cp {} "$GITHUB_WORKSPACE/out/" \; 2>/dev/null || true
+          # 渠道二：传统云打包只在 stdout 给一个临时下载链接，本地不会留文件
+          URL=$(grep -oE 'https?://service\.dcloud\.net\.cn/build/download/[A-Za-z0-9._=&%-]+' \
+                /tmp/pack-android.log 2>/dev/null | head -1 || true)
+          [ -n "$URL" ] || URL=$(grep -oE 'https?://[^ "]+download[^ "]+' \
+                /tmp/pack-android.log 2>/dev/null | head -1 || true)
+          if [ -n "$URL" ]; then
+            echo "云打包下载链接: $URL"
+            curl -sSL --retry 3 --retry-delay 5 -o "$GITHUB_WORKSPACE/out/app.apk" "$URL"
+          fi
+          ls -lh "$GITHUB_WORKSPACE/out"
+          test -n "$(ls -A "$GITHUB_WORKSPACE/out")" || {
+            echo "::error::未拿到 APK —— 下面是 cli pack 的完整输出，据此判断云端失败原因："
+            cat /tmp/pack-android.log
+            exit 1
+          }
 
       - uses: actions/upload-artifact@v4
         with:

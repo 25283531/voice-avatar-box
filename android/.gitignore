@@ -1,0 +1,11 @@
+/build
+/.gradle
+/app/build
+/app/release
+local.properties
+# H5 产物由 CI 构建后拷入，不入库
+/app/src/main/assets/web/
+/app/src/main/res/mipmap-hdpi/
+/app/src/main/res/mipmap-xhdpi/
+/app/src/main/res/mipmap-xxhdpi/
+/app/src/main/res/mipmap-xxxhdpi/

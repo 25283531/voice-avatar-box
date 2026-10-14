@@ -149,7 +149,7 @@ def cmd_log(args):
             "-H", "Accept: application/vnd.github+json",
             f"https://api.github.com{API}/actions/jobs/{j['id']}/logs"],
             capture_output=True).stdout.decode("utf-8", "replace")
-        print(out[-8000:])
+        print(out)
 
 
 def main():

@@ -1,0 +1,177 @@
+name: android-build
+
+# 安卓 APK：uni-app H5 + Android WebView 壳，**全程在 runner 内完成，不走 DCloud 云打包**。
+#
+# 思路：app-build 已经能稳定产出 H5，本项目手机端又不依赖 App 原生能力
+# （唯一用到 plus.runtime.restart() 的地方已有 H5 降级分支），
+# 因此把 H5 塞进 assets/web，用 androidx.webkit 的 WebViewAssetLoader 映射成
+# https://elder.local/assets/web/index.html 加载，就是一个功能完整的原生 App。
+# 好处：不要 DCloud 账号 / 实名 / 每月 5 次配额，签名用自己的 keystore。
+#
+# 触发：改动 app/ 或 android/ 时自动跑（paths 增量），也可手动 / 发 Release 时跑。
+on:
+  push:
+    paths:
+      - 'app/src/**'
+      - 'app/env/**'
+      - 'app/package.json'
+      - 'app/pnpm-lock.yaml'
+      - 'app/vite.config.ts'
+      - 'android/**'
+      - '.github/workflows/android-build.yml'
+  pull_request:
+    paths:
+      - 'app/src/**'
+      - 'app/env/**'
+      - 'app/package.json'
+      - 'app/pnpm-lock.yaml'
+      - 'app/vite.config.ts'
+      - 'android/**'
+      - '.github/workflows/android-build.yml'
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      version_name:
+        description: 版本名
+        type: string
+        default: 1.0.0
+      version_code:
+        description: 版本号（整数，需递增）
+        type: string
+        default: '100'
+      sign:
+        description: '签名：self=仓库 secrets 里的 keystore（缺省）/ debug=调试签名'
+        type: choice
+        options: [self, debug]
+        default: self
+
+env:
+  NODE_VERSION: '20'
+  PNPM_VERSION: '10.10.0'
+  HUSKY: '0'
+
+jobs:
+  apk:
+    name: 构建 Android APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: ${{ env.PNPM_VERSION }}
+          run_install: false
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+          cache-dependency-path: app/pnpm-lock.yaml
+
+      - name: 安装前端依赖
+        working-directory: app
+        run: pnpm install --frozen-lockfile --registry https://registry.npmjs.org
+
+      - name: 构建 H5（相对路径，供 WebView 加载）
+        working-directory: app
+        env:
+          VITE_APP_PUBLIC_BASE: './'
+        run: |
+          set -e
+          pnpm build:h5
+          test -f dist/build/h5/index.html
+          ls -lh dist/build/h5
+
+      - name: 把 H5 与图标装进 Android 工程
+        run: |
+          set -e
+          WEB=android/app/src/main/assets/web
+          rm -rf "$WEB"
+          mkdir -p "$WEB"
+          cp -r app/dist/build/h5/. "$WEB/"
+          # 兜底：把 index.html 里的绝对资源路径改成相对路径
+          # （WebView 里页面在 /assets/web/ 下，"/xxx" 会解析到虚拟域根目录而 404）
+          python - <<'PY'
+          import os
+          p = 'android/app/src/main/assets/web/index.html'
+          s = open(p, encoding='utf-8').read()
+          fixed = s.replace('="/', '="./').replace("='/", "='./")
+          if fixed != s:
+              open(p, 'w', encoding='utf-8').write(fixed)
+              print('已把资源路径改为相对路径')
+          print([x for x in fixed.split('>') if 'script' in x.lower() or 'stylesheet' in x.lower()][:4])
+          PY
+          # 图标复用 app/src/static/icons（不重复入库）
+          for spec in "hdpi:72x72" "xhdpi:96x96" "xxhdpi:144x144" "xxxhdpi:192x192"; do
+            d="android/app/src/main/res/mipmap-${spec%%:*}"
+            mkdir -p "$d"
+            cp "app/src/static/icons/${spec##*:}.png" "$d/ic_launcher.png"
+          done
+          du -sh "$WEB"
+          test -f "$WEB/index.html"
+
+      - name: 准备签名证书
+        id: sign
+        if: inputs.sign != 'debug'
+        env:
+          KS_B64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          STORE_PASS: ${{ secrets.ANDROID_STORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+        run: |
+          set -e
+          if [ -z "$KS_B64" ]; then
+            echo "::warning::未配置 ANDROID_KEYSTORE_BASE64，回落到 debug 签名"
+            exit 0
+          fi
+          KS="$RUNNER_TEMP/app.keystore"
+          echo "$KS_B64" | base64 -d > "$KS"
+          # 别名对不上时 gradle 只会给个含糊的报错，这里先自查
+          if ! keytool -list -keystore "$KS" -storepass "$STORE_PASS" -alias "$KEY_ALIAS" >/dev/null 2>&1; then
+            echo "::error::keystore 里找不到别名 $KEY_ALIAS，实际别名如下："
+            keytool -list -keystore "$KS" -storepass "$STORE_PASS" 2>&1 | head -20
+            exit 1
+          fi
+          echo "keystore_file=$KS" >> "$GITHUB_OUTPUT"
+          echo "签名证书就绪，别名 $KEY_ALIAS"
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: 安装 Android SDK 组件
+        run: |
+          SDK="${ANDROID_HOME:-$ANDROID_SDK_ROOT}"
+          echo "ANDROID_HOME=$SDK"
+          "$SDK/cmdline-tools/latest/bin/sdkmanager" --licenses >/dev/null 2>&1 <<< "y" || true
+          "$SDK/cmdline-tools/latest/bin/sdkmanager" \
+            --install "platforms;android-34" "build-tools;34.0.0" >/dev/null 2>&1 || true
+
+      - name: Gradle 构建 Release APK
+        working-directory: android
+        env:
+          ANDROID_KEYSTORE_FILE: ${{ steps.sign.outputs.keystore_file }}
+          ANDROID_STORE_PASSWORD: ${{ secrets.ANDROID_STORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          set -e
+          chmod +x gradlew
+          VNAME="${{ inputs.version_name || '1.0.0' }}"
+          VCODE="${{ inputs.version_code || '100' }}"
+          ./gradlew --no-daemon --stacktrace assembleRelease \
+            -PVERSION_NAME="$VNAME" -PVERSION_CODE="$VCODE"
+          ls -lh app/build/outputs/apk/release/
+          # 统一文件名，方便下载
+          for f in app/build/outputs/apk/release/*.apk; do
+            mv "$f" "app/build/outputs/apk/release/elder-companion-${VNAME}-${VCODE}.apk"
+          done
+          ls -lh app/build/outputs/apk/release/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: elder-app-android-apk
+          path: android/app/build/outputs/apk/release/*.apk
+          retention-days: 30
