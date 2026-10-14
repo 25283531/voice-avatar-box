@@ -1,0 +1,116 @@
+name: docker-build
+
+# 后端镜像构建。
+#
+#   push / PR          -> 只构建并跑一遍容器冒烟（验证 Dockerfile 与启动链路），不推送
+#   workflow_dispatch  -> 勾选 publish 后推送到 ghcr.io（手动产出最终镜像）
+#
+# 端口：容器内 8080，对外发布 8064
+#   docker run -d -p 8064:8080 -e ELDER_DB=... ghcr.io/25283531/voice-avatar-box:latest
+on:
+  push:
+    branches: [main, master]
+    paths:
+      - 'server/**'
+      - '.github/workflows/docker-build.yml'
+  pull_request:
+    paths:
+      - 'server/**'
+      - '.github/workflows/docker-build.yml'
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: 推送镜像到 ghcr.io（关闭则只构建自检）
+        type: boolean
+        default: false
+      tag:
+        description: 镜像标签
+        type: string
+        default: latest
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE: ghcr.io/${{ github.repository }}
+
+jobs:
+  docker:
+    name: 构建后端镜像
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 解析镜像标签
+        id: meta
+        run: |
+          TAG="${{ inputs.tag }}"
+          if [ -z "$TAG" ]; then TAG="${GITHUB_SHA::7}"; fi
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "sha=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+          echo "镜像: ${REGISTRY}/${GITHUB_REPOSITORY}:${TAG}"
+
+      - name: 准备 Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: 登录 ghcr.io
+        if: github.event_name == 'workflow_dispatch' && inputs.publish
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 构建镜像（本地加载，用于冒烟）
+        uses: docker/build-push-action@v6
+        with:
+          context: ./server
+          file: ./server/Dockerfile
+          platforms: linux/amd64
+          load: true
+          push: false
+          tags: ${{ env.IMAGE }}:${{ steps.meta.outputs.tag }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: 启动容器并验证 /api/health
+        run: |
+          set -e
+          docker rm -f elder-smoke >/dev/null 2>&1 || true
+          docker run -d --name elder-smoke \
+            -p 8064:8080 \
+            -e ELDER_DB=sqlite:////tmp/elder-smoke.db \
+            -e ELDER_JWT_SECRET=ci-smoke-secret \
+            ${{ env.IMAGE }}:${{ steps.meta.outputs.tag }}
+          for i in $(seq 1 40); do
+            if curl -fsS http://127.0.0.1:8064/api/health; then
+              echo ""; echo "容器冒烟通过"
+              docker logs elder-smoke | tail -5
+              docker rm -f elder-smoke >/dev/null 2>&1 || true
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "容器未在 40s 内就绪，日志如下："
+          docker logs elder-smoke | tail -40
+          docker rm -f elder-smoke >/dev/null 2>&1 || true
+          exit 1
+
+      - name: 推送镜像
+        if: github.event_name == 'workflow_dispatch' && inputs.publish
+        run: |
+          IMG="${REGISTRY}/${GITHUB_REPOSITORY}"
+          docker tag "${IMG}:${{ steps.meta.outputs.tag }}" "${IMG}:${{ steps.meta.outputs.tag }}"
+          docker push "${IMG}:${{ steps.meta.outputs.tag }}"
+          if [ "${{ steps.meta.outputs.tag }}" != "${{ steps.meta.outputs.sha }}" ]; then
+            docker tag "${IMG}:${{ steps.meta.outputs.tag }}" "${IMG}:${{ steps.meta.outputs.sha }}"
+            docker push "${IMG}:${{ steps.meta.outputs.sha }}"
+          fi
+          echo "### 镜像已发布" >> "$GITHUB_STEP_SUMMARY"
+          echo "\`\`\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "docker pull ${IMG}:${{ steps.meta.outputs.tag }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "docker run -d -p 8064:8080 --env-file .env ${IMG}:${{ steps.meta.outputs.tag }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "\`\`\`" >> "$GITHUB_STEP_SUMMARY"

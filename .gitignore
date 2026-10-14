@@ -1,0 +1,43 @@
+# ---------------------------------------------------------- Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+
+# ---------------------------------------------------------- 本地数据 / 密钥
+.env
+*.db
+*.sqlite3
+*.log
+
+# ---------------------------------------------------------- Node / 前端
+node_modules/
+app/dist/
+app/unpackage/
+app/.hbuilderx/
+.stylelintcache
+.eslintcache
+*.local
+
+# ---------------------------------------------------------- 固件（ESP-IDF）
+firmware/build/
+firmware/sdkconfig
+firmware/sdkconfig.old
+firmware/dependencies.lock
+firmware/managed_components/
+firmware/*.bin
+firmware/*.elf
+firmware/*.map
+
+# ---------------------------------------------------------- 杂项
+# 本地会话/记忆数据，不进仓库
+.workbuddy/
+Setup Log*.txt
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp

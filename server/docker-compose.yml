@@ -1,0 +1,98 @@
+# 老人陪伴提醒助手 —— 一键部署
+#
+# 核心栈（默认启动）：
+#   elder-db      MySQL 8        业务数据
+#   elder-server  本服务          业务 API + 管理页面   http://localhost:8080
+#
+# 语音栈（可选，需要时加 --profile xiaozhi）：
+#   xiaozhi-*     复用 xiaozhi-esp32-server 官方镜像，承载 ASR/LLM/TTS 与 OTA
+#
+# 访问入口：http://localhost:8064 （容器内 8080，对外只映射 8064）
+#
+#   docker compose up -d
+#   docker compose --profile xiaozhi up -d
+#
+services:
+
+  # ------------------------------------------------------------ 业务数据库
+  elder-db:
+    image: mysql:8.0
+    container_name: elder-db
+    restart: unless-stopped
+    command: >
+      --character-set-server=utf8mb4
+      --collation-server=utf8mb4_unicode_ci
+      --default-time-zone=+08:00
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-123456}
+      MYSQL_DATABASE: elder_companion
+      TZ: Asia/Shanghai
+    volumes:
+      - elder-db-data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-p${MYSQL_ROOT_PASSWORD:-123456}"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+    networks: [elder-net]
+
+  # ------------------------------------------------------------ 业务后端
+  elder-server:
+    build: .
+    container_name: elder-server
+    restart: unless-stopped
+    depends_on:
+      elder-db:
+        condition: service_healthy
+    environment:
+      TZ: Asia/Shanghai
+      ELDER_DB: mysql+pymysql://root:${MYSQL_ROOT_PASSWORD:-123456}@elder-db:3306/elder_companion?charset=utf8mb4
+      ELDER_JWT_SECRET: ${ELDER_JWT_SECRET:-please-change-this-secret-in-production}
+      ELDER_CORS: ${ELDER_CORS:-*}
+      ELDER_XIAOZHI_WS: ${ELDER_XIAOZHI_WS:-ws://xiaozhi-server:8000/xiaozhi/v1/}
+      ELDER_XIAOZHI_OTA: ${ELDER_XIAOZHI_OTA:-http://xiaozhi-server:8003/xiaozhi/ota/}
+    # 对外只发布一个端口，默认 8064（8080 常与其它服务冲突）
+    ports:
+      - "${ELDER_HTTP_PORT:-8064}:8080"
+    networks: [elder-net]
+    security_opt:
+      - seccomp:unconfined
+
+  # ============================================================ 语音链路（可选）
+  xiaozhi-server:
+    image: ghcr.io/xinnan-tech/xiaozhi-esp32-server:server_latest
+    container_name: xiaozhi-server
+    restart: unless-stopped
+    profiles: ["xiaozhi"]
+    ports:
+      - "8000:8000"     # WebSocket 语音通道
+      - "8003:8003"     # OTA / 视觉分析
+    environment:
+      TZ: Asia/Shanghai
+    volumes:
+      - ./data/xiaozhi:/opt/xiaozhi-esp32-server/data
+    networks: [elder-net]
+    security_opt:
+      - seccomp:unconfined
+
+  xiaozhi-web:
+    image: ghcr.io/xinnan-tech/xiaozhi-esp32-server:web_latest
+    container_name: xiaozhi-web
+    restart: unless-stopped
+    profiles: ["xiaozhi"]
+    depends_on: [xiaozhi-server]
+    ports:
+      - "8002:8002"     # 小智智控台（设备管理 / 音色 / 角色）
+    environment:
+      TZ: Asia/Shanghai
+    volumes:
+      - ./data/web:/uploadfile
+    networks: [elder-net]
+
+volumes:
+  elder-db-data:
+
+networks:
+  elder-net:
+    driver: bridge

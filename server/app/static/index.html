@@ -1,0 +1,715 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>老人陪伴提醒助手 · 管理后台</title>
+<style>
+  :root{
+    --bg:#f5f7fa; --panel:#ffffff; --line:#e3e8ef; --text:#1f2937; --muted:#6b7280;
+    --brand:#2563eb; --brand-soft:#eff6ff; --ok:#16a34a; --warn:#d97706; --bad:#dc2626;
+    --radius:10px;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--text);
+       font:14px/1.6 -apple-system,"Segoe UI","Microsoft YaHei",sans-serif}
+  #app{max-width:1180px;margin:0 auto;padding:20px 16px 60px}
+  h1{font-size:19px;margin:0}
+  h2{font-size:16px;margin:0 0 12px}
+  .muted{color:var(--muted)}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);
+        padding:16px;margin-bottom:14px}
+  .row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
+  .row>*{margin:0}
+  header.bar{display:flex;justify-content:space-between;align-items:center;margin-bottom:14px}
+  nav{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:14px}
+  nav button{border:1px solid var(--line);background:var(--panel);border-radius:20px;
+        padding:6px 16px;cursor:pointer;color:var(--text)}
+  nav button.on{background:var(--brand);border-color:var(--brand);color:#fff}
+  button{border:1px solid var(--line);background:var(--panel);border-radius:6px;
+        padding:6px 12px;cursor:pointer;color:var(--text);font-size:13px}
+  button.primary{background:var(--brand);border-color:var(--brand);color:#fff}
+  button.danger{color:var(--bad);border-color:#f3c7c7}
+  button:disabled{opacity:.5;cursor:not-allowed}
+  input,select,textarea{border:1px solid var(--line);border-radius:6px;padding:6px 9px;
+        font-size:13px;background:#fff;color:var(--text);font-family:inherit}
+  textarea{width:100%;min-height:82px;resize:vertical}
+  label{display:block;font-size:12px;color:var(--muted);margin-bottom:3px}
+  .grid{display:grid;gap:10px}
+  .g2{grid-template-columns:repeat(2,minmax(0,1fr))}
+  .g3{grid-template-columns:repeat(3,minmax(0,1fr))}
+  .g4{grid-template-columns:repeat(4,minmax(0,1fr))}
+  table{width:100%;border-collapse:collapse;font-size:13px}
+  th,td{text-align:left;padding:8px 6px;border-bottom:1px solid var(--line);vertical-align:top}
+  th{color:var(--muted);font-weight:600;font-size:12px}
+  code{background:#f1f5f9;padding:1px 5px;border-radius:4px;font-size:12px}
+  .tag{display:inline-block;padding:1px 8px;border-radius:10px;font-size:12px;
+       background:var(--brand-soft);color:var(--brand)}
+  .tag.ok{background:#e8f7ee;color:var(--ok)}
+  .tag.bad{background:#fdeaea;color:var(--bad)}
+  .tag.warn{background:#fdf3e3;color:var(--warn)}
+  .kpi{background:var(--brand-soft);border-radius:var(--radius);padding:12px}
+  .kpi .n{font-size:24px;font-weight:700;color:var(--brand);line-height:1.2}
+  .kpi .l{font-size:12px;color:var(--muted)}
+  .big-code{font:22px/1.4 ui-monospace,Consolas,monospace;letter-spacing:1px;
+       background:#0f172a;color:#7dd3fc;padding:12px 16px;border-radius:8px;
+       display:inline-block;margin:8px 0}
+  .bars{display:flex;align-items:flex-end;gap:6px;height:120px;padding-top:8px}
+  .bars .b{flex:1;background:var(--brand);border-radius:4px 4px 0 0;min-height:2px;position:relative}
+  .bars .x{text-align:center;font-size:11px;color:var(--muted);margin-top:4px}
+  .err{background:#fdeaea;color:var(--bad);padding:8px 12px;border-radius:6px;margin-bottom:10px}
+  .mask{position:fixed;inset:0;background:rgba(15,23,42,.45);display:flex;
+        align-items:flex-start;justify-content:center;padding:40px 16px;overflow:auto}
+  .modal{background:#fff;border-radius:12px;padding:18px;width:100%;max-width:720px}
+  .close{float:right;border:none;background:none;font-size:20px;cursor:pointer;color:var(--muted)}
+  .empty{padding:20px;text-align:center;color:var(--muted)}
+  @media(max-width:820px){.g3,.g4{grid-template-columns:repeat(2,minmax(0,1fr))}}
+</style>
+</head>
+<body>
+<div id="app">
+
+  <!-- ============================ 登录 ============================ -->
+  <div v-if="!token" class="card" style="max-width:380px;margin:80px auto">
+    <h2>登录管理后台</h2>
+    <div v-if="err" class="err">{{err}}</div>
+    <label>用户名</label>
+    <input v-model="loginForm.username" style="width:100%;margin-bottom:10px" @keyup.enter="doLogin" />
+    <label>密码</label>
+    <input v-model="loginForm.password" type="password" style="width:100%;margin-bottom:14px" @keyup.enter="doLogin" />
+    <button class="primary" style="width:100%" :disabled="busy" @click="doLogin">登 录</button>
+    <p class="muted" style="margin-top:12px;font-size:12px">
+      首次部署默认账号 <code>admin</code> / <code>admin123</code>，登录后请立即修改。
+    </p>
+  </div>
+
+  <!-- ============================ 主体 ============================ -->
+  <template v-else>
+    <header class="bar">
+      <div>
+        <h1>老人陪伴提醒助手 · 管理后台</h1>
+        <div class="muted" style="font-size:12px">
+          业务面由本服务提供 · 语音链路走 xiaozhi-esp32-server
+        </div>
+      </div>
+      <div class="row">
+        <span class="muted" style="font-size:12px">{{user.username}}</span>
+        <button @click="logout">退出</button>
+      </div>
+    </header>
+
+    <nav>
+      <button v-for="t in tabs" :key="t.k" :class="{on:tab===t.k}" @click="tab=t.k">{{t.n}}</button>
+    </nav>
+
+    <div v-if="err" class="err">{{err}}</div>
+
+    <!-- ---------------------- 概览 ---------------------- -->
+    <section v-if="tab==='home'">
+      <div class="grid g4" style="margin-bottom:14px">
+        <div class="kpi"><div class="n">{{devices.length}}</div><div class="l">设备总数</div></div>
+        <div class="kpi"><div class="n">{{devices.filter(d=>d.online).length}}</div><div class="l">在线设备</div></div>
+        <div class="kpi"><div class="n">{{reminders.length}}</div><div class="l">提醒规则</div></div>
+        <div class="kpi"><div class="n">{{avatars.length}}</div><div class="l">形象数量</div></div>
+      </div>
+      <div class="card">
+        <h2>快速上手</h2>
+        <ol class="muted" style="margin:0;padding-left:20px">
+          <li>在「设备」页登记设备，点「生成激活码」，屏幕上会显示形如 <code>A-3829-4471-0056</code> 的 13 位码</li>
+          <li>手机端输入该码完成绑定；激活码 10 分钟内有效，末位是 Luhn 校验位，输错当场提示</li>
+          <li>在「提醒」页添加服药 / 日程规则，支持按周、按月、隔天与一天多次</li>
+          <li>在「形象」页配置 EAF 序列帧资源包与提示词，在设备页应用到具体设备</li>
+          <li>在「AI 接入」页配置 ASR / LLM / TTS 平台，可导出为小智配置</li>
+        </ol>
+      </div>
+    </section>
+
+    <!-- ---------------------- 设备 ---------------------- -->
+    <section v-if="tab==='devices'">
+      <div class="card">
+        <h2>登记设备</h2>
+        <div class="row">
+          <div><label>设备标识（eFuse MAC）</label><input v-model="devForm.device_id" placeholder="aabbccddeeff" /></div>
+          <div><label>名称</label><input v-model="devForm.name" placeholder="客厅陪伴助手" /></div>
+          <button class="primary" @click="createDevice">添加</button>
+        </div>
+      </div>
+      <div class="card">
+        <h2>设备列表</h2>
+        <table v-if="devices.length">
+          <thead><tr><th>名称</th><th>标识</th><th>状态</th><th>形象</th><th>最近在线</th><th>操作</th></tr></thead>
+          <tbody>
+            <tr v-for="d in devices" :key="d.id">
+              <td>{{d.name}}</td>
+              <td><code>{{d.device_id}}</code></td>
+              <td><span class="tag" :class="d.online?'ok':''">{{d.online?'在线':'离线'}}</span></td>
+              <td>
+                <select :value="d.avatar_id||''" @change="applyAvatar(d,$event)">
+                  <option value="">未设置</option>
+                  <option v-for="a in avatars" :key="a.id" :value="a.id">{{a.name}}</option>
+                </select>
+              </td>
+              <td class="muted">{{fmt(d.last_seen_at)}}</td>
+              <td class="row">
+                <button @click="genCode(d)">激活码</button>
+                <button @click="openReminders(d)">提醒</button>
+                <button @click="openStats(d)">统计</button>
+                <button class="danger" @click="removeDevice(d)">删除</button>
+              </td>
+            </tr>
+          </tbody>
+        </table>
+        <div v-else class="empty">还没有设备，先在上方登记一台</div>
+      </div>
+
+      <div v-if="codeBox" class="mask" @click.self="codeBox=null">
+        <div class="modal">
+          <button class="close" @click="codeBox=null">&times;</button>
+          <h2>设备激活码</h2>
+          <p class="muted">让设备屏幕显示该码，或用手机端输入。<b>10 分钟内有效</b>，过期请在设备上重新获取。</p>
+          <div class="big-code">{{codeBox.display}}</div>
+          <p class="muted" style="font-size:12px">
+            原始码：<code>{{codeBox.code}}</code> · 结构：1 位字母 + 12 位数字（末位 Luhn 校验位）
+          </p>
+          <div class="row"><button class="primary" @click="copy(codeBox.code)">复制</button></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ---------------------- 提醒 ---------------------- -->
+    <section v-if="tab==='reminders'">
+      <div class="card">
+        <div class="row" style="justify-content:space-between">
+          <h2>提醒规则</h2>
+          <div class="row">
+            <select v-model="curDeviceId">
+              <option v-for="d in devices" :key="d.id" :value="d.id">{{d.name}}</option>
+            </select>
+            <button class="primary" :disabled="!curDeviceId" @click="editReminder(null)">新增提醒</button>
+          </div>
+        </div>
+        <table v-if="reminders.length">
+          <thead><tr><th>标题</th><th>类型</th><th>时间</th><th>重复</th><th>确认</th><th>状态</th><th>操作</th></tr></thead>
+          <tbody>
+            <tr v-for="r in reminders" :key="r.id">
+              <td>
+                {{r.title}}
+                <div class="muted" style="font-size:12px" v-if="r.dose">剂量：{{r.dose}}</div>
+                <div class="muted" style="font-size:12px">下次：{{fmt(r.next_fire_at)}}</div>
+              </td>
+              <td>{{typeName(r.rtype)}}</td>
+              <td>{{(r.times_of_day||[]).join(' ')}}</td>
+              <td>{{kindName(r)}}</td>
+              <td>{{(r.confirm_methods||[]).join('/')||'—'}}</td>
+              <td>
+                <span class="tag" :class="r.enabled?'ok':''">{{r.enabled?'启用':'暂停'}}</span>
+              </td>
+              <td class="row">
+                <button @click="editReminder(r)">编辑</button>
+                <button @click="toggleReminder(r)">{{r.enabled?'暂停':'启用'}}</button>
+                <button class="danger" @click="removeReminder(r)">删除</button>
+              </td>
+            </tr>
+          </tbody>
+        </table>
+        <div v-else class="empty">该设备还没有提醒规则</div>
+      </div>
+
+      <div class="card" v-if="curDeviceId">
+        <h2>最近回执</h2>
+        <table v-if="events.length">
+          <thead><tr><th>应触发</th><th>状态</th><th>确认方式</th><th>确认时间</th><th>备注</th></tr></thead>
+          <tbody>
+            <tr v-for="e in events" :key="e.id">
+              <td>{{fmt(e.due_at)}}</td>
+              <td><span class="tag" :class="stateClass(e.state)">{{stateName(e.state)}}</span></td>
+              <td>{{methodName(e.confirm_method)}}</td>
+              <td>{{fmt(e.confirmed_at)}}</td>
+              <td class="muted">{{e.note}}</td>
+            </tr>
+          </tbody>
+        </table>
+        <div v-else class="empty">暂无回执</div>
+      </div>
+
+      <div v-if="rBox" class="mask" @click.self="rBox=null">
+        <div class="modal">
+          <button class="close" @click="rBox=null">&times;</button>
+          <h2>{{rBox.id?'编辑提醒':'新增提醒'}}</h2>
+          <div class="grid g2">
+            <div><label>标题</label><input v-model="rForm.title" style="width:100%" /></div>
+            <div><label>类型</label>
+              <select v-model.number="rForm.rtype" style="width:100%">
+                <option :value="0">服药</option><option :value="1">日程</option>
+                <option :value="2">喝水</option><option :value="3">运动</option><option :value="4">自定义</option>
+              </select></div>
+            <div><label>播报文案（留空则读标题）</label><input v-model="rForm.speak_text" style="width:100%" /></div>
+            <div><label>剂量 / 备注</label><input v-model="rForm.dose" style="width:100%" placeholder="1 片，饭后" /></div>
+          </div>
+
+          <div class="grid g2" style="margin-top:10px">
+            <div><label>重复方式</label>
+              <select v-model.number="rForm.schedule_kind" style="width:100%">
+                <option :value="1">每天</option><option :value="2">每周指定几天</option>
+                <option :value="3">每月指定几号</option><option :value="4">每隔 N 天</option>
+                <option :value="0">指定日期一次</option>
+              </select></div>
+            <div><label>触发时刻（24h，逗号分隔，如 08:00, 20:00）</label>
+              <input v-model="timesText" style="width:100%" placeholder="08:00, 12:00, 18:00" /></div>
+          </div>
+
+          <div class="grid g3" style="margin-top:10px" v-if="rForm.schedule_kind===2">
+            <div><label>星期（1=周一）</label><input v-model="weekText" style="width:100%" placeholder="1,3,5" /></div>
+            <div><label>生效开始</label><input v-model="rForm.start_date" placeholder="2026-10-01" /></div>
+            <div><label>生效结束</label><input v-model="rForm.end_date" placeholder="2027-10-01" /></div>
+          </div>
+          <div class="grid g3" style="margin-top:10px" v-if="rForm.schedule_kind===3">
+            <div><label>每月几号</label><input v-model="monthText" placeholder="1,15" /></div>
+            <div><label>生效开始</label><input v-model="rForm.start_date" placeholder="2026-10-01" /></div>
+            <div><label>生效结束</label><input v-model="rForm.end_date" placeholder="2027-10-01" /></div>
+          </div>
+          <div class="grid g3" style="margin-top:10px" v-if="rForm.schedule_kind===4">
+            <div><label>每隔天数</label><input v-model.number="rForm.interval_days" type="number" min="1" /></div>
+            <div><label>起始日期</label><input v-model="rForm.start_date" placeholder="2026-10-01" /></div>
+            <div><label>结束日期</label><input v-model="rForm.end_date" placeholder="2026-12-31" /></div>
+          </div>
+          <div class="grid g3" style="margin-top:10px" v-if="rForm.schedule_kind===0">
+            <div><label>日期</label><input v-model="rForm.once_date" placeholder="2026-10-15" /></div>
+          </div>
+
+          <div class="grid g3" style="margin-top:10px">
+            <div><label>需要确认</label>
+              <select v-model="rForm.require_confirm" style="width:100%">
+                <option :value="true">需要</option><option :value="false">不需要</option>
+              </select></div>
+            <div><label>未确认重复间隔（分钟）</label><input v-model.number="rForm.repeat_interval_min" type="number" /></div>
+            <div><label>超时升级（分钟）</label><input v-model.number="rForm.escalate_after_min" type="number" /></div>
+          </div>
+
+          <div style="margin-top:10px">
+            <label>允许的确认方式</label>
+            <div class="row">
+              <label style="display:flex;gap:4px;align-items:center">
+                <input type="checkbox" value="voice" v-model="rForm.confirm_methods" /> 语音</label>
+              <label style="display:flex;gap:4px;align-items:center">
+                <input type="checkbox" value="button" v-model="rForm.confirm_methods" /> 按键（长按3秒+30秒内短按）</label>
+              <label style="display:flex;gap:4px;align-items:center">
+                <input type="checkbox" value="app" v-model="rForm.confirm_methods" /> 手机端</label>
+            </div>
+          </div>
+
+          <div class="row" style="margin-top:16px;justify-content:flex-end">
+            <button @click="rBox=null">取消</button>
+            <button class="primary" @click="saveReminder">保存</button>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ---------------------- 形象 ---------------------- -->
+    <section v-if="tab==='avatars'">
+      <div class="card">
+        <div class="row" style="justify-content:space-between">
+          <h2>形象 / 角色</h2>
+          <button class="primary" @click="editAvatar(null)">新增形象</button>
+        </div>
+        <table v-if="avatars.length">
+          <thead><tr><th>名称</th><th>EAF 资源包</th><th>屏幕</th><th>音色</th><th>操作</th></tr></thead>
+          <tbody>
+            <tr v-for="a in avatars" :key="a.id">
+              <td>{{a.name}}<div class="muted" style="font-size:12px">{{a.description}}</div></td>
+              <td><code>{{a.eaf_pack_name||'—'}}</code></td>
+              <td>{{a.screen_width}}×{{a.screen_height}}</td>
+              <td>{{a.tts_voice||'—'}}</td>
+              <td class="row">
+                <button @click="editAvatar(a)">编辑</button>
+                <button class="danger" @click="removeAvatar(a)">删除</button>
+              </td>
+            </tr>
+          </tbody>
+        </table>
+        <div v-else class="empty">还没有形象</div>
+      </div>
+
+      <div v-if="aBox" class="mask" @click.self="aBox=null">
+        <div class="modal">
+          <button class="close" @click="aBox=null">&times;</button>
+          <h2>{{aForm.id?'编辑形象':'新增形象'}}</h2>
+          <div class="grid g2">
+            <div><label>名称</label><input v-model="aForm.name" style="width:100%" /></div>
+            <div><label>简介</label><input v-model="aForm.description" style="width:100%" /></div>
+            <div><label>EAF 资源包名</label><input v-model="aForm.eaf_pack_name" style="width:100%" placeholder="xiaonuan" /></div>
+            <div><label>资源包下载地址</label><input v-model="aForm.eaf_pack_url" style="width:100%" /></div>
+            <div><label>屏幕宽</label><input v-model.number="aForm.screen_width" type="number" /></div>
+            <div><label>屏幕高</label><input v-model.number="aForm.screen_height" type="number" /></div>
+          </div>
+          <div style="margin-top:10px">
+            <label>系统提示词</label><textarea v-model="aForm.system_prompt"></textarea>
+          </div>
+          <div class="grid g2" style="margin-top:10px">
+            <div><label>TTS 音色</label><input v-model="aForm.tts_voice" style="width:100%" /></div>
+            <div><label>SHA256（资源包校验）</label><input v-model="aForm.eaf_pack_sha256" style="width:100%" /></div>
+          </div>
+          <div style="margin-top:10px">
+            <label>片段映射 JSON（idle / listening / mouth_open / smile / blink ...）</label>
+            <textarea v-model="clipsText" style="min-height:76px"></textarea>
+          </div>
+          <div style="margin-top:10px">
+            <label>情绪灯效 JSON（{"happy":{"rgb":"#3AD07A","effect":"breath"}}）</label>
+            <textarea v-model="lightsText" style="min-height:76px"></textarea>
+          </div>
+          <div class="row" style="margin-top:16px;justify-content:flex-end">
+            <button @click="aBox=null">取消</button>
+            <button class="primary" @click="saveAvatar">保存</button>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ---------------------- AI 接入 ---------------------- -->
+    <section v-if="tab==='providers'">
+      <div class="card">
+        <div class="row" style="justify-content:space-between">
+          <h2>AI 平台接入</h2>
+          <div class="row">
+            <button @click="exportXiaozhi">导出小智配置</button>
+            <button class="primary" @click="editProvider(null)">新增</button>
+          </div>
+        </div>
+        <table v-if="providers.length">
+          <thead><tr><th>名称</th><th>能力</th><th>平台</th><th>模型</th><th>优先级</th><th>状态</th><th>操作</th></tr></thead>
+          <tbody>
+            <tr v-for="p in providers" :key="p.id">
+              <td>{{p.name}}</td>
+              <td><span class="tag">{{p.kind}}</span></td>
+              <td>{{p.provider}}</td>
+              <td>{{p.model||'—'}}</td>
+              <td>{{p.priority}}</td>
+              <td><span class="tag" :class="p.enabled?'ok':''">{{p.enabled?'启用':'停用'}}</span></td>
+              <td class="row">
+                <button @click="editProvider(p)">编辑</button>
+                <button class="danger" @click="removeProvider(p)">删除</button>
+              </td>
+            </tr>
+          </tbody>
+        </table>
+        <div v-else class="empty">还没有配置任何 AI 平台</div>
+      </div>
+
+      <div v-if="pBox" class="mask" @click.self="pBox=null">
+        <div class="modal">
+          <button class="close" @click="pBox=null">&times;</button>
+          <h2>{{pForm.id?'编辑 AI 配置':'新增 AI 配置'}}</h2>
+          <div class="grid g2">
+            <div><label>名称</label><input v-model="pForm.name" style="width:100%" placeholder="主力大模型" /></div>
+            <div><label>能力</label>
+              <select v-model="pForm.kind" style="width:100%">
+                <option value="asr">语音识别 ASR</option><option value="llm">大模型 LLM</option>
+                <option value="tts">语音合成 TTS</option><option value="vad">端点检测 VAD</option>
+              </select></div>
+            <div><label>平台</label>
+              <select v-model="pForm.provider" style="width:100%">
+                <option value="aliyun">阿里云百炼</option><option value="volcengine">火山引擎</option>
+                <option value="deepseek">DeepSeek</option><option value="zhipu">智谱</option>
+                <option value="openai">OpenAI 兼容</option><option value="ollama">Ollama（自部署）</option>
+                <option value="dify">Dify</option><option value="xinference">Xinference（自部署）</option>
+              </select></div>
+            <div><label>模型</label><input v-model="pForm.model" style="width:100%" /></div>
+            <div><label>接口地址</label><input v-model="pForm.endpoint" style="width:100%" /></div>
+            <div><label>API Key</label><input v-model="pForm.api_key" type="password" style="width:100%" /></div>
+            <div><label>优先级（越小越优先）</label><input v-model.number="pForm.priority" type="number" /></div>
+            <div><label>启用</label>
+              <select v-model="pForm.enabled" style="width:100%">
+                <option :value="true">启用</option><option :value="false">停用</option>
+              </select></div>
+          </div>
+          <div style="margin-top:10px">
+            <label>附加参数 JSON（温度、音色、采样率等）</label>
+            <textarea v-model="paramsText" style="min-height:70px"></textarea>
+          </div>
+          <div class="row" style="margin-top:16px;justify-content:flex-end">
+            <button @click="pBox=null">取消</button>
+            <button class="primary" @click="saveProvider">保存</button>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ---------------------- 统计 ---------------------- -->
+    <section v-if="tab==='stats'">
+      <div class="card">
+        <div class="row" style="justify-content:space-between">
+          <h2>交互统计</h2>
+          <select v-model="curDeviceId">
+            <option v-for="d in devices" :key="d.id" :value="d.id">{{d.name}}</option>
+          </select>
+        </div>
+        <div v-if="stat" class="grid g4">
+          <div class="kpi"><div class="n">{{stat.today_total}}</div><div class="l">今日交互次数</div></div>
+          <div class="kpi"><div class="n">{{stat.today_dialog}}</div><div class="l">今日对话轮次</div></div>
+          <div class="kpi"><div class="n">{{stat.today_confirm}}</div><div class="l">今日按时确认</div></div>
+          <div class="kpi"><div class="n" :style="{color:stat.missed_today?'var(--bad)':'var(--ok)'}">{{stat.missed_today}}</div><div class="l">今日超时未确认</div></div>
+        </div>
+        <div v-if="stat" style="margin-top:14px">
+          <div class="muted" style="font-size:12px;margin-bottom:4px">近 {{stat.series.length}} 天交互次数</div>
+          <div class="bars">
+            <div v-for="p in stat.series" :key="p.date">
+              <div class="b" :style="{height:barHeight(p.total)+'px'}" :title="p.date+' 共 '+p.total+' 次'"></div>
+              <div class="x">{{p.date.slice(5)}}</div>
+            </div>
+          </div>
+        </div>
+        <div v-else class="empty">选择设备后查看统计</div>
+      </div>
+    </section>
+  </template>
+</div>
+
+<script src="/static/vendor/vue.global.prod.js"></script>
+<script>
+const { createApp } = Vue;
+
+createApp({
+  data(){
+    return {
+      token: localStorage.getItem('elder_token') || '',
+      user: JSON.parse(localStorage.getItem('elder_user') || '{}'),
+      tab: 'home',
+      tabs: [
+        {k:'home',n:'概览'},{k:'devices',n:'设备'},{k:'reminders',n:'提醒'},
+        {k:'avatars',n:'形象'},{k:'providers',n:'AI 接入'},{k:'stats',n:'统计'}
+      ],
+      err: '', busy: false,
+      loginForm: { username:'', password:'' },
+      devices: [], avatars: [], providers: [], reminders: [], events: [],
+      curDeviceId: null, stat: null,
+      devForm: { device_id:'', name:'我的陪伴助手' },
+      codeBox: null,
+      rBox: null, rForm: null, timesText:'', weekText:'', monthText:'',
+      aBox: null, aForm: null, clipsText:'', lightsText:'',
+      pBox: null, pForm: null, paramsText:''
+    };
+  },
+  methods:{
+    async api(path, opt){
+      const res = await fetch(path, Object.assign({
+        headers: Object.assign(
+          {'Content-Type':'application/json'},
+          this.token ? {Authorization:'Bearer '+this.token} : {}
+        )
+      }, opt || {}));
+      if (res.status === 401){ this.token=''; localStorage.removeItem('elder_token'); return null; }
+      const text = await res.text();
+      let data = null;
+      try { data = text ? JSON.parse(text) : null; } catch(e){ data = text; }
+      if (!res.ok){ throw new Error((data && data.detail) || ('HTTP '+res.status)); }
+      return data;
+    },
+    async doLogin(){
+      this.busy = true; this.err = '';
+      try{
+        const r = await fetch('/api/auth/login', {
+          method:'POST', headers:{'Content-Type':'application/json'},
+          body: JSON.stringify(this.loginForm)
+        });
+        const d = await r.json();
+        if (!r.ok) throw new Error(d.detail || '登录失败');
+        this.token = d.access_token;
+        this.user = {username:d.username, id:d.user_id, is_admin:d.is_admin};
+        localStorage.setItem('elder_token', this.token);
+        localStorage.setItem('elder_user', JSON.stringify(this.user));
+        await this.loadAll();
+      }catch(e){ this.err = e.message; }
+      finally{ this.busy = false; }
+    },
+    logout(){ this.token=''; localStorage.removeItem('elder_token'); },
+    async loadAll(){
+      await Promise.all([this.loadDevices(), this.loadAvatars(), this.loadProviders()]);
+      if (this.curDeviceId) await this.loadReminders();
+    },
+    async loadDevices(){
+      const r = await this.api('/api/devices'); if(!r) return;
+      this.devices = r;
+      if (!this.curDeviceId && r.length) this.curDeviceId = r[0].id;
+    },
+    async loadAvatars(){ const r = await this.api('/api/avatars'); if(r) this.avatars = r; },
+    async loadProviders(){ const r = await this.api('/api/providers'); if(r) this.providers = r; },
+    async loadReminders(){
+      if (!this.curDeviceId) return;
+      const r = await this.api('/api/reminders?device_pk='+this.curDeviceId);
+      if (r) this.reminders = r;
+      const e = await this.api('/api/devices/'+this.curDeviceId+'/events?limit=50');
+      if (e) this.events = e;
+      const s = await this.api('/api/stats/overview?device_pk='+this.curDeviceId);
+      this.stat = s;
+    },
+
+    // -------- 设备 --------
+    async createDevice(){
+      try{
+        await this.api('/api/devices', {method:'POST', body:JSON.stringify(this.devForm)});
+        this.devForm = {device_id:'', name:'我的陪伴助手'};
+        await this.loadDevices();
+      }catch(e){ this.err = e.message; }
+    },
+    async genCode(d){
+      try{
+        this.codeBox = await this.api('/api/devices/'+d.id+'/code', {method:'POST'});
+      }catch(e){ this.err = e.message; }
+    },
+    async applyAvatar(d, ev){
+      const v = ev.target.value;
+      try{
+        if (v) await this.api('/api/avatars/'+v+'/apply/'+d.id, {method:'POST'});
+        else await this.api('/api/devices/'+d.id, {method:'PATCH', body:JSON.stringify({avatar_id:0})});
+        await this.loadDevices();
+      }catch(e){ this.err = e.message; }
+    },
+    async removeDevice(d){
+      if (!confirm('删除设备「'+d.name+'」及其全部提醒？')) return;
+      await this.api('/api/devices/'+d.id, {method:'DELETE'});
+      await this.loadDevices();
+    },
+    openReminders(d){ this.curDeviceId = d.id; this.tab='reminders'; this.loadReminders(); },
+    openStats(d){ this.curDeviceId = d.id; this.tab='stats'; this.loadReminders(); },
+    copy(t){ navigator.clipboard && navigator.clipboard.writeText(t); },
+
+    // -------- 提醒 --------
+    blankReminder(){
+      return { title:'', speak_text:'', rtype:0, schedule_kind:1,
+        times_of_day:['08:00'], weekdays:[], month_days:[], interval_days:1,
+        once_date:null, start_date:null, end_date:null, dose:'',
+        require_confirm:true, repeat_interval_min:10, repeat_times:3,
+        escalate_after_min:30, confirm_methods:['voice','button'], enabled:true };
+    },
+    editReminder(r){
+      this.rForm = r ? JSON.parse(JSON.stringify(r)) : this.blankReminder();
+      this.timesText = (this.rForm.times_of_day||[]).join(', ');
+      this.weekText = (this.rForm.weekdays||[]).join(',');
+      this.monthText = (this.rForm.month_days||[]).join(',');
+      this.rBox = true;
+    },
+    async saveReminder(){
+      this.rForm.times_of_day = this.timesText.split(/[,，\s]+/).filter(Boolean);
+      this.rForm.weekdays = this.weekText.split(/[,，\s]+/).filter(Boolean).map(Number);
+      this.rForm.month_days = this.monthText.split(/[,，\s]+/).filter(Boolean).map(Number);
+      const body = JSON.parse(JSON.stringify(this.rForm));
+      delete body.id; delete body.device_id; delete body.creator_id;
+      delete body.created_at; delete body.updated_at; delete body.next_fire_at;
+      try{
+        if (this.rForm.id){
+          await this.api('/api/reminders/'+this.rForm.id, {method:'PATCH', body:JSON.stringify(body)});
+        }else{
+          await this.api('/api/reminders?device_pk='+this.curDeviceId, {method:'POST', body:JSON.stringify(body)});
+        }
+        this.rBox = false; await this.loadReminders();
+      }catch(e){ this.err = e.message; }
+    },
+    async toggleReminder(r){
+      await this.api('/api/reminders/'+r.id+'/toggle', {method:'POST'});
+      await this.loadReminders();
+    },
+    async removeReminder(r){
+      if (!confirm('删除提醒「'+r.title+'」？')) return;
+      await this.api('/api/reminders/'+r.id, {method:'DELETE'});
+      await this.loadReminders();
+    },
+
+    // -------- 形象 --------
+    blankAvatar(){
+      return { name:'', description:'', eaf_pack_name:'', eaf_pack_url:'', eaf_pack_sha256:'',
+        screen_width:320, screen_height:240, clips:{}, system_prompt:'', tts_voice:'',
+        emotion_lights:{}, enabled:true };
+    },
+    editAvatar(a){
+      this.aForm = a ? JSON.parse(JSON.stringify(a)) : this.blankAvatar();
+      this.clipsText = JSON.stringify(this.aForm.clips||{}, null, 2);
+      this.lightsText = JSON.stringify(this.aForm.emotion_lights||{}, null, 2);
+      this.aBox = true;
+    },
+    async saveAvatar(){
+      try{
+        this.aForm.clips = this.clipsText.trim() ? JSON.parse(this.clipsText) : {};
+        this.aForm.emotion_lights = this.lightsText.trim() ? JSON.parse(this.lightsText) : {};
+      }catch(e){ this.err = 'JSON 格式错误：'+e.message; return; }
+      const body = JSON.parse(JSON.stringify(this.aForm));
+      delete body.id; delete body.created_at;
+      try{
+        if (this.aForm.id) await this.api('/api/avatars/'+this.aForm.id, {method:'PATCH', body:JSON.stringify(body)});
+        else await this.api('/api/avatars', {method:'POST', body:JSON.stringify(body)});
+        this.aBox = false; await this.loadAvatars();
+      }catch(e){ this.err = e.message; }
+    },
+    async removeAvatar(a){
+      if (!confirm('删除形象「'+a.name+'」？')) return;
+      await this.api('/api/avatars/'+a.id, {method:'DELETE'});
+      await this.loadAvatars();
+    },
+
+    // -------- AI --------
+    blankProvider(){
+      return { name:'', kind:'llm', provider:'deepseek', endpoint:'', api_key:'',
+        model:'', params:{}, priority:10, enabled:true };
+    },
+    editProvider(p){
+      this.pForm = p ? JSON.parse(JSON.stringify(p)) : this.blankProvider();
+      this.paramsText = JSON.stringify(this.pForm.params||{}, null, 2);
+      this.pBox = true;
+    },
+    async saveProvider(){
+      try{ this.pForm.params = this.paramsText.trim() ? JSON.parse(this.paramsText) : {}; }
+      catch(e){ this.err = 'JSON 格式错误：'+e.message; return; }
+      const body = JSON.parse(JSON.stringify(this.pForm));
+      delete body.id; delete body.created_at;
+      try{
+        if (this.pForm.id) await this.api('/api/providers/'+this.pForm.id, {method:'PATCH', body:JSON.stringify(body)});
+        else await this.api('/api/providers', {method:'POST', body:JSON.stringify(body)});
+        this.pBox = false; await this.loadProviders();
+      }catch(e){ this.err = e.message; }
+    },
+    async removeProvider(p){
+      if (!confirm('删除配置「'+p.name+'」？')) return;
+      await this.api('/api/providers/'+p.id, {method:'DELETE'});
+      await this.loadProviders();
+    },
+    async exportXiaozhi(){
+      const d = await this.api('/api/providers/export/xiaozhi');
+      if (d) { console.log(d); alert('已导出到浏览器控制台，可复制到小智 config.yaml 的 selected_module 下'); }
+    },
+
+    // -------- 展示辅助 --------
+    fmt(v){
+      if (!v) return '—';
+      const d = new Date(v);
+      if (isNaN(d.getTime())) return v;
+      const p = n => String(n).padStart(2,'0');
+      return d.getFullYear()+'-'+p(d.getMonth()+1)+'-'+p(d.getDate())+' '+p(d.getHours())+':'+p(d.getMinutes());
+    },
+    barHeight(n){
+      const max = Math.max(1, ...(this.stat ? this.stat.series.map(s=>s.total) : [1]));
+      return Math.round(8 + (n / max) * 100);
+    },
+    typeName(t){ return ['服药','日程','喝水','运动','自定义'][t] || '自定义'; },
+    kindName(r){
+      const k = r.schedule_kind;
+      if (k===0) return '一次 '+ (r.once_date||'');
+      if (k===1) return '每天';
+      if (k===2) return '每周 ' + (r.weekdays||[]).map(w=>'一二三四五六日'[w-1]).join('');
+      if (k===3) return '每月 ' + (r.month_days||[]).join('、') + ' 号';
+      if (k===4) return '每 ' + r.interval_days + ' 天';
+      return '—';
+    },
+    stateName(s){ return ['待触发','已响铃','已确认','超时未确认','已跳过'][s] || '—'; },
+    stateClass(s){ return s===2?'ok':(s===3?'bad':(s===1?'warn':'')); },
+    methodName(m){ return ['—','语音','按键','手机端','自动'][m] || '—'; }
+  },
+  watch:{
+    curDeviceId(){ this.loadReminders(); }
+  },
+  mounted(){
+    if (this.token) this.loadAll().catch(e => { this.err = e.message; });
+  }
+}).mount('#app');
+</script>
+</body>
+</html>

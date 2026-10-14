@@ -1,0 +1,131 @@
+name: app-build
+
+# 手机端（uni-app + Vue3）构建。
+#
+#   push / PR          -> 构建 H5 自检（验证依赖、页面、打包链路），产物保留 7 天
+#   workflow_dispatch  -> 可选 h5 / mp-weixin / both，产物保留 30 天，用于正式发包
+#
+# 后端地址固定在 env/.env 的 VITE_ELDER_BASEURL（https://voice.250886.xyz），
+# 手动触发时可临时覆盖 server_baseurl。
+#
+# Android / iOS 原生包不走本工作流：uni-app 的 App 端打包依赖 HBuilderX 云端证书与
+# 原生工程，请用 HBuilderX「发行 -> 原生App云打包」，详见 docs/手机APP开发说明.md。
+on:
+  push:
+    branches: [main, master]
+    paths:
+      - 'app/src/**'
+      - 'app/env/**'
+      - 'app/package.json'
+      - 'app/pnpm-lock.yaml'
+      - 'app/vite.config.ts'
+      - 'app/manifest.config.ts'
+      - 'app/pages.config.ts'
+      - '.github/workflows/app-build.yml'
+  pull_request:
+    paths:
+      - 'app/src/**'
+      - 'app/env/**'
+      - 'app/package.json'
+      - 'app/pnpm-lock.yaml'
+      - '.github/workflows/app-build.yml'
+  workflow_dispatch:
+    inputs:
+      platform:
+        description: 构建目标
+        type: choice
+        options: [both, h5, mp-weixin]
+        default: both
+      server_baseurl:
+        description: 业务后端地址（留空用 env/.env 里已固定的值）
+        type: string
+        default: ''
+
+env:
+  NODE_VERSION: '20'
+  PNPM_VERSION: '10.10.0'
+  HUSKY: '0'
+  WORKDIR: app
+
+jobs:
+  build:
+    name: 构建 ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - key: h5
+            name: H5
+            script: build:h5
+            out: dist/build/h5
+            artifact: elder-app-h5
+          - key: mp-weixin
+            name: 微信小程序
+            script: build:mp-weixin
+            out: dist/build/mp-weixin
+            artifact: elder-app-mp-weixin
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 判断本次是否需要构建
+        id: gate
+        run: |
+          PLAT="${{ inputs.platform }}"
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "$PLAT" != "both" ] && [ "$PLAT" != "${{ matrix.key }}" ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: 安装 pnpm
+        if: steps.gate.outputs.skip != 'true'
+        uses: pnpm/action-setup@v4
+        with:
+          version: ${{ env.PNPM_VERSION }}
+          run_install: false
+
+      - name: 准备 Node
+        if: steps.gate.outputs.skip != 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+          cache-dependency-path: ${{ env.WORKDIR }}/pnpm-lock.yaml
+
+      - name: 覆盖后端地址（手动触发时）
+        if: steps.gate.outputs.skip != 'true' && inputs.server_baseurl != ''
+        working-directory: app
+        run: |
+          sed -i "s#^VITE_ELDER_BASEURL *= *.*#VITE_ELDER_BASEURL = '${{ inputs.server_baseurl }}'#" env/.env
+          cat env/.env | grep ELDER_BASEURL
+
+      - name: 安装依赖
+        if: steps.gate.outputs.skip != 'true'
+        working-directory: app
+        run: pnpm install --frozen-lockfile --registry https://registry.npmjs.org
+
+      - name: 构建 ${{ matrix.name }}
+        if: steps.gate.outputs.skip != 'true'
+        working-directory: app
+        run: pnpm run ${{ matrix.script }}
+
+      - name: 校验后端地址已固化进产物
+        if: steps.gate.outputs.skip != 'true' && matrix.key == 'h5'
+        working-directory: app
+        run: |
+          if grep -rq "voice.250886.xyz" dist/build/h5; then
+            echo "已包含 https://voice.250886.xyz"
+          else
+            echo "产物中未找到后端地址，检查 VITE_ELDER_BASEURL 是否被内联"; exit 1
+          fi
+
+      - name: 上传产物
+        if: steps.gate.outputs.skip != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: app/${{ matrix.out }}
+          retention-days: ${{ github.event_name == 'workflow_dispatch' && 30 || 7 }}
