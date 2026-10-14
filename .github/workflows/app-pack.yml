@@ -1,28 +1,33 @@
 name: app-pack
 
-# 手机端原生包：Android APK + iOS IPA
+# 手机端原生包：Android APK
 #
 # 用 DCloud 官方 HBuilderX Linux CLI 做**云打包**（编译在 DCloud 云端完成，
-# 所以 Linux runner 也能出 iOS 的 ipa，不需要 macOS / Xcode / Android Studio）。
+# 本机/CI 都不需要 macOS、Xcode、Android Studio、Android SDK）。
 #
-# 触发：Actions → app-pack → Run workflow（选平台），或发 Release 自动跑。
+# 触发：Actions → app-pack → Run workflow，或发 Release 自动跑。
+#
+# 为什么不能在 runner 上"纯本地"打：uni-app 的 App 端原生运行时（含 nvue/原生插件引擎）
+# 是 DCloud 以闭源 AAR 形式提供的离线 SDK，开源 CLI 只能产出 App 资源、打不出 APK；
+# 而且离线打包还额外需要 DCloud 后台按「包名 + 签名 SHA1」申请的 AppKey。
+# 两条路（云打包 / 离线 Gradle 打包）都绕不开 DCloud 账号，云打包是省事的那条。
+#
+# iOS 暂不做：没有 Apple 开发者证书（云打包 iOS 必须有 p12 + mobileprovision）。
+# 将来有证书时把 ios job 从 git 历史里恢复即可。
 #
 # 需要在 Settings ▸ Secrets and variables ▸ Actions 里配置：
 #   DCLOUD_USERNAME / DCLOUD_PASSWORD   DCloud 账号（云打包强制登录，免费注册）
 #   UNI_APPID                           自己在 DCloud 后台建的应用 appid（形如 __UNI__XXXXXXX）
 #                                       —— 不能复用小智的 __UNI__36A515E，云打包会校验归属
-#   Android 自有证书（可选，不配则用 DCloud 公共证书）：
+#   Android 自有证书（可选，不配则用 DCloud 公共证书，能装但不能上架商店）：
 #     ANDROID_KEYSTORE_BASE64 / ANDROID_KEY_ALIAS / ANDROID_KEY_PASSWORD / ANDROID_STORE_PASSWORD
-#   iOS（必填）：
-#     IOS_P12_BASE64 / IOS_P12_PASSWORD / IOS_PROFILE_BASE64 / IOS_BUNDLE_ID
 on:
   workflow_dispatch:
     inputs:
-      platform:
-        description: 打包平台
-        type: choice
-        options: [android, ios, both]
-        default: android
+      uni_appid:
+        description: 'uni-app appid（DCloud 后台自己建的应用，形如 __UNI__XXXXXXX；留空则用 secrets.UNI_APPID）'
+        type: string
+        default: ''
       android_packagename:
         description: Android 包名
         type: string
@@ -54,7 +59,7 @@ jobs:
   # ================================================================ Android
   android:
     name: 打包 Android APK
-    if: github.event_name == 'release' || inputs.platform == 'android' || inputs.platform == 'both'
+    if: github.event_name == 'release' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
@@ -78,7 +83,7 @@ jobs:
       - name: 写入 appid 与版本号
         working-directory: app
         env:
-          UNI_APPID: ${{ secrets.UNI_APPID }}
+          UNI_APPID: ${{ inputs.uni_appid || secrets.UNI_APPID }}
           VERSION_NAME: ${{ inputs.version_name || '1.0.0' }}
           VERSION_CODE: ${{ inputs.version_code || '100' }}
         run: |
@@ -181,134 +186,4 @@ jobs:
         with:
           name: elder-app-android
           path: out/*.apk
-          retention-days: 30
-
-  # ===================================================================== iOS
-  ios:
-    name: 打包 iOS IPA
-    if: github.event_name == 'release' || inputs.platform == 'ios' || inputs.platform == 'both'
-    runs-on: ubuntu-latest
-    timeout-minutes: 60
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: pnpm/action-setup@v4
-        with:
-          version: ${{ env.PNPM_VERSION }}
-          run_install: false
-
-      - uses: actions/setup-node@v4
-        with:
-          node-version: ${{ env.NODE_VERSION }}
-          cache: pnpm
-          cache-dependency-path: app/pnpm-lock.yaml
-
-      - name: 安装前端依赖
-        working-directory: app
-        run: pnpm install --frozen-lockfile --registry https://registry.npmjs.org
-
-      - name: 还原 Apple 证书
-        env:
-          P12: ${{ secrets.IOS_P12_BASE64 }}
-          PROFILE: ${{ secrets.IOS_PROFILE_BASE64 }}
-        run: |
-          set -e
-          if [ -z "$P12" ] || [ -z "$PROFILE" ]; then
-            echo "::error title=缺少 iOS 证书::需要 secrets：IOS_P12_BASE64（p12 的 base64）、IOS_P12_PASSWORD、IOS_PROFILE_BASE64（mobileprovision 的 base64）。证书须从 Apple 开发者账号导出（只能在 macOS 钥匙串里做）。"
-            exit 1
-          fi
-          echo "$P12" | base64 -d > /tmp/ios.p12
-          echo "$PROFILE" | base64 -d > /tmp/ios.mobileprovision
-          ls -lh /tmp/ios.p12 /tmp/ios.mobileprovision
-
-      - name: 写入 appid 与版本号
-        working-directory: app
-        env:
-          UNI_APPID: ${{ secrets.UNI_APPID }}
-          VERSION_NAME: ${{ inputs.version_name || '1.0.0' }}
-          VERSION_CODE: ${{ inputs.version_code || '100' }}
-        run: |
-          python -c "
-          import json, os, re
-          p = 'src/manifest.json'
-          s = open(p, encoding='utf-8').read()
-          appid = os.environ.get('UNI_APPID', '').strip()
-          if appid:
-              s = re.sub(r'\"appid\"\s*:\s*\"[^\"]*\"', '\"appid\": \"%s\"' % appid, s, count=1)
-          s = re.sub(r'\"versionName\"\s*:\s*\"[^\"]*\"', '\"versionName\": \"%s\"' % os.environ['VERSION_NAME'], s, count=1)
-          s = re.sub(r'\"versionCode\"\s*:\s*\"[^\"]*\"', '\"versionCode\": \"%s\"' % os.environ['VERSION_CODE'], s, count=1)
-          open(p, 'w', encoding='utf-8').write(s)
-          print('appid ->', json.loads(s).get('appid'))
-          "
-
-      - name: 缓存 HBuilderX CLI
-        id: hx
-        uses: actions/cache@v4
-        with:
-          path: ${{ env.HX_DIR }}
-          key: hbuilderx-${{ env.HX_VERSION }}
-
-      - name: 下载 HBuilderX Linux CLI
-        if: steps.hx.outputs.cache-hit != 'true'
-        run: |
-          set -e
-          mkdir -p "$HX_DIR"
-          curl -sSL -o /tmp/hx.tar.gz \
-            "https://download1.dcloud.net.cn/download/HBuilderX.${HX_VERSION}.linux_x64.full.tar.gz"
-          tar -xzf /tmp/hx.tar.gz -C "$HX_DIR"
-
-      - name: 安装无头运行环境
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq xvfb libgtk-3-0 libnss3 libxss1 libasound2 \
-            libgbm1 libatk-bridge2.0-0 libcups2 libdrm2 libxkbcommon0
-
-      - name: 生成打包配置
-        env:
-          BUNDLE: ${{ secrets.IOS_BUNDLE_ID }}
-          P12_PASS: ${{ secrets.IOS_P12_PASSWORD }}
-        run: |
-          python -c "
-          import json, os
-          cfg = {'project': os.path.join(os.environ['GITHUB_WORKSPACE'], 'app'), 'platform': 'ios', 'safemode': False,
-                 'ios': {'bundle': os.environ.get('BUNDLE') or 'com.elder.companion',
-                         'supporteddevice': 'iPhone,iPad',
-                         'profile': '/tmp/ios.mobileprovision',
-                         'certfile': '/tmp/ios.p12',
-                         'certpassword': os.environ.get('P12_PASS', '')}}
-          json.dump(cfg, open('/tmp/pack-ios.json', 'w'), ensure_ascii=False, indent=2)
-          print(json.dumps(cfg, ensure_ascii=False, indent=2))
-          "
-
-      - name: 云打包（iOS）
-        env:
-          DCLOUD_USERNAME: ${{ secrets.DCLOUD_USERNAME }}
-          DCLOUD_PASSWORD: ${{ secrets.DCLOUD_PASSWORD }}
-        run: |
-          set -e
-          if [ -z "$DCLOUD_USERNAME" ]; then
-            echo "::error::缺少 secrets DCLOUD_USERNAME / DCLOUD_PASSWORD"
-            exit 1
-          fi
-          HX=$(find "$HX_DIR" -maxdepth 3 -type f -name cli | head -1)
-          cd "$(dirname "$HX")"
-          xvfb-run -a ./cli open || true
-          sleep 8
-          ./cli user login --username "$DCLOUD_USERNAME" --password "$DCLOUD_PASSWORD"
-          ./cli project open --path "$GITHUB_WORKSPACE/app"
-          ./cli pack --config /tmp/pack-ios.json 2>&1 | tee /tmp/pack-ios.log
-          ./cli app quit || true
-
-      - name: 收集 IPA
-        working-directory: app
-        run: |
-          mkdir -p "$GITHUB_WORKSPACE/out"
-          find unpackage -name "*.ipa" -exec cp {} "$GITHUB_WORKSPACE/out/" \; || true
-          ls -lh "$GITHUB_WORKSPACE/out" || true
-          test -n "$(ls -A "$GITHUB_WORKSPACE/out")" || { echo "未找到 ipa，见上一步打包日志"; exit 1; }
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: elder-app-ios
-          path: out/*.ipa
           retention-days: 30
