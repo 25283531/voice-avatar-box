@@ -135,6 +135,31 @@ static bool queue_pop(evt_t *out)
 
 /* ---------------------------------------------------------------- 时间 */
 
+/**
+ * 把 struct tm 当 UTC 解释，返回 epoch 秒数。
+ *
+ * 为什么不用 timegm()：newlib 在 -std=gnu17 下并不声明 timegm，
+ * 隐式声明会被 -Werror=all 直接判错；而 mktime() 依赖本地时区、
+ * 需要临时改全局 TZ，有副作用。这里用 Howard Hinnant 的
+ * days-from-civil 算法，纯算术、可测试、无全局状态。
+ */
+static time_t elder_utc_epoch(const struct tm *tm)
+{
+    int y = tm->tm_year + 1900;
+    int m = tm->tm_mon + 1;
+    if (m <= 2) {
+        y -= 1;
+        m += 12;
+    }
+    const int era = (y >= 0 ? y : y - 399) / 400;
+    const unsigned yoe = (unsigned)(y - era * 400);                 // [0, 399]
+    const unsigned doy = (unsigned)((153 * (m - 3) + 2) / 5 + tm->tm_mday - 1); // [0, 365]
+    const unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;     // [0, 146096]
+    const int64_t days = (int64_t)era * 146097 + (int64_t)doe - 719468;
+
+    return (time_t)(days * 86400 + tm->tm_hour * 3600 + tm->tm_min * 60 + tm->tm_sec);
+}
+
 /*
  * 后端 /api/device/sync 返回的 server_time 是**带偏移的 ISO8601**
  * （Pydantic 序列化 aware datetime，如 "2026-10-15T09:30:00+08:00"）。
@@ -178,8 +203,10 @@ esp_err_t elder_time_apply_server_time(const char *iso)
     tmv.tm_min  = m;
     tmv.tm_sec  = s;
 
-    /* timegm：把 tm 当 UTC 解释 → epoch（newlib 提供 timegm） */
-    time_t local_epoch = timegm(&tmv);
+    /* 把 tm 当 UTC 解释 → epoch。
+     * 不用 timegm()：newlib 在 -std=gnu17 下不声明它（隐式声明会被 -Werror=all 拦下），
+     * 这里用 days-from-civil 算法自行计算，纯算术、无全局时区副作用。 */
+    time_t local_epoch = elder_utc_epoch(&tmv);
     time_t utc_epoch = local_epoch - off_min * 60;
 
     struct timeval tv = { .tv_sec = utc_epoch, .tv_usec = 0 };

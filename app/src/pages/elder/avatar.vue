@@ -22,7 +22,14 @@ async function refresh() {
   catch { /* 已提示 */ }
 }
 
+const browseOnly = ref(false)
+
 async function onPick(a: Avatar) {
+  // 从「我的 → 系统形象库」进来时没有具体设备，只做浏览
+  if (browseOnly.value) {
+    uni.showToast({ title: '请到「设备」页选择设备后再绑定形象', icon: 'none' })
+    return
+  }
   try {
     await applyAvatar(a.id, devicePk.value)
     currentId.value = a.id
@@ -32,6 +39,7 @@ async function onPick(a: Avatar) {
 }
 
 async function onClear() {
+  if (browseOnly.value) return
   try {
     await updateDevice(devicePk.value, { avatar_id: 0 })
     currentId.value = null
@@ -46,6 +54,7 @@ function clipCount(a: Avatar) {
 
 onLoad((options: any) => {
   devicePk.value = Number(options?.devicePk || 0)
+  browseOnly.value = devicePk.value <= 0
   deviceName.value = decodeURIComponent(options?.name || '')
   const cur = Number(options?.current || 0)
   currentId.value = cur || null
@@ -56,8 +65,8 @@ onShow(() => { refresh() })
 <template>
   <view class="page">
     <view class="head">
-      <text class="dname">{{ deviceName }}</text>
-      <text class="sub">切换后设备下次心跳生效（默认 5 分钟内）</text>
+      <text class="dname">{{ browseOnly ? '系统形象库' : deviceName }}</text>
+      <text class="sub">{{ browseOnly ? '在「设备」页选择设备后即可绑定形象' : '切换后设备下次心跳生效（默认 5 分钟内）' }}</text>
     </view>
 
     <view v-for="a in avatars" :key="a.id" class="card" @click="onPick(a)">
@@ -71,7 +80,7 @@ onShow(() => { refresh() })
     </view>
 
     <view v-if="avatars.length === 0" class="tip">还没有形象，请先到 WEB 管理后台添加</view>
-    <button v-else class="btn ghost" @click="onClear">清除形象</button>
+    <button v-if="!browseOnly" class="btn ghost" @click="onClear">清除形象</button>
   </view>
 </template>
 

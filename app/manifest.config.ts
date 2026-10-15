@@ -118,7 +118,9 @@ export default defineManifestConfig({
   'quickapp': {},
   /* 小程序特有相关 */
   'mp-weixin': {
-    appid: VITE_WX_APPID,
+    // 微信小程序 appid：需使用自己在 mp.weixin.qq.com 申请的，
+    // 不要复用其它项目的 appid。为空时仅能在微信开发者工具里预览（无法上传发布）。
+    appid: VITE_WX_APPID || '',
     setting: {
       urlCheck: false,
       // 是否启用 ES6 转 ES5

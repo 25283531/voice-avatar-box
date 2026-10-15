@@ -16,115 +16,63 @@
   },
   "tabBar": {
     "custom": false,
-    "color": "#e6e6e6",
-    "selectedColor": "#667dea",
+    "color": "#9aa0a6",
+    "selectedColor": "#e8590c",
     "backgroundColor": "#fff",
-    "borderStyle": "black",
-    "height": "50px",
-    "fontSize": "10px",
-    "iconWidth": "24px",
-    "spacing": "3px",
+    "borderStyle": "white",
+    "height": "58px",
+    "fontSize": "12px",
+    "iconWidth": "26px",
+    "spacing": "4px",
     "list": [
       {
-        "iconPath": "static/tabbar/robot.png",
-        "selectedIconPath": "static/tabbar/robot_activate.png",
-        "pagePath": "pages/index/index",
+        "iconPath": "static/tabbar/home.png",
+        "selectedIconPath": "static/tabbar/homeHL.png",
+        "pagePath": "pages/home/index",
         "text": "首页",
         "icon": "home",
         "iconType": "uiLib"
       },
       {
-        "iconPath": "static/tabbar/robot.png",
-        "selectedIconPath": "static/tabbar/robot_activate.png",
-        "pagePath": "pages/elder/index",
-        "text": "陪伴",
-        "icon": "i-carbon-user-profile",
+        "iconPath": "static/tabbar/device.png",
+        "selectedIconPath": "static/tabbar/device_activate.png",
+        "pagePath": "pages/device/index",
+        "text": "设备",
+        "icon": "i-carbon-devices",
         "iconType": "uiLib"
       },
       {
-        "iconPath": "static/tabbar/network.png",
-        "selectedIconPath": "static/tabbar/network_activate.png",
-        "pagePath": "pages/device-config/index",
-        "text": "配网",
-        "icon": "i-carbon-network-3",
+        "iconPath": "static/tabbar/example.png",
+        "selectedIconPath": "static/tabbar/exampleHL.png",
+        "pagePath": "pages/schedule/index",
+        "text": "日程",
+        "icon": "i-carbon-calendar",
         "iconType": "uiLib"
       },
       {
-        "iconPath": "static/tabbar/system.png",
-        "selectedIconPath": "static/tabbar/system_activate.png",
-        "pagePath": "pages/settings/index",
-        "text": "系统",
-        "icon": "i-carbon-settings",
+        "iconPath": "static/tabbar/personal.png",
+        "selectedIconPath": "static/tabbar/personalHL.png",
+        "pagePath": "pages/profile/index",
+        "text": "我的",
+        "icon": "i-carbon-user",
         "iconType": "uiLib"
       }
     ]
   },
   "pages": [
     {
-      "path": "pages/index/index",
+      "path": "pages/home/index",
       "type": "home",
-      "layout": "tabbar",
       "style": {
-        "navigationStyle": "custom",
-        "navigationBarTitleText": "首页"
+        "navigationBarTitleText": "老人陪伴助手"
       }
-    },
-    {
-      "path": "pages/agent/edit",
-      "type": "page"
-    },
-    {
-      "path": "pages/agent/index",
-      "type": "page",
-      "layout": "default",
-      "style": {
-        "navigationBarTitleText": "智能体",
-        "navigationStyle": "custom"
-      }
-    },
-    {
-      "path": "pages/agent/provider",
-      "type": "page",
-      "layout": "default",
-      "style": {
-        "navigationBarTitleText": "编辑源",
-        "navigationStyle": "custom"
-      }
-    },
-    {
-      "path": "pages/agent/speedPitch",
-      "type": "page",
-      "layout": "default",
-      "style": {
-        "navigationBarTitleText": "语音设置",
-        "navigationStyle": "custom"
-      }
-    },
-    {
-      "path": "pages/agent/tools",
-      "type": "page",
-      "layout": "default",
-      "style": {
-        "navigationBarTitleText": "编辑功能",
-        "navigationStyle": "custom"
-      }
-    },
-    {
-      "path": "pages/chat-history/detail",
-      "type": "page",
-      "layout": "default",
-      "style": {
-        "navigationStyle": "custom",
-        "navigationBarTitleText": "聊天详情"
-      }
-    },
-    {
-      "path": "pages/chat-history/index",
-      "type": "page"
     },
     {
       "path": "pages/device/index",
-      "type": "page"
+      "type": "page",
+      "style": {
+        "navigationBarTitleText": "设备"
+      }
     },
     {
       "path": "pages/device-config/index",
@@ -142,24 +90,10 @@
       }
     },
     {
-      "path": "pages/elder/index",
-      "type": "page",
-      "style": {
-        "navigationBarTitleText": "老人陪伴助手"
-      }
-    },
-    {
       "path": "pages/elder/reminder-edit",
       "type": "page",
       "style": {
         "navigationBarTitleText": "编辑提醒"
-      }
-    },
-    {
-      "path": "pages/elder/reminder",
-      "type": "page",
-      "style": {
-        "navigationBarTitleText": "提醒管理"
       }
     },
     {
@@ -170,30 +104,10 @@
       }
     },
     {
-      "path": "pages/forgot-password/index",
-      "type": "page",
-      "layout": "default",
-      "style": {
-        "navigationStyle": "custom",
-        "navigationBarTitleText": "ForgotPassword"
-      }
-    },
-    {
       "path": "pages/login/index",
       "type": "page",
-      "layout": "default",
       "style": {
-        "navigationStyle": "custom",
-        "navigationBarTitleText": "Login"
-      }
-    },
-    {
-      "path": "pages/login/privacy-policy-en",
-      "type": "page",
-      "layout": "default",
-      "style": {
-        "navigationStyle": "custom",
-        "navigationBarTitleText": "Privacy Policy"
+        "navigationBarTitleText": "登录"
       }
     },
     {
@@ -206,15 +120,6 @@
       }
     },
     {
-      "path": "pages/login/user-agreement-en",
-      "type": "page",
-      "layout": "default",
-      "style": {
-        "navigationStyle": "custom",
-        "navigationBarTitleText": "User Agreement"
-      }
-    },
-    {
       "path": "pages/login/user-agreement-zh",
       "type": "page",
       "layout": "default",
@@ -224,41 +129,19 @@
       }
     },
     {
-      "path": "pages/register/index",
+      "path": "pages/profile/index",
       "type": "page",
-      "layout": "default",
       "style": {
-        "navigationStyle": "custom",
-        "navigationBarTitleText": "注册"
+        "navigationBarTitleText": "我的"
       }
     },
     {
-      "path": "pages/settings/index",
+      "path": "pages/schedule/index",
       "type": "page",
-      "layout": "default",
       "style": {
-        "navigationBarTitleText": "设置",
-        "navigationStyle": "custom"
+        "navigationBarTitleText": "日程"
       }
-    },
-    {
-      "path": "pages/voiceprint/index",
-      "type": "page"
     }
   ],
-  "subPackages": [
-    {
-      "root": "pages-sub",
-      "pages": [
-        {
-          "path": "demo/index",
-          "type": "page",
-          "layout": "default",
-          "style": {
-            "navigationBarTitleText": "分包页面"
-          }
-        }
-      ]
-    }
-  ]
+  "subPackages": []
 }

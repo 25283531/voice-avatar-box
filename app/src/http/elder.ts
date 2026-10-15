@@ -1,24 +1,26 @@
 /**
  * 老人陪伴助手业务后端的独立请求层。
  *
- * 为什么不复用项目里已有的 alova 实例：
- *   现有实例绑定的是小智 manager-api（Java），鉴权体系、响应结构都不同；
- *   本业务后端是独立的 FastAPI 服务，响应体就是裸数据（非 {code,msg,data}），
- *   因此这里单独用 uni.request 封装一套，互不干扰，也便于单独切换服务地址。
+ * 设计约定（重要）：
+ *   1. 服务端地址在**代码级写死**，不提供任何"网络设置 / 服务地址"入口，
+ *      避免用户配错地址导致连不上（需求：手机 APP 不能进行网络设置）。
+ *   2. 不复用项目里已有的 alova 实例：那套绑定的是小智 manager-api（Java），
+ *      鉴权体系、响应结构都不同；本业务后端是独立的 FastAPI 服务，
+ *      响应体就是裸数据（非 {code,msg,data}），因此单独用 uni.request 封装。
+ *   3. **不接入小智任何服务**（无小智账号登录、无小智 OTA、无小智智能体市场）。
  */
 const TOKEN_KEY = 'elder_token'
-const BASE_URL_KEY = 'elder_base_url'
 const USER_KEY = 'elder_user'
 
-/** 默认业务后端地址；打包前请在 env/.env 里配置 VITE_ELDER_BASEURL */
-const DEFAULT_BASE_URL: string = (import.meta.env.VITE_ELDER_BASEURL as string) || 'https://voice.250886.xyz'
+/**
+ * 业务后端地址（服务端接口 + 业务接口统一走这个域名）。
+ * 生产域名由 nginx 反代到 Docker 容器的 8064 端口。
+ */
+const BASE_URL = 'https://voice.2508866.xyz'
 
+/** 返回写死的业务后端地址（只读，不允许运行时修改） */
 export function getElderBaseUrl(): string {
-  return (uni.getStorageSync(BASE_URL_KEY) as string) || DEFAULT_BASE_URL
-}
-
-export function setElderBaseUrl(url: string) {
-  uni.setStorageSync(BASE_URL_KEY, url)
+  return BASE_URL
 }
 
 export function getElderToken(): string {
@@ -39,7 +41,8 @@ export function getElderUser(): Record<string, any> {
   if (!raw) return {}
   try {
     return typeof raw === 'string' ? JSON.parse(raw) : raw
-  } catch {
+  }
+  catch {
     return {}
   }
 }
@@ -76,7 +79,7 @@ export function elderRequest<T = any>(path: string, options: ElderRequestOptions
 
   return new Promise<T>((resolve, reject) => {
     uni.request({
-      url: getElderBaseUrl() + path,
+      url: BASE_URL + path,
       method: method as any,
       data: data as any,
       header,
@@ -95,14 +98,15 @@ export function elderRequest<T = any>(path: string, options: ElderRequestOptions
         if (res.statusCode === 401) {
           clearElderToken()
           uni.showToast({ title: '登录已失效，请重新登录', icon: 'none' })
-        } else if (toast) {
+        }
+        else if (toast) {
           uni.showToast({ title: String(detail).slice(0, 40), icon: 'none' })
         }
         reject(new Error(detail))
       },
       fail: (err: any) => {
         const msg = (err && err.errMsg) || '网络请求失败'
-        if (toast) uni.showToast({ title: '网络异常，请检查服务地址', icon: 'none' })
+        if (toast) uni.showToast({ title: '网络异常，请稍后重试', icon: 'none' })
         reject(new Error(msg))
       },
     })

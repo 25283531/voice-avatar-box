@@ -28,37 +28,35 @@ export const selectedTabbarStrategy = TABBAR_MAP.NATIVE_TABBAR
 // selectedTabbarStrategy==NO_TABBAR(0) 时，tabbarList 不生效
 export const tabbarList: FgTabBarItem[] = [
   {
-    iconPath: 'static/tabbar/robot.png',
-    selectedIconPath: 'static/tabbar/robot_activate.png',
-    pagePath: 'pages/index/index',
+    iconPath: 'static/tabbar/home.png',
+    selectedIconPath: 'static/tabbar/homeHL.png',
+    pagePath: 'pages/home/index',
     text: '首页',
     icon: 'home',
-    // 选用 UI 框架自带的 icon 时，iconType 为 uiLib
-    iconType: 'uiLib',
-  },
-  // 老人陪伴助手入口（本项目新增）
-  {
-    iconPath: 'static/tabbar/robot.png',
-    selectedIconPath: 'static/tabbar/robot_activate.png',
-    pagePath: 'pages/elder/index',
-    text: '陪伴',
-    icon: 'i-carbon-user-profile',
     iconType: 'uiLib',
   },
   {
-    iconPath: 'static/tabbar/network.png',
-    selectedIconPath: 'static/tabbar/network_activate.png',
-    pagePath: 'pages/device-config/index',
-    text: '配网',
-    icon: 'i-carbon-network-3',
+    iconPath: 'static/tabbar/device.png',
+    selectedIconPath: 'static/tabbar/device_activate.png',
+    pagePath: 'pages/device/index',
+    text: '设备',
+    icon: 'i-carbon-devices',
     iconType: 'uiLib',
   },
   {
-    iconPath: 'static/tabbar/system.png',
-    selectedIconPath: 'static/tabbar/system_activate.png',
-    pagePath: 'pages/settings/index',
-    text: '系统',
-    icon: 'i-carbon-settings',
+    iconPath: 'static/tabbar/example.png',
+    selectedIconPath: 'static/tabbar/exampleHL.png',
+    pagePath: 'pages/schedule/index',
+    text: '日程',
+    icon: 'i-carbon-calendar',
+    iconType: 'uiLib',
+  },
+  {
+    iconPath: 'static/tabbar/personal.png',
+    selectedIconPath: 'static/tabbar/personalHL.png',
+    pagePath: 'pages/profile/index',
+    text: '我的',
+    icon: 'i-carbon-user',
     iconType: 'uiLib',
   },
 ]
@@ -70,14 +68,15 @@ export const cacheTabbarEnable = selectedTabbarStrategy === TABBAR_MAP.NATIVE_TA
 const _tabbar: TabBar = {
   // 只有微信小程序支持 custom。App 和 H5 不生效
   custom: selectedTabbarStrategy === TABBAR_MAP.CUSTOM_TABBAR_WITH_CACHE,
-  color: '#e6e6e6',
-  selectedColor: '#667dea',
+  color: '#9aa0a6',
+  selectedColor: '#e8590c',
   backgroundColor: '#fff',
-  borderStyle: 'black',
-  height: '50px',
-  fontSize: '10px',
-  iconWidth: '24px',
-  spacing: '3px',
+  borderStyle: 'white',
+  // 适老化：tabbar 加高、字号加大，方便老人点击
+  height: '58px',
+  fontSize: '12px',
+  iconWidth: '26px',
+  spacing: '4px',
   list: tabbarList as unknown as TabBar['list'],
 }
 

@@ -1,79 +1,43 @@
-import type { Language } from '@/store/lang'
+/**
+ * 文案表（仅简体中文）。
+ *
+ * 本项目面向国内老年用户，只提供中文界面，因此不再集成多语言框架，
+ * 仅保留 t('key') 的调用形式，便于配网等复用页面无需改动调用处。
+ * 切换语言 / 语言商店等能力已随之移除。
+ */
 import { ref } from 'vue'
-import { useLangStore } from '@/store/lang'
-
-import de from './de'
-import en from './en'
-import pt_BR from './pt_BR'
-import vi from './vi'
-// 导入各个语言的翻译文件
 import zh_CN from './zh_CN'
-import zh_TW from './zh_TW'
 
-// 语言包映射
-const messages = {
-  zh_CN,
-  en,
-  zh_TW,
-  de,
-  vi,
-  pt_BR,
+const messages: Record<string, Record<string, string>> = {
+  zh_CN: zh_CN as unknown as Record<string, string>,
 }
 
-// 当前使用的语言
-const currentLang = ref<Language>('zh_CN')
+const currentLang = ref('zh_CN')
 
-// 初始化语言
-export function initI18n() {
-  const langStore = useLangStore()
-  currentLang.value = langStore.currentLang
+/** 初始化（兼容旧调用点，无实际动作） */
+export function initI18n() {}
+
+/** 切换语言（本项目仅中文，空实现并提示） */
+export function changeLanguage() {
+  uni.showToast({ title: '当前仅支持简体中文', icon: 'none' })
 }
 
-// 切换语言
-export function changeLanguage(lang: Language) {
-  currentLang.value = lang
-  const langStore = useLangStore()
-  langStore.changeLang(lang)
-}
-
-// 获取翻译文本
+/** 取文案；找不到时返回 key 本身 */
 export function t(key: string, params?: Record<string, string | number>): string {
-  const langMessages = messages[currentLang.value]
-
-  // 直接查找扁平键名
-  if (langMessages && typeof langMessages === 'object' && key in langMessages) {
-    const value = langMessages[key]
-    if (typeof value === 'string') {
-      // 处理参数替换
-      if (params) {
-        let result = value
-        Object.entries(params).forEach(([paramKey, paramValue]) => {
-          const regex = new RegExp(`\{${paramKey}\}`, 'g')
-          result = result.replace(regex, String(paramValue))
-        })
-        return result
-      }
-      return value
-    }
-    return key
-  }
-
-  return key // 如果找不到对应的翻译，返回key本身
+  const value = messages[currentLang.value]?.[key]
+  if (typeof value !== 'string') return key
+  if (!params) return value
+  let result = value
+  Object.entries(params).forEach(([k, v]) => {
+    result = result.replace(new RegExp(`\\{${k}\\}`, 'g'), String(v))
+  })
+  return result
 }
 
-// 获取当前语言
-export function getCurrentLanguage(): Language {
+export function getCurrentLanguage(): string {
   return currentLang.value
 }
 
-// 获取支持的语言列表
-export function getSupportedLanguages(): { code: Language, name: string }[] {
-  return [
-    { code: 'zh_CN', name: '简体中文' },
-    { code: 'en', name: 'English' },
-    { code: 'zh_TW', name: '繁體中文' },
-    { code: 'de', name: 'Deutsch' },
-    { code: 'vi', name: 'Tiếng Việt' },
-    { code: 'pt_BR', name: 'Português (Brasil)' },
-  ]
+export function getSupportedLanguages(): { code: string, name: string }[] {
+  return [{ code: 'zh_CN', name: '简体中文' }]
 }

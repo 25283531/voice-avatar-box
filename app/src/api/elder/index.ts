@@ -10,6 +10,7 @@ export interface ElderUser {
   username: string
   nickname: string
   phone: string
+  email: string
   is_admin: boolean
 }
 
@@ -105,7 +106,7 @@ export function elderLogin(username: string, password: string) {
     '/api/auth/login', { username, password })
 }
 
-export function elderRegister(data: { username: string, password: string, nickname?: string, phone?: string }) {
+export function elderRegister(data: { username: string, password: string, nickname?: string, phone?: string, email?: string }) {
   return elderPost<ElderUser>('/api/auth/register', data)
 }
 
@@ -180,4 +181,111 @@ export function applyAvatar(avatarPk: number, devicePk: number) {
 // ============================================================ 统计
 export function statsOverview(devicePk: number, days = 7) {
   return elderGet<StatsOverview>('/api/stats/overview', { device_pk: devicePk, days })
+}
+
+// ============================================================ 会员
+export interface MembershipInfo {
+  is_vip: boolean
+  plan: string
+  expires_at: string | null
+  days_left: number
+  benefits: string[]
+}
+
+export interface MembershipPlan {
+  plan: string
+  name: string
+  price: number
+  months: number
+  benefits: string[]
+}
+
+export interface MembershipUsage {
+  devices: { used: number, limit: number }
+  agents: { used: number, limit: number }
+  reminders: { used: number, limit: number }
+}
+
+export function getMembership() {
+  return elderGet<MembershipInfo & { usage: MembershipUsage }>('/api/membership')
+}
+
+export function listMembershipPlans() {
+  return elderGet<MembershipPlan[]>('/api/membership/plans')
+}
+
+/** 开通 / 续费会员（months 为月数；后端暂为模拟订单，未接真实支付） */
+export function activateMembership(data: { plan: string, months: number }) {
+  return elderPost<MembershipInfo>('/api/membership/activate', data)
+}
+
+// ============================================================ 账户（我的）
+export interface ElderAccount {
+  id: number
+  username: string
+  nickname: string
+  phone: string
+  email: string
+  is_admin: boolean
+}
+
+export function getMe() {
+  return elderGet<ElderAccount>('/api/auth/me')
+}
+
+export function changePassword(data: { old_password: string, new_password: string }) {
+  return elderPost('/api/auth/password', data)
+}
+
+export function changeEmail(email: string) {
+  return elderPatch<ElderAccount>('/api/auth/email', { email })
+}
+
+// ============================================================ 自有 agent 角色
+export interface AgentRole {
+  id: number
+  name: string
+  description: string
+  system_prompt: string
+  tts_voice: string
+  is_default: boolean
+}
+
+export function listAgentRoles() {
+  return elderGet<AgentRole[]>('/api/providers/safe')
+}
+
+export function createAgentRole(data: Partial<AgentRole>) {
+  return elderPost<AgentRole>('/api/providers', data)
+}
+
+/** 把某个 agent 角色绑定到设备（一台设备一个生效角色） */
+export function bindAgentRole(devicePk: number, roleId: number) {
+  return elderPost(`/api/devices/${devicePk}/agent`, { role_id: roleId })
+}
+
+// ============================================================ 首页聚合
+export interface HomeSummary {
+  devices: {
+    id: number
+    name: string
+    online: boolean
+    last_seen_at: string | null
+    ip: string
+    fw_version: string
+    device_time: string | null
+    agent_name: string | null
+    avatar_name: string | null
+  }[]
+  medicine_today: {
+    pending_count: number
+    pending_times: string[]
+    confirmed_count: number
+    total_count: number
+  }
+  membership: MembershipInfo
+}
+
+export function homeSummary() {
+  return elderGet<HomeSummary>('/api/home/summary')
 }

@@ -1,10 +1,10 @@
 {
-  "name": "xiaozhi-mobile-admin",
+  "name": "elder-companion-app",
   "type": "commonjs",
   "version": "3.4.0",
   "unibest-version": "3.4.0",
   "packageManager": "pnpm@10.10.0",
-  "description": "xiaozhi-esp32-server的移动端管理后台",
+  "description": "老人陪伴助手 · 家属端（uni-app + Vue3）",
   "generate-time": "2025-08-04",
   "author": {
     "name": "huangjunsen",
