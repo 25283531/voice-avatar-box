@@ -15,6 +15,21 @@
 
 #include "board.h"
 
+
+// >>> BEGIN elder-companion overlay (由 tools/merge_to_xiaozhi.py 注入，勿手改) >>>
+// LVGL 9.3.0 把 lv_image_cache_resize() 藏在内部头文件里，lvgl.h 未暴露，
+// 而本文件在 CONFIG_SPIRAM 分支调用了它 —— 补上声明，否则编译失败。
+#if defined(__has_include)
+#if __has_include("src/misc/cache/instance/lv_image_cache.h")
+#include "src/misc/cache/instance/lv_image_cache.h"
+#else
+extern "C" void lv_image_cache_resize(uint32_t new_size, bool evict_now);
+#endif
+#else
+#include "src/misc/cache/instance/lv_image_cache.h"
+#endif
+// <<< END elder-companion overlay <<<
+
 #define TAG "LcdDisplay"
 
 LV_FONT_DECLARE(BUILTIN_TEXT_FONT);

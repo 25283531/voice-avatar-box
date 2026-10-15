@@ -49,6 +49,7 @@ ELDER_DST = XIAOZHI / "components" / "elder"
 MAIN_CMAKE = XIAOZHI / "main" / "CMakeLists.txt"
 MAIN_CC = XIAOZHI / "main" / "main.cc"
 SDK_DEFAULTS = XIAOZHI / "sdkconfig.defaults"
+LCD_DISPLAY_CC = XIAOZHI / "main" / "display" / "lcd_display.cc"
 
 BEGIN = "# >>> BEGIN elder-companion overlay (由 tools/merge_to_xiaozhi.py 注入，勿手改) >>>"
 END = "# <<< END elder-companion overlay <<<"
@@ -125,6 +126,37 @@ CONFIG_ELDER_DEMO_DATA=n
 """
 
 
+# 打进 main/display/lcd_display.cc 的补丁：补上 LVGL 9.3.0 未暴露的内部声明。
+#
+# 背景（上游真实缺陷，不是我们引入的）：
+#   lcd_display.cc 在 `#if CONFIG_SPIRAM` 分支里调用 lv_image_cache_resize()，
+#   而该函数的声明位于 LVGL 的 src/misc/cache/instance/lv_image_cache.h，
+#   这个头文件**没有被 lvgl.h 包含**（只有内部的 lv_cache.h 会包含它），
+#   于是 `CONFIG_SPIRAM=y` 时必然编译失败：
+#       error: 'lv_image_cache_resize' was not declared in this scope
+#   上游 sdkconfig.defaults.esp32s3 本身就开了 CONFIG_SPIRAM，无法绕开。
+#
+# 做法：在文件顶部（#define TAG 之前，处于文件作用域）插入一段带 __has_include
+# 兜底的补丁 —— 头文件在就直接包含，不在就退化为显式 extern "C" 声明，
+# 这样即便将来 LVGL 换版本/挪动文件也不会把构建搞挂。
+LCD_DISPLAY_PATCH = """
+// >>> BEGIN elder-companion overlay (由 tools/merge_to_xiaozhi.py 注入，勿手改) >>>
+// LVGL 9.3.0 把 lv_image_cache_resize() 藏在内部头文件里，lvgl.h 未暴露，
+// 而本文件在 CONFIG_SPIRAM 分支调用了它 —— 补上声明，否则编译失败。
+#if defined(__has_include)
+#if __has_include("src/misc/cache/instance/lv_image_cache.h")
+#include "src/misc/cache/instance/lv_image_cache.h"
+#else
+extern "C" void lv_image_cache_resize(uint32_t new_size, bool evict_now);
+#endif
+#else
+#include "src/misc/cache/instance/lv_image_cache.h"
+#endif
+// <<< END elder-companion overlay <<<
+
+"""
+
+
 def strip_overlay(text: str, begin: str, end: str) -> tuple[str, bool]:
     """去掉已有的 overlay 段，返回 (新文本, 是否原本存在)。"""
     had = begin in text
@@ -166,6 +198,26 @@ def remove_overlay(path: Path, begin: str = BEGIN, end: str = END) -> bool:
     if had:
         path.write_text(new.rstrip("\n") + "\n", encoding="utf-8")
     return had
+
+
+def insert_once(path: Path, anchor: str, patch: str, tag: str, before: bool = True) -> bool:
+    """幂等地在 anchor 行前/后插入 patch。已存在 tag 则返回 False。"""
+    if not path.is_file():
+        print(f"[merge] 文件不存在，跳过: {path}", file=sys.stderr)
+        return False
+    text = path.read_text(encoding="utf-8", errors="replace")
+    if tag in text:
+        return False
+    if anchor not in text:
+        print(f"[merge] 警告：{path} 中未找到锚点 `{anchor.strip()}`，跳过该补丁",
+              file=sys.stderr)
+        return False
+    if before:
+        text = text.replace(anchor, patch + anchor, 1)
+    else:
+        text = text.replace(anchor, anchor + patch, 1)
+    path.write_text(text, encoding="utf-8")
+    return True
 
 
 def merge() -> int:
@@ -211,6 +263,13 @@ def merge() -> int:
     else:
         print(f"[merge] 已是最新: {SDK_DEFAULTS}")
 
+    # 5) main/display/lcd_display.cc 补丁（LVGL 9.3.0 + PSRAM 的 lv_image_cache_resize 声明）
+    if insert_once(LCD_DISPLAY_CC, '#define TAG "LcdDisplay"\n', LCD_DISPLAY_PATCH,
+                   "elder-companion overlay"):
+        print(f"[merge] 已注入: {LCD_DISPLAY_CC}")
+    else:
+        print(f"[merge] 已是最新: {LCD_DISPLAY_CC}")
+
     print("\n[merge] 完成。下一步：")
     print("  python tools/idfwin.py set-target esp32s3   (需先 cd 到 firmware/xiaozhi)")
     print("  python tools/idfwin.py build")
@@ -221,14 +280,18 @@ def clean() -> int:
     for p in (MAIN_CMAKE, SDK_DEFAULTS):
         if remove_overlay(p):
             print(f"[merge] 已还原: {p}")
-    if MAIN_CC.is_file():
-        text = MAIN_CC.read_text(encoding="utf-8")
-        if "elder_bridge_start" in text:
-            import re
-            text = re.sub(r"\n *// >>> BEGIN elder-companion overlay.*?// <<< END elder-companion overlay <<<\n",
-                          "", text, flags=re.S)
-            MAIN_CC.write_text(text, encoding="utf-8")
-            print(f"[merge] 已还原: {MAIN_CC}")
+    import re
+    cpp_block = re.compile(
+        r"\n *// >>> BEGIN elder-companion overlay.*?// <<< END elder-companion overlay <<<\n",
+        flags=re.S)
+    for p in (MAIN_CC, LCD_DISPLAY_CC):
+        if not p.is_file():
+            continue
+        text = p.read_text(encoding="utf-8")
+        new = cpp_block.sub("", text)
+        if new != text:
+            p.write_text(new, encoding="utf-8")
+            print(f"[merge] 已还原: {p}")
     if ELDER_DST.exists():
         shutil.rmtree(ELDER_DST)
         print(f"[merge] 已删除: {ELDER_DST}")
@@ -241,11 +304,14 @@ def check() -> int:
     ok &= MAIN_CMAKE.is_file() and BEGIN in MAIN_CMAKE.read_text(encoding="utf-8")
     ok &= MAIN_CC.is_file() and "elder_bridge_start" in MAIN_CC.read_text(encoding="utf-8")
     ok &= SDK_DEFAULTS.is_file() and BEGIN in SDK_DEFAULTS.read_text(encoding="utf-8")
+    lcd_ok = LCD_DISPLAY_CC.is_file() and "elder-companion overlay" in LCD_DISPLAY_CC.read_text(encoding="utf-8")
+    ok &= lcd_ok
     print("[merge] 合并状态:", "已合并" if ok else "未合并/不完整")
     print(f"  components/elder : {'OK' if ELDER_DST.is_dir() else 'MISSING'}")
     print(f"  main/CMakeLists  : {'OK' if MAIN_CMAKE.is_file() and BEGIN in MAIN_CMAKE.read_text(encoding='utf-8') else 'MISSING'}")
     print(f"  main/main.cc     : {'OK' if MAIN_CC.is_file() and 'elder_bridge_start' in MAIN_CC.read_text(encoding='utf-8') else 'MISSING'}")
     print(f"  sdkconfig.defaults: {'OK' if SDK_DEFAULTS.is_file() and BEGIN in SDK_DEFAULTS.read_text(encoding='utf-8') else 'MISSING'}")
+    print(f"  display/lcd_display.cc: {'OK' if lcd_ok else 'MISSING'}")
     return 0 if ok else 2
 
 
