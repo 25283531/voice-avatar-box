@@ -44,6 +44,69 @@ jobs:
       - name: 运行业务闭环冒烟测试
         run: python tools/smoke_server.py 8099
 
+  # 用真实 MySQL 再跑一遍同一套业务闭环。
+  # 必要性：SQLite 覆盖不到 pymysql 的连接/握手路径，而线上部署踩的坑正是
+  #   (2013, 'Lost connection to MySQL server during query')
+  # —— mysqld 尚未就绪时客户端直接在读握手包阶段被断开。这个 job 保证
+  # wait_for_db() 的重试逻辑对 MySQL 真的有效。
+  mysql-smoke:
+    name: MySQL 真实路径冒烟
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      mysql:
+        image: mysql:8.0
+        env:
+          MYSQL_ROOT_PASSWORD: smoke-pass
+          MYSQL_DATABASE: elder_companion
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd "mysqladmin ping -h 127.0.0.1 -uroot -psmoke-pass"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 20
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 准备 Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+          cache-dependency-path: server/requirements.txt
+
+      - name: 安装依赖
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r server/requirements.txt
+
+      - name: 等 MySQL 真正可查询
+        run: |
+          python - <<'PY'
+          import sys, time
+          import pymysql
+          last = None
+          for i in range(60):
+              try:
+                  c = pymysql.connect(host="127.0.0.1", user="root", password="smoke-pass",
+                                      database="elder_companion", connect_timeout=5)
+                  c.close()
+                  print(f"MySQL 已可查询（第 {i+1} 次尝试）")
+                  sys.exit(0)
+              except Exception as e:
+                  last = e
+                  time.sleep(2)
+          print("MySQL 始终不可用:", last)
+          sys.exit(1)
+          PY
+
+      - name: 跑业务闭环（mysql+pymysql）
+        env:
+          ELDER_DB: mysql+pymysql://root:smoke-pass@127.0.0.1:3306/elder_companion?charset=utf8mb4
+        run: python tools/smoke_server.py 8098
+
   dockerfile-lint:
     name: Dockerfile 语法检查
     runs-on: ubuntu-latest

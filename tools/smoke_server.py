@@ -57,7 +57,9 @@ def req(method: str, path: str, body: dict | None = None, token: str | None = No
             return e.code, raw
 
 
-def wait_ready(timeout: float = 60.0) -> bool:
+def wait_ready(timeout: float = 120.0) -> bool:
+    # 用外部数据库（CI 的 MySQL service）时，服务启动包含 wait_for_db 重试，
+    # 给足余量以免把「连接慢」误判成「启动失败」。
     end = time.time() + timeout
     while time.time() < end:
         try:
@@ -73,12 +75,16 @@ def wait_ready(timeout: float = 60.0) -> bool:
 def main() -> int:
     env = dict(os.environ)
     env.pop("MSYSTEM", None)
-    env["ELDER_DB"] = f"sqlite:///{DB_PATH.as_posix()}"
+    # 外部显式给了 ELDER_DB 就用它（CI 里用 MySQL service 验证 mysql+pymysql 真实路径），
+    # 否则退回本地临时 SQLite 文件，保证零依赖可跑。
+    external_db = os.environ.get("ELDER_DB", "").strip()
+    db_url = external_db or f"sqlite:///{DB_PATH.as_posix()}"
+    env["ELDER_DB"] = db_url
     env["ELDER_JWT_SECRET"] = "smoke-test-secret"
     env["ELDER_SCHEDULER_INTERVAL"] = "3600"   # 测试期间不跑后台调度，避免干扰
     env["PYTHONIOENCODING"] = "utf-8"
 
-    print(f"[boot] starting server on :{PORT} (sqlite: {DB_PATH})")
+    print(f"[boot] starting server on :{PORT} (db: {db_url.split('@')[-1]})")
     proc = subprocess.Popen(
         [PY, "-m", "uvicorn", "app.main:app", "--host", "127.0.0.1", "--port", str(PORT),
          "--log-level", "warning"],
