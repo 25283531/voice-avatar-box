@@ -61,11 +61,20 @@ APP 是给家属用的，不接入小智任何服务，业务后端地址在代�
 
 ## 服务器部署
 
+默认**内置 SQLite**，一个容器就能跑，不需要任何外部数据库：
+
 ```bash
 cd server
-cp .env.example .env            # 至少改 ELDER_JWT_SECRET、MYSQL_ROOT_PASSWORD
+cp .env.example .env            # 至少改 ELDER_JWT_SECRET
 docker compose up -d            # 对外 http://<host>:8064
-docker compose --profile xiaozhi up -d   # 额外拉起小智语音链路（8000/8003/8002）
+docker compose --profile xiaozhi up -d   # 额外拉起语音链路（8000/8003/8002）
+```
+
+改用 MySQL（含字符集/时区要求、排障与备份）：见 [`docs/DEPLOY.md`](docs/DEPLOY.md)。
+
+```bash
+# MySQL 变体是叠加文件，必须和主文件一起加载
+docker compose -f docker-compose.yml -f docker-compose.mysql.yml up -d
 ```
 
 nginx 反代片段：

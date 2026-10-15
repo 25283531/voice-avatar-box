@@ -13,6 +13,10 @@ venv/
 !app/env/.env
 *.db
 *.sqlite3
+# SQLite 的 WAL / journal 伴生文件（进程被强杀时会残留）
+*.db-journal
+*.db-wal
+*.db-shm
 *.log
 
 # ---------------------------------------------------------- Node / 前端

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 from datetime import timedelta
+from pathlib import Path
 from zoneinfo import ZoneInfo
 
 # ---------------------------------------------------------------- 基础
@@ -19,11 +20,30 @@ PORT = int(os.getenv("ELDER_PORT", "8080"))
 TZ = ZoneInfo(os.getenv("ELDER_TZ", "Asia/Shanghai"))
 
 # ---------------------------------------------------------------- 数据库
-# 默认走 MySQL(Docker Compose)；本地调试可设 ELDER_DB=sqlite:///./elder.db
-DATABASE_URL = os.getenv(
-    "ELDER_DB",
-    "mysql+pymysql://root:123456@elder-db:3306/elder_companion?charset=utf8mb4",
-)
+# 默认**内置 SQLite**：`docker compose up -d` 开箱即用，不需要任何外部数据库，
+# 也不再默认拉一个 MySQL 容器。想用 MySQL 就显式设 ELDER_DB（或叠加
+# docker-compose.mysql.yml），见 docs/DEPLOY.md。
+#
+# 默认文件位置的选择依据：
+#   1. 镜像里 WORKDIR 是 /app，直接放 ./elder.db 会落在容器可写层，
+#      容器一重建数据就没了 —— 所以优先放持久化目录；
+#   2. docker-compose.yml 把命名卷 elder-data 挂到 /data，
+#      那里才是真正的持久化落点，故容器内的首选路径是 /data/elder.db；
+#   3. 但同一个默认值也要能在本机（Windows / macOS 裸跑）直接跑起来，
+#      这些机器上不存在 /data，此时退回当前工作目录下的 ./elder.db。
+# 因此这里做一次「存在且可写」的判断，而不是写死某一个路径。
+# 持久化目录本身可用 ELDER_DATA_DIR 覆盖（例如挂到 NAS / 宿主机目录时）。
+def _default_sqlite_url() -> str:
+    """选出默认 SQLite 库文件位置，返回 SQLAlchemy 连接串。"""
+    data_dir = Path(os.getenv("ELDER_DATA_DIR", "/data"))
+    if data_dir.is_dir() and os.access(data_dir, os.W_OK):
+        # sqlite:////data/elder.db 的四条斜杠：前两条是 scheme 分隔，后两条才是绝对路径的 /
+        return f"sqlite:///{data_dir.as_posix()}/elder.db"
+    # 退回当前工作目录（uvicorn 启动时所在的目录），相对路径的 sqlite:///./elder.db
+    return "sqlite:///./elder.db"
+
+
+DATABASE_URL = os.getenv("ELDER_DB", _default_sqlite_url())
 DB_ECHO = os.getenv("ELDER_DB_ECHO", "0") == "1"
 DB_POOL_PRE_PING = True
 
@@ -61,6 +81,16 @@ XIAOZHI_OTA_URL = os.getenv("ELDER_XIAOZHI_OTA", "http://xiaozhi-server:8003/xia
 # 联网时以服务端生成的实例为准做对账。
 SCHEDULE_AHEAD_HOURS = int(os.getenv("ELDER_SCHEDULE_AHEAD_HOURS", "36"))
 SCHEDULER_INTERVAL_SEC = int(os.getenv("ELDER_SCHEDULER_INTERVAL", "60"))
+
+# ---------------------------------------------------------------- 会员（人工核销）
+# 订单号 / 收款金额的占用有效期（小时）：超时后订单置为 expired，号段与金额随之释放。
+MEMBERSHIP_ORDER_TTL_HOURS = int(os.getenv("ELDER_ORDER_TTL_HOURS", "48"))
+# 下单频率限制：同一用户在该窗口内最多创建这么多笔订单，避免刷号占满 4 位号段
+MEMBERSHIP_ORDER_RATE_WINDOW_SEC = int(os.getenv("ELDER_ORDER_RATE_WINDOW", "60"))
+MEMBERSHIP_ORDER_RATE_MAX = int(os.getenv("ELDER_ORDER_RATE_MAX", "3"))
+# 金额区间合法边界（整数分）：至少 1 元，最多 999.99 元
+AMOUNT_MIN_LIMIT_CENTS = 100
+AMOUNT_MAX_LIMIT_CENTS = 99999
 
 # ---------------------------------------------------------------- 其它
 CORS_ORIGINS = os.getenv("ELDER_CORS", "*").split(",")

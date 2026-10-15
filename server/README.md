@@ -5,14 +5,25 @@ Docker 一键部署的业务后端，负责**设备绑定、提醒规则与回�
 
 ## 1. 快速开始
 
+默认形态**内置 SQLite**，只起一个容器，不需要任何外部数据库：
+
 ```bash
 cd server
-cp .env.example .env          # 修改 ELDER_JWT_SECRET
-docker compose up -d          # 启动 MySQL + 业务后端
+cp .env.example .env          # 可选；至少改 ELDER_JWT_SECRET
+docker compose up -d          # 只起业务后端（内置 SQLite）
 ```
 
 打开 <http://localhost:8064> 进入管理后台，默认账号 `admin` / `admin123`（**登录后立即改密码**）。
 容器内监听 8080，对外只发布 8064（`ELDER_HTTP_PORT` 可改）。
+
+数据落在命名卷 `elder-data` 的 `/data/elder.db`。`docker compose down` 不会删卷，
+但 **`docker compose down -v` 会连数据一起删**，请先备份。
+
+改用 MySQL（自带容器）：
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.mysql.yml up -d
+```
 
 连带语音链路一起起（可选，需联网拉官方镜像）：
 
@@ -24,11 +35,14 @@ docker compose --profile xiaozhi up -d
 #  8064  本服务（业务面 + 管理后台，容器内 8080）
 ```
 
+> 完整的部署文档（接入 MySQL 的完整步骤、SQLite→MySQL 迁移、Nginx 反代与 HTTPS、
+> 环境变量对照表、排障、备份恢复）见 **[../docs/DEPLOY.md](../docs/DEPLOY.md)**。
+
 ## 2. 本地开发（不依赖 Docker）
 
 ```bash
 pip install -r requirements.txt
-export ELDER_DB="sqlite:///./elder.db"      # 默认走 MySQL，本地可切 SQLite
+export ELDER_DB="sqlite:///./elder.db"      # 默认就是 SQLite，这行只是显式指定位置
 export ELDER_JWT_SECRET="dev-secret"
 uvicorn app.main:app --reload --port 8080
 ```
@@ -102,18 +116,24 @@ python tools/smoke_server.py 8099
 
 | 变量 | 默认 | 说明 |
 | --- | --- | --- |
-| `ELDER_DB` | MySQL 连接串 | 也支持 `sqlite:///./elder.db` |
+| `ELDER_DB` | 内置 SQLite 路径 | **留空即用内置 SQLite**；填 `mysql+pymysql://...` 切 MySQL |
+| `ELDER_DATA_DIR` | `/data` | 内置 SQLite 的持久化目录（容器里是命名卷） |
+| `ELDER_HTTP_PORT` | 8064 | 宿主机对外端口（容器内固定 8080） |
 | `ELDER_JWT_SECRET` | 弱默认值 | **生产必须改** |
-| `ELDER_PORT` | 8080 | 监听端口 |
 | `ELDER_CORS` | `*` | 跨域来源，逗号分隔 |
+| `ELDER_TZ` | `Asia/Shanghai` | 业务时区，影响提醒时间计算 |
+| `ELDER_DB_WAIT_SEC` | 180 | 启动等待数据库秒数（仅 MySQL 生效） |
 | `ELDER_XIAOZHI_WS` | 内网地址 | 下发给设备的语音通道 |
 | `ELDER_XIAOZHI_OTA` | 内网地址 | 下发给设备的 OTA 地址 |
 | `ELDER_ACT_TTL_MIN` | 10 | 激活码有效分钟数 |
 | `ELDER_SCHEDULE_AHEAD_HOURS` | 36 | 预排期提前量 |
 
+完整清单与接入 MySQL 的步骤见 [../docs/DEPLOY.md](../docs/DEPLOY.md)。
+
 ## 7. 生产注意事项
 
 - `ELDER_JWT_SECRET` 必须换成随机长字符串
-- MySQL 数据落在卷 `elder-db-data`，定期备份
-- 管理后台与 API 同端口，建议用 Nginx 反代并开 HTTPS
+- SQLite 数据落在卷 `elder-data` 的 `elder.db`（`docker compose down -v` 会删），MySQL 落在 `elder-db-data`，都要定期备份
+- 管理后台与 API 同端口，建议用 Nginx 反代并开 HTTPS（见 docs/DEPLOY.md）
 - 表结构目前靠 `create_all` 自动建，多实例滚动升级前请引入 Alembic 迁移
+- SQLite 适合单机；多人共用或数据量上来后按 docs/DEPLOY.md 切 MySQL

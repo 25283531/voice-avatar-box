@@ -1,0 +1,85 @@
+# 老人陪伴提醒助手 —— MySQL 变体（overlay 叠加文件）
+#
+# 这是**叠加文件**，不能单独使用，必须和主文件一起加载：
+#
+#   docker compose -f docker-compose.yml -f docker-compose.mysql.yml up -d
+#   docker compose -f docker-compose.yml -f docker-compose.mysql.yml down
+#   docker compose -f docker-compose.yml -f docker-compose.mysql.yml logs -f elder-db
+#
+# 它做三件事：
+#   1. 把 elder-server 的 ELDER_DB 从内置 SQLite 改成 MySQL 连接串；
+#   2. 补上 elder-db（mysql:8.0）服务与 elder-db-data 数据卷；
+#   3. 给 elder-server 加 depends_on: condition: service_healthy，等数据库真正就绪。
+#
+# 想连外部已有的 MySQL，不要起这里的 elder-db：见 docs/DEPLOY.md 第 2 节，
+# 只把 ELDER_DB 指向外部实例即可（用 docker compose 的 environment 覆盖，
+# 或者 docker run -e ELDER_DB=...）。
+#
+# 常用变量（写在 server/.env 里即可被自动读取）：
+#   MYSQL_ROOT_PASSWORD   默认 123456，生产必须改
+#   ELDER_DB_WAIT_SEC     默认 180，启动阶段等待数据库可用的秒数
+#   ELDER_HTTP_PORT       默认 8064
+#
+services:
+
+  # ------------------------------------------------------------ 业务数据库
+  elder-db:
+    image: mysql:8.0
+    container_name: elder-db
+    restart: unless-stopped
+    command: >
+      --character-set-server=utf8mb4
+      --collation-server=utf8mb4_unicode_ci
+      --default-time-zone=+08:00
+      --default-authentication-plugin=mysql_native_password
+      --skip-name-resolve
+      --innodb-buffer-pool-size=256M
+      --max-connections=200
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-123456}
+      MYSQL_DATABASE: elder_companion
+      # 服药提醒是时间强相关业务，mysqld 的时区必须和服务端一致（Asia/Shanghai）。
+      # 上面 --default-time-zone=+08:00 管的是 SQL 里的 NOW()/TIMESTAMP 行为，
+      # 这个 TZ 管的是容器日志与系统时区，两者都设上才不会差 8 小时。
+      TZ: Asia/Shanghai
+    volumes:
+      - elder-db-data:/var/lib/mysql
+    healthcheck:
+      # 不能用 mysqladmin ping —— 它只判断「服务在跑」，即使认证失败也返回 0，
+      # 容易在 mysqld 尚未能接受查询时误判为就绪。这里执行真实的 SELECT 1，
+      # 并把 stderr 丢掉，只用退出码表达健康与否。
+      test:
+        - CMD-SHELL
+        - mysql -h 127.0.0.1 -uroot -p"$$MYSQL_ROOT_PASSWORD" -e "SELECT 1" >/dev/null 2>&1
+      interval: 10s
+      timeout: 5s
+      retries: 15
+      start_period: 60s
+    networks: [elder-net]
+
+  # ------------------------------------------------------------ 业务后端（覆盖主文件）
+  elder-server:
+    environment:
+      TZ: Asia/Shanghai
+      # 覆盖主文件里的 sqlite:////data/elder.db。
+      # 格式：mysql+pymysql://<用户>:<密码>@<主机>:<端口>/<库名>?charset=utf8mb4
+      # 注意密码里的特殊字符（@ / : / #）要做 URL 转义，否则会被当成分隔符。
+      ELDER_DB: mysql+pymysql://root:${MYSQL_ROOT_PASSWORD:-123456}@elder-db:3306/elder_companion?charset=utf8mb4
+      # 启动时最多等多久数据库（秒）。即使 elder-db 判定 healthy，mysqld 也可能
+      # 还在初始化，直接连会得到 (2013, 'Lost connection ... during query')。
+      # MySQL 8 首次初始化数据目录在 Windows/WSL2 上可能要 30~90s，别把这里调太小。
+      ELDER_DB_WAIT_SEC: ${ELDER_DB_WAIT_SEC:-180}
+      ELDER_JWT_SECRET: ${ELDER_JWT_SECRET:-please-change-this-secret-in-production}
+      ELDER_CORS: ${ELDER_CORS:-*}
+      ELDER_XIAOZHI_WS: ${ELDER_XIAOZHI_WS:-ws://xiaozhi-server:8000/xiaozhi/v1/}
+      ELDER_XIAOZHI_OTA: ${ELDER_XIAOZHI_OTA:-http://xiaozhi-server:8003/xiaozhi/ota/}
+    depends_on:
+      elder-db:
+        condition: service_healthy
+
+volumes:
+  elder-db-data:
+
+networks:
+  elder-net:
+    driver: bridge

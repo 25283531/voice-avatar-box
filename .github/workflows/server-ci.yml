@@ -41,6 +41,27 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r server/requirements.txt
 
+      # 挡住「用 urllib.parse.urlparse 解析 SQLite 连接串」的回退：
+      # urlparse 会把 sqlite:///C:/a/b.db 的 path 解析成 /C:/a/b.db，
+      # Windows 上 mkdir 直接抛 WinError 123（文件名、目录名或卷标语法不正确），
+      # 服务一启动就崩。必须用 SQLAlchemy 自己的 make_url()。
+      # 三个形态一起断言，顺带守住 sqlite:////data/elder.db 的四斜杠（绝对路径）写法。
+      - name: 校验 SQLite 连接串解析
+        run: |
+          python - <<'PY'
+          from sqlalchemy.engine import make_url
+
+          cases = {
+              "sqlite:///./x.db": "./x.db",
+              "sqlite:////data/elder.db": "/data/elder.db",
+              "sqlite:///C:/a/b.db": "C:/a/b.db",
+          }
+          for url, expected in cases.items():
+              got = make_url(url).database
+              assert got == expected, f"{url} -> {got!r}, 期望 {expected!r}"
+              print(f"OK {url} -> {got}")
+          PY
+
       - name: 运行业务闭环冒烟测试
         run: python tools/smoke_server.py 8099
 
@@ -106,6 +127,22 @@ jobs:
         env:
           ELDER_DB: mysql+pymysql://root:smoke-pass@127.0.0.1:3306/elder_companion?charset=utf8mb4
         run: python tools/smoke_server.py 8098
+
+  # 两个 compose 文件的语法校验。
+  # 必要性：MySQL 变体是 overlay 叠加文件（docker-compose.mysql.yml 不能单独用），
+  # 写坏了本地 `docker compose config` 才报错，而这个仓库平时并不起容器 ——
+  # 加一道 CI 挡住 YAML 语法错误、变量引用错误与「少了主文件」的用法错误。
+  compose-config:
+    name: Compose 文件校验
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: 校验默认形态（内置 SQLite）
+        working-directory: server
+        run: docker compose config --quiet
+      - name: 校验 MySQL 变体（必须与主文件一起加载）
+        working-directory: server
+        run: docker compose -f docker-compose.yml -f docker-compose.mysql.yml config --quiet
 
   dockerfile-lint:
     name: Dockerfile 语法检查

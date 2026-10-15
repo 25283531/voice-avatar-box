@@ -1,69 +1,43 @@
-# 老人陪伴提醒助手 —— 一键部署
+# 老人陪伴提醒助手 —— 一键部署（默认 SQLite，零外部依赖）
 #
-# 核心栈（默认启动）：
-#   elder-db      MySQL 8        业务数据
-#   elder-server  本服务          业务 API + 管理页面   http://localhost:8080
+# 默认只起一个服务，数据落在内置 SQLite 文件里：
+#   elder-server  本服务   业务 API + 管理页面 + 内置 SQLite   http://localhost:8064
 #
-# 语音栈（可选，需要时加 --profile xiaozhi）：
-#   xiaozhi-*     复用 xiaozhi-esp32-server 官方镜像，承载 ASR/LLM/TTS 与 OTA
+# 为什么默认不用 MySQL：
+#   本项目面向家用 / 单机部署，一台机器跑一个容器最省事。SQLite 是 Python 标准库自带
+#   （无需额外依赖、无需额外的数据库容器、无需等待数据库就绪），`docker compose up -d`
+#   就能直接用。要换成 MySQL 时再叠加 docker-compose.mysql.yml 即可，见 docs/DEPLOY.md。
+#
+# 数据持久化：
+#   命名卷 elder-data 挂到容器 /data，库文件是 /data/elder.db。
+#   `docker compose down` 不会删卷，数据还在；`docker compose down -v` 会连卷一起删。
 #
 # 访问入口：http://localhost:8064 （容器内 8080，对外只映射 8064）
 #
-#   docker compose up -d
-#   docker compose --profile xiaozhi up -d
+#   docker compose up -d                        # 仅业务面（SQLite）
+#   docker compose --profile xiaozhi up -d      # 再带上语音链路
+#   docker compose -f docker-compose.yml -f docker-compose.mysql.yml up -d   # 改用 MySQL
 #
 services:
-
-  # ------------------------------------------------------------ 业务数据库
-  elder-db:
-    image: mysql:8.0
-    container_name: elder-db
-    restart: unless-stopped
-    command: >
-      --character-set-server=utf8mb4
-      --collation-server=utf8mb4_unicode_ci
-      --default-time-zone=+08:00
-      --default-authentication-plugin=mysql_native_password
-      --skip-name-resolve
-      --innodb-buffer-pool-size=256M
-      --max-connections=200
-    environment:
-      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-123456}
-      MYSQL_DATABASE: elder_companion
-      TZ: Asia/Shanghai
-    volumes:
-      - elder-db-data:/var/lib/mysql
-    healthcheck:
-      # 不能用 mysqladmin ping —— 它只判断「服务在跑」，即使认证失败也返回 0，
-      # 容易在 mysqld 尚未能接受查询时误判为就绪。这里执行真实的 SELECT 1，
-      # 并把 stderr 丢掉，只用退出码表达健康与否。
-      test:
-        - CMD-SHELL
-        - mysql -h 127.0.0.1 -uroot -p"$$MYSQL_ROOT_PASSWORD" -e "SELECT 1" >/dev/null 2>&1
-      interval: 10s
-      timeout: 5s
-      retries: 15
-      start_period: 60s
-    networks: [elder-net]
 
   # ------------------------------------------------------------ 业务后端
   elder-server:
     build: .
     container_name: elder-server
     restart: unless-stopped
-    depends_on:
-      elder-db:
-        condition: service_healthy
     environment:
       TZ: Asia/Shanghai
-      ELDER_DB: mysql+pymysql://root:${MYSQL_ROOT_PASSWORD:-123456}@elder-db:3306/elder_companion?charset=utf8mb4
-      # 启动时最多等多久数据库（秒）。即使 elder-db 判定 healthy，mysqld 也可能
-      # 还在初始化，直接连会得到 (2013, 'Lost connection ... during query')。
+      # 内置 SQLite 的落点：容器里 /data 是命名卷（见下方 volumes）。
+      # 四条斜杠 = sqlite:// + 绝对路径 /data/elder.db，别写成三条（那会变成相对路径）。
+      ELDER_DB: sqlite:////data/elder.db
+      # SQLite 是本地文件，不需要等数据库就绪；这个变量只在切到 MySQL 时才起作用。
       ELDER_DB_WAIT_SEC: ${ELDER_DB_WAIT_SEC:-180}
       ELDER_JWT_SECRET: ${ELDER_JWT_SECRET:-please-change-this-secret-in-production}
       ELDER_CORS: ${ELDER_CORS:-*}
       ELDER_XIAOZHI_WS: ${ELDER_XIAOZHI_WS:-ws://xiaozhi-server:8000/xiaozhi/v1/}
       ELDER_XIAOZHI_OTA: ${ELDER_XIAOZHI_OTA:-http://xiaozhi-server:8003/xiaozhi/ota/}
+    volumes:
+      - elder-data:/data
     # 对外只发布一个端口，默认 8064（8080 常与其它服务冲突）
     ports:
       - "${ELDER_HTTP_PORT:-8064}:8080"
@@ -103,7 +77,8 @@ services:
     networks: [elder-net]
 
 volumes:
-  elder-db-data:
+  # 内置 SQLite 库文件所在卷（elder.db）。备份/迁移就是拷这个文件。
+  elder-data:
 
 networks:
   elder-net:
