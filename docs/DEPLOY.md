@@ -488,9 +488,38 @@ docker inspect --format '{{.State.ExitCode}}' elder-server
 （间隔 `ELDER_SCHEDULER_INTERVAL`，默认 60 秒一轮，预排期提前量 `ELDER_SCHEDULE_AHEAD_HOURS` 默认 36 小时）。
 
 - 它挂掉**不会**让 API 不可用，所以 `/api/health` 仍然 200 —— 监控探活探不出定时任务半瘫。
-  想确认它在跑，看日志里有没有持续出现的 `scheduler` 记录，或观察提醒实例是否按期生成。
 - 一轮里某一步抛异常会带走**这一轮剩下的所有步骤**，所以日志里出现 scheduler 的 traceback
   要当回事处理，不要只看接口还能通就放过。
+
+#### 7.1.1 用 `/api/health/scheduler` 看定时任务是否在跑
+
+```bash
+curl -s http://<host>:8064/api/health/scheduler
+```
+
+```json
+{
+  "last_ok_at": "2026-10-15T14:03:12+08:00",
+  "consecutive_failures": 0,
+  "last_error": null
+}
+```
+
+| 字段 | 含义 | 判读 |
+| --- | --- | --- |
+| `last_ok_at` | 最近一次完整跑完的时刻（带时区） | 为 `null` 表示启动后一轮都没成功过；正常情况下应随每轮推进 |
+| `consecutive_failures` | 连续失败次数 | 成功一轮即归零；持续大于 0 说明定时任务半瘫 |
+| `last_error` | 最近一次异常信息 | 配合日志定位，成功时为 `null` |
+
+建议的告警条件：`consecutive_failures > 0` 持续 5 分钟，或
+`last_ok_at` 早于当前时间 10 分钟以上。
+
+**为什么单独开一个端点，而不把状态并进 `/api/health`**：
+`HEALTHCHECK` 每 30 秒打一次 `/api/health`，它一旦非 200，容器就被判定
+`unhealthy` —— 可此时进程还在、`8064` 上的业务 API 也照样能服务，只是后台的
+排期补全 / 订单过期没跑成。为了后台任务把整个容器判死，连带代价太大。
+所以两者职责严格分开：`/api/health` 只表达「进程活着」（永远 200），
+`/api/health/scheduler` 只给运维和监控看，**不参与任何探活链路**。
 
 ---
 

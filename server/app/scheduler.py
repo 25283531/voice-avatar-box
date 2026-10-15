@@ -27,6 +27,25 @@ from .schedule import local_now, materialize_events
 
 log = logging.getLogger("elder.scheduler")
 
+# 周期任务的健康快照，供 GET /api/health/scheduler 读取。
+#
+# 为什么单独开一个端点而不是塞进 /api/health：
+#   Dockerfile 的 HEALTHCHECK 每 30 秒打一次 /api/health，它一旦从 200 变成非 200，
+#   容器就会被判定 unhealthy —— 可此时进程还在、8064 上的业务 API 也照样能用，
+#   只是后台的排期补全 / 订单过期之类没跑成。为了后台任务把整个容器判死，连带代价太大。
+#   所以「探活」和「后台任务是否健康」必须分开：/api/health 只表达进程活着，
+#   运维要看后台任务就查这个专门的端点（它不进任何探活链路）。
+_SCHEDULER_HEALTH: dict[str, object] = {
+    "last_ok_at": None,       # 最近一次完整跑完的时刻（带时区 ISO 字符串），从未成功过为 None
+    "consecutive_failures": 0,  # 连续失败次数，成功一轮即归零
+    "last_error": None,       # 最近一次异常的字符串，成功时为 None
+}
+
+
+def scheduler_health() -> dict[str, object]:
+    """返回周期任务健康快照的副本（只读，避免调用方改到内部状态）。"""
+    return dict(_SCHEDULER_HEALTH)
+
 
 def _tick(session: Session) -> None:
     now = local_now()
@@ -101,3 +120,18 @@ async def run_forever() -> None:
                 await asyncio.to_thread(_tick, s)
         except Exception as exc:  # noqa: BLE001
             log.exception("scheduler tick failed: %s", exc)
+            # 记账本身绝不能再抛异常，否则会把 run_forever 整个带走
+            try:
+                _SCHEDULER_HEALTH["consecutive_failures"] = \
+                    int(_SCHEDULER_HEALTH["consecutive_failures"]) + 1
+                _SCHEDULER_HEALTH["last_error"] = str(exc)
+            except Exception:  # noqa: BLE001
+                pass
+            continue
+        # 成功一轮：刷新成功时刻并把连续失败次数清零
+        try:
+            _SCHEDULER_HEALTH["last_ok_at"] = local_now().isoformat()
+            _SCHEDULER_HEALTH["consecutive_failures"] = 0
+            _SCHEDULER_HEALTH["last_error"] = None
+        except Exception:  # noqa: BLE001
+            pass

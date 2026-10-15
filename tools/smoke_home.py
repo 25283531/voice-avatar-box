@@ -426,6 +426,38 @@ def main() -> int:
         code, s9 = req("GET", "/api/home/summary", token=u1)
         check("清扫后首页与设备列表口径一致",
               s9["devices"][0].get("online") is False, str(s9["devices"][0].get("online")))
+
+        # ============================================ 6. 后台任务健康快照
+        # 周期任务可能在后台连着失败、而业务 API 照旧 200，所以要有专门端点能看出来；
+        # 同时必须守住 /api/health 只表达「进程活着」，不能被后台任务状态污染
+        # （Dockerfile 的 HEALTHCHECK 每 30 秒打它一次，非 200 就会把容器判死）。
+        code, hs = req("GET", "/api/health/scheduler")
+        check("后台任务健康端点返回 200", code == 200, str(code))
+        check("健康快照含三个约定字段",
+              {"last_ok_at", "consecutive_failures", "last_error"} <= set((hs or {}).keys()),
+              str(sorted((hs or {}).keys())))
+        check("刚起来时连续失败次数为 0", (hs or {}).get("consecutive_failures") == 0,
+              str((hs or {}).get("consecutive_failures")))
+        # 端点只是「如实反映模块状态」，这里进程内改坏状态验证函数不是永远返回 0
+        # （服务端跑在子进程里，改不到它的模块变量，故函数级断言放本地做）
+        from app import scheduler as _sched
+        _sched._SCHEDULER_HEALTH["consecutive_failures"] = 3
+        _sched._SCHEDULER_HEALTH["last_error"] = "boom"
+        snap = _sched.scheduler_health()
+        check("状态改坏后快照如实反映次数", snap.get("consecutive_failures") == 3,
+              str(snap.get("consecutive_failures")))
+        check("状态改坏后快照如实反映错误信息", snap.get("last_error") == "boom",
+              str(snap.get("last_error")))
+        # 快照必须是副本，否则调用方能改到内部状态
+        snap["consecutive_failures"] = 999
+        check("快照是副本（不会污染内部状态）",
+              _sched.scheduler_health().get("consecutive_failures") == 3,
+              str(_sched.scheduler_health().get("consecutive_failures")))
+        # 守门：探活端点绝不能受后台任务状态影响
+        code, hc = req("GET", "/api/health")
+        check("探活端点不受后台任务状态影响，仍为 200", code == 200, str(code))
+        check("探活端点仍只表达进程存活", (hc or {}).get("ok") is True, str(hc))
+
         # 进程内开过一次连接，先释放再删临时库，否则 Windows 上文件被占着删不掉
         engine.dispose()
 

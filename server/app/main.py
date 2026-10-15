@@ -120,7 +120,29 @@ for r in (membership.router, membership.admin_router, membership.device_router):
 
 @app.get("/api/health")
 def health():
+    """容器探活端点：只表达「进程活着」，永远返回 200。
+
+    ⚠️ 不要往这里加任何后台任务的健康状态 —— Dockerfile 的 HEALTHCHECK 每 30 秒
+    打一次这里，它一旦非 200 容器就被判 unhealthy，而此时业务 API 其实还能正常服务。
+    后台任务的健康状况请看 /api/health/scheduler。
+    """
     return {"ok": True, "service": APP_NAME, "version": APP_VERSION}
+
+
+@app.get("/api/health/scheduler")
+def health_scheduler():
+    """后台周期任务健康快照（排期补全 / 超时升级 / 订单与会员过期 / 离线清扫）。
+
+    这个端点**不参与任何探活链路**，只给运维和监控看：
+      - last_ok_at           最近一次完整跑完的时刻，从未成功过为 None
+      - consecutive_failures 连续失败次数，成功一轮即归零
+      - last_error           最近一次异常信息，成功时为 None
+    """
+    # 惰性导入：scheduler 依赖 db / models / membership，模块级直接 import
+    # 会把初始化顺序钉死，放在函数里更稳。
+    from .scheduler import scheduler_health
+
+    return scheduler_health()
 
 
 # ---------------------------------------------------------------- 管理页面
