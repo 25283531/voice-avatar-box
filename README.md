@@ -11,7 +11,7 @@
 | 路径 | 说明 |
 | --- | --- |
 | `server/` | FastAPI 业务后端 + WEB 管理后台（单页，离线可用）+ Docker 部署文件 |
-| `app/` | 手机端（uni-app v3 + Vue3，复用 xiaozhi `manager-mobile`），出 H5 / 微信小程序 |
+| `app/` | 手机端家属端 APP（uni-app v3 + Vue3），四个栏目：首页 / 设备 / 日程 / 我的；出 H5 / 微信小程序 / Android APK |
 | `android/` | Android 原生壳工程（WebView + `WebViewAssetLoader`），把 H5 打成 APK，不依赖 DCloud |
 | `firmware/` | ESP32-S3 固件（`components/elder` 为本项目新增组件，编译前需合入 xiaozhi 源码树） |
 | `tools/` | 辅助脚本：`smoke_server.py` 后端冒烟、`make_firmware.py` 合并烧录 bin、`idfwin.py` / `winrun.py` Windows 下的 IDF 包装 |
@@ -24,9 +24,9 @@
 | --- | --- | --- |
 | 容器内监听 | `8080` | `ELDER_PORT` 可覆盖 |
 | **对外发布** | **`8064`** | 镜像只发布这一个端口，`-p 8064:8080` |
-| 生产域名 | `https://voice.250886.xyz` | nginx 反代到 `127.0.0.1:8064`，手机端已固化此地址 |
-| 管理后台 | `https://voice.250886.xyz/` | 默认账号 `admin` / `admin123`，登录后请立即改密 |
-| 接口文档 | `https://voice.250886.xyz/docs` | FastAPI 自动生成 |
+| 生产域名 | `https://voice.2508866.xyz` | nginx 反代到 `127.0.0.1:8064`，手机端已固化此地址 |
+| 管理后台 | `https://voice.2508866.xyz/` | 默认账号 `admin` / `admin123`，登录后请立即改密 |
+| 接口文档 | `https://voice.2508866.xyz/docs` | FastAPI 自动生成 |
 
 ## GitHub Actions 工作流
 
@@ -36,7 +36,6 @@
 | `docker-build.yml` | push/PR 改动 `server/`；可手动 | 构建镜像 → 起容器校验 `/api/health`；手动触发勾选 `publish` 才推送 `ghcr.io/25283531/voice-avatar-box` |
 | `app-build.yml` | push/PR 改动 `app/`；可手动 | 构建 H5 / 微信小程序并上传产物；校验后端地址已内联 |
 | `android-build.yml` | push/PR 改动 `app/`、`android/`；可手动 / 发 Release | **一次产出可安装的 Android APK**（H5 + WebView 壳，全程在 runner 内，不用 DCloud 账号） |
-| `app-pack.yml` | 可手动 / 发 Release | 备选：uni-app 云打包出 APK（需要 DCloud 账号 + 实名认证，免费额度每月 5 次） |
 
 增量触发：每个工作流都带 `paths` 过滤，推送只跑受影响的那条
 （例如只改 `docs/` 或 `firmware/` 不会触发任何构建；改 `tools/` 只跑 `server-ci`）。
@@ -45,6 +44,19 @@
 
 - `docker-build`：勾选 `publish`、填 `tag`（如 `v0.1.0`）→ 推送镜像，产物在 ghcr 包列表
 - `app-build`：选 `both` / `h5` / `mp-weixin` → 产物在 Actions 运行页的 Artifacts
+- `android-build`：选 `self`（仓库证书签名）/ `debug` → 产物为可直接安装的 APK
+
+### 手机 APP 栏目
+
+APP 是给家属用的，不接入小智任何服务，业务后端地址在代码级写死
+（`app/src/http/elder.ts`，域名 `https://voice.2508866.xyz`），**不提供任何网络设置入口**。
+
+| 栏目 | 内容 |
+| --- | --- |
+| 首页 | 已绑定设备、设备状态（网络连接 / 设备时间）、当日服药状态（待服数量、待服时间点、已确认次数）、会员状态（是否开通 / 到期时间 / 权益） |
+| 设备 | 添加设备（激活码）、删除设备、重命名、给设备配网、为每台设备绑定不同 agent 角色 |
+| 日程 | 服药提醒与日程提醒：新增 / 编辑 / 暂停 / 代老人确认 / 删除 |
+| 我的 | 账户名、修改密码、更换绑定邮箱、开通（续费）会员、创建自有 agent 角色、系统形象库、缓存管理、应用信息、隐私政策、用户协议 |
 - `android-build`：填版本号 → 产物 Artifacts 里的 `elder-app-android-apk`
 
 ## 服务器部署
@@ -61,7 +73,7 @@ nginx 反代片段：
 ```nginx
 server {
     listen 443 ssl;
-    server_name voice.250886.xyz;
+    server_name voice.2508866.xyz;
     # ssl_certificate / ssl_certificate_key ...
 
     location / {
@@ -83,7 +95,7 @@ pnpm build:h5          # 产物 app/dist/build/h5
 pnpm build:mp-weixin   # 产物 app/dist/build/mp-weixin，用微信开发者工具上传
 ```
 
-- 后端地址固定 `https://voice.250886.xyz`（`app/env/.env` 的 `VITE_ELDER_BASEURL`）
+- 后端地址**代码级写死** `https://voice.2508866.xyz`（`app/src/http/elder.ts` 的 `BASE_URL` 常量）
 - 页面入口：`src/pages/elder/`（绑定设备、提醒列表与编辑、统计、形象选择）
 
 ### Android APK（CI 一次出包，不依赖 DCloud）
@@ -113,7 +125,8 @@ pnpm build:mp-weixin   # 产物 app/dist/build/mp-weixin，用微信开发者工
 
 > iOS：没有 Apple 开发者证书（p12 + mobileprovision 缺一不可），暂不支持。
 
-> 备选路径 `app-pack.yml`（uni-app 云打包）仍在，需要 `DCLOUD_USERNAME` / `DCLOUD_PASSWORD`
+> `app-pack.yml`（uni-app 云打包）**已废弃**：DCloud 账号登录失败且强制实名认证，
+> 现已改走 `android-build.yml` 的 H5 + WebView 壳方案，全程在 GitHub runner 内出 APK。
 > 两个 Secret，且该账号必须已在 DCloud 注册并实名。
 
 ## 固件

@@ -26,7 +26,7 @@ on:
       server_url:
         description: '设备要连的业务后端地址（留空则用 sdkconfig.defaults 里的值）'
         type: string
-        default: https://voice.250886.xyz
+        default: https://voice.2508866.xyz
       board:
         description: '目标板卡 Kconfig 符号（默认立创·实战派）'
         type: string
@@ -108,12 +108,25 @@ jobs:
         env:
           IDF_CCACHE_ENABLE: '1'
         run: |
-          set -e
+          # ⚠️ 必须 pipefail：idf.py build | tail 时管道退出码取自 tail(0)，
+          #    会把构建失败吞掉，导致后续步骤才莫名失败、看不到真正的错误。
+          set -eo pipefail
           . "$IDF_PATH/export.sh"
           cd "$PROJECT_DIR"
-          idf.py build 2>&1 | tail -120
+          idf.py build 2>&1 | tee build/ci-build.log | tail -120
           echo "=== 产物 ==="
           ls -lh build/*.bin build/bootloader/*.bin build/partition_table/*.bin 2>/dev/null || true
+
+      # 失败时把真正的编译错误打出来（上面的 tail -120 可能被 LVGL 的 #warning 刷屏盖住）
+      - name: 输出编译错误（失败时）
+        if: failure()
+        shell: bash
+        run: |
+          cd "$PROJECT_DIR"
+          echo "=== 从完整日志中提取错误 ==="
+          grep -nE "^FAILED:|error:|undefined reference|No such file or directory|collect2: error" build/ci-build.log 2>/dev/null | head -60 || true
+          echo "=== idf.py 控制台日志 ==="
+          grep -nE "^FAILED:|error:|undefined reference" build/log/idf_py_stdout_output_* 2>/dev/null | head -40 || true
 
       - name: 生成单文件烧录镜像
         shell: bash
