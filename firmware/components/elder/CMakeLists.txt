@@ -4,6 +4,9 @@ idf_component_register(
         "src/input.c"
         "src/reminder.c"
         "src/activation.c"
+        "src/ui.c"
+        "src/net.c"
+        "src/sync.c"
     INCLUDE_DIRS "include"
     REQUIRES
         driver
@@ -11,4 +14,11 @@ idf_component_register(
         nvs_flash
         esp_driver_rmt
         esp_driver_gpio
+        esp_http_client
+        json
 )
+
+# 说明：src/elder_bridge.cc **不在这里编译**。
+# 它是 C++ 的 xiaozhi 适配层，必须编译进 main 组件才能访问
+# Application / Display / AudioService。由 tools/merge_to_xiaozhi.py
+# 追加到 xiaozhi/main/CMakeLists.txt 的 target_sources() 中。

@@ -34,6 +34,13 @@ firmware/*.bin
 firmware/*.elf
 firmware/*.map
 
+# 上游 xiaozhi 镜像的构建产物（managed_components 由 IDF 组件管理器自动拉取，约 509MB）
+firmware/xiaozhi/build/
+firmware/xiaozhi/managed_components/
+firmware/xiaozhi/sdkconfig
+firmware/xiaozhi/sdkconfig.old
+firmware/xiaozhi/components/elder/
+
 # ---------------------------------------------------------- 杂项
 # 本地会话/记忆数据，不进仓库
 .workbuddy/
@@ -55,3 +62,6 @@ Thumbs.db
 *.jks
 *.p12
 *.mobileprovision
+
+# 本地下载的构建产物
+out/

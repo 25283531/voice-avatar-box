@@ -100,6 +100,7 @@ esp_err_t elder_reminder_flush(void)
 
 static void set_state(int idx, elder_rmd_state_t st)
 {
+    if (idx < 0 || idx >= ELDER_REMINDER_MAX) return;
     if (g.state[idx] == (uint8_t)st) return;
     g.state[idx] = (uint8_t)st;
     ESP_LOGI(TAG, "[%s] %s -> %s", g.table.items[idx].label,
@@ -143,6 +144,7 @@ static void tick(void)
             g.state[i] = ELDER_RMD_IDLE;
             g.fired_today[i] = false;
             g.confirm_deadline_us[i] = 0;
+            g.table.items[i].fired_due_at = 0;
         }
         g.dirty = true;
     }
@@ -159,6 +161,12 @@ static void tick(void)
         /* 触发 */
         if (!g.fired_today[i] && g.state[i] == ELDER_RMD_IDLE && now_min >= due) {
             g.fired_today[i] = true;
+            /* 记录本次到期时刻：后端回执靠 (reminder_id, due_at) 定位实例 */
+            struct tm due_tm = tm_now;
+            due_tm.tm_hour = it->hour;
+            due_tm.tm_min  = it->minute;
+            due_tm.tm_sec  = 0;
+            it->fired_due_at = (int64_t)mktime(&due_tm);
             set_state(i, ELDER_RMD_PENDING);
         }
 
@@ -243,6 +251,58 @@ esp_err_t elder_reminder_set_enabled(uint8_t id, bool enabled)
     g.table.items[id].enabled = enabled;
     g.dirty = true;
     return ESP_OK;
+}
+
+esp_err_t elder_reminder_replace_all(const elder_rmd_item_t *items, uint8_t count)
+{
+    if (count > ELDER_REMINDER_MAX) return ESP_ERR_INVALID_SIZE;
+
+    /* 先按 server_id 保留「今日已确认/已触发」的运行态，避免同步打断老人当天的进度 */
+    uint16_t keep_done = 0;
+    for (uint8_t i = 0; i < g.table.count && i < ELDER_REMINDER_MAX; i++) {
+        if (g.state[i] == ELDER_RMD_DONE) keep_done |= (1u << i);
+    }
+
+    memset(g.table.items, 0, sizeof(g.table.items));
+    for (uint8_t i = 0; i < count; i++) {
+        memcpy(&g.table.items[i], &items[i], sizeof(elder_rmd_item_t));
+        g.table.items[i].id = i;
+        g.table.items[i].label[ELDER_REMINDER_LABEL] = '\0';
+        /* 沿用旧表同 server_id 的状态（index 相同即视为同一条，服务端顺序稳定） */
+        if (keep_done & (1u << i)) {
+            g.state[i] = ELDER_RMD_DONE;
+        } else {
+            g.state[i] = ELDER_RMD_IDLE;
+        }
+        g.fired_today[i] = false;
+        g.confirm_deadline_us[i] = 0;
+    }
+    for (int i = count; i < ELDER_REMINDER_MAX; i++) {
+        g.state[i] = ELDER_RMD_IDLE;
+        g.fired_today[i] = false;
+    }
+
+    g.table.count = count;
+    g.table.done_today = keep_done;
+    g.table.pending_today = 0;
+    g.dirty = true;
+    ESP_LOGI(TAG, "提醒表已同步：%u 条（后端下发）", count);
+    return elder_reminder_flush();
+}
+
+int elder_reminder_find_by_server_id(uint32_t server_id)
+{
+    if (!server_id) return -1;
+    for (int i = 0; i < g.table.count && i < ELDER_REMINDER_MAX; i++) {
+        if (g.table.items[i].server_id == server_id) return i;
+    }
+    return -1;
+}
+
+time_t elder_reminder_get_due_at(uint8_t id)
+{
+    if (id >= g.table.count) return 0;
+    return (time_t)g.table.items[id].fired_due_at;
 }
 
 esp_err_t elder_reminder_list(const elder_rmd_table_t **out)

@@ -1,0 +1,152 @@
+name: firmware-build
+
+# ESP32-S3 固件：在 GitHub runner 上用 Espressif 官方 ESP-IDF 容器编译。
+#
+# 为什么放 CI：
+#   - 本机资源有限，全量编译 2277 个目标（含 LVGL / esp-sr / EAF 形象）耗时长
+#   - runner 每次都是干净环境，不受本机 PATH / MSYS / 工具链污染影响
+#
+# 流程：checkout → merge_to_xiaozhi.py 注入 elder → idf.py set-target esp32s3 → build
+#       → merge-bin 出单文件烧录镜像 → 上传 artifact
+#
+# 触发：改动 firmware/ 或本文件时自动跑；也可手动（可覆盖板卡与后端地址）。
+
+on:
+  push:
+    paths:
+      - 'firmware/**'
+      - 'tools/merge_to_xiaozhi.py'
+      - '.github/workflows/firmware-build.yml'
+  workflow_dispatch:
+    inputs:
+      idf_version:
+        description: 'ESP-IDF 版本（对应 espressif/idf 镜像 tag）'
+        type: string
+        default: v5.5.1
+      server_url:
+        description: '设备要连的业务后端地址（留空则用 sdkconfig.defaults 里的值）'
+        type: string
+        default: https://voice.250886.xyz
+      board:
+        description: '目标板卡 Kconfig 符号（默认立创·实战派）'
+        type: string
+        default: CONFIG_BOARD_TYPE_LICHUANG_DEV_S3
+
+env:
+  IDF_TARGET: esp32s3
+  PROJECT_DIR: firmware/xiaozhi
+
+jobs:
+  build:
+    name: 编译 ESP32-S3 固件
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    # 官方镜像里 IDF_PATH / 工具链已就位；idf.py 需先 source export.sh
+    container:
+      image: espressif/idf:v5.5.1
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 注入 elder 组件到 xiaozhi 源码树
+        run: |
+          set -e
+          python3 tools/merge_to_xiaozhi.py
+          python3 tools/merge_to_xiaozhi.py --check
+
+      - name: 按输入覆盖板卡与后端地址
+        env:
+          BOARD_SYM: ${{ inputs.board || 'CONFIG_BOARD_TYPE_LICHUANG_DEV_S3' }}
+          SERVER_URL: ${{ inputs.server_url }}
+        run: |
+          set -e
+          DEF="$PROJECT_DIR/sdkconfig.defaults"
+          python3 - "$DEF" "$BOARD_SYM" "$SERVER_URL" <<'PY'
+          import re, sys
+          path, board, url = sys.argv[1], sys.argv[2], sys.argv[3]
+          s = open(path, encoding='utf-8').read()
+          # 板卡：先把所有 CONFIG_BOARD_TYPE_* 置 n，再打开目标项
+          s = re.sub(r'^CONFIG_BOARD_TYPE_\w+=y$', lambda m: m.group(0)[:-1] + 'n',
+                     s, flags=re.M)
+          if re.search(rf'^{re.escape(board)}=', s, flags=re.M):
+              s = re.sub(rf'^{re.escape(board)}=.*$', f'{board}=y', s, flags=re.M)
+          else:
+              s += f'\n{board}=y\n'
+          if url.strip():
+              if re.search(r'^CONFIG_ELDER_SERVER_URL=', s, flags=re.M):
+                  s = re.sub(r'^CONFIG_ELDER_SERVER_URL=.*$',
+                             f'CONFIG_ELDER_SERVER_URL="{url.strip()}"', s, flags=re.M)
+              else:
+                  s += f'\nCONFIG_ELDER_SERVER_URL="{url.strip()}"\n'
+          open(path, 'w', encoding='utf-8').write(s)
+          print('板卡 =', board)
+          print('后端 =', url.strip() or '(沿用默认)')
+          PY
+          echo "--- sdkconfig.defaults 关键行 ---"
+          grep -E 'BOARD_TYPE|ELDER_SERVER_URL|EMOTE|SPIRAM|FLASHSIZE|PARTITION' "$DEF" || true
+
+      - name: 缓存 IDF 组件与 ccache
+        uses: actions/cache@v4
+        with:
+          path: |
+            firmware/xiaozhi/managed_components
+            /root/.ccache
+          key: idf-${{ inputs.idf_version || 'v5.5.1' }}-${{ hashFiles('firmware/xiaozhi/dependencies.lock', 'firmware/xiaozhi/main/idf_component.yml') }}
+          restore-keys: |
+            idf-${{ inputs.idf_version || 'v5.5.1' }}-
+
+      - name: set-target（生成 sdkconfig）
+        shell: bash
+        run: |
+          set -e
+          . "$IDF_PATH/export.sh"
+          cd "$PROJECT_DIR"
+          idf.py set-target "$IDF_TARGET"
+          grep -E 'CONFIG_BOARD_TYPE|CONFIG_ELDER_SERVER_URL|CONFIG_USE_EMOTE|CONFIG_SPIRAM' sdkconfig | head -12 || true
+
+      - name: 编译
+        shell: bash
+        env:
+          IDF_CCACHE_ENABLE: '1'
+        run: |
+          set -e
+          . "$IDF_PATH/export.sh"
+          cd "$PROJECT_DIR"
+          idf.py build 2>&1 | tail -120
+          echo "=== 产物 ==="
+          ls -lh build/*.bin build/bootloader/*.bin build/partition_table/*.bin 2>/dev/null || true
+
+      - name: 生成单文件烧录镜像
+        shell: bash
+        run: |
+          set -e
+          . "$IDF_PATH/export.sh"
+          cd "$PROJECT_DIR"
+          # IDF 5.x 自带 merge-bin；失败不致命，仍可用 flash_args 分别烧写
+          idf.py merge-bin -o build/merged-flash.bin || echo "::warning::merge-bin 失败，用 flash_args 分别烧写"
+
+      - name: 整理产物
+        if: always()
+        run: |
+          set -e
+          mkdir -p "$GITHUB_WORKSPACE/out"
+          cd "$PROJECT_DIR"
+          cp -v build/bootloader/bootloader.bin        "$GITHUB_WORKSPACE/out/" 2>/dev/null || true
+          cp -v build/partition_table/partition-table.bin "$GITHUB_WORKSPACE/out/" 2>/dev/null || true
+          cp -v build/ota_data_initial.bin             "$GITHUB_WORKSPACE/out/" 2>/dev/null || true
+          cp -v build/generated_assets.bin             "$GITHUB_WORKSPACE/out/" 2>/dev/null || true
+          cp -v build/merged-flash.bin                 "$GITHUB_WORKSPACE/out/" 2>/dev/null || true
+          cp -v build/flasher_args.json                "$GITHUB_WORKSPACE/out/" 2>/dev/null || true
+          # 应用镜像文件名随工程名变化，统一抓取
+          find build -maxdepth 1 -name "*.bin" ! -name "generated_assets.bin" \
+               ! -name "ota_data_initial.bin" -exec cp -v {} "$GITHUB_WORKSPACE/out/" \; 2>/dev/null || true
+          echo "=== 收集到的产物 ==="
+          ls -lh "$GITHUB_WORKSPACE/out" || true
+          test -n "$(ls -A "$GITHUB_WORKSPACE/out")" || { echo "::error::未收集到任何 bin"; exit 1; }
+
+      - name: 上传固件产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: elder-firmware-esp32s3
+          path: out/
+          retention-days: 30
+          if-no-files-found: error

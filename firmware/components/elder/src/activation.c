@@ -50,6 +50,8 @@ esp_err_t elder_activation_generate(char *out_code, size_t len)
     s_deadline_us = esp_timer_get_time() + VALID_MS * 1000LL;
 
     memcpy(out_code, s_code, ELDER_ACT_CODE_LEN);
+    /* 缓冲区还有富余就补一个 \0，避免调用方直接当字符串用时越界 */
+    if (len > ELDER_ACT_CODE_LEN) out_code[ELDER_ACT_CODE_LEN] = '\0';
     ESP_LOGI(TAG, "new activation code generated (valid 10min)");
     return ESP_OK;
 }

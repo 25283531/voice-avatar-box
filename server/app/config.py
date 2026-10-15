@@ -27,6 +27,14 @@ DATABASE_URL = os.getenv(
 DB_ECHO = os.getenv("ELDER_DB_ECHO", "0") == "1"
 DB_POOL_PRE_PING = True
 
+# 启动时等待数据库可用的最长时间（秒）。
+# Docker Compose 下 elder-db 虽然带 healthcheck，但在 Windows/WSL2 上 MySQL 8
+# 首次初始化数据目录可能耗时 30~90s，且 depends_on 的健康判定与 mysqld 真正
+# 开始接受查询之间存在窗口期——客户端会拿到
+#   pymysql.err.OperationalError (2013, 'Lost connection to MySQL server during query')
+# 因此启动阶段必须自带重试，而不是依赖编排层的时序。
+DB_WAIT_SEC = float(os.getenv("ELDER_DB_WAIT_SEC", "180"))
+
 # ---------------------------------------------------------------- 安全
 JWT_SECRET = os.getenv("ELDER_JWT_SECRET", "please-change-this-secret-in-production")
 JWT_ALG = "HS256"

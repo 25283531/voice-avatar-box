@@ -23,6 +23,10 @@ services:
       --character-set-server=utf8mb4
       --collation-server=utf8mb4_unicode_ci
       --default-time-zone=+08:00
+      --default-authentication-plugin=mysql_native_password
+      --skip-name-resolve
+      --innodb-buffer-pool-size=256M
+      --max-connections=200
     environment:
       MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-123456}
       MYSQL_DATABASE: elder_companion
@@ -30,11 +34,16 @@ services:
     volumes:
       - elder-db-data:/var/lib/mysql
     healthcheck:
-      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-p${MYSQL_ROOT_PASSWORD:-123456}"]
+      # 不能用 mysqladmin ping —— 它只判断「服务在跑」，即使认证失败也返回 0，
+      # 容易在 mysqld 尚未能接受查询时误判为就绪。这里执行真实的 SELECT 1，
+      # 并把 stderr 丢掉，只用退出码表达健康与否。
+      test:
+        - CMD-SHELL
+        - mysql -h 127.0.0.1 -uroot -p"$$MYSQL_ROOT_PASSWORD" -e "SELECT 1" >/dev/null 2>&1
       interval: 10s
       timeout: 5s
-      retries: 12
-      start_period: 30s
+      retries: 15
+      start_period: 60s
     networks: [elder-net]
 
   # ------------------------------------------------------------ 业务后端
@@ -48,6 +57,9 @@ services:
     environment:
       TZ: Asia/Shanghai
       ELDER_DB: mysql+pymysql://root:${MYSQL_ROOT_PASSWORD:-123456}@elder-db:3306/elder_companion?charset=utf8mb4
+      # 启动时最多等多久数据库（秒）。即使 elder-db 判定 healthy，mysqld 也可能
+      # 还在初始化，直接连会得到 (2013, 'Lost connection ... during query')。
+      ELDER_DB_WAIT_SEC: ${ELDER_DB_WAIT_SEC:-180}
       ELDER_JWT_SECRET: ${ELDER_JWT_SECRET:-please-change-this-secret-in-production}
       ELDER_CORS: ${ELDER_CORS:-*}
       ELDER_XIAOZHI_WS: ${ELDER_XIAOZHI_WS:-ws://xiaozhi-server:8000/xiaozhi/v1/}

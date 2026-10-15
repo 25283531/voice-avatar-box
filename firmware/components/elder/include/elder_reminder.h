@@ -3,6 +3,7 @@
 
 #include <stdint.h>
 #include <stdbool.h>
+#include <time.h>
 #include "esp_err.h"
 
 #ifdef __cplusplus
@@ -39,10 +40,16 @@ typedef struct {
     uint8_t  id;
     uint8_t  hour;
     uint8_t  minute;
-    uint8_t  type;                       /* elder_rmd_type_t */
-    uint8_t  repeat_mask;                /* bit0=周日 ... bit6=周六 */
+    uint8_t  type;                       /* elder_rmd_type_t：0=日程 1=服药 */
+    uint8_t  repeat_mask;                /* bit0=周日 ... bit6=周六（注意与后端差异，见 sync.c） */
     bool     enabled;
     char     label[ELDER_REMINDER_LABEL + 1];
+
+    /* ---- 与后端对齐的扩展字段（见 elder_sync.c 的映射说明）---- */
+    uint32_t server_id;                  /* 后端 Reminder.id；0 = 设备本地自建 */
+    uint8_t  rtype;                      /* 后端 ReminderType：0=服药 1=日程 2=喝水 3=运动 4=自定义 */
+    uint8_t  schedule_kind;              /* 后端 ScheduleKind：0=一次 1=每天 2=每周 3=每月 4=隔N天 */
+    int64_t  fired_due_at;               /* 本次触发的到期时刻（unix 秒），回执用它定位实例 */
 } elder_rmd_item_t;
 
 typedef struct {
@@ -67,6 +74,18 @@ esp_err_t elder_reminder_add(const elder_rmd_item_t *item);
 esp_err_t elder_reminder_del(uint8_t id);
 esp_err_t elder_reminder_set_enabled(uint8_t id, bool enabled);
 esp_err_t elder_reminder_list(const elder_rmd_table_t **out);
+
+/**
+ * @brief 用后端下发的规则**整体替换**本地表（幂等，按 server_id 复用条目）。
+ *        替换后 dirty 但不立即落盘，由 tick 去抖写 NVS。
+ */
+esp_err_t elder_reminder_replace_all(const elder_rmd_item_t *items, uint8_t count);
+
+/** 按后端 reminder_id 查本地索引；找不到返回 -1 */
+int elder_reminder_find_by_server_id(uint32_t server_id);
+
+/** 取出本次触发的到期时刻（unix 秒）；未触发返回 0 */
+time_t elder_reminder_get_due_at(uint8_t id);
 
 /**
  * @brief 标记某条提醒已完成（语音确认 / 按键确认 / APP 远程确认都走这里）

@@ -1,0 +1,48 @@
+menu "老人陪伴 & 提醒助手 (Elder Companion)"
+
+    config ELDER_SERVER_URL
+        string "业务后端地址 (FastAPI)"
+        default "http://192.168.1.100:8000"
+        help
+            老人陪伴助手业务后端的根地址，形如 http://192.168.1.100:8000。
+            固件会在其后拼接 /api/device/sync、/api/device/events 等路径。
+            末尾不要带斜杠。
+
+    config ELDER_SERVER_TOKEN
+        string "设备令牌 device_token（留空则用激活码流程获取）"
+        default ""
+        help
+            设备绑定后由后端签发的 JWT。首次烧录可留空，
+            设备会进入激活码屏显流程；一旦获取成功会写入 NVS 持久化。
+
+    config ELDER_SYNC_INTERVAL_SEC
+        int "心跳同步周期（秒）"
+        range 60 3600
+        default 300
+        help
+            设备主动拉取提醒列表的周期。服务端可在 /api/device/sync
+            的 sync_interval_sec 字段覆盖该值。
+
+    config ELDER_HTTP_TIMEOUT_MS
+        int "HTTP 请求超时（毫秒）"
+        range 2000 60000
+        default 8000
+        help
+            单次 HTTP 请求的硬超时（DNS + 连接 + 收发全程）。
+            离线时必须靠它快速失败，绝不能让同步任务卡死。
+
+    config ELDER_ENABLE_RGB
+        bool "启用外扩 WS2812 指示灯"
+        default y
+        help
+            立创实战派板载没有 WS2812，需在 GPIO10（可改 elder_board.h）
+            外接灯珠。硬件上 ESP32-S3 的 3.3V 电平需经 74HCT 转换。
+
+    config ELDER_DEMO_DATA
+        bool "烧录出厂演示提醒（早8点/晚8点服药）"
+        default n
+        help
+            打开后首次启动会写入两条演示提醒，方便无后端时验证链路。
+            正式部署请关闭，避免与后端下发的规则冲突。
+
+endmenu
