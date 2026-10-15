@@ -59,19 +59,22 @@ END = "# <<< END elder-companion overlay <<<"
 # Application / Board / Display 等符号。若改成「独立的 elder 组件 + REQUIRES」，
 # 组件是无法反向依赖 main 的。
 CMAKE_OVERLAY = f"""{BEGIN}
-# ---- elder 组件源码直接编入 main（bridge 需要访问 xiaozhi 的 C++ API）----
+# ---- 只把 C++ 适配层编进 main ----
+# elder_bridge.cc 需要访问 xiaozhi 的 Application / Board / Display / AudioService，
+# 这些符号只存在于 main 组件，而 ESP-IDF 的组件不能反向依赖 main，
+# 所以它必须编进 main。
+#
+# 其余纯 C 源文件（rgb/input/reminder/activation/ui/net/sync）由
+# components/elder 组件自己的 CMakeLists.txt 编译。
+# ⚠️ 千万不要把它们也加进这里的 target_sources()：同一批 .c 会被编译两次，
+#    链接期直接 duplicate symbol（本机增量编译不会暴露，全量构建才报）。
 set(ELDER_DIR "${{PROJECT_DIR}}/components/elder")
 target_sources(${{COMPONENT_LIB}} PRIVATE
-    "${{ELDER_DIR}}/src/rgb.c"
-    "${{ELDER_DIR}}/src/input.c"
-    "${{ELDER_DIR}}/src/reminder.c"
-    "${{ELDER_DIR}}/src/activation.c"
-    "${{ELDER_DIR}}/src/ui.c"
-    "${{ELDER_DIR}}/src/net.c"
-    "${{ELDER_DIR}}/src/sync.c"
     "${{ELDER_DIR}}/src/elder_bridge.cc"
 )
 target_include_directories(${{COMPONENT_LIB}} PRIVATE "${{ELDER_DIR}}/include")
+# 链接 elder 组件：同时传递它的 REQUIRES（driver / json / esp_http_client 等）
+target_link_libraries(${{COMPONENT_LIB}} PRIVATE idf::elder)
 
 # ---- 在 app_main() 启动 xiaozhi 之后拉起 elder ----
 {END}
