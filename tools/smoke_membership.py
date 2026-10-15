@@ -4,15 +4,15 @@
     python tools/smoke_membership.py [--port 8098]
 
 覆盖：
-    A. 用户端：会员状态 / 套餐 / 下单 / 订单号冲突 409 / 金额区间随机且不重复 /
+    A. 用户端：会员状态 / 套餐 / 下单 / 订单号冲突 409 / 金额区间内随机（不要求唯一） /
        频率限制 429 / 已支付通知 / 放弃 / 收款信息
-    B. 管理端：配置读写 / 订单列表 / 按订单号查询 / 确认到账（幂等）/ 驳回 /
-       后台直接分配 / 过期清理 / 非管理员 403
+    B. 管理端：配置读写 / 订单列表 / 按订单号查金额 / **按金额反查订单号** /
+       确认到账（幂等）/ 驳回 / 后台直接分配 / 过期清理 / 非管理员 403
     C. 设备端：当日配额 / 陪聊时长上报（提醒类不计入配额）
 
 另外有一段**进程内**用例，直接调 app.membership 验证：
-    - 连续分配 20 个金额互不重复且都落在区间内
-    - 区间被占满时抛 409（提示管理员放宽区间）
+    - 连续分配 20 个金额都落在区间内（金额不独占，允许重复）
+    - 窄区间（仅 6 个候选值）下仍能连续分配，不会因「被占满」抛 409
 """
 from __future__ import annotations
 
@@ -148,11 +148,12 @@ def main() -> int:
 
         # ==================================================== 3. 管理端配置
         code, cfg = req("PATCH", "/api/admin/membership/config", {
-            "amount_range": {"min_cents": 1000, "max_cents": 9999, "enabled": True},
+            # 默认区间是 10.00~12.00 元；这里显式写一遍，顺带验证可写
+            "amount_range": {"min_cents": 1000, "max_cents": 1200, "enabled": True},
             "payment": {"channel": "微信", "payee_name": "张三", "account": "wxp://test",
                         "qr_url": "https://example.com/qr.png", "note": "转账请备注订单号"},
         }, admin_token)
-        check("管理端写入配置", code == 200 and cfg["amount_range"]["max_cents"] == 9999,
+        check("管理端写入配置", code == 200 and cfg["amount_range"]["max_cents"] == 1200,
               str(code))
         check("收款信息回读一致", cfg["payment"]["payee_name"] == "张三", "")
 
@@ -170,7 +171,7 @@ def main() -> int:
         check("下单成功（小写订单号自动转大写）",
               code == 201 and o1.get("code") == "A3F9", f"code={o1.get('code')}")
         amount1 = o1.get("amount_cents", 0)
-        check("金额落在 1000~9999 分", 1000 <= amount1 <= 9999, f"{amount1} 分")
+        check("金额落在 1000~1200 分", 1000 <= amount1 <= 1200, f"{amount1} 分")
         check("返回元单位展示值", o1.get("amount_yuan") == f"{amount1 / 100:.2f}",
               str(o1.get("amount_yuan")))
         check("下单返回收款信息", bool(o1.get("payment_info", {}).get("payee_name")), "")
@@ -190,12 +191,13 @@ def main() -> int:
                       {"code": "Z9Z9", "plan_code": "not-exist"}, u1)
         check("套餐不存在返回 404", code == 404, f"code={code}")
 
-        # 金额不重复
+        # 金额不做独占：第二笔只要落在区间内即可，允许与首笔相同
+        # （订单号才是唯一标识，管理员既能按订单号查金额，也能按金额反查订单号）
         code, o2 = req("POST", "/api/membership/orders",
                        {"code": "B7K1", "plan_code": "quarterly"}, u1)
-        check("第二笔订单金额与首笔不同",
-              code == 201 and o2.get("amount_cents") != amount1,
-              f"{o2.get('amount_cents')} vs {amount1}")
+        check("第二笔订单金额落在区间内",
+              code == 201 and 1000 <= o2.get("amount_cents", -1) <= 1200,
+              f"{o2.get('amount_cents')} 分")
 
         # 频率限制：60 秒内第 4 笔
         code, o3 = req("POST", "/api/membership/orders", {"code": "C2M8", "plan_code": "yearly"}, u1)
@@ -235,6 +237,42 @@ def main() -> int:
         check("查询结果含用户与套餐",
               found.get("username") == "mem1" and found.get("plan_name") == "月卡",
               f"{found.get('username')}/{found.get('plan_name')}")
+
+        # ---- 人工核销的第二个入口：按金额反查订单号 ----
+        # 金额不独占，所以是「管理员先看到收款记录里的这笔钱，反查是谁下的单」。
+        code, by_amt = req("GET", f"/api/admin/membership/orders/by-amount?amount_cents={amount1}",
+                           token=admin_token)
+        check("按金额反查返回 200", code == 200, f"code={code}")
+        check("按金额反查能命中 A3F9",
+              isinstance(by_amt, list) and any(o["code"] == "A3F9" for o in by_amt),
+              str([o.get("code") for o in by_amt]) if isinstance(by_amt, list) else str(by_amt))
+        check("反查结果带金额与用户",
+              isinstance(by_amt, list)
+              and any(o.get("amount_cents") == amount1 and o.get("username") == "mem1"
+                      for o in by_amt), "")
+        # 元 -> 分必须用 Decimal：10.53 用 float 乘 100 会变成 1052，查不到
+        yuan = f"{amount1 / 100:.2f}"
+        code, by_yuan = req("GET",
+                            f"/api/admin/membership/orders/by-amount?amount_yuan={yuan}",
+                            token=admin_token)
+        check("按元单位反查与按分反查结果一致",
+              code == 200 and isinstance(by_yuan, list)
+              and any(o["code"] == "A3F9" for o in by_yuan), f"{yuan} 元")
+        # 查不到是正常结果，返回空数组而不是 404
+        code, none_hit = req("GET", "/api/admin/membership/orders/by-amount?amount_cents=1",
+                             token=admin_token)
+        check("金额无对应订单时返回空数组（不报 404）",
+              code == 200 and isinstance(none_hit, list) and len(none_hit) == 0, f"code={code}")
+        # 参数缺失 / 非法
+        code, _ = req("GET", "/api/admin/membership/orders/by-amount", token=admin_token)
+        check("缺金额参数返回 422", code == 422, f"code={code}")
+        code, _ = req("GET", "/api/admin/membership/orders/by-amount?amount_yuan=abc",
+                      token=admin_token)
+        check("金额格式非法返回 422", code == 422, f"code={code}")
+        # 管理端接口必须鉴权
+        code, _ = req("GET", f"/api/admin/membership/orders/by-amount?amount_cents={amount1}",
+                      token=u1)
+        check("非管理员按金额反查返回 403", code == 403, f"code={code}")
 
         code, conf = req("POST", "/api/admin/membership/orders/A3F9/confirm", {},
                          admin_token)
@@ -379,30 +417,30 @@ def main() -> int:
                     created_at=utcnow(), expires_at=utcnow() + timedelta(hours=48),
                 ))
                 s.commit()
-            check("连续分配 20 个金额互不重复", len(set(picked)) == 20, f"{len(set(picked))} 个唯一值")
-            check("金额全部落在区间内", all(1000 <= v <= 9999 for v in picked), "")
+            check("连续分配 20 个金额全部落在区间内",
+                  all(1000 <= v <= 1200 for v in picked),
+                  f"{min(picked)}~{max(picked)}")
+            # 金额不独占，所以「重复」是允许的、也是预期的；这里只验证不会越界
+            check("金额允许重复（不再做 48 小时独占）",
+                  len(picked) == 20, f"{len(set(picked))} 个不同值（允许少于 20）")
 
-            # 区间耗尽
+            # 区间很窄（只有 6 个候选值）时依然能连续下单，不会因为「被占满」而 409
             rng = svc.get_amount_range(s)
             rng.min_cents = 1000
             rng.max_cents = 1005
             s.commit()
             got: list[int] = []
-            exhausted = False
+            err = None
             try:
                 for i in range(20, 40):
-                    v = svc.pick_amount_cents(s)
-                    got.append(v)
-                    s.add(MembershipOrder(
-                        code=f"{i:04d}", user_id=1, plan_code="monthly", amount_cents=v,
-                        status="pending", created_at=utcnow(),
-                        expires_at=utcnow() + timedelta(hours=48),
-                    ))
-                    s.commit()
-            except HTTPException as e:
-                exhausted = (e.status_code == 409)
-            check("区间耗尽后抛 409 提示放宽区间",
-                  exhausted and len(set(got)) == 6, f"占用 {len(set(got))} 个值后耗尽")
+                    got.append(svc.pick_amount_cents(s))
+            except HTTPException as e:  # noqa: BLE001
+                err = e
+            check("窄区间下仍可连续分配（不再因占满抛 409）",
+                  err is None and len(got) == 20,
+                  f"分配 {len(got)} 次，err={err.status_code if err else None}")
+            check("窄区间分配仍不越界",
+                  all(1000 <= v <= 1005 for v in got), f"{min(got)}~{max(got)}")
 
     finally:
         proc.terminate()

@@ -1,15 +1,20 @@
 """会员系统核心逻辑（人工核销版）。
 
 背景：当前拿不到支付接口，会员只能走「线下转账 + 管理员肉眼核对」。
-为了让管理员能在自己的收款账号里**反查唯一订单**，每个订单会分配一个
-「4 位订单号 + 区间内随机且不重复的金额（整数分）」，两者在 48 小时内唯一。
+每个订单会分配一个「4 位订单号 + 区间内随机的金额（整数分）」，两者一一绑定，
+于是人工核销有**两个方向**：
 
-占用规则（对齐 docs/会员功能规划.md 第 2/4 节）
+- 订单号 → 金额：用户付款后报号，管理员查出这笔该收多少钱，去收款记录核对。
+- 金额 → 订单号：管理员先在收款记录里看到一笔入账，用金额反查是谁下的单
+  （见 find_orders_by_amount）。
+
+占用规则（对齐 docs/会员功能规划.md 第 2/3 节）
 ------------------------------------------------
 - 订单号：48 小时内**所有状态**的订单都占用（含 confirmed/rejected/cancelled），
   防止管理员刚核销完的号被另一个用户复用造成错账。
-- 金额：同上，48 小时内未被占用的整数分才允许分配。
-- pending / notified 一旦超过 48 小时由定时任务置 expired，号段与金额释放。
+- 金额：**不做占用**。订单号才是唯一标识，重复金额完全能靠订单号区分开；
+  早期版本在这里做「48 小时内不重复」，会把区间占满导致新订单下不了单，已废弃。
+- pending / notified 一旦超过 48 小时由定时任务置 expired，订单号释放。
 
 所有金额一律用**整数分**参与计算与存储，只在出参展示时转成元。
 """
@@ -60,8 +65,16 @@ CLOSED_ORDER_STATUS = (
     OrderStatus.CONFIRMED, OrderStatus.REJECTED, OrderStatus.CANCELLED, OrderStatus.EXPIRED,
 )
 
+# 默认金额区间：10.00 ~ 12.00 元（1000~1200 分，共 201 个候选值）。
+#
+# ⚠️ 金额**不要求唯一**：订单号与金额是一一绑定的，管理员拿到订单号就能看到这笔的
+# 专属金额，去收款记录里核对有没有这笔入账即可确认；反过来也能先看到收款记录里的
+# 金额、再按金额反查订单号（见 find_orders_by_amount）。
+# 因此金额只是「让每一笔转账可区分」的标记，不需要像订单号那样做独占 ——
+# 早期版本要求「48 小时内金额不重复」，结果区间很快被占满、新订单直接下不了单，
+# 而实际上同一金额对应两笔订单也完全能靠订单号区分开。
 DEFAULT_MIN_CENTS = 1000
-DEFAULT_MAX_CENTS = 9999
+DEFAULT_MAX_CENTS = 1200
 DEFAULT_FREE_DAILY_SECONDS = 3600
 DEFAULT_IDLE_TIMEOUT_SECONDS = 90
 
@@ -189,18 +202,12 @@ def is_code_occupied(db: Session, code: str, now: datetime | None = None) -> boo
     return row is not None
 
 
-def occupied_amounts(db: Session, now: datetime | None = None) -> set[int]:
-    """当前被占用的金额集合（整数分）。"""
-    rows = db.scalars(
-        select(MembershipOrder.amount_cents).where(_occupied_filter(now))
-    ).all()
-    return {int(v) for v in rows if v is not None}
-
-
 def pick_amount_cents(db: Session, now: datetime | None = None) -> int:
-    """在区间内随机取一个 48 小时内未被占用的整数分。
+    """在区间内随机取一个整数分作为本笔订单的专属金额。
 
-    区间耗尽时抛 409，提示管理员放宽区间。
+    金额**不做去重**：它与订单号一一绑定，管理员既可以用订单号查金额，
+    也可以用金额反查订单号（find_orders_by_amount），重复金额不会造成混淆。
+    早期版本在这里做「48 小时内不重复」，会把区间占满导致新订单下不了单，已废弃。
     """
     cfg = get_amount_range(db)
     lo = int(cfg.min_cents)
@@ -213,16 +220,7 @@ def pick_amount_cents(db: Session, now: datetime | None = None) -> int:
             status.HTTP_400_BAD_REQUEST,
             f"金额区间配置非法，应在 {AMOUNT_MIN_LIMIT_CENTS}~{AMOUNT_MAX_LIMIT_CENTS} 分之间",
         )
-
-    used = occupied_amounts(db, now)
-    candidates = [v for v in range(lo, hi + 1) if v not in used]
-    if not candidates:
-        raise HTTPException(
-            status.HTTP_409_CONFLICT,
-            f"金额区间 {lo}~{hi} 分在 {MEMBERSHIP_ORDER_TTL_HOURS} 小时内已被占满，"
-            f"请管理员放宽金额区间或等待旧订单过期",
-        )
-    return secrets.choice(candidates)
+    return secrets.randbelow(hi - lo + 1) + lo
 
 
 # ---------------------------------------------------------------- 套餐
@@ -298,6 +296,27 @@ def get_order_by_code(db: Session, raw_code: str) -> MembershipOrder:
     if order is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, f"订单不存在: {code}")
     return order
+
+
+def find_orders_by_amount(db: Session, amount_cents: int,
+                          include_inactive: bool = False,
+                          limit: int = 50) -> list[MembershipOrder]:
+    """按金额反查订单号（管理员的第二个核销入口）。
+
+    场景：管理员先在收款记录里看到一笔「10.53 元」的入账，但不知道是谁下的单，
+    就用这个金额反查订单号，找到订单后再确认到账。
+
+    金额不做独占，所以同一个金额可能命中多笔订单（不同时间、不同用户），
+    这里按创建时间倒序全部返回，由管理员结合时间/金额/用户名判断。
+    默认只看「仍可能待收款」的订单（活跃状态或 48 小时窗口内），
+    include_inactive=True 时才翻历史全量。
+    """
+    q = select(MembershipOrder).where(MembershipOrder.amount_cents == amount_cents)
+    if not include_inactive:
+        q = q.where(_occupied_filter())
+    return list(db.scalars(
+        q.order_by(MembershipOrder.created_at.desc()).limit(limit)
+    ).all())
 
 
 def notify_paid(db: Session, order: MembershipOrder) -> MembershipOrder:

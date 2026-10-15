@@ -9,6 +9,7 @@
 """
 from __future__ import annotations
 
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
@@ -325,6 +326,52 @@ def list_orders(status_: str | None = Query(None, alias="status"),
     if status_:
         q = q.where(models.MembershipOrder.status == status_)
     rows = db.scalars(q.order_by(models.MembershipOrder.created_at.desc()).limit(limit)).all()
+    return [_order_out(db, o) for o in rows]
+
+
+def _parse_amount_cents(amount_yuan: str | None, amount_cents: int | None) -> int:
+    """把管理员输入的金额统一转成整数分。
+
+    元 -> 分必须用 Decimal 而不是 float：10.53 * 100 在二进制浮点下是 1052.9999...，
+    直接 int() 会变成 1052，和库里存的 1053 对不上，反查就查不到。
+    """
+    if amount_cents is not None:
+        return int(amount_cents)
+    if amount_yuan is None or not str(amount_yuan).strip():
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY,
+                            "请提供 amount_yuan（如 10.53）或 amount_cents（如 1053）")
+    try:
+        value = Decimal(str(amount_yuan).strip())
+    except InvalidOperation:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY,
+                            f"金额格式非法: {amount_yuan}")
+    if value < 0:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "金额不能为负")
+    return int((value * 100).to_integral_value(rounding=ROUND_HALF_UP))
+
+
+# 注意：这个路由必须注册在 /orders/{code} 之前。
+# FastAPI 按注册顺序匹配，否则 "by-amount" 会被当成 code 去查订单。
+@admin_router.get("/orders/by-amount", response_model=list[OrderOut])
+def find_orders_by_amount(
+        amount_yuan: str | None = Query(None, description="金额（元），如 10.53"),
+        amount_cents: int | None = Query(None, ge=0, description="金额（分），如 1053"),
+        all_: bool = Query(False, alias="all",
+                           description="翻历史全量；默认只看仍可能待收款的订单"),
+        limit: int = Query(50, ge=1, le=200),
+        db: Session = Depends(get_db),
+        admin: models.User = Depends(get_current_admin)):
+    """按金额反查订单号（人工核销的两个入口之一）。
+
+    入口一：用户报订单号 -> `GET /orders/{code}` 查这笔该收多少钱。
+    入口二：管理员先看收款记录里到了一笔钱 -> 用金额反查是哪笔订单。
+
+    金额不独占，所以一个金额可能命中多笔；返回按创建时间倒序，由管理员结合
+    时间 / 用户名 / 套餐来判断。全部查不到时返回空数组（不报 404）——
+    「这个金额暂时没有对应订单」是正常结果，不是错误。
+    """
+    cents = _parse_amount_cents(amount_yuan, amount_cents)
+    rows = svc.find_orders_by_amount(db, cents, include_inactive=all_, limit=limit)
     return [_order_out(db, o) for o in rows]
 
 
