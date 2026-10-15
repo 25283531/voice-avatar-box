@@ -1,7 +1,7 @@
 """后端冒烟测试：本地起服务（SQLite），跑通业务闭环。
 
 用法：
-    python tools/smoke_server.py [--port 8099]
+    python tools/smoke_server.py [--port 8100]
 
 覆盖：健康检查 -> 注册/登录 -> 建设备 -> 申请激活码 -> 校验 Luhn
       -> 绑定设备 -> 建服药提醒（复杂规则）-> 排期 -> 设备同步
@@ -23,12 +23,26 @@ ROOT = Path(__file__).resolve().parent.parent
 SERVER = ROOT / "server"
 PY = sys.executable
 
-# 跨平台默认落点（原来写死 D:\espdev 在 Linux CI 上会直接失败）
-DB_PATH = Path(os.environ.get("SMOKE_DB", str(Path(tempfile.gettempdir()) / "elder_smoke.db")))
+# 默认端口统一由 tools/smoke_ports.py 托管（唯一真源），各脚本不再各写一份 ——
+# 早先 smoke_home/smoke_roles/smoke_memory 都是 8097、smoke_models/smoke_mail
+# 都是 8096，并行跑必然撞车，且会连到残留进程上产生假失败。
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from smoke_ports import (  # noqa: E402
+    detect_addr_in_use,
+    guard_or_die,
+    resolve_port,
+)
+
+# 跨平台默认落点（原来写死 D:\espdev 在 Linux CI 上会直接失败）。
+# 默认文件名带 PID：多人/CI 并行跑时固定文件名会互相抢同一个文件，
+# Windows 上直接 PermissionError（另一个进程正占用）。要固定路径就用
+# SMOKE_DB_DIR 覆盖目录，或 SMOKE_DB 指定完整路径。
+DB_DIR = Path(os.environ.get("SMOKE_DB_DIR", str(Path(tempfile.gettempdir()))))
+DB_PATH = Path(os.environ.get("SMOKE_DB", str(DB_DIR / f"elder_smoke_{os.getpid()}.db")))
 if DB_PATH.exists():
     DB_PATH.unlink()
 
-PORT = int(next((a for a in sys.argv[1:] if a.isdigit()), 8099))
+PORT = resolve_port("smoke_server")
 BASE = f"http://127.0.0.1:{PORT}"
 
 results: list[tuple[str, bool, str]] = []
@@ -85,6 +99,15 @@ def main() -> int:
     env["PYTHONIOENCODING"] = "utf-8"
 
     print(f"[boot] starting server on :{PORT} (db: {db_url.split('@')[-1]})")
+    # ---- 三段式端口守卫（QA 第 4 轮「假绿」修复）----
+    # 端口被占时 uvicorn 的 socket bind 会失败，**但进程不退出**（活着、只是没在
+    # 监听）；而 /api/health **永远返回 200** -> wait_ready 会探到**别人的服务**
+    # -> 全部断言打到别人身上、用自己从未 seed 过的 DB。
+    # 三段：①事前 is_port_free ②socket 占位缩小竞态窗口 ③起服务后校验 stderr
+    # ⚠️ 三段加起来**仍不是绝对保证**（①与真正 bind 之间有不可消除的竞态窗口）。
+    #    真正的绝对保证是让服务自证身份（run_id），需改生产代码，留给下一轮。
+    guard_or_die(PORT, "smoke_server.py")
+
     proc = subprocess.Popen(
         [PY, "-m", "uvicorn", "app.main:app", "--host", "127.0.0.1", "--port", str(PORT),
          "--log-level", "warning"],

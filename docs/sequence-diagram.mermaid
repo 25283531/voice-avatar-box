@@ -1,0 +1,98 @@
+%% 角色模型 · 时序图
+%% 来源：docs/架构设计-角色模型与人格能力.md §9
+%% 三条主线：① 派生命名（copy-on-write）② prompt 编译（fail-closed）③ P0 缺陷修复后的删除路径
+
+%% ============ 9.1 派生命名（copy-on-write）============
+sequenceDiagram
+    autonumber
+    participant U as 家属(APP)
+    participant R as routers/roles.py
+    participant RP as persona/RoleRepo
+    participant C as persona/catalog.py
+    participant DB as ai_providers
+    participant D as devices
+
+    U->>R: POST /api/roles/presets/12/derive {name:"我妈的小暖", inherit:true}
+    R->>R: require_role_read(db, 12, user)
+    Note over R: preset 公开只读，任何登录用户可派生
+    R->>DB: SELECT preset WHERE id=12 AND record_type='preset'
+    DB-->>R: preset row
+    Note over R: Q3 决策：继承调整选项默认勾选
+    R->>C: regenerate_locked(preset.guardrails.hard)
+    C-->>R: 5 条 hard 红线（代码常量兜底，含新增项）
+
+    R->>DB: INSERT role(record_type='role', owner_id=user.id,<br/>parent_id=12, traits={},<br/>guardrails={hard: 5条 locked},<br/>system_prompt=preset.system_prompt)
+    DB-->>R: role.id = 57
+
+    alt inherit=true（默认）
+        R->>DB: 读 preset 的 L2 manual 画像 → 复制为新角色的 L2
+        Note over R: 只复制「家属对这个角色的手动交代」<br/>L1 统计值天然跟着人走，不复制
+    end
+
+    R->>DB: SELECT 母版各字段 → 计算哈希（写审计用）
+    Note over R: 契约套件 INV-1 断言：母版哈希未变
+    R-->>U: 201 {id:57, name:"我妈的小暖", parent_id:12}
+
+
+%% ============ 9.2 prompt 编译（fail-closed 路径）============
+sequenceDiagram
+    autonumber
+    participant VOICE as 语音链路
+    participant BR as memory/bridge.py
+    participant PC as persona/compiler.py
+    participant PM as persona.ProfileMerger
+    participant GR as persona/guardrails.py
+    participant DB as SQLite/MySQL
+
+    VOICE->>BR: recall_for_reply(db, user_id, agent_id, utterance)
+    BR->>DB: SELECT role WHERE id=agent_id AND deleted_at IS NULL
+    DB-->>BR: role row（或 None → 回落到 preset）
+    BR->>DB: SELECT L1 profile (agent_key=0)
+    BR->>DB: SELECT L2 profile (agent_key=agent_id)
+    BR->>PM: merge(l1, l2, declared_traits)
+    PM-->>BR: 合并画像（L2.manual > L1 统计 > traits 声明）
+    BR->>PC: compile(spec=role, profile=merged, memory_ctx)
+    PC->>GR: regenerate_locked(role.guardrails.hard)
+    Note over GR: 代码常量覆盖 DB 伪造值<br/>用户清空 guardrails 也拿回全部 5 条
+    GR-->>PC: 5 条 locked 红线
+    PC->>PC: sanitize(system_prompt / note / 示例)
+    PC->>GR: assert_present(compiled)
+    alt 红线齐全（正常路径）
+        GR-->>PC: OK
+        PC-->>BR: 完整 system prompt（红线首尾两处）
+        BR-->>VOICE: 注入文本
+        VOICE->>VOICE: llm_gateway.chat(...)
+    else 红线缺失（正常路径不可能发生）
+        GR-->>PC: GuardrailViolation
+        PC-->>BR: 抛错（fail-closed，不降级）
+        BR-->>VOICE: 拒绝服务 + log.error
+    end
+
+
+%% ============ 9.3 P0 缺陷修复后的删除路径 ============
+sequenceDiagram
+    autonumber
+    participant U as 普通用户(APP)
+    participant R as routers/roles.py
+    participant P as routers/providers.py
+    participant DB as ai_providers
+    participant DEV as device_api/sync
+
+    Note over U: 缺陷 1 的攻击路径：删掉平台 LLM 配置
+    U->>P: DELETE /api/providers/7（7 是一条 llm_main 配置）
+    P->>P: require_admin(user)
+    P-->>U: 403 需要管理员权限
+    Note over P: 即使是 admin，角色路径也碰不到它
+
+    U->>R: DELETE /api/roles/57（57 是我自己的派生角色）
+    R->>DB: SELECT row 57
+    R->>R: 断言 row.record_type == 'role' and row.owner_id == user.id
+    R->>DB: UPDATE deleted_at=now(), enabled=0 WHERE id=57
+    R->>DB: UPDATE devices SET agent_id=NULL WHERE agent_id=57
+    R-->>U: 204（软删，画像与审计保留 → INV-4）
+    Note over R: kind!='' 的行在这里根本取不到（双保险）
+
+    Note over DEV: 设备下次心跳
+    DEV->>DB: WHERE enabled=True AND kind.in_(DEVICE_KINDS)
+    Note over DEV: 此查询一行未改<br/>角色行 kind='' 天然不匹配<br/>record_type='config' 恒成立
+    DB-->>DEV: 全部平台配置（LLM 未丢 → 对话正常）

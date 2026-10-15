@@ -1,7 +1,7 @@
 """会员系统冒烟测试（人工核销版）。
 
 用法：
-    python tools/smoke_membership.py [--port 8098]
+    python tools/smoke_membership.py [--port 8106]
 
 覆盖：
     A. 用户端：会员状态 / 套餐 / 下单 / 订单号冲突 409 / 金额区间内随机（不要求唯一） /
@@ -30,12 +30,26 @@ ROOT = Path(__file__).resolve().parent.parent
 SERVER = ROOT / "server"
 PY = sys.executable
 
+# 默认端口统一由 tools/smoke_ports.py 托管（唯一真源），各脚本不再各写一份 ——
+# 早先 smoke_server 是 8099，本脚本是 8098，而 CI 的 MySQL job 又拿 8098 跑
+# smoke_server，两边端口表对不上。并行跑必然撞车。
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from smoke_ports import (  # noqa: E402
+    detect_addr_in_use,
+    guard_or_die,
+    resolve_port,
+)
+
+# 默认文件名带 PID：多人/CI 并行跑时固定文件名会互相抢同一个文件，
+# Windows 上直接 PermissionError（另一个进程正占用）。要固定路径就用
+# SMOKE_DB_DIR 覆盖目录，或 SMOKE_MEMBER_DB 指定完整路径。
+DB_DIR = Path(os.environ.get("SMOKE_DB_DIR", str(Path(tempfile.gettempdir()))))
 DB_PATH = Path(os.environ.get("SMOKE_MEMBER_DB",
-                              str(Path(tempfile.gettempdir()) / "elder_smoke_member.db")))
+                              str(DB_DIR / f"elder_smoke_member_{os.getpid()}.db")))
 if DB_PATH.exists():
     DB_PATH.unlink()
 
-PORT = int(next((a for a in sys.argv[1:] if a.isdigit()), 8098))
+PORT = resolve_port("smoke_membership")
 BASE = f"http://127.0.0.1:{PORT}"
 
 results: list[tuple[str, bool, str]] = []
@@ -86,6 +100,15 @@ def main() -> int:
     env["PYTHONIOENCODING"] = "utf-8"
 
     print(f"[boot] starting server on :{PORT} (db: {DB_PATH})")
+    # ---- 三段式端口守卫（QA 第 4 轮「假绿」修复）----
+    # 端口被占时 uvicorn 的 socket bind 会失败，**但进程不退出**（活着、只是没在
+    # 监听）；而 /api/health **永远返回 200** -> wait_ready 会探到**别人的服务**
+    # -> 全部断言打到别人身上、用自己从未 seed 过的 DB。
+    # 三段：①事前 is_port_free ②socket 占位缩小竞态窗口 ③起服务后校验 stderr
+    # ⚠️ 三段加起来**仍不是绝对保证**（①与真正 bind 之间有不可消除的竞态窗口）。
+    #    真正的绝对保证是让服务自证身份（run_id），需改生产代码，留给下一轮。
+    guard_or_die(PORT, "smoke_membership.py")
+
     proc = subprocess.Popen(
         [PY, "-m", "uvicorn", "app.main:app", "--host", "127.0.0.1", "--port", str(PORT),
          "--log-level", "warning"],

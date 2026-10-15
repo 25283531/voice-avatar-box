@@ -10,12 +10,12 @@
 
 | 路径 | 说明 |
 | --- | --- |
-| `server/` | FastAPI 业务后端 + WEB 管理后台（单页，离线可用）+ Docker 部署文件 |
+| `server/` | **单一镜像**的服务端：FastAPI 业务后端 + 自研语音链路 + 记忆与人格模块 + 多模型网关 + Docker 部署文件 |
 | `app/` | 手机端家属端 APP（uni-app v3 + Vue3），四个栏目：首页 / 设备 / 日程 / 我的；出 H5 / 微信小程序 / Android APK |
 | `android/` | Android 原生壳工程（WebView + `WebViewAssetLoader`），把 H5 打成 APK，不依赖 DCloud |
 | `firmware/` | ESP32-S3 固件（`components/elder` 为本项目新增组件，编译前需合入 xiaozhi 源码树） |
 | `tools/` | 辅助脚本：`smoke_server.py` 后端冒烟、`make_firmware.py` 合并烧录 bin、`idfwin.py` / `winrun.py` Windows 下的 IDF 包装 |
-| `docs/` | 烧录指南、手机 APP 开发说明 |
+| `docs/` | [`架构设计.md`](docs/架构设计.md) 平台整体架构与选型 · [`DEPLOY.md`](docs/DEPLOY.md) 部署与 MySQL 接入 · [`会员功能规划.md`](docs/会员功能规划.md) 会员与人工核销 · 烧录指南 · 手机 APP 开发说明 |
 | `老人陪伴提醒助手-技术方案-v1.md` | 完整技术方案（硬件、形象引擎、激活码算法、风险清单） |
 
 ## 端口与地址约定
@@ -23,8 +23,9 @@
 | 项 | 值 | 备注 |
 | --- | --- | --- |
 | 容器内监听 | `8080` | `ELDER_PORT` 可覆盖 |
-| **对外发布** | **`8064`** | 镜像只发布这一个端口，`-p 8064:8080` |
-| 生产域名 | `https://voice.2508866.xyz` | nginx 反代到 `127.0.0.1:8064`，手机端已固化此地址 |
+| **对外发布** | **`8064`** | 镜像只发布这一个端口，`-p 8064:8080`。HTTP API、语音 WebSocket、OTA 全复用它 |
+| 语音 WebSocket | `ws(s)://<域名>/api/voice/v1/ws` | **自研链路**，与 API 同源同端口，不需要额外开端口 |
+| 生产域名 | `https://voice.2508866.xyz` | nginx 反代到 `127.0.0.1:8064`，手机端已固化此地址；反代需放行 WebSocket 升级头 |
 | 管理后台 | `https://voice.2508866.xyz/` | 默认账号 `admin` / `admin123`，登录后请立即改密 |
 | 接口文档 | `https://voice.2508866.xyz/docs` | FastAPI 自动生成 |
 
@@ -61,16 +62,21 @@ APP 是给家属用的，不接入小智任何服务，业务后端地址在代�
 
 ## 服务器部署
 
-默认**内置 SQLite**，一个容器就能跑，不需要任何外部数据库：
+默认**单一镜像**：业务、会员、语音链路、角色与记忆、邮件——全部平台级能力都在同一个容器里，
+默认内置 SQLite，不需要任何外部数据库或额外的语音服务容器。
 
 ```bash
 cd server
 cp .env.example .env            # 至少改 ELDER_JWT_SECRET
 docker compose up -d            # 对外 http://<host>:8064
-docker compose --profile xiaozhi up -d   # 额外拉起语音链路（8000/8003/8002）
 ```
 
-改用 MySQL（含字符集/时区要求、排障与备份）：见 [`docs/DEPLOY.md`](docs/DEPLOY.md)。
+> 语音链路是自研的（`server/app/voice/`），与本服务同进程、**同端口 8064**，
+> 设备连 `ws(s)://<域名>/api/voice/v1/ws`，地址由服务端自动下发。
+> **不再依赖任何第三方语音服务端**，镜像也不需要第二个端口。
+
+只有在用户量上来之后才需要接 MySQL（**仅换数据库，不拆分服务**），
+详见 [`docs/DEPLOY.md`](docs/DEPLOY.md)。
 
 ```bash
 # MySQL 变体是叠加文件，必须和主文件一起加载

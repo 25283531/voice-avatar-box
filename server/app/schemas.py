@@ -6,6 +6,7 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from .model_catalog import API_STYLES, KIND_LIST
 from .schedule import parse_hhmm
 
 
@@ -143,6 +144,14 @@ class ActivationCodeOut(ORMBase):
 
 # ============================================================ 形象
 class AvatarIn(ORMBase):
+    """形象（纯外观）。**刻意不含 system_prompt**。
+
+    人格已统一到 AIProvider（架构 §4.2）。这里即便留着那个字段也不会有用 ——
+    它对每个角色都一样，而每个角色的 system_prompt 各不相同。留着只会让
+    调用方误以为改形象能改说话方式。
+    tts_voice 仍在：它是「形象的**默认**音色」，角色自带音色时以角色的为准。
+    """
+
     name: str
     description: str = ""
     eaf_pack_name: str = ""
@@ -151,7 +160,6 @@ class AvatarIn(ORMBase):
     screen_width: int = 320
     screen_height: int = 240
     clips: dict[str, str] = Field(default_factory=dict)
-    system_prompt: str = ""
     tts_voice: str = ""
     emotion_lights: dict[str, Any] = Field(default_factory=dict)
     enabled: bool = True
@@ -159,30 +167,65 @@ class AvatarIn(ORMBase):
 
 class AvatarOut(AvatarIn):
     id: int
+    # 归属：preset = 平台形象（仅管理员可写）；role = 用户形象
+    record_type: str = "preset"
+    owner_id: int | None = None
     created_at: datetime
 
 
-# ============================================================ AI 供应商 / agent 角色
-# 同一张表两类记录（详见 models.AIProvider 的类注释）：
-#   kind 非空 -> 一条真实可调用的平台配置（asr/llm/tts/vad），参与下发与导出；
-#   kind 为空 -> APP 自建的 agent 角色，只有人格与音色，不参与下发与导出。
-# 因此 kind / provider 都可空：APP 的「创建我的 agent 角色」只传
-# {name, description, system_prompt, tts_voice} 也要能建成。
+# ============================================================ AI 供应商（仅平台配置）
+# 角色已彻底拆到 /api/roles（见本文件下方的 Role* schema）。
+# 因此 ProviderIn 现在**只描述平台配置**：kind 必填非空。
+# 这不是为了"接口好看"，而是一条物理保证 ——
+# 现状（修复前）允许 kind="" 建行，而这种行会被 device_api 按
+# `kind.in_(DEVICE_KINDS)` 之外的路径处理、或被 APP 当成真配置用；
+# 一个没有厂商与模型的"配置"一旦混进下发包就会顶掉真实的 LLM 配置。
 class ProviderIn(ORMBase):
     name: str
-    kind: str = Field(default="", pattern="^(asr|llm|tts|vad)?$")
+    # 用校验器而不是 regex pattern：候选值是会增长的，写死在 pattern 里每加一种
+    # 能力就得改一处字符串，漏改就变成「接口能存进去、列表却查不出来」的玄学问题。
+    kind: str
     provider: str = ""
     endpoint: str = ""
     api_key: str = ""
     model: str = ""
-    # ---- agent 角色字段，对应 APP 的 AgentRole ----
-    description: str = ""
-    system_prompt: str = ""
-    tts_voice: str = ""
-    is_default: bool = False
+    # ---- 调用层元信息（读取方见 app/llm_gateway.py）----
+    # 厂商 API 风格：决定调用层拼哪种报文。空串 = 默认 OpenAI 兼容。
+    api_style: str = ""
+    # 是否支持流式返回；将来语音链路做逐句合成时会用到
+    supports_stream: bool = False
+    # 单次请求超时（秒）。本地小模型首 token 可能十几秒，云端通常几秒内
+    timeout_sec: int = Field(default=30, ge=1, le=600)
+    # 失败重试次数（不含首次），只针对「同一条配置」，整条不可用会按 priority 换下一条
+    max_retries: int = Field(default=1, ge=0, le=5)
+    # 上下文长度上限（token）。0 = 未知/不限制；>0 时调用层据此裁剪对话历史
+    context_window: int = Field(default=0, ge=0)
+    # 厂商特有参数：temperature / max_tokens / top_p 等，由调用层读取
     params: dict[str, Any] = Field(default_factory=dict)
     priority: int = 10
     enabled: bool = True
+
+    @field_validator("kind")
+    @classmethod
+    def _check_kind(cls, v: str) -> str:
+        v = (v or "").strip()
+        # 空 kind 一律拒绝：那是角色，而角色的入口是 /api/roles。
+        # 在schema 层就挡住，比在路由里判更早，也让"忘记传 kind"这种调用方 bug
+        # 直接暴露成 422 而不是静默落一条残缺数据。
+        if not v:
+            raise ValueError("kind 必填。创建角色请用 POST /api/roles")
+        if v not in KIND_LIST:
+            raise ValueError(f"kind 只能是 {'/'.join(KIND_LIST)} 之一")
+        return v
+
+    @field_validator("api_style")
+    @classmethod
+    def _check_api_style(cls, v: str) -> str:
+        v = (v or "").strip()
+        if v and v not in API_STYLES:
+            raise ValueError(
+                f"api_style 只能是 {'/'.join(API_STYLES)} 之一，留空表示默认（OpenAI 兼容）")
+        return v
 
 
 class ProviderOut(ProviderIn):
@@ -191,10 +234,15 @@ class ProviderOut(ProviderIn):
 
 
 class ProviderSafeOut(ORMBase):
-    """下发给设备/APP 的脱敏配置，不含 api_key。
+    """下发给设备/APP 的脱敏配置，不含 api_key。**只含平台配置**（P0-2 止血）。
 
-    APP 的「系统形象 / agent 角色列表」走的就是这个接口（/api/providers/safe），
-    所以角色相关的字段也要带上，否则 APP 拿到的是半个 AgentRole。
+    这里曾经还带 description / system_prompt / tts_voice / is_default ——
+    那是给 APP 的「agent 角色列表」用的，而角色现已独立到 /api/roles。
+    留着这些字段等于让"平台配置"与"角色"在响应里继续混淆，
+    而这正是 P0-1 事故链路的起点。
+
+    调用层元信息（超时/重试/api_style/上下文）刻意不带：设备侧不直接调模型，
+    带上只会让每次心跳的下发包变胖。想看这些字段走 GET /api/providers。
     """
     id: int
     name: str
@@ -202,12 +250,231 @@ class ProviderSafeOut(ORMBase):
     provider: str = ""
     endpoint: str = ""
     model: str = ""
+    priority: int = 10
+    enabled: bool = True
+
+
+# ============================================================ 角色（人格的统一入口）
+# 权限代号见架构 §6.1：T=登录用户、O=仅 owner、A=仅管理员、AO=owner 或管理员、
+# R=公开只读（仍需登录）。所有越权一律 404（唯一例外：preset 的 DELETE 返回 403，
+# 因为"平台预设不可删"本身就是要给用户看的规则）。
+class RoleIn(ORMBase):
+    """新建**原创**角色。parent_id 不在这里 —— 派生走 /derive 专用接口。"""
+    name: str = Field(min_length=1, max_length=64)
+    description: str = ""
+    # 家属特别交代（软性）。医疗红线等硬约束由代码常量注入，不在这里。
+    system_prompt: str = ""
+    tts_voice: str = ""
+    avatar_id: int | None = None
+    # 性格 overlay：只存"与母版不同"的项。非法值由 persona.spec 校验拦下。
+    traits: dict[str, Any] = Field(default_factory=dict)
+
+
+class RoleDeriveIn(ORMBase):
+    """从预设或自己的角色**派生**一份（copy-on-write 物理复制）。
+
+    ``inherit`` 对应 PRD Q3 的「继承调整」选项，**默认 True**（用户已拍板）：
+    为真时把母版的 L2 手动画像（家属对这个角色的交代）复制为新角色的 L2。
+    不复制 L1 统计值 —— 那是"这个人"的画像，天然跟着人走，跨角色复制会串味。
+    """
+    name: str = Field(min_length=1, max_length=64)
+    inherit: bool = True
+
+
+class RoleRestoreIn(ORMBase):
+    """还原为预设的入参。预留字段（未来可能支持"只还原某几项"），当前无必填。"""
+    confirm: bool = True
+
+
+class GuardrailIn(ORMBase):
+    """家属追加/移除一条**软性**约束。
+
+    只允许从平台白名单里勾选（架构 §12 U4），不接受自由文本：
+    自由文本无法校验，且可能与 hard 段直接冲突 —— 而冲突的红线等于没有红线。
+    """
+    guardrail_id: str
+    # True = 追加，False = 移除
+    enabled: bool = True
+
+
+class RoleOut(ORMBase):
+    """角色详情 / 列表项。
+
+    ``traits`` 是**overlay 原样**（可能为空），``traits_effective`` 是叠加母版
+    之后的生效值 —— 两个都返回，APP 才能既显示"你改了什么"又显示"实际是什么"。
+    """
+    id: int
+    name: str
     description: str = ""
     system_prompt: str = ""
     tts_voice: str = ""
+    avatar_id: int | None = None
     is_default: bool = False
+    # 'preset' = 平台预设；'role' = 用户角色
+    record_type: str = "role"
+    owner_id: int | None = None
+    parent_id: int | None = None
+    traits: dict[str, Any] = Field(default_factory=dict)
+    traits_effective: dict[str, Any] = Field(default_factory=dict)
+    guardrail_version: str = ""
+    guardrail_ack_at: datetime | None = None
+    guardrail_acked: bool = False
+    deleted_at: datetime | None = None
+    archived_at: datetime | None = None
+    created_at: datetime
+
+
+class RoleListOut(ORMBase):
+    """GET /api/roles 的分区返回。
+
+    刻意分区而不是给一个扁平 list：APP 的角色页要按「平台推荐 / 我的角色」
+    分区渲染（PRD §11.1 线框），让后端把分区做好，前端就不必再自己按
+    owner_id == me 过滤一遍 —— 那正是容易漏掉 preset 的一处逻辑。
+    """
+    presets: list[RoleOut] = Field(default_factory=list)
+    mine: list[RoleOut] = Field(default_factory=list)
+
+
+class RoleDiffItem(ORMBase):
+    """一处差异：哪个字段 / trait，从什么变成什么。
+
+    ⚠️ **契约决策 D-3**（2026-10-16 主理人拍板，全文见
+    ``docs/架构设计-角色模型与人格能力.md`` §6.1 与 ``routers/roles.py``
+    的 ``role_diff`` docstring）：采用「**全量 items + changed 标记**」，
+    **不**拆成"仅变更 items + modified_traits"。
+
+    四条理由（写在这里是为了防止后人来"优化"它）：
+      1. 向后兼容、纯增量 —— APP 现有遍历 ``items`` 的代码不受影响；
+      2. APP 还没接详情/还原页面，现在做破坏性变更零收益；
+      3. 全量 + 标记支持 UI 渐进：先照旧渲染 items，接页面时再按 changed 过滤；
+      4. 将来真要做「还原确认弹窗」发现不够用时，迁到拆两个数组是纯服务端
+         改动、成本很低；反过来现在拆、以后要合回来才叫麻烦。
+
+    → **严禁改名或删除 ``field`` / ``label`` / ``parent_value`` /
+    ``current_value``**：它们是 APP 已依赖的契约。
+    由 eval 的 ``ok_contract_v2`` 断言守着。
+    """
+    field: str
+    label: str
+    parent_value: Any = None
+    current_value: Any = None
+    # changed=True 表示用户确实改过；changed=False 表示继承自母版、未被修改，
+    # 只是列出来让 UI 说明「这项跟平台一致」（QA 报告的 Bug 2：契约歧义）。
+    # ⚠️ 只做加法：不改任何既有字段名与结构，items 的遍历方式照旧可用。
+    #
+    # 默认值刻意是True（"没标明就当成有改动"）而不是 False：
+    # 这是**保守方向** —— 一个没读 changed 的旧客户端，它眼里的 items 里
+    # 绝大多数确实是用户改过的项；反过来默认 False 会让"忘了赋值"
+    # 静默变成"什么都没改"，而那正好是 Bug 2 的原始症状（误显示 0 项）。
+    changed: bool = True
+
+
+class RoleDiffOut(ORMBase):
+    """GET /api/roles/{id}/diff：与母版的差异清单。
+
+    ⚠️ 同样是契约 D-3（全量 items + changed 标记）的落点，见
+    :class:`RoleDiffItem` 的注释。``items`` / ``id`` / ``parent_id`` /
+    ``parent_name`` 四个既有字段一个都不能改名或删除。
+    """
+    id: int
+    parent_id: int | None = None
+    parent_name: str = ""
+    items: list[RoleDiffItem] = Field(default_factory=list)
+    # items 中 changed=True 的条数。给 APP 一个可直接显示的「你改了 N 项」，
+    # 不必自己在客户端过滤 —— 过滤逻辑分散到各端，必然有一端漏改。
+    #
+    # ⚠️ 它必须恒等于 items 里 changed=True 的项数。计数与明细不一致时，
+    # APP 上「你改了 3 项」与列表里数出来的 4 行会同时出现，用户无法判断
+    # 哪个是真的。eval 的 ok_contract_v2 断言守着这条自洽性。
+    changed_count: int = 0
+
+
+class GuardrailCardOut(ORMBase):
+    """GET /api/roles/{id}/guardrails：安全承诺卡的数据。
+
+    ``items`` 是给人看的红线清单（不是给模型看的 prompt 文本），所以带label。
+    ``acked`` 表示家属已确认过**当前版本**的红线；红线版本一变就自动变回false，
+    让 APP 重新要求确认 —— 这是"红线更新了要让用户知情"的唯一落点。
+    """
+    role_id: int
+    role_name: str
+    version: str
+    items: list[dict[str, Any]] = Field(default_factory=list)
+    soft: list[dict[str, Any]] = Field(default_factory=list)
+    acked: bool = False
+    ack_at: datetime | None = None
+    ack_version: str = ""
+
+
+class RolePromptOut(ORMBase):
+    """GET /api/roles/{id}/prompt：编译产物预览（家属的透明窗口）。"""
+    role_id: int
+    role_name: str
+    # 完整 system prompt
+    prompt: str
+    # 分段视图，便于 APP 折叠展示（也便于 eval 按段断言）
+    sections: list[dict[str, str]] = Field(default_factory=list)
+    guardrail_version: str = ""
+
+
+class ResolvedModelOut(ORMBase):
+    """GET /api/providers/resolve 的返回：某用途最终落到哪条配置（脱敏）。
+
+    上层（将来的记忆提取 / 对话编排）只说 usage，不必知道配的是哪一家；
+    这里把「它到底是谁」答清楚，便于排查「为什么这句话是用这个模型回的」。
+    api_key 一律不返回。
+    """
+    usage: str
+    kind: str
+    id: int
+    name: str
+    provider: str
+    model: str
+    endpoint: str
+    api_style: str = ""
+    supports_stream: bool = False
+    context_window: int = 0
+    timeout_sec: int = 30
     priority: int = 10
-    enabled: bool = True
+    # True = 首选 kind 没启用，是走候选链后面的 kind 兜底命中的
+    # （典型场景：「没配 llm_main，退回旧的 llm」）。看到它就该去补配置。
+    fallback: bool = False
+
+
+class ModelTestIn(ORMBase):
+    """管理端「测试连接」：按用途真发一次请求，验证这条链路是否可用。"""
+    usage: str = "chat"
+    # chat / vision 用：OpenAI 形状的 messages
+    messages: list[dict[str, Any]] = Field(default_factory=list)
+    # embed 用：待向量化的文本
+    text: str = ""
+    # rerank 用：待重排的候选文档
+    documents: list[str] = Field(default_factory=list)
+
+
+class ModelTestOut(ORMBase):
+    """测试连接的统一返回：成功与失败都回 200，用 ok 与 error_code 区分。
+
+    刻意不用 HTTP 错误码表达失败 —— 这是管理页手动点的「试试能不能通」，
+    失败本身就是**预期结果之一**。用 4xx/5xx 会让调用方到处写 try/catch，
+    而真正有价值的「为什么失败」在 error_code + message 里。
+    需要 HTTP 语义时看 error_code 与 llm_gateway 的错误类型对照表即可。
+    """
+    ok: bool
+    usage: str = ""
+    kind: str = ""
+    provider_pk: int = 0
+    provider_name: str = ""
+    model: str = ""
+    text: str = ""
+    vectors: list[list[float]] = Field(default_factory=list)
+    scores: list[float] = Field(default_factory=list)
+    elapsed_ms: int = 0
+    # 成功时为空串；失败时取值见 llm_gateway 各错误类的 code
+    error_code: str = ""
+    message: str = ""
+    # 每次尝试（含失败的那些）的明细，排障时比一句失败原因有用得多
+    attempts: list[dict[str, Any]] = Field(default_factory=list)
 
 
 # ============================================================ 首页聚合
@@ -409,6 +676,10 @@ class DeviceSyncOut(ORMBase):
     sync_interval_sec: int = 300
     # 新增字段：缺省为 None，老版本设备忽略即可（也可单独调 GET /api/device/quota）
     quota: DeviceQuotaOut | None = None
+    # 本次生效的音色（架构 §4.2）：角色自带音色优先，没有才回落到形象的默认音色。
+    # 放在顶层而不是 avatar 里，因为音色随**角色**变、而 avatar 段描述的是外观 ——
+    # 老固件读 avatar.tts_voice 仍然可用（那是形象的默认值），新固件读这里。
+    tts_voice: str = ""
 
 
 # ============================================================ 会员（人工核销）
@@ -570,3 +841,202 @@ class ChatUsageOut(ORMBase):
     limit_seconds: int | None = None
     unlimited: bool = False
     remaining_seconds: int | None = None
+
+
+# ============================================================ 邮箱服务
+# 平台需要一个邮箱配置，支撑「邮箱找回密码」与「邮箱提交问题」两件事。
+# 用户全程在 APP 内操作，所以这里只有 API、没有网页端表单。
+def _check_email_str(v: str) -> str:
+    """「长得像邮箱」的宽松校验，与 EmailChangeIn 保持同一套规则。
+
+    只做格式检查、不发验证邮件：项目是私有化部署，邮箱是找回密码的线索而不是
+    强凭证，卡太死只会让用户在 APP 里填不进去。
+    """
+    v = (v or "").strip()
+    if v.count("@") != 1 or v.startswith("@") or v.endswith("@"):
+        raise ValueError("邮箱格式不正确")
+    domain = v.split("@")[1]
+    if "." not in domain or domain.startswith(".") or domain.endswith("."):
+        raise ValueError("邮箱格式不正确")
+    return v
+
+
+class SmtpConfigIn(ORMBase):
+    """管理端局部更新 SMTP 配置：全字段可选，只传要改的。
+
+    password 的语义是**只写**：传了就覆盖，不传就保持原值。读取接口永远
+    拿不到明文（只给掩码），所以「改端口」这类操作不需要先把密码读出来再回传。
+    """
+
+    host: str | None = None
+    port: int | None = None
+    username: str | None = None
+    password: str | None = None
+    use_tls: bool | None = None
+    use_ssl: bool | None = None
+    from_addr: str | None = None
+    from_name: str | None = None
+    # 工单通知收件人；留空表示回落到 from_addr
+    notify_to: str | None = None
+    enabled: bool | None = None
+
+    @field_validator("port")
+    @classmethod
+    def _check_port(cls, v: int | None) -> int | None:
+        if v is None:
+            return v
+        if not 1 <= int(v) <= 65535:
+            raise ValueError("端口应在 1~65535 之间")
+        return int(v)
+
+    @field_validator("from_addr", "notify_to")
+    @classmethod
+    def _check_addr(cls, v: str | None) -> str | None:
+        # 允许留空（留空回落），填了就必须长得像邮箱
+        if v is None or not v.strip():
+            return (v or "").strip()
+        v = v.strip()
+        if v.count("@") != 1 or v.startswith("@") or v.endswith("@"):
+            raise ValueError("邮箱格式不正确")
+        domain = v.split("@")[1]
+        if "." not in domain or domain.startswith(".") or domain.endswith("."):
+            raise ValueError("邮箱格式不正确")
+        return v
+
+
+class SmtpConfigOut(ORMBase):
+    """管理端读取 SMTP 配置。
+
+    ⚠️ password **只返回掩码**（如 ``ab******gh``），明文永不出口：
+    管理端页面与 APP 的日志、截图、抓包都可能把这些响应留存下来，
+    一旦明文回显，等于给「看一眼后台」的人发了一份邮箱授权码。
+    前端要判断「有没有配密码」请用 has_password。
+    """
+
+    host: str = ""
+    port: int = 465
+    username: str = ""
+    password: str = ""          # 掩码，不是明文
+    has_password: bool = False
+    use_tls: bool = False
+    use_ssl: bool = True
+    from_addr: str = ""
+    from_name: str = ""
+    notify_to: str = ""
+    enabled: bool = False
+    updated_at: datetime | None = None
+
+
+class MailTestIn(ORMBase):
+    """发送测试邮件。to 留空时发给平台自己的通知邮箱（notify_to / from_addr）。"""
+
+    to: str = ""
+    subject: str = ""
+
+
+class MailTestOut(ORMBase):
+    """测试发信结果。
+
+    这条接口存在的意义就是「配完立刻知道能不能发出去」：SMTP 参数配错的概率
+    极高，没有自检手段就只能等用户投诉了再去翻日志。所以失败时把原因原样返回。
+    """
+
+    ok: bool
+    error: str = ""
+    to: str = ""
+    # 伪装模式下并没有真的发信，管理端/测试据此区分
+    fake: bool = False
+    message: str = ""
+
+
+class PasswordResetRequestIn(ORMBase):
+    """申请找回密码验证码。"""
+
+    email: str = Field(min_length=3, max_length=128)
+
+    @field_validator("email")
+    @classmethod
+    def _check(cls, v: str) -> str:
+        return _check_email_str(v)
+
+
+class PasswordResetRequestOut(ORMBase):
+    """申请找回密码的响应。
+
+    ⚠️ 这个响应体对「邮箱已注册」和「邮箱未注册」必须**完全一致**（连字段值
+    都不能差），否则就是一个账号枚举漏洞：攻击者挨个试邮箱就能拿到注册用户
+    名单。所以这里不给任何与账号相关的信息，只给固定的阈值提示。
+    """
+
+    ok: bool = True
+    message: str = "如果该邮箱已注册，验证码已经发送到该邮箱，请查收"
+    # 重发冷却秒数，APP 据此把「重新发送」按钮置灰倒计时
+    cooldown_sec: int = 60
+    # 验证码有效期（秒），APP 展示「15 分钟内有效」
+    expires_in_sec: int = 900
+
+
+class PasswordResetVerifyIn(ORMBase):
+    """提交验证码 + 新密码。密码长度下限与注册接口保持一致（6 位）。"""
+
+    email: str = Field(min_length=3, max_length=128)
+    code: str = Field(min_length=6, max_length=6)
+    new_password: str = Field(min_length=6, max_length=128)
+
+    @field_validator("email")
+    @classmethod
+    def _check(cls, v: str) -> str:
+        return _check_email_str(v)
+
+
+class PasswordResetVerifyOut(ORMBase):
+    ok: bool = True
+    message: str = "密码已重置，请使用新密码登录"
+    # 走到这里说明验证码校验通过（等于已证明邮箱归属），告诉用户是哪个账号无妨
+    username: str = ""
+
+
+class TicketCreateIn(ORMBase):
+    """提交问题（工单）。匿名可提交，但必须留邮箱，否则管理员没法回复。"""
+
+    email: str = Field(min_length=3, max_length=128)
+    title: str = Field(min_length=1, max_length=128)
+    content: str = Field(min_length=1, max_length=4000)
+    # 会员支付 / 设备故障 / 提醒异常 / 账号问题 / 其它，未知值按其它处理
+    category: str = "other"
+    device_id: str = ""
+
+    @field_validator("email")
+    @classmethod
+    def _check(cls, v: str) -> str:
+        return _check_email_str(v)
+
+
+class TicketPatchIn(ORMBase):
+    """管理端更新工单：改状态 / 写回复。两个字段都可选。"""
+
+    status: str | None = None
+    admin_reply: str = ""
+    # 是否把回复邮件通知提交者，默认 True（写了回复就通知）
+    notify: bool = True
+
+
+class TicketOut(ORMBase):
+    id: int
+    user_id: int | None = None
+    email: str
+    title: str
+    content: str
+    category: str = "other"
+    # 分类 / 状态的中文展示文案：APP 与邮件正文直接显示，不做二次映射
+    category_text: str = "其它"
+    device_id: str = ""
+    status: str = "open"
+    status_text: str = "待处理"
+    admin_reply: str = ""
+    admin_id: int | None = None
+    replied_at: datetime | None = None
+    created_at: datetime
+    updated_at: datetime
+    # 提交者用户名（匿名提交为空串），管理端列表看得到是谁提的
+    username: str = ""

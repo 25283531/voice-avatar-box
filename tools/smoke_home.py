@@ -1,7 +1,7 @@
 """首页聚合 / 账户 / 设备角色 冒烟测试。
 
 用法：
-    python tools/smoke_home.py [--port 8097]
+    python tools/smoke_home.py [--port 8102]
 
 覆盖 APP 四个新增后端接口的字段契约（对照 app/src/api/elder/index.ts）：
     1. POST   /api/auth/password    修改密码（旧密码错 400 / 新密码太短 422 / 未登录 401）
@@ -26,13 +26,26 @@ ROOT = Path(__file__).resolve().parent.parent
 SERVER = ROOT / "server"
 PY = sys.executable
 
+# 默认端口统一由 tools/smoke_ports.py 托管（唯一真源），各脚本不再各写一份 ——
+# 早先 smoke_home/smoke_roles/smoke_memory 都是 8097，并行跑必然撞车。
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from smoke_ports import (  # noqa: E402
+    detect_addr_in_use,
+    guard_or_die,
+    resolve_port,
+)
 
+
+# 默认文件名带 PID：多人/CI 并行跑时固定文件名会互相抢同一个文件，
+# Windows 上直接 PermissionError（另一个进程正占用）。要固定路径就用
+# SMOKE_DB_DIR 覆盖目录，或 SMOKE_HOME_DB 指定完整路径。
+DB_DIR = Path(os.environ.get("SMOKE_DB_DIR", str(Path(tempfile.gettempdir()))))
 DB_PATH = Path(os.environ.get(
-    "SMOKE_HOME_DB", str(Path(tempfile.gettempdir()) / "elder_smoke_home.db")))
+    "SMOKE_HOME_DB", str(DB_DIR / f"elder_smoke_home_{os.getpid()}.db")))
 # 相对路径是相对 server 进程的工作目录（server/）解析的，清理时要拼上
 DB_FILE = DB_PATH if DB_PATH.is_absolute() else (SERVER / DB_PATH)
 
-PORT = int(next((a for a in sys.argv[1:] if a.isdigit()), 8097))
+PORT = resolve_port("smoke_home")
 BASE = f"http://127.0.0.1:{PORT}"
 
 # 当天（本机时区，与服务端 TZ 一致）与两个固定的服药时间点
@@ -90,6 +103,15 @@ def main() -> int:
         DB_FILE.unlink()
 
     print(f"[boot] starting server on :{PORT} (db: {DB_FILE})")
+    # ---- 三段式端口守卫（QA 第 4 轮「假绿」修复）----
+    # 端口被占时 uvicorn 的 socket bind 会失败，**但进程不退出**（活着、只是没在
+    # 监听）；而 /api/health **永远返回 200** -> wait_ready 会探到**别人的服务**
+    # -> 全部断言打到别人身上、用自己从未 seed 过的 DB。
+    # 三段：①事前 is_port_free ②socket 占位缩小竞态窗口 ③起服务后校验 stderr
+    # ⚠️ 三段加起来**仍不是绝对保证**（①与真正 bind 之间有不可消除的竞态窗口）。
+    #    真正的绝对保证是让服务自证身份（run_id），需改生产代码，留给下一轮。
+    guard_or_die(PORT, "smoke_home.py")
+
     proc = subprocess.Popen(
         [PY, "-m", "uvicorn", "app.main:app", "--host", "127.0.0.1", "--port", str(PORT),
          "--log-level", "warning"],
@@ -107,6 +129,9 @@ def main() -> int:
         # ==================================================== 准备账号
         code, tk = req("POST", "/api/auth/login", {"username": "admin", "password": "admin123"})
         check("登录默认管理员", code == 200 and bool(tk.get("access_token")), str(code))
+        # 平台 AI 配置现在是**仅管理员**可写（原先任何登录用户都能建/改/删，
+        # 那正是 P0-1 事故链路的源头），所以建配置要用管理员 token。
+        admin_token = tk.get("access_token", "")
 
         def reg(name: str) -> str:
             req("POST", "/api/auth/register",
@@ -244,43 +269,55 @@ def main() -> int:
               f"{d3.get('device_time')} vs {d3.get('last_seen_at')}")
 
         # ==================================================== 4. agent 角色字段
-        # 角色走 /api/providers（APP 的「创建我的 agent 角色」也是这个接口）。
-        # 4.1 只传 AgentRole 的字段就要能建成（APP createAgentRole 就是这么发的）
-        code, role = req("POST", "/api/providers", {
+        # 角色走 /api/roles（平台配置走 /api/providers，两者已彻底拆分：
+        # /api/providers 只接受带 kind 的平台配置，角色建在它上面会被 422）。
+        # 4.1 只传角色的字段就要能建成（APP createAgentRole 就是这么发的）
+        code, role = req("POST", "/api/roles", {
             "name": "小暖医生",
             "description": "温和的服药提醒助手",
             "system_prompt": "你是耐心的服药提醒助手",
             "tts_voice": "zh-CN-XiaoxiaoNeural",
-            "is_default": True,
         }, u1)
         role_id = role.get("id", 0)
         check("只传角色字段即可创建（不再 422）", code == 201 and bool(role_id), f"code={code}")
         check("角色字段原样返回",
               role.get("description") == "温和的服药提醒助手"
               and role.get("system_prompt") == "你是耐心的服药提醒助手"
-              and role.get("tts_voice") == "zh-CN-XiaoxiaoNeural"
-              and role.get("is_default") is True,
-              str({k: role.get(k) for k in ("description", "system_prompt", "tts_voice", "is_default")}))
-        check("角色记录 kind 为空（不参与下发 / 导出）", role.get("kind") == "",
-              str(role.get("kind")))
+              and role.get("tts_voice") == "zh-CN-XiaoxiaoNeural",
+              str({k: role.get(k) for k in ("description", "system_prompt", "tts_voice")}))
+        check("角色记录 record_type='role'、parent 为空",
+              role.get("record_type") == "role" and role.get("parent_id") is None,
+              f"{role.get('record_type')} parent={role.get('parent_id')}")
 
-        # 4.2 完整 AI 平台配置的行为照旧
+        # 4.2 完整 AI 平台配置的行为照旧（但仅管理员可建）
         code, plat = req("POST", "/api/providers", {
             "name": "主力对话", "kind": "llm", "provider": "deepseek",
             "model": "deepseek-chat", "api_key": "sk-should-not-leak", "priority": 1,
-        }, u1)
-        check("完整 AI 平台配置照旧可建", code == 201 and plat.get("kind") == "llm", str(code))
+        }, admin_token)
+        check("完整 AI 平台配置照旧可建（管理员）",
+              code == 201 and plat.get("kind") == "llm", str(code))
+        code, _ = req("POST", "/api/providers", {"name": "普通用户建配置", "kind": "llm"}, u1)
+        check("普通用户建平台配置 -> 403", code == 403, f"code={code}")
 
-        # 4.3 脱敏列表要带上角色字段，且不能泄密钥
+        # 4.3 脱敏列表只含平台配置、且不能泄密钥；角色改由 /api/roles 提供
         code, safe = req("GET", "/api/providers/safe", token=u1)
         safe_rows = safe if isinstance(safe, list) else []
-        role_row = next((p for p in safe_rows if p.get("id") == role_id), {})
-        check("/safe 返回含角色字段",
-              set(["description", "system_prompt", "tts_voice", "is_default"]) <= set(role_row),
-              ",".join(sorted(role_row)))
+        check("/safe 返回含平台配置字段",
+              all({"id", "name", "kind", "provider", "endpoint", "model"} <= set(r)
+                  for r in safe_rows),
+              f"{len(safe_rows)} 条")
         check("/safe 不含 api_key", not any("api_key" in p for p in safe_rows),
               f"{len(safe_rows)} 条")
-        check("/safe 同时含角色与平台配置", len(safe_rows) >= 2, f"{len(safe_rows)} 条")
+        check("/safe 不再混角色（角色走 /api/roles）",
+              all(p.get("kind") for p in safe_rows),
+              ",".join(str(p.get("kind")) for p in safe_rows))
+        code, _ = req("GET", "/api/providers/safe")
+        check("/safe 未登录访问 -> 401（P0-2 止血）", code == 401, f"code={code}")
+        code, roles_of_u1 = req("GET", "/api/roles", token=u1)
+        check("/api/roles 分区含新建的角色",
+              code == 200 and any(r.get("id") == role_id
+                                  for r in (roles_of_u1 or {}).get("mine", [])),
+              str([r.get("id") for r in (roles_of_u1 or {}).get("mine", [])]))
 
         # 4.4 导出小智配置只应含真实平台配置，不能被角色污染
         code, exported = req("GET", "/api/providers/export/xiaozhi", token=u1)
@@ -300,6 +337,10 @@ def main() -> int:
         check("首页 device.agent_name 回显角色名",
               s4["devices"][0].get("agent_name") == "小暖医生",
               str(s4["devices"][0].get("agent_name")))
+
+        # P0-4：平台 LLM 配置不能被绑成角色（原先只查存在性）
+        code, _ = req("POST", f"/api/devices/{dev_pk}/agent", {"role_id": plat.get("id", 0)}, u1)
+        check("把平台 LLM 配置绑成角色 -> 404", code == 404, f"code={code}")
 
         code, _ = req("POST", f"/api/devices/{dev_pk}/agent", {"role_id": role_id}, u2)
         check("绑定他人设备 -> 404（不暴露设备存在性）", code == 404, f"code={code}")

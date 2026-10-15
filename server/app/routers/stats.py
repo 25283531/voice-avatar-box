@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
-from datetime import timedelta
+from datetime import timedelta, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import func, select
@@ -36,17 +36,35 @@ def overview(device_pk: int, days: int = Query(7, ge=1, le=60),
     today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
 
     # --- 交互次数按天聚合 ---
-    since = today_start - timedelta(days=days - 1)
-    rows = db.execute(
-        select(
-            func.date(models.Interaction.ts),
-            models.Interaction.kind,
-            func.count(models.Interaction.id),
-        )
+    # ⚠️ **分桶必须按服务端本地时区，而不是 UTC**。这条曾是个真实缺陷：
+    # ``Interaction.ts`` 存的是 UTC，而 ``today_start`` 是本地时区的零点，
+    # 两者在 SQL 里被直接比较；而 ``func.date(ts)`` 在 SQLite 上取的是 ts 字面量
+    # 的日期部分，也就是 **UTC 日期**。于是本地 00:00~08:00 之间
+    # （UTC 还是前一天）刚上报的交互会被归到"昨天"的桶里，
+    # 而查找用的 key 是本地日期 —— 两者对不上，today_total 恒为 0。
+    # 症状是"早上八点前看统计永远是 0，八点后自己就好了"，极难定位。
+    #
+    # 修法：把 ts 先换算到本地时区再取日期。SQLite 没有原生时区函数，
+    # 统一在 Python 侧做—— 这里数据量是单设备的交互条数（每天几十条），
+    # 全量取回再分桶的开销可以忽略，换来的是 SQLite/MySQL 行为一致。
+    since = today_start.astimezone(models.utcnow().tzinfo) - timedelta(days=days - 1)
+    raw_rows = db.execute(
+        select(models.Interaction.ts, models.Interaction.kind)
         .where(models.Interaction.device_id == device_pk,
                models.Interaction.ts >= since)
-        .group_by(func.date(models.Interaction.ts), models.Interaction.kind)
     ).all()
+
+    rows: list[tuple[str, int, int]] = []
+    for ts, kind in raw_rows:
+        if ts is None:
+            continue
+        # ⚠️ SQLite 的 DateTime 列读回来是 **naive** 的（时区信息被丢掉），
+        # 而它存的其实是 UTC。所以这里必须先补回 UTC 时区再换算 ——
+        # 直接对 naive 值调 astimezone()，Python 会拿**进程本地时区**去理解它，
+        # 于是同一个值在 UTC 机器与 UTC+8 机器上会算出不同的"本地日期"。
+        aware = ts if ts.tzinfo is not None else ts.replace(tzinfo=timezone.utc)
+        local_day = aware.astimezone(now.tzinfo).date()
+        rows.append((str(local_day), int(kind), 1))
 
     per_day: dict[str, dict[str, int]] = defaultdict(
         lambda: {"total": 0, "wake": 0, "dialog": 0, "confirm": 0, "miss": 0, "sos": 0}

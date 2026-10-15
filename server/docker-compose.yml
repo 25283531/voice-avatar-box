@@ -1,12 +1,19 @@
-# 老人陪伴提醒助手 —— 一键部署（默认 SQLite，零外部依赖）
+# 老人陪伴提醒助手 —— 一键部署（**单一镜像**，默认 SQLite，零外部依赖）
 #
-# 默认只起一个服务，数据落在内置 SQLite 文件里：
-#   elder-server  本服务   业务 API + 管理页面 + 内置 SQLite   http://localhost:8064
+# ⚠️ 本文件只包含一个服务：elder-server。这不是简化，是刻意设计的项目约束。
 #
-# 为什么默认不用 MySQL：
-#   本项目面向家用 / 单机部署，一台机器跑一个容器最省事。SQLite 是 Python 标准库自带
-#   （无需额外依赖、无需额外的数据库容器、无需等待数据库就绪），`docker compose up -d`
-#   就能直接用。要换成 MySQL 时再叠加 docker-compose.mysql.yml 即可，见 docs/DEPLOY.md。
+# 历史沿革：早期为快速验证，语音/AI 链路直接复用了 xiaozhi-esp32-server 的官方
+# 容器（profiles: xiaozhi），等于把角色、音色、记忆、大模型调用都放在了第三方进程里。
+# 现在语音链路已改为**自研**（server/app/voice/），与本服务同进程、同端口：
+#   - 设备连的 WebSocket 就是本容器的 /api/voice/v1/ws
+#   - 地址由服务端按请求 Host 自动推导下发（见 _voice_endpoints），无需手工配置
+#   - 因此不再有任何 profile，也不再需要 xiaozhi 那些额外的容器与端口
+#
+# 一个镜像承担全部平台级能力：
+#   业务面   注册/登录/找回密码、账号邮箱、工单、设备管理、配网、提醒日程
+#   会员面   套餐、订单（4 位订单号 + 区间随机金额）、人工核销、陪聊配额
+#   语音面   WebSocket 语音链路、ASR/LLM/TTS 编排、MCP 工具、多模型路由
+#   角色面   预置角色与形象、用户自建角色、人格与语气演化、长期记忆
 #
 # 数据持久化：
 #   命名卷 elder-data 挂到容器 /data，库文件是 /data/elder.db。
@@ -14,13 +21,13 @@
 #
 # 访问入口：http://localhost:8064 （容器内 8080，对外只映射 8064）
 #
-#   docker compose up -d                        # 仅业务面（SQLite）
-#   docker compose --profile xiaozhi up -d      # 再带上语音链路
-#   docker compose -f docker-compose.yml -f docker-compose.mysql.yml up -d   # 改用 MySQL
+#   docker compose up -d                        # 默认形态（内置 SQLite）
+#   docker compose -f docker-compose.yml -f docker-compose.mysql.yml up -d   # 用户量大时改用 MySQL
+#
+#   注：只有在用户量上来之后才需要接 MySQL，详见 docs/DEPLOY.md。
 #
 services:
 
-  # ------------------------------------------------------------ 业务后端
   elder-server:
     build: .
     container_name: elder-server
@@ -34,47 +41,21 @@ services:
       ELDER_DB_WAIT_SEC: ${ELDER_DB_WAIT_SEC:-180}
       ELDER_JWT_SECRET: ${ELDER_JWT_SECRET:-please-change-this-secret-in-production}
       ELDER_CORS: ${ELDER_CORS:-*}
-      ELDER_XIAOZHI_WS: ${ELDER_XIAOZHI_WS:-ws://xiaozhi-server:8000/xiaozhi/v1/}
-      ELDER_XIAOZHI_OTA: ${ELDER_XIAOZHI_OTA:-http://xiaozhi-server:8003/xiaozhi/ota/}
+      # ---------------------------------------------------------------- 语音链路
+      # 自研语音链路与本服务同源同端口，设备地址由服务端自动推导，**默认不用配**。
+      # 只有当部署在反代后面、且 Host 头没被正确透传时才需要显式指定，例如：
+      #   ELDER_VOICE_PUBLIC_BASE: https://voice.2508866.xyz
+      # 注意必须给 https（服务端会自动换成 wss），给 ws:// 会导致设备拒绝连接。
+      ELDER_VOICE_PUBLIC_BASE: ${ELDER_VOICE_PUBLIC_BASE:-}
     volumes:
       - elder-data:/data
-    # 对外只发布一个端口，默认 8064（8080 常与其它服务冲突）
+    # 对外只发布一个端口，默认 8064（8080 常与其它服务冲突）。
+    # 语音 WebSocket 复用这一个端口，不要再开第二个。
     ports:
       - "${ELDER_HTTP_PORT:-8064}:8080"
     networks: [elder-net]
     security_opt:
       - seccomp:unconfined
-
-  # ============================================================ 语音链路（可选）
-  xiaozhi-server:
-    image: ghcr.io/xinnan-tech/xiaozhi-esp32-server:server_latest
-    container_name: xiaozhi-server
-    restart: unless-stopped
-    profiles: ["xiaozhi"]
-    ports:
-      - "8000:8000"     # WebSocket 语音通道
-      - "8003:8003"     # OTA / 视觉分析
-    environment:
-      TZ: Asia/Shanghai
-    volumes:
-      - ./data/xiaozhi:/opt/xiaozhi-esp32-server/data
-    networks: [elder-net]
-    security_opt:
-      - seccomp:unconfined
-
-  xiaozhi-web:
-    image: ghcr.io/xinnan-tech/xiaozhi-esp32-server:web_latest
-    container_name: xiaozhi-web
-    restart: unless-stopped
-    profiles: ["xiaozhi"]
-    depends_on: [xiaozhi-server]
-    ports:
-      - "8002:8002"     # 小智智控台（设备管理 / 音色 / 角色）
-    environment:
-      TZ: Asia/Shanghai
-    volumes:
-      - ./data/web:/uploadfile
-    networks: [elder-net]
 
 volumes:
   # 内置 SQLite 库文件所在卷（elder.db）。备份/迁移就是拷这个文件。

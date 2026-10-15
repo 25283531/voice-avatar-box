@@ -22,6 +22,10 @@ import { getElderToken } from '@/http/elder'
 
 const devices = ref<Device[]>([])
 const avatars = ref<Avatar[]>([])
+// 平台预设与我的角色分开存，模板才能分区渲染（PRD §11.1 线框）。
+// roles 是两者的合并，给 onPickRole 与空态判断用。
+const presetRoles = ref<any[]>([])
+const myRoles = ref<any[]>([])
 const roles = ref<any[]>([])
 const loading = ref(false)
 
@@ -37,7 +41,15 @@ async function refresh() {
   try {
     devices.value = await listDevices()
     avatars.value = await listAvatars().catch(() => [])
-    roles.value = await listAgentRoles().catch(() => [])
+    // 角色已拆分到 /api/roles，返回 {presets, mine} 分区。
+    // 这里要的是「这台设备能绑的全部角色」= 平台预设 + 我的，所以两个分区合并。
+    // ⚠️ 绝不能再把平台 AI 配置当角色渲染 —— 改造前 roles 直接来自
+    // /api/providers/safe，用户会在"选角色"里看到一堆 provider/endpoint/model，
+    // 而且点删除会把平台 LLM 配置真删掉（P0-1/P0-2）。
+    const rl = await listAgentRoles().catch(() => ({ presets: [], mine: [] }) as any)
+    presetRoles.value = (rl.presets || []).filter((r: any) => !r.deleted_at)
+    myRoles.value = (rl.mine || []).filter((r: any) => !r.deleted_at)
+    roles.value = [...presetRoles.value, ...myRoles.value]
   }
   catch { /* 请求层已提示 */ }
   finally {
@@ -225,11 +237,17 @@ onShow(() => { refresh() })
             为「{{ currentDevice()?.name }}」绑定角色
           </view>
           <view class="tip left">
-            每台设备可以绑定不同的角色，角色决定形象、音色和说话风格
+            每台设备可以绑定不同的角色。角色决定说话方式与音色，形象决定屏幕上的外观
           </view>
 
-          <view v-if="roles.length" class="group-label">我的角色</view>
-          <view v-for="r in roles" :key="`r${r.id}`" class="pick" @click="onPickRole(r)">
+          <view v-if="presetRoles.length" class="group-label">平台推荐</view>
+          <view v-for="r in presetRoles" :key="`p${r.id}`" class="pick" @click="onPickRole(r)">
+            <text class="pick-name">{{ r.name }}</text>
+            <text class="pick-sub">{{ r.description || '平台预设角色' }}</text>
+          </view>
+
+          <view v-if="myRoles.length" class="group-label">我的角色</view>
+          <view v-for="r in myRoles" :key="`r${r.id}`" class="pick" @click="onPickRole(r)">
             <text class="pick-name">{{ r.name }}</text>
             <text class="pick-sub">{{ r.description || '自定义角色' }}</text>
           </view>

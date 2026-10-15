@@ -54,30 +54,48 @@ export function setElderUser(user: Record<string, any>) {
 export interface ElderRequestOptions {
   method?: 'GET' | 'POST' | 'PATCH' | 'DELETE'
   data?: Record<string, any>
-  /** 是否需要携带 token，默认 true */
-  auth?: boolean
+  /**
+   * 是否需要携带 token，默认 true。
+   * 'optional' = 有 token 就带上（登录后提交会自动关联账号），没 token 也不报错，
+   * 专给「匿名也能用」的接口（提交工单：忘记密码的人根本登不进来）。
+   */
+  auth?: boolean | 'optional'
   /** 是否弹出错误提示，默认 true */
   toast?: boolean
   timeout?: number
 }
 
+/** 原始响应：连同 HTTP 状态码一起交出（成功失败都 resolve） */
+export interface ElderRawResult<T = any> {
+  statusCode: number
+  data: T
+}
+
 /**
- * 发起请求。成功直接返回业务数据；失败抛出 Error（message 为服务端 detail）。
+ * 原始请求：不做任何加工，**失败也 resolve**，把 { statusCode, data } 原样交出。
+ *
+ * 存在的理由：找回密码这组的失败分支是需要分诊的 —— 429 冷却、503 平台没配邮件、
+ * 400 验证码错误（而且 detail 是 { message, attempts_left } 结构），要靠状态码和
+ * attempts_left 才能说出「验证码不对，你还可以试 3 次」这种人话；elderRequest 会
+ * 把对象型 detail 直接 String() 成 "[object Object]"。这类接口走这里自己写文案。
  */
-export function elderRequest<T = any>(path: string, options: ElderRequestOptions = {}): Promise<T> {
-  const { method = 'GET', data, auth = true, toast = true, timeout = 10000 } = options
+export function elderRequestRaw<T = any>(
+  path: string,
+  options: ElderRequestOptions = {},
+): Promise<ElderRawResult<T>> {
+  const { method = 'GET', data, auth = true, timeout = 10000 } = options
 
   const header: Record<string, string> = { 'Content-Type': 'application/json' }
-  if (auth) {
+  if (auth === 'optional') {
     const token = getElderToken()
-    if (!token) {
-      uni.showToast({ title: '请先登录', icon: 'none' })
-      return Promise.reject(new Error('未登录'))
-    }
+    if (token) header.Authorization = `Bearer ${token}`
+  }
+  else if (auth) {
+    const token = getElderToken()
     header.Authorization = `Bearer ${token}`
   }
 
-  return new Promise<T>((resolve, reject) => {
+  return new Promise<ElderRawResult<T>>((resolve, reject) => {
     uni.request({
       url: BASE_URL + path,
       method: method as any,
@@ -85,17 +103,41 @@ export function elderRequest<T = any>(path: string, options: ElderRequestOptions
       header,
       timeout,
       success: (res: any) => {
-        // 204 No Content
-        if (res.statusCode === 204) {
+        resolve({ statusCode: res.statusCode as number, data: res.data as T })
+      },
+      fail: (err: any) => {
+        reject(new Error((err && err.errMsg) || '网络请求失败'))
+      },
+    })
+  })
+}
+
+/**
+ * 发起请求。成功直接返回业务数据；失败抛出 Error（message 为服务端 detail）。
+ */
+export function elderRequest<T = any>(path: string, options: ElderRequestOptions = {}): Promise<T> {
+  const { auth = true, toast = true } = options
+
+  if (auth === true && !getElderToken()) {
+    uni.showToast({ title: '请先登录', icon: 'none' })
+    return Promise.reject(new Error('未登录'))
+  }
+
+  return new Promise<T>((resolve, reject) => {
+    elderRequestRaw<T>(path, options)
+      .then((raw) => {
+        // 204 No Content：没有响应体
+        if (raw.statusCode === 204) {
           resolve(undefined as any)
           return
         }
-        if (res.statusCode >= 200 && res.statusCode < 300) {
-          resolve(res.data as T)
+        if (raw.statusCode >= 200 && raw.statusCode < 300) {
+          resolve(raw.data)
           return
         }
-        const detail = (res.data && (res.data.detail || res.data.message)) || `请求失败(${res.statusCode})`
-        if (res.statusCode === 401) {
+        const body: any = raw.data
+        const detail = (body && (body.detail || body.message)) || `请求失败(${raw.statusCode})`
+        if (raw.statusCode === 401) {
           clearElderToken()
           uni.showToast({ title: '登录已失效，请重新登录', icon: 'none' })
         }
@@ -103,13 +145,12 @@ export function elderRequest<T = any>(path: string, options: ElderRequestOptions
           uni.showToast({ title: String(detail).slice(0, 40), icon: 'none' })
         }
         reject(new Error(detail))
-      },
-      fail: (err: any) => {
-        const msg = (err && err.errMsg) || '网络请求失败'
+      })
+      .catch((err: any) => {
+        const msg = (err && err.message) || '网络请求失败'
         if (toast) uni.showToast({ title: '网络异常，请稍后重试', icon: 'none' })
         reject(new Error(msg))
-      },
-    })
+      })
   })
 }
 

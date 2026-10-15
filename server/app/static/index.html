@@ -404,8 +404,15 @@
             <div><label>名称</label><input v-model="pForm.name" style="width:100%" placeholder="主力大模型" /></div>
             <div><label>能力</label>
               <select v-model="pForm.kind" style="width:100%">
-                <option value="asr">语音识别 ASR</option><option value="llm">大模型 LLM</option>
-                <option value="tts">语音合成 TTS</option><option value="vad">端点检测 VAD</option>
+                <option value="asr">语音识别 ASR</option>
+                <option value="tts">语音合成 TTS</option>
+                <option value="vad">端点检测 VAD</option>
+                <option value="llm">大模型 LLM（默认/兜底）</option>
+                <option value="llm_main">大模型·主对话（大参数）</option>
+                <option value="llm_light">小模型·识别与执行（小参数）</option>
+                <option value="embedding">向量模型 Embedding</option>
+                <option value="rerank">重排模型 Rerank</option>
+                <option value="vision">视觉理解 Vision（预留）</option>
               </select></div>
             <div><label>平台</label>
               <select v-model="pForm.provider" style="width:100%">
@@ -422,10 +429,52 @@
               <select v-model="pForm.enabled" style="width:100%">
                 <option :value="true">启用</option><option :value="false">停用</option>
               </select></div>
+            <div><label>厂商 API 风格</label>
+              <select v-model="pForm.api_style" style="width:100%">
+                <option value="">OpenAI 兼容（默认）</option>
+                <option value="openai_compatible">OpenAI 兼容</option>
+                <option value="openai">OpenAI 官方</option>
+                <option value="anthropic">Anthropic Claude</option>
+                <option value="gemini">Google Gemini</option>
+                <option value="aliyun">阿里云百炼</option>
+                <option value="volcengine">火山方舟</option>
+                <option value="ollama">Ollama（本地）</option>
+                <option value="xinference">Xinference（本地）</option>
+                <option value="custom">自定义</option>
+              </select></div>
+            <div><label>超时（秒）</label><input v-model.number="pForm.timeout_sec" type="number" min="1" max="600" /></div>
+            <div><label>失败重试次数</label><input v-model.number="pForm.max_retries" type="number" min="0" max="5" /></div>
+            <div><label>上下文上限 token（0=不限）</label><input v-model.number="pForm.context_window" type="number" min="0" /></div>
+            <div><label>支持流式</label>
+              <select v-model="pForm.supports_stream" style="width:100%">
+                <option :value="false">否</option><option :value="true">是</option>
+              </select></div>
           </div>
           <div style="margin-top:10px">
-            <label>附加参数 JSON（温度、音色、采样率等）</label>
+            <label>附加参数 JSON（温度 temperature、max_tokens 等）</label>
             <textarea v-model="paramsText" style="min-height:70px"></textarea>
+          </div>
+          <div style="margin-top:10px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+            <label style="margin:0">试一下（按用途真发一次请求）</label>
+            <select v-model="testUsage" style="width:auto">
+              <option value="chat">chat 正式对话</option>
+              <option value="light">light 轻量任务</option>
+              <option value="embed">embed 向量化</option>
+              <option value="rerank">rerank 重排</option>
+            </select>
+            <button style="width:auto;padding:6px 14px" @click="testModel()">测试连接</button>
+            <button style="width:auto;padding:6px 14px" @click="resolveUsage()">解析这条用途落到谁</button>
+          </div>
+          <div v-if="testResult" style="margin-top:8px;font-size:12px;line-height:1.6">
+            <div :style="{color:testResult.ok?'#1a7f37':'#b42318'}">
+              {{ testResult.ok ? '调用成功' : '调用失败' }}
+              <span v-if="testResult.error_code">（{{testResult.error_code}}）</span>
+              <span v-if="testResult.model">· {{testResult.model}} · {{testResult.elapsed_ms}}ms</span>
+            </div>
+            <pre style="white-space:pre-wrap;word-break:break-all;margin:4px 0 0">{{ testResult.ok ? (testResult.text || JSON.stringify(testResult.vectors || testResult.scores)) : testResult.message }}</pre>
+            <div v-if="(testResult.attempts||[]).length" style="color:#666">
+              尝试记录：{{ testResult.attempts.map(a=>a.name+'('+a.kind+'/'+(a.ok?'成功':a.error_code)+')').join(' → ') }}
+            </div>
           </div>
           <div class="row" style="margin-top:16px;justify-content:flex-end">
             <button @click="pBox=null">取消</button>
@@ -487,7 +536,8 @@ createApp({
       codeBox: null,
       rBox: null, rForm: null, timesText:'', weekText:'', monthText:'',
       aBox: null, aForm: null, clipsText:'', lightsText:'',
-      pBox: null, pForm: null, paramsText:''
+      pBox: null, pForm: null, paramsText:'',
+      testUsage: 'chat', testResult: null
     };
   },
   methods:{
@@ -648,12 +698,29 @@ createApp({
 
     // -------- AI --------
     blankProvider(){
-      return { name:'', kind:'llm', provider:'deepseek', endpoint:'', api_key:'',
-        model:'', params:{}, priority:10, enabled:true };
+      return { name:'', kind:'llm_main', provider:'deepseek', endpoint:'', api_key:'',
+        model:'', api_style:'', supports_stream:false, timeout_sec:30, max_retries:1,
+        context_window:0, params:{}, priority:10, enabled:true };
+    },
+    // 「测试连接」与「解析用途」：调到新增的两个网关端点上
+    async testModel(){
+      this.testResult = null;
+      const usageMap = {llm:'chat', llm_light:'light', embedding:'embed', rerank:'rerank'};
+      const usage = this.testUsage || usageMap[this.pForm.kind] || 'chat';
+      const d = await this.api('/api/providers/test',
+        {method:'POST', body:JSON.stringify({usage, messages:[{role:'user',content:'你好，请用一句话介绍自己'}]})});
+      if (d) this.testResult = d;
+    },
+    async resolveUsage(){
+      this.testResult = null;
+      const d = await this.api('/api/providers/resolve?usage='+(this.testUsage||'chat'));
+      if (d) this.testResult = {ok:true, model:d.name+' → '+d.kind+'/'+d.model+'（'+(d.fallback?'兜底命中':'首选')+'）',
+        attempts:[{name:d.name, kind:d.kind, ok:true}], elapsed_ms:d.timeout_sec*1000};
     },
     editProvider(p){
       this.pForm = p ? JSON.parse(JSON.stringify(p)) : this.blankProvider();
       this.paramsText = JSON.stringify(this.pForm.params||{}, null, 2);
+      this.testResult = null;
       this.pBox = true;
     },
     async saveProvider(){

@@ -50,7 +50,28 @@ uvicorn app.main:app --reload --port 8080
 冒烟测试（自动起服务跑完整业务闭环）：
 
 ```bash
-python tools/smoke_server.py 8099
+python tools/smoke_server.py 8100
+```
+
+各冒烟脚本的默认端口**互不重复**，因此可以放心并行跑（每个脚本记得配独立的
+`TMPDIR`，否则临时 SQLite 库会互相抢占）：
+
+```bash
+python tools/smoke_server.py 8100 & \
+python tools/smoke_roles.py 8101 & \
+python tools/smoke_home.py 8102 & \
+python tools/smoke_memory.py 8103 & \
+python tools/smoke_models.py 8104 & \
+python tools/smoke_mail.py 8105 & \
+python tools/smoke_membership.py 8106 & \
+wait
+```
+
+端口表的**唯一真源**是 `tools/smoke_ports.py`；端口可用位置参数或 `--port N`
+覆盖（CI 就是这么用的）。查看当前端口表与占用情况：
+
+```bash
+python tools/smoke_ports.py --check
 ```
 
 ## 3. 架构边界
@@ -123,8 +144,7 @@ python tools/smoke_server.py 8099
 | `ELDER_CORS` | `*` | 跨域来源，逗号分隔 |
 | `ELDER_TZ` | `Asia/Shanghai` | 业务时区，影响提醒时间计算 |
 | `ELDER_DB_WAIT_SEC` | 180 | 启动等待数据库秒数（仅 MySQL 生效） |
-| `ELDER_XIAOZHI_WS` | 内网地址 | 下发给设备的语音通道 |
-| `ELDER_XIAOZHI_OTA` | 内网地址 | 下发给设备的 OTA 地址 |
+| `ELDER_VOICE_PUBLIC_BASE` | 留空自动推导 | 语音链路对外地址。**默认不用配**——自研语音链路与 API 同源同端口，服务端按请求 Host 自动推导。仅在反代未透传 Host 时显式指定，填 `https://voice.2508866.xyz`（会自动换成 `wss://`）|
 | `ELDER_ACT_TTL_MIN` | 10 | 激活码有效分钟数 |
 | `ELDER_SCHEDULE_AHEAD_HOURS` | 36 | 预排期提前量 |
 
