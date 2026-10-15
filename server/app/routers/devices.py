@@ -14,6 +14,8 @@ from ..schemas import (
     ActivationCodeOut,
     BindIn,
     BindOut,
+    DeviceAgentIn,
+    DeviceAgentOut,
     DeviceCreate,
     DeviceOut,
     DeviceUpdate,
@@ -80,6 +82,32 @@ def delete_device(device_pk: int, db: Session = Depends(get_db),
     dev = require_device_owner(device_pk, user, db)
     db.delete(dev)
     db.commit()
+
+
+@router.post("/{device_pk}/agent", response_model=DeviceAgentOut)
+def bind_agent(device_pk: int, payload: DeviceAgentIn, db: Session = Depends(get_db),
+               user: models.User = Depends(get_current_user)):
+    """给设备绑定一个 agent 角色（一台设备同时只生效一个）。
+
+    越权处理与 require_device_owner 略有不同：别人的设备这里统一返回 404
+    而不是 403 —— 403 等于告诉调用方「这台设备存在，只是不是你的」，
+    会把设备主键是否存在这一信息泄露出去。
+
+    TODO: 目前只把 agent_id 落库。设备心跳（/api/device/sync）还没有把角色
+    下发给固件，等端侧支持「按角色切换人格 / 音色」时，在 DeviceSyncOut 里
+    加一个 agent 字段、复用这里取角色的逻辑即可，不必改本接口。
+    """
+    dev = db.get(models.Device, device_pk)
+    if dev is None or (not user.is_admin and dev.owner_id != user.id):
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "设备不存在")
+
+    role = db.get(models.AIProvider, payload.role_id)
+    if role is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "角色不存在")
+
+    dev.agent_id = role.id
+    db.commit()
+    return DeviceAgentOut(device_pk=dev.id, role_id=role.id, role_name=role.name)
 
 
 # ============================================================ 激活码

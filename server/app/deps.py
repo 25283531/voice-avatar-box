@@ -43,6 +43,13 @@ def get_current_device(
     return dev
 
 
+def get_current_admin(user: models.User = Depends(get_current_user)) -> models.User:
+    """管理端接口统一入口：非管理员一律 403。"""
+    if not user.is_admin:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "需要管理员权限")
+    return user
+
+
 def require_device_owner(
     device_pk: int,
     user: models.User,

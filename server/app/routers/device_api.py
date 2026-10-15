@@ -17,10 +17,12 @@ from .. import models
 from ..config import SCHEDULE_AHEAD_HOURS, XIAOZHI_OTA_URL, XIAOZHI_WS_URL
 from ..db import get_db
 from ..deps import get_current_device
+from ..membership import quota_snapshot
 from ..models import EventState, Interaction, ReminderEvent, utcnow
 from ..schedule import local_now, materialize_events
 from ..schemas import (
     AvatarOut,
+    DeviceQuotaOut,
     DeviceSyncOut,
     EventOut,
     EventReportIn,
@@ -61,12 +63,18 @@ def sync(fw_version: str = "", db: Session = Depends(get_db),
     ).all()
 
     avatar = db.get(models.Avatar, dev.avatar_id) if dev.avatar_id else None
+    # 只下发真正的平台配置：ai_providers 里的 agent 角色（kind 为空）没有厂商与模型，
+    # 下发给设备会被当成一条可用的 LLM 配置，反而把真实配置顶掉。
     providers = db.scalars(
-        select(models.AIProvider).where(models.AIProvider.enabled.is_(True))
+        select(models.AIProvider)
+        .where(models.AIProvider.enabled.is_(True),
+               models.AIProvider.kind.in_(("asr", "llm", "tts", "vad")))
         .order_by(models.AIProvider.kind, models.AIProvider.priority)
     ).all()
 
     db.refresh(dev)
+    # 规划文档 7.3：心跳时顺带下发当日陪聊配额（已用/上限/空闲切断/服药关键词）
+    quota = DeviceQuotaOut(**quota_snapshot(db, dev.owner_id, device_ids=[dev.id]))
     return DeviceSyncOut(
         server_time=now,
         device=dev,
@@ -76,6 +84,7 @@ def sync(fw_version: str = "", db: Session = Depends(get_db),
         providers=[ProviderSafeOut.model_validate(p) for p in providers],
         ws_url=XIAOZHI_WS_URL,
         ota_url=XIAOZHI_OTA_URL,
+        quota=quota,
     )
 
 

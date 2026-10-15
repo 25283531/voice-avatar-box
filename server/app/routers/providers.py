@@ -75,11 +75,16 @@ def delete_provider(provider_pk: int, db: Session = Depends(get_db),
 @router.get("/export/xiaozhi")
 def export_for_xiaozhi(db: Session = Depends(get_db),
                        user: models.User = Depends(get_current_user)):
-    """导出成小智 server 的 selected_module 片段，便于把配置同步过去。"""
+    """导出成小智 server 的 selected_module 片段，便于把配置同步过去。
+
+    只导出真正的平台配置（kind 属于 asr/llm/tts/vad）：ai_providers 里还存着
+    APP 自建的 agent 角色（kind 为空），它们没有厂商和模型，混进导出片段里
+    会把真实的 LLM/ASR 配置顶掉。
+    """
     out: dict[str, dict] = {}
     rows = db.scalars(
         select(models.AIProvider)
-        .where(models.AIProvider.enabled.is_(True))
+        .where(models.AIProvider.enabled.is_(True), models.AIProvider.kind.in_(VALID_KINDS))
         .order_by(models.AIProvider.kind, models.AIProvider.priority)
     ).all()
     for r in rows:

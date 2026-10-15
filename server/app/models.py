@@ -47,6 +47,10 @@ class User(Base):
     password_hash: Mapped[str] = mapped_column(String(255))
     nickname: Mapped[str] = mapped_column(String(64), default="")
     phone: Mapped[str] = mapped_column(String(32), default="")
+    # 绑定邮箱，APP「我的」页可自行更换（PATCH /api/auth/email）。
+    # 这里**不加唯一索引**：老账号的 email 都是空串，唯一索引会让第二个用户直接写不进去；
+    # 唯一性由接口层查询校验（重复返回 409）保证。
+    email: Mapped[str] = mapped_column(String(128), default="")
     is_admin: Mapped[bool] = mapped_column(Boolean, default=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
@@ -65,6 +69,12 @@ class Device(Base):
     name: Mapped[str] = mapped_column(String(64), default="我的陪伴助手")
     owner_id: Mapped[int | None] = mapped_column(ForeignKey("users.id"), nullable=True)
     avatar_id: Mapped[int | None] = mapped_column(ForeignKey("avatars.id"), nullable=True)
+    # 生效的 agent 角色（对应 ai_providers 里的一条记录，APP「创建我的 agent 角色」
+    # 走的也是 POST /api/providers）。形象（avatar_id）管的是屏幕上的外观与音色，
+    # 角色（agent_id）管的是人格与提示词，两者互不影响、可各选一个。
+    # TODO: 目前只落库，/api/device/sync 还没有把 agent 下发给设备；
+    #       等设备侧支持按角色切换人格时，在 DeviceSyncOut 里补一个 agent 字段即可。
+    agent_id: Mapped[int | None] = mapped_column(ForeignKey("ai_providers.id"), nullable=True)
 
     # 运行时状态
     online: Mapped[bool] = mapped_column(Boolean, default=False)
@@ -147,19 +157,36 @@ class Avatar(Base):
 
 # ================================================================ AI 供应商
 class AIProvider(Base):
-    """多平台 AI API 接入配置（需求 15）。"""
+    """多平台 AI API 接入配置（需求 15）+ 自建 agent 角色（APP「我的 agent 角色」）。
+
+    同一张表承载两类记录，靠 ``kind`` 是否为空区分：
+      * kind 为 asr / llm / tts / vad：一条真实可调用的平台配置，会参与
+        /api/device/sync 的下发与 /api/providers/export/xiaozhi 的导出；
+      * kind 为空字符串：APP 自建的「agent 角色」，只有人格（system_prompt）、
+        音色（tts_voice）等描述性字段，不参与下发与导出（否则会被当成一条
+        真实的 LLM 配置，把既有 AI 平台配置顶掉）。
+    APP 的 AgentRole（见 app/src/api/elder/index.ts）走的就是后一种。
+    """
 
     __tablename__ = "ai_providers"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     name: Mapped[str] = mapped_column(String(64))
-    # asr / llm / tts / vad
-    kind: Mapped[str] = mapped_column(String(16), index=True)
+    # asr / llm / tts / vad；为空表示这是一条「角色」记录而非平台配置
+    kind: Mapped[str] = mapped_column(String(16), default="", index=True)
     # 厂商：aliyun / volcengine / deepseek / zhipu / openai / ollama / dify / xinference ...
-    provider: Mapped[str] = mapped_column(String(32))
+    provider: Mapped[str] = mapped_column(String(32), default="")
     endpoint: Mapped[str] = mapped_column(String(512), default="")
     api_key: Mapped[str] = mapped_column(String(512), default="")
     model: Mapped[str] = mapped_column(String(128), default="")
+    # ---- 以下是 agent 角色字段（APP 的 AgentRole），平台配置用不到 ----
+    description: Mapped[str] = mapped_column(String(255), default="")
+    # 角色人格 / 系统提示词
+    system_prompt: Mapped[str] = mapped_column(Text, default="")
+    # 角色音色，如 zh-CN-XiaoxiaoNeural
+    tts_voice: Mapped[str] = mapped_column(String(64), default="")
+    # 是否默认角色（APP 新建角色时可选中）
+    is_default: Mapped[bool] = mapped_column(Boolean, default=False)
     # 厂商特有参数（温度、top_p、采样率、音色等）
     params: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     # 数字越小优先级越高，主用失败时自动切下一个
@@ -313,3 +340,175 @@ class Interaction(Base):
     duration_ms: Mapped[int] = mapped_column(Integer, default=0)
     # 扩展信息：如 ASR 文本、情绪标签、提醒事件 id
     meta: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+
+
+# ================================================================ 会员
+# 当前没有支付接口，走「用户线下转账 -> 订单号 + 随机金额 -> 管理员肉眼核对 -> 手动核销」链路。
+# 详见 docs/会员功能规划.md。
+class MembershipSource:
+    """会员来源。"""
+
+    ORDER = "order"    # 订单核销
+    ADMIN = "admin"    # 后台直接分配
+    GIFT = "gift"      # 赠送 / 补偿
+
+
+class MembershipStatus:
+    """会员记录状态。"""
+
+    ACTIVE = "active"
+    EXPIRED = "expired"
+
+
+class Membership(Base):
+    """用户会员记录。
+
+    一个用户只保留一行（uq_membership_user），续费时在原记录上延长 expires_at，
+    便于 GET /api/membership 一次查清状态；开通历史由 MembershipOrder 承担审计。
+    """
+
+    __tablename__ = "memberships"
+    __table_args__ = (
+        UniqueConstraint("user_id", name="uq_membership_user"),
+        Index("ix_membership_expires", "expires_at"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    # 套餐 code（membership_plans.code），后台直接分配时填自定义标识
+    plan: Mapped[str] = mapped_column(String(32), default="")
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    source: Mapped[str] = mapped_column(String(16), default=MembershipSource.ORDER)
+    status: Mapped[str] = mapped_column(String(16), default=MembershipStatus.ACTIVE, index=True)
+    note: Mapped[str] = mapped_column(String(255), default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
+
+
+class MembershipPlan(Base):
+    """会员套餐（定义开通天数与展示价，实际收款金额以订单的随机金额为准）。"""
+
+    __tablename__ = "membership_plans"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    code: Mapped[str] = mapped_column(String(32), unique=True, index=True)
+    name: Mapped[str] = mapped_column(String(64))
+    description: Mapped[str] = mapped_column(String(255), default="")
+    days: Mapped[int] = mapped_column(Integer, default=30)
+    # 展示价（整数分），仅用于页面展示与套餐对比，不参与实际收款对账
+    price_cents: Mapped[int] = mapped_column(Integer, default=0)
+    sort: Mapped[int] = mapped_column(Integer, default=0)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class OrderStatus:
+    """订单状态机：pending -> notified -> confirmed / rejected，旁支 cancelled / expired。"""
+
+    PENDING = "pending"      # 已创建，等待用户付款
+    NOTIFIED = "notified"    # 用户声称已付款，等待管理员核对
+    CONFIRMED = "confirmed"  # 管理员确认到账，会员已开通
+    REJECTED = "rejected"    # 管理员未查到入账
+    CANCELLED = "cancelled"  # 用户主动放弃
+    EXPIRED = "expired"      # 超过 48 小时未支付
+
+
+class MembershipOrder(Base):
+    """会员订单。
+
+    code 为 4 位 `[A-Z0-9]`，落库与查询统一大写；
+    amount_cents 为整数分，在区间内随机且 48 小时内不重复，
+    管理员凭「订单号 + 金额」在收款账号里反查唯一订单。
+    """
+
+    __tablename__ = "membership_orders"
+    __table_args__ = (
+        Index("ix_order_code", "code"),
+        Index("ix_order_status_created", "status", "created_at"),
+        Index("ix_order_amount", "amount_cents"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    code: Mapped[str] = mapped_column(String(4), index=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    plan_code: Mapped[str] = mapped_column(String(32), default="")
+    # 实际应付金额（整数分，禁止浮点）
+    amount_cents: Mapped[int] = mapped_column(Integer, default=0)
+    status: Mapped[str] = mapped_column(String(16), default=OrderStatus.PENDING, index=True)
+
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    notified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    confirmed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # 核销管理员与备注（审计）
+    admin_id: Mapped[int | None] = mapped_column(ForeignKey("users.id"), nullable=True)
+    admin_note: Mapped[str] = mapped_column(String(255), default="")
+
+
+class MembershipAmountRange(Base):
+    """金额区间配置（单行）：随机收款金额的取值区间，单位分。"""
+
+    __tablename__ = "membership_amount_range"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    min_cents: Mapped[int] = mapped_column(Integer, default=1000)
+    max_cents: Mapped[int] = mapped_column(Integer, default=9999)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
+
+
+class PaymentConfig(Base):
+    """收款信息配置（单行）：收款账号 / 收款二维码，由管理端维护后下发给 APP。"""
+
+    __tablename__ = "payment_config"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    # 收款渠道名，如「微信」「支付宝」「银行卡」
+    channel: Mapped[str] = mapped_column(String(32), default="微信")
+    payee_name: Mapped[str] = mapped_column(String(64), default="")
+    account: Mapped[str] = mapped_column(String(128), default="")
+    qr_url: Mapped[str] = mapped_column(String(512), default="")
+    note: Mapped[str] = mapped_column(String(255), default="")
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
+
+
+class ChatQuotaConfig(Base):
+    """陪聊配额配置（单行）：非会员每日秒数、空闲切断秒数、会员是否不限。"""
+
+    __tablename__ = "chat_quota_config"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    free_daily_seconds: Mapped[int] = mapped_column(Integer, default=3600)
+    idle_timeout_seconds: Mapped[int] = mapped_column(Integer, default=90)
+    vip_unlimited: Mapped[bool] = mapped_column(Boolean, default=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
+
+
+class ChatUsage(Base):
+    """设备每日陪聊时长（服务端按日对账，端侧本地也有一份兜底统计）。"""
+
+    __tablename__ = "chat_usage"
+    __table_args__ = (UniqueConstraint("device_id", "date", name="uq_chat_usage_device_date"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    device_id: Mapped[int] = mapped_column(ForeignKey("devices.id"), index=True)
+    # 设备本地日期 YYYY-MM-DD
+    date: Mapped[str] = mapped_column(String(10), index=True)
+    used_seconds: Mapped[int] = mapped_column(Integer, default=0)
+    session_count: Mapped[int] = mapped_column(Integer, default=0)
+    # 服药/提醒类会话不计入 used_seconds，这里单独累计便于排查
+    reminder_seconds: Mapped[int] = mapped_column(Integer, default=0)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
+
+
+class ReminderKeyword(Base):
+    """服药/提醒关键词表，下发给设备做本地意图判定（命中则不占用陪聊配额）。"""
+
+    __tablename__ = "reminder_keywords"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    word: Mapped[str] = mapped_column(String(32), unique=True, index=True)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    sort: Mapped[int] = mapped_column(Integer, default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)

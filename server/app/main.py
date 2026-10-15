@@ -21,7 +21,9 @@ from fastapi.staticfiles import StaticFiles
 from .config import APP_NAME, APP_VERSION, CORS_ORIGINS
 from .db import SessionLocal, init_db
 from .models import Avatar
-from .routers import avatars, auth, device_api, devices, providers, reminders, stats
+from .routers import (avatars, auth, device_api, devices, home, membership, providers,
+                      reminders, stats)
+from .schema_patch import ensure_missing_columns
 from .security import hash_password
 
 logging.basicConfig(
@@ -70,10 +72,22 @@ def _seed() -> None:
         db.commit()
 
 
+def _seed_membership() -> None:
+    """会员系统种子数据：金额区间、配额配置、默认套餐、服药关键词。"""
+    from . import membership as mbs
+
+    with SessionLocal() as db:
+        mbs.seed_defaults(db)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_db()
+    # 本项目没有 Alembic，create_all 不会给老库补列，
+    # 这里给升级上来的旧库补齐后加的字段（幂等，见 app/schema_patch.py）
+    ensure_missing_columns()
     _seed()
+    _seed_membership()
     from . import scheduler
 
     task = asyncio.create_task(scheduler.run_forever())
@@ -96,7 +110,11 @@ app.add_middleware(
 )
 
 for r in (auth.router, devices.router, reminders.router, avatars.router,
-          providers.router, stats.router, device_api.router):
+          providers.router, stats.router, device_api.router, home.router):
+    app.include_router(r)
+
+# 会员系统：用户端 /api/membership、管理端 /api/admin/membership、设备端 /api/device/quota 等
+for r in (membership.router, membership.admin_router, membership.device_router):
     app.include_router(r)
 
 
