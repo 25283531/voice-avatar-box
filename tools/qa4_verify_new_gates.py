@@ -19,6 +19,17 @@
 
 用法：
     python tools/qa4_verify_new_gates.py
+
+🛡️ 隔离说明
+-----------
+所有变异只发生在 :mod:`mutation_sandbox` 建立的**本次运行独有**的临时
+副本里，``ROOT`` / ``SERVER`` / ``CATALOG`` 等常量在导入期就已指向沙箱。
+**工作区 ``server/`` 全程只读。**
+
+改造前这里是「原地改写工作区 + ``finally`` 无条件写回」。无条件写回有个
+更隐蔽的危害：若测试窗口期内别的 agent 改了同一文件，那行 ``write_bytes``
+会把**对方的改动整段抹掉**。现在改为条件写回——内容不再等于我的变异版
+就跳过并报警。宁可人工介入，不可覆盖别人的工作。
 """
 from __future__ import annotations
 
@@ -30,8 +41,18 @@ import sys
 import tempfile
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent.parent
-SERVER = ROOT / "server"
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from mutation_sandbox import (  # noqa: E402
+    ConditionalRestore,
+    install_global_sandbox,
+)
+
+# 建立本次运行独有的沙箱；下面所有常量都指向副本而非工作区。
+_SB = install_global_sandbox("qa4_verify_new_gates")
+
+ROOT = _SB.root
+SERVER = _SB.server
 CATALOG = SERVER / "app" / "persona" / "catalog.py"
 GUARD = SERVER / "app" / "persona" / "guardrails.py"
 COMPILER = SERVER / "app" / "persona" / "compiler.py"
@@ -130,11 +151,16 @@ def mutate_and_probe(label: str, target: Path,
     mut = src_n
     for old, new in pairs:
         mut = mut.replace(_norm(old), _norm(new), 1)
-    _write(target, mut.replace("\n", eol))
+    # 🛡️ 条件写回：禁止 ``finally: write(original)``。若测试窗口期内别人
+    # 改了同一文件，无条件写回会把对方的改动整段抹掉。
+    guard = ConditionalRestore(target)
+    guard.write(mut.replace("\n", eol).encode("utf-8"))
     try:
         code, out = run_eval()
     finally:
-        _write(target, src)          # bytes 级复原
+        if not guard.restore():
+            print("[!! 拒绝复原] 疑似并发改动，已保留磁盘现状", file=sys.stderr)
+            return False, []
     red = code != 0
     fails = block_after(out, "硬失败")
     print(f"    {label}: exit={code}  硬失败明细={fails or '（无）'}")
@@ -259,12 +285,16 @@ def probe_m4() -> tuple[bool, list[str]]:
         return False, []
 
     gmut = gsrc.replace(head_old, head_new, 1).replace(tail_old, tail_new, 1)
-    _write(GUARD, gmut.replace("\n", geol))
+    # 🛡️ 条件写回（见 mutate_and_probe 的说明）。
+    gguard = ConditionalRestore(GUARD)
+    cguard = ConditionalRestore(COMPILER)
+    gguard.write(gmut.replace("\n", geol).encode("utf-8"))
     try:
         code, out = run_eval()
     finally:
-        _write(GUARD, gsrc_raw)      # bytes 级复原
-        _write(COMPILER, csrc_raw)
+        if not (gguard.restore() and cguard.restore()):
+            print("[!! 拒绝复原] 疑似并发改动，已保留磁盘现状", file=sys.stderr)
+            return False, []
     red = code != 0
     fails = block_after(out, "硬失败")
     print(f"    M4 降级为参考建议: exit={code}  硬失败明细={fails or '（无）'}")
@@ -297,12 +327,17 @@ def probe_golden_codify() -> None:
         return
     reds[0]["text"] = old_text + "（紧急时可酌情给出结论。）"
     eol = "\r\n" if "\r\n" in raw else "\n"
-    _write(bl, (_json.dumps(data, ensure_ascii=False, indent=2) + "\n")
-           .replace("\n", eol))
+    # 🛡️ 条件写回：黄金副本是REDLINE_ASSET，绝不无条件覆盖。
+    blguard = ConditionalRestore(bl)
+    blguard.write(
+        (_json.dumps(data, ensure_ascii=False, indent=2) + "\n")
+        .replace("\n", eol).encode("utf-8"))
     try:
         code, out = run_eval()
     finally:
-        _write(bl, raw)                # bytes 级复原
+        if not blguard.restore():
+            print("[!! 拒绝复原] 疑似并发改动，已保留磁盘现状", file=sys.stderr)
+            return
     fails = block_after(out, "硬失败")
     print(f"    只改黄金副本: exit={code}  硬失败明细={fails or '（无）'}")
     check("只改黄金副本 -> 变红（说明黄金副本确实在起作用）", code != 0,

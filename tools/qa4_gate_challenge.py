@@ -30,6 +30,17 @@
 每组变异都必须**复原**catalog.py；脚本退出前自检复原结果，
 任何一次复原失败立刻 exit 3（比门禁红更严重：工作区被污染了）。
 
+🛡️ 隔离说明
+-----------
+所有变异只发生在 :mod:`mutation_sandbox` 建立的**本次运行独有**的临时
+副本里，``ROOT`` / ``SERVER`` / ``CATALOG`` 等常量在导入期就已指向沙箱。
+**工作区 ``server/`` 全程只读。**
+
+改造前这里是「原地改写工作区+ ``finally`` 无条件写回」。无条件写回有个
+更隐蔽的危害：若测试窗口期内别的 agent 改了同一文件，那行``write_bytes``
+会把**对方的改动整段抹掉**。现在改为条件写回——内容不再等于我的变异版
+就跳过并报警。宁可人工介入，不可覆盖别人的工作。
+
 用法：
     python tools/qa4_gate_challenge.py
 """
@@ -42,8 +53,18 @@ import sys
 import tempfile
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent.parent
-SERVER = ROOT / "server"
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from mutation_sandbox import (  # noqa: E402
+    ConditionalRestore,
+    install_global_sandbox,
+)
+
+# 建立本次运行独有的沙箱；下面所有常量都指向副本而非工作区。
+_SB = install_global_sandbox("qa4_gate_challenge")
+
+ROOT = _SB.root
+SERVER = _SB.server
 CATALOG = SERVER / "app" / "persona" / "catalog.py"
 ASSERTIONS = SERVER / "evals" / "assertions.py"
 PY = sys.executable
@@ -110,11 +131,17 @@ def with_mutation(target: Path, old: str, new: str, label: str,
         check(f"{label}：变异前置条件命中", False,
               "目标片段已变，脚本需更新（这本身是提示：门禁脚本与代码漂移了）")
         return False
-    _write_exact(target, src_n.replace(old_n, new_n, 1).replace("\n", eol))
+    # 🛡️ 条件写回：只有内容仍等于我的变异版时才复原，否则跳过并报警。
+    # 绝不用``finally: write_bytes(src)`` —— 那会把并发者的改动整段抹掉。
+    guard = ConditionalRestore(target)
+    guard.write(
+        src_n.replace(old_n, new_n, 1).replace("\n", eol).encode("utf-8"))
     try:
         code, out = run_eval()
     finally:
-        _write_exact(target, src)             # 无条件复原（bytes，字节级一致）
+        if not guard.restore():
+            print("[!! 拒绝复原] 疑似并发改动，已保留磁盘现状", file=sys.stderr)
+            return False
     red = (code != 0)
     detail = f"exit={code}"
     if not red:
@@ -306,11 +333,15 @@ def _mutate_pairs(target: Path, pairs: list[tuple[str, str]]) -> bool:
     mut = src_n
     for old, new in pairs:
         mut = mut.replace(_norm(old), _norm(new), 1)
-    _write_exact(target, mut.replace("\n", eol))
+    # 🛡️ 条件写回（见 with_mutation 的说明）：禁止无条件复原。
+    guard = ConditionalRestore(target)
+    guard.write(mut.replace("\n", eol).encode("utf-8"))
     try:
         code, _out = run_eval()
     finally:
-        _write_exact(target, src)
+        if not guard.restore():
+            globals()["_LAST_CODE"] = 0
+            return False
     globals()["_LAST_CODE"] = code
     return True
 
@@ -354,19 +385,26 @@ def main() -> int:
     ceol = "\r\n" if "\r\n" in _read(comp) else "\n"
     if (_norm(ORIG_RENDER_HEAD_TAIL) in gsrc and _norm(ORIG_RENDER_TAIL) in gsrc
             and _norm(ORIG_SECTIONS) in csrc):
-        _write_exact(guard, gsrc.replace(_norm(ORIG_RENDER_HEAD_TAIL),
-                                         _norm(DEMOTED_RENDER_HEAD), 1)
-                            .replace(_norm(ORIG_RENDER_TAIL),
-                                     _norm(DEMOTED_RENDER_TAIL), 1)
-                            .replace("\n", geol))
-        _write_exact(comp, csrc.replace(_norm(ORIG_SECTIONS),
-                                        _norm(DEMOTED_SECTIONS), 1)
-                             .replace("\n", ceol))
+        gguard = ConditionalRestore(guard)
+        cguard = ConditionalRestore(comp)
+        gguard.write(
+            gsrc.replace(_norm(ORIG_RENDER_HEAD_TAIL),
+                         _norm(DEMOTED_RENDER_HEAD), 1)
+               .replace(_norm(ORIG_RENDER_TAIL),
+                        _norm(DEMOTED_RENDER_TAIL), 1)
+               .replace("\n", geol).encode("utf-8"))
+        cguard.write(
+            csrc.replace(_norm(ORIG_SECTIONS),
+                         _norm(DEMOTED_SECTIONS), 1)
+               .replace("\n", ceol).encode("utf-8"))
         try:
             code, _out = run_eval()
         finally:
-            _write_exact(guard, gsrc.replace("\n", geol))
-            _write_exact(comp, csrc.replace("\n", ceol))
+            # 🛡️ 条件写回：任一文件被第三方改动就拒绝覆盖并报警。
+            g_ok, c_ok = gguard.restore(), cguard.restore()
+            if not (g_ok and c_ok):
+                print("[!! 拒绝复原] 疑似并发改动，已保留磁盘现状", file=sys.stderr)
+                code = 0
         check("M4 红线降级为「参考建议」并挪到中段-> 期望变红（位置+黑名单挡）",
               code != 0, f"exit={code}")
     else:
