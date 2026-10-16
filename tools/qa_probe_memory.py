@@ -15,6 +15,17 @@
 用法：
     "C:/Users/Administrator/.workbuddy/binaries/python/envs/elder/Scripts/python.exe" \
         tools/qa_probe_memory.py
+
+并发/代理防护（后补）
+--------------------
+原先端口硬写 ``8123``，与 ``qa3_false_green`` / ``qa4_dirty_all_readpoints``
+**完全相同** —— 三个脚本并行跑必然撞车。本脚本尤其不能撞：它启动的是
+``_BOOTSTRAP`` 假模型客户端（``ELDER_MEMORY_FAKE_CLIENT``），一旦连上别人的
+服务，记忆抽取/检索全部走**别人的模型与别人的 DB**，而断言却按「确定性假
+模型」的预期来判-> 结果既可能假绿也可能假红，且**极难归因**。
+
+两处根因都已修掉：端口改由 ``smoke_ports.resolve_port()`` 分配，
+本地请求走模块级 ``_OPENER``（``ProxyHandler({})`` 显式禁用环境代理）。
 """
 from __future__ import annotations
 
@@ -28,9 +39,29 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from smoke_ports import (  # noqa: E402  (需先补 sys.path)
+    detect_addr_in_use,
+    guard_or_die,
+    guard_port,
+    release_port,
+    resolve_port,
+)
+
 ROOT = Path(__file__).resolve().parent.parent
 SERVER = ROOT / "server"
 PY = sys.executable
+
+# --------------------------------------------------------------------------
+# 本地请求一律绕过环境代理
+# --------------------------------------------------------------------------
+# ``urllib.request.urlopen`` 会走**全局** ProxyHandler，而它读 ``http_proxy`` /
+# ``HTTP_PROXY`` 环境变量。本机设了 ``http_proxy=http://127.0.0.1:49710``，
+# 于是所有指向 127.0.0.1 的请求被绕到代理一跳 —— 表现为「偶发 60s 超时」。
+# 本脚本对超时尤其敏感（记忆检索要连发多次），偶发超时会让5g/5c 这类
+# 缓存一致性断言变成**随机假红**。``ProxyHandler({})`` = 空表= 显式禁用代理。
+_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 DB_PATH = Path(os.environ.get(
     "QA_PROBE_DB",
@@ -38,7 +69,8 @@ DB_PATH = Path(os.environ.get(
 if DB_PATH.exists():
     DB_PATH.unlink()
 
-PORT = int(next((a for a in sys.argv[1:] if a.isdigit()), 8123))
+# 端口来自唯一真源（不再硬写 8123）；--port N / 裸位置参数仍可覆盖（CI 依赖）。
+PORT = resolve_port("qa_probe_memory")
 BASE = f"http://127.0.0.1:{PORT}"
 
 results: list[tuple[str, bool, str]] = []
@@ -56,7 +88,7 @@ def req(method: str, path: str, body: dict | None = None, token: str | None = No
     if token:
         r.add_header("Authorization", "Bearer " + token)
     try:
-        with urllib.request.urlopen(r, timeout=60) as resp:
+        with _OPENER.open(r, timeout=60) as resp:
             raw = resp.read().decode("utf-8")
             return resp.status, (json.loads(raw) if raw else None)
     except urllib.error.HTTPError as e:
@@ -87,8 +119,29 @@ def main() -> int:
     env["ELDER_SCHEDULER_INTERVAL"] = "3600"
     env["PYTHONIOENCODING"] = "utf-8"
     env["ELDER_MEMORY_FAKE_CLIENT"] = "1"
+    # 只把回环豁免出代理（保留出网能力），见 qa3_false_green.spawn 同款说明。
+    env["NO_PROXY"] = "127.0.0.1,localhost" + (
+        f",{env['no_proxy']}" if env.get("no_proxy") else "")
+    env["no_proxy"] = env["NO_PROXY"]
+
+    # ---- 防线①（+② 占位收尾）：端口被占就立刻退出，一个服务都不起----
+    # 本脚本对「连错服务」最敏感：它断言的是**确定性假模型**下的记忆行为，
+    # 一旦连上别人的服务，抽取/检索走的是别人的模型与别人的 DB，
+    # 5c/5d/5g 这类缓存一致性断言会变成无法归因的随机结果。
+    #
+    # ⚠️ 三道防线合起来**仍不是绝对保证**：「检查通过」到「uvicorn 真正
+    # bind」之间存在不可消除的竞态窗口。真正的绝对保证是服务端启动时生成
+    # run_id、由 /api/health 回传、本脚本比对身份（需改生产代码，留待下一轮）。
+    # **不要因为加了预检就认为并发跑已经安全。**
+    guard_or_die(PORT, "qa_probe_memory.py")
 
     print(f"[boot] starting server on :{PORT} (db: {DB_PATH})")
+    # ---- 防线②：起服务前重新占位，把「检查 -> Popen」的窗口压到最小----
+    hold, hint = guard_port(PORT)
+    if hold is None:
+        print(f"[boot] {hint}")
+        return 1
+    release_port(hold, PORT)
     proc = subprocess.Popen(
         [PY, "-c", _BOOTSTRAP, str(PORT)],
         cwd=str(SERVER), env=env,
@@ -99,6 +152,12 @@ def main() -> int:
         if not wait_ready():
             out = proc.stdout.read() if proc.stdout else ""
             print("[boot] server did not become ready:\n" + out[-3000:])
+            # ---- 防线③：not ready 且输出里有「地址被占」-> 是端口冲突，
+            # 不是代码回归，两者处置完全不同，必须区分开。----
+            if detect_addr_in_use(out):
+                print(f"[boot] ✗ 结论：**端口 {PORT} 被占**，本脚本未起服务、"
+                      f"结果不可信。")
+                print("[boot]   换端口重跑：python tools/qa_probe_memory.py <其它端口>")
             return 1
         print("[boot] ready\n")
 

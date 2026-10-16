@@ -23,6 +23,24 @@ B. 归一是「防御」还是「静默吞掉」
 
 用法：
     python tools/qa4_dirty_all_readpoints.py
+
+并发/代理防护（后补）
+--------------------
+原先本脚本端口硬写 ``8123``，与 ``qa3_false_green`` / ``qa_probe_memory``
+**完全相同** —— 三个脚本并行跑必然撞车。撞车症状极具误导性：后起者的
+uvicorn bind 失败（WinError 10048）而进程不退出，本脚本的 ``wait_ready()``
+只探 ``/api/health``，于是探到**别人的服务** -> 全部断言打在别人身上、
+用**自己那个从未初始化的 DB**，症状是「断言数诡异地少了一截」。
+
+实测（改造前，坏代理下并行跑本脚本与 qa3_false_green）::
+
+    ERROR: [Errno 10048] error while attempting to bind on address
+           ('127.0.0.1', 8123): [winerror 10048] 通常每个套接字地址...
+    [boot] not ready:
+    exit=1
+
+两处根因都已修掉：端口改由 ``smoke_ports.resolve_port()`` 分配，
+本地请求走模块级 ``_OPENER``（``ProxyHandler({})`` 显式禁用环境代理）。
 """
 from __future__ import annotations
 
@@ -38,14 +56,35 @@ import urllib.request
 from contextlib import contextmanager
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from smoke_ports import (  # noqa: E402  (需先补 sys.path)
+    detect_addr_in_use,
+    guard_or_die,
+    guard_port,
+    release_port,
+    resolve_port,
+)
+
 ROOT = Path(__file__).resolve().parent.parent
 SERVER = ROOT / "server"
 PY = sys.executable
 
+# --------------------------------------------------------------------------
+# 本地请求一律绕过环境代理
+# --------------------------------------------------------------------------
+# ``urllib.request.urlopen`` 会走**全局** ProxyHandler，而它读 ``http_proxy`` /
+# ``HTTP_PROXY`` 环境变量。本机设了 ``http_proxy=http://127.0.0.1:49710``，
+# 于是所有指向 127.0.0.1 的请求被绕到代理一跳 —— 表现就是「有时 25s 超时」，
+# 偶发、极难定位，是本项目间歇性超时的真正根因。
+# ``ProxyHandler({})`` = 空代理表 = 显式禁用代理。
+_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
 DB_PATH = Path(tempfile.gettempdir()) / f"elder_qa4_dirty_{os.getpid()}.db"
 if DB_PATH.exists():
     DB_PATH.unlink()
-PORT = int(next((a for a in sys.argv[1:] if a.isdigit()), 8123))
+# 端口来自唯一真源（不再硬写 8123）；--port N / 裸位置参数仍可覆盖（CI 依赖）。
+PORT = resolve_port("qa4_dirty_all_readpoints")
 BASE = f"http://127.0.0.1:{PORT}"
 
 results: list[tuple[str, bool, str]] = []
@@ -64,7 +103,7 @@ def req(method: str, path: str, body: dict | None = None, token: str | None = No
     if token:
         r.add_header("Authorization", "Bearer " + token)
     try:
-        with urllib.request.urlopen(r, timeout=25) as resp:
+        with _OPENER.open(r, timeout=25) as resp:
             raw = resp.read().decode("utf-8")
             return resp.status, (json.loads(raw) if raw else None)
     except urllib.error.HTTPError as e:
@@ -147,8 +186,31 @@ def main() -> int:
     env["ELDER_JWT_SECRET"] = "qa4-dirty"
     env["ELDER_SCHEDULER_INTERVAL"] = "3600"
     env["PYTHONIOENCODING"] = "utf-8"
+    # 只把回环豁免出代理（保留出网能力），见qa3_false_green.spawn 同款说明。
+    env["NO_PROXY"] = "127.0.0.1,localhost" + (
+        f",{env['no_proxy']}" if env.get("no_proxy") else "")
+    env["no_proxy"] = env["NO_PROXY"]
+
+    # ---- 防线①（+② 占位收尾）：端口被占就立刻退出，一个服务都不起----
+    # 必须在**起子服务之前**：否则本脚本会连上别人的服务，用自己从未
+    # 初始化的 DB 把断言跑成假绿（这正是本脚本要覆盖的脏数据读点全铺场景，
+    # 一旦连错服务，A1「无任何 5xx」会因数据不对而变成不可解释的失败）。
+    #
+    # ⚠️ 三道防线合起来**仍不是绝对保证**：「检查通过」到「uvicorn 真正
+    # bind」之间存在不可消除的竞态窗口。真正的绝对保证是服务端启动时生成
+    # run_id、由 /api/health 回传、本脚本比对身份（需改生产代码，留待下一轮）。
+    # **不要因为加了预检就认为并发跑已经安全。**
+    guard_or_die(PORT, "qa4_dirty_all_readpoints.py")
 
     print(f"[boot] server :{PORT} db={db_url}")
+    # ---- 防线②：起服务前重新占位，把「检查 -> Popen」的窗口压到最小----
+    # guard_or_die 内部已经做过一次占位并立即释放；这里在**紧邻 Popen** 的
+    # 位置再占一次，让检查与真正 bind 之间尽可能短。
+    hold, hint = guard_port(PORT)
+    if hold is None:
+        print(f"[boot] {hint}")
+        return 1
+    release_port(hold, PORT)
     proc = subprocess.Popen(
         [PY, "-m", "uvicorn", "app.main:app", "--host", "127.0.0.1",
          "--port", str(PORT), "--log-level", "error"],
@@ -159,6 +221,14 @@ def main() -> int:
         if not wait_ready():
             out = proc.stdout.read() if proc.stdout else ""
             print("[boot] not ready:\n" + out[-3000:])
+            # ---- 防线③：not ready 且输出里有「地址被占」-> 是端口冲突，
+            # 不是代码回归。两者的处置完全不同，必须区分开。----
+            if detect_addr_in_use(out):
+                print(f"[boot] ✗ 结论：**端口 {PORT} 被占**，本脚本未起服务、"
+                      f"结果不可信。")
+                print("[boot]   换端口重跑：python tools/qa4_dirty_all_readpoints.py "
+                      "<其它端口>")
+                return 1
             return 1
         print("[boot] ready\n")
 

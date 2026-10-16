@@ -99,8 +99,9 @@ jobs:
       # MySQL 侧由 qa3_migration 的 T6（MySQL DDL 静态体检）
       # 加上 mysql-smoke job 里 smoke_server/smoke_roles 的真实 MySQL 往返共同覆盖。
       #
-      # 端口：qa3_r2_restart=8188、qa3_device_binding=8199（qa3_migration 不起服务）。
-      # 两者都在 smoke_ports.py 的 8100-8106 段之外，与冒烟端口表无冲突（已核）。
+      # 端口：三个脚本都不占冒烟端口段 —— qa3_r2_restart=8113、
+      # qa3_device_binding=8114（qa3_migration 不起服务），
+      # 均由 tools/smoke_ports.py 统一登记，与冒烟的 8100-8106 无冲突。
       - name: 重启不变式（回填不改角色归属）
         run: python tools/qa3_r2_restart.py
 
