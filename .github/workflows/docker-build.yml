@@ -65,7 +65,7 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: 构建镜像（本地加载，用于冒烟）
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: ./server
           file: ./server/Dockerfile
