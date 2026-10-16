@@ -17,6 +17,7 @@ import tempfile
 import time
 import urllib.error
 import urllib.request
+from datetime import date, timedelta
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -280,6 +281,27 @@ def main() -> int:
                    and bool(sync.get("server_time")))
         check("设备心跳同步（规则+排期+形象+AI配置）", ok_sync,
               f"reminders={len(sync.get('reminders', []))} upcoming={len(sync.get('upcoming', []))}")
+
+        # 上面那条 upcoming>=1 只能顺带发现「排期恒空」，且**依赖运行当天的星期几**：
+        # 本用例的规则是「每周一三五」，只有当天下一次触发落在 36h 窗口外时才红
+        # （周六跑就红，周一到周五跑都绿）。所以它不是可靠的看门狗。
+        # 下面这条与星期无关：造一条「一次性、10 天后」的规则，它的下一次触发必然
+        # 在 SCHEDULE_AHEAD_HOURS(36h) 之外，任何 materialize 窗口都装不下它 ——
+        # 若心跳不给它兜底补一次触发，真机就永远不知道该在那天响铃。
+        far_day = (date.today() + timedelta(days=10)).isoformat()
+        code, far_rm = req("POST", f"/api/reminders?device_pk={dev_pk}", {
+            "title": "远期复查", "speak_text": "该去复查了", "schedule_kind": 0,
+            "times_of_day": ["09:00"], "once_date": far_day,
+        }, token)
+        check("创建远期一次性提醒（10 天后）", code == 201, str(code))
+        code, sync2 = req("POST", "/api/device/sync", {}, dev_token)
+        far_due = sync2.get("upcoming", []) if isinstance(sync2, dict) else []
+        far_ok = (code == 200 and any(
+            e.get("reminder_id") == far_rm.get("id")
+            and str(e.get("due_at", "")).startswith(far_day)
+            for e in far_due if isinstance(e, dict)))
+        check("远期触发也随心跳下发（排期视野兜底）", far_ok,
+              f"once={far_day} code={code} upcoming={[e.get('due_at') for e in far_due if isinstance(e, dict)]}")
 
         # ---------------------------------------------------- 10. 提醒回执
         code, ev = req("POST", "/api/device/events", {

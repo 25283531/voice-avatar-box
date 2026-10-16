@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 from datetime import timedelta
+from datetime import timezone as dt_timezone
 from typing import Any
 
 from fastapi import APIRouter, Depends, Request, status
@@ -26,7 +27,7 @@ from ..llm_gateway import resolve_row
 from ..membership import quota_snapshot
 from ..model_catalog import DEVICE_KINDS, KIND_LLM
 from ..models import EventState, Interaction, ReminderEvent, utcnow
-from ..schedule import local_now, materialize_events
+from ..schedule import local_now, materialize_events, next_occurrence
 from ..schemas import (
     AvatarOut,
     DeviceQuotaOut,
@@ -89,7 +90,7 @@ def sync(request: Request, fw_version: str = "", db: Session = Depends(get_db),
                                       models.Reminder.enabled.is_(True))
     ).all()
     now = local_now()
-    upcoming = db.scalars(
+    upcoming = list(db.scalars(
         select(ReminderEvent)
         .where(ReminderEvent.device_id == dev.id,
                ReminderEvent.state == int(EventState.PENDING),
@@ -97,7 +98,48 @@ def sync(request: Request, fw_version: str = "", db: Session = Depends(get_db),
                ReminderEvent.due_at <= now + timedelta(hours=SCHEDULE_AHEAD_HOURS))
         .order_by(ReminderEvent.due_at)
         .limit(200)
-    ).all()
+    ).all())
+
+    # 补齐「视野内一条实例都没有」的规则，让每条启用规则至少有一次触发随心跳下发。
+    #
+    # 为什么需要：SCHEDULE_AHEAD_HOURS(36h) 对「每天」类规则总是够用（相邻两次触发
+    # 最多隔 24h），但对周/月级规则可能一条都装不下 —— 「每周一三五」的规则在周六看，
+    # 下一次触发（周一 08:00）远在 35h 之外，materialize_events 建不出任何实例，
+    # upcoming 就是空数组。设备此时完全不知道下次该什么时候响铃，
+    # 本模块开头承诺的「一次拿全提醒排期」落空（老人也看不到下次服药时间）。
+    #
+    # 为什么逐条补、而不是直接放大 hours：SCHEDULE_AHEAD_HOURS 一放大，
+    # 「每天 3 次」的规则会一次性灌进几百条实例，而响应侧 .limit(200) 会截断，
+    # 排期表和载荷都跟着膨胀。逐条补最多每条规则 +1 条，代价恒定。
+    covered = {e.reminder_id for e in upcoming}
+    created = False
+    for r in rules:
+        if r.id in covered:
+            continue
+        nxt = next_occurrence(r, now)
+        if nxt is None:
+            continue
+        ev = db.scalar(
+            select(ReminderEvent).where(
+                ReminderEvent.reminder_id == r.id, ReminderEvent.due_at == nxt
+            )
+        )
+        if ev is None:
+            ev = ReminderEvent(reminder_id=r.id, device_id=dev.id, due_at=nxt,
+                               state=int(EventState.PENDING))
+            db.add(ev)
+            created = True
+        elif ev.state != int(EventState.PENDING):
+            # 已响铃/已确认/已超时的实例不重排：重复下发会让老人重复响铃。
+            continue
+        upcoming.append(ev)
+        covered.add(r.id)
+    if created:
+        db.commit()
+    # 统一按 UTC 排序键排：窗口查出来的行 due_at 是 SQLite 回读的「墙上时间」(naive)，
+    # 刚 db.add 的对象还是 schedule 生成的 aware 值，直接排序会抛
+    # TypeError: can't compare offset-naive and offset-aware datetimes。
+    upcoming.sort(key=lambda e: e.due_at.replace(tzinfo=dt_timezone.utc))
 
     avatar = db.get(models.Avatar, dev.avatar_id) if dev.avatar_id else None
     # ⚠️⚠️ 下面这条查询是本项目最敏感的一行，**绝对不要**加 owner 或 record_type 条件。
