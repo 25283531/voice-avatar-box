@@ -485,10 +485,17 @@ def main() -> int:
         d2_id = d2.get("id", 0)
         check("第二次派生成功", code == 201 and bool(d2_id), f"code={code}")
         prompt_before = d2.get("system_prompt")
-        code, _ = req("PATCH", f"/api/roles/{preset_id}",
-                      {"name": "小暖（平台预设）· 已改", "system_prompt": "母版被改了"},
-                      admin)
-        check("管理员改母版 -> 200", code == 200, f"code={code}")
+        # ⚠️ 改母版必须走**管理端** `/api/admin/presets/{pk}`。
+        # 用户端 `PATCH /api/roles/{pk}` 对 preset 自PR #19 起一律 403
+        # （`reject_preset_write`：它是审计旁路，且只传 name 会连带清空
+        # description/system_prompt/tts_voice）—— 见
+        # docs/架构设计-人格预设运营后台.md §3.5 / 断言 T31。
+        # 本用例要验的是**派生角色不受母版改动影响**，与"从哪个端点改母版"
+        # 无关，所以换成唯一合法的写路径，用例意图不变。
+        code, _ = req("PATCH", f"/api/admin/presets/{preset_id}",
+                      {"name": "小暖（平台预设）· 已改",
+                       "system_prompt": "母版被改了"}, admin)
+        check("管理员经管理端改母版 -> 200", code == 200, f"code={code}")
         code, d2_after = req("GET", f"/api/roles/{d2_id}", token=u1)
         check("INV-1 母版被改后，已派生角色的 system_prompt 不变",
               d2_after.get("system_prompt") == prompt_before,
@@ -496,7 +503,7 @@ def main() -> int:
         check("INV-1 母版改动不影响派生角色名",
               d2_after.get("name") == "第二个派生", str(d2_after.get("name")))
         # 还原母版，避免影响后续用例
-        req("PATCH", f"/api/roles/{preset_id}",
+        req("PATCH", f"/api/admin/presets/{preset_id}",
             {"name": "小暖（平台预设）", "system_prompt": prompt_before}, admin)
 
         # ==================================================== 6. INV-2 越权矩阵

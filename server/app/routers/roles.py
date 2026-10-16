@@ -88,6 +88,53 @@ def _spec_of(db: Session, row: models.AIProvider):
     return spec
 
 
+def reject_preset_write(row: models.AIProvider) -> None:
+    """**平台人格预设**只能从管理端改，走用户端一律 403（断言 T31 守）。
+
+    为什么需要它
+    --------------------------------------------------------
+    ``require_role(write=True)`` 对 preset 放行管理员
+    （``models.AIProvider.can_write``：``preset -> bool(user.is_admin)``），
+    所以**管理员能从用户端改平台预设**。这件事本身是有意设计
+    （APP 侧历史上就是这么用的），但它与本轮引入的
+    ``admin_preset_audits`` 组合起来就成了**审计旁路**：
+
+        用户端 PATCH（不写审计）  +  管理端 PATCH（写审计）
+
+    ⇒ 审计表声称「记录了平台预设的每一次改动」，而实际上有一条谁都能走、
+    零留痕的旁路。**一张能被绕过的审计表等于没有审计表** ——
+    这与本轮堵掉 ``guardrails/soft`` 的理由是同一条（设计 §3.5）。
+
+    ⚠️ **这里比 ``guardrails/soft`` 更严重**：那条只影响软约束（勾选制、
+    7 条白名单）；这条影响 ``update_role`` 覆盖的**全部主字段**
+    （name / description / system_prompt / tts_voice / avatar_id / traits），
+    而 preset 是全平台共享行 ⇒ 一次误操作影响**所有用户的角色列表**。
+
+    ⚠️⚠️ 连带清空的坑（QA 独立复现、本轮实跑确认）
+    ------------------------------------------------
+    ``RoleIn`` 里 ``description`` / ``system_prompt`` / ``tts_voice``
+    都有默认值 ``""``，而 ``update_role`` 对它们是**无条件整体覆写**
+    （只有 ``name`` 写作 ``if payload.name``）。所以：
+
+        PATCH {"name": "只改了名字"}   ← 只传一个字段
+
+    会把 description / system_prompt / tts_voice **全部清空**，
+    且 ``admin_preset_audits`` 里**一条记录都不会留**。
+
+    这是「PATCH 用默认值表示未提供」与「无条件整体覆写」两个
+    **各自都合理**的设计凑在一起产生的组合缺陷 —— 任何一方单独看都没错。
+    正因如此**堵写入口比修默认值更彻底**：只要 preset 不能从这里改，
+    清空就无从发生；而修默认值会改动**所有**用户角色的 PATCH 语义
+    （那是 APP 已依赖的契约）。
+
+    :raises HTTPException: 目标是 preset 时 403。
+    """
+    if row.is_preset():
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            "平台人格预设请在管理端调整（人格预设 → 编辑），用户端不支持修改")
+
+
 class _CandidateRow:
     """``from_row`` 的输入替身：只提供它读到的那几个属性。
 
@@ -492,8 +539,23 @@ def update_role(role_pk: int, payload: RoleIn, db: Session = Depends(get_db),
     —— 不是靠"校验时忽略非法字段"，而是没有这个字段可传。
     这比任何校验都可靠：绕过接口直接改库也没用，因为编译时一律用常量再生
     （见 persona/guardrails.py）。
+
+    ⚠️⚠️ **平台人格预设一律 403**（本轮新增，断言 T31 守）
+    ------------------------------------------------
+    目标为 preset 时整个端点拒绝，理由与危害见
+    :func:`reject_preset_write`。一句话版本：这里放行 admin，
+    而本函数对 ``description`` / ``system_prompt`` / ``tts_voice``
+    是**无条件整体覆写**（``RoleIn`` 里它们的默认值是 ``""``），
+    所以 admin 误传 ``{"name": "..."}`` 就会**把三者全清空**，
+    且不留任何审计 —— 全平台共享行被清空，影响所有用户。
+
+    影响面：preset 的用户端写入口**目前没有任何 UI**
+    （管理台改走 /api/admin/presets，APP 未接角色编辑），实际调用方为零。
+    为什么是 403 而不是 404：这是**产品规则**不是安全边界，
+    与 preset 的 DELETE / guardrails/soft 返回 403 同理。
     """
     row = require_role(db, role_pk, user, write=True)
+    reject_preset_write(row)
     if row.deleted_at is not None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "角色不存在")
 
@@ -802,12 +864,15 @@ def toggle_soft_guardrail(role_pk: int, payload: GuardrailIn, db: Session = Depe
     为什么是 403 而不是 404：这是**产品规则**不是安全边界 ——
     "平台预设的软约束归管理端管"这条规则本身就是要给管理员看的，
     与 preset 的 DELETE 返回 403 同理（``deps`` 模块注释已论证过这个例外）。
+
+    ⚠️ 判定与理由统一收在 :func:`reject_preset_write` 里，与
+    ``update_role`` 共用**同一个守卫函数** —— 这是刻意的：
+    两处各写一遍 ``if row.is_preset(): raise 403`` 的话，改了一处忘了另一处
+    就是下一个旁路，而这种旁路**不会被任何断言抓到**（因为断言通常只盯
+    其中一个入口）。收在一处后，" preset 的用户端写入口"就有了唯一清单。
     """
     row = require_role(db, role_pk, user, write=True)
-    if row.is_preset():
-        raise HTTPException(
-            status.HTTP_403_FORBIDDEN,
-            "平台预设的软约束请在管理端调整（人格预设 → 编辑 → 家属额外要求）")
+    reject_preset_write(row)
     try:
         row.guardrails = guardrails.toggle_soft(row.guardrails, payload.guardrail_id,
                                                 bool(payload.enabled))

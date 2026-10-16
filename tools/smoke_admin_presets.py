@@ -1,25 +1,32 @@
 """管理端 · **平台人格预设运营后台**冒烟（``/api/admin/presets``）。
 
-这个脚本存在的理由不是"再测一遍接口"，而是把**六条边界钉成可执行的断言**。
-每条断言在名字里带编号（T01..T30），与 ``docs/架构设计-人格预设运营后台.md``
+这个脚本存在的理由不是"再测一遍接口"，而是把**七条边界钉成可执行的断言**。
+每条断言在名字里带编号（T01..T31），与 ``docs/架构设计-人格预设运营后台.md``
 §8.2 的清单一一对应 —— 将来对不上时，**以设计文档为准**，因为那里记着
 每条断言"防的是哪类事故"。
 
-================================ 六条边界 =================================
+================================ 七条边界 =================================
 
 1. **鉴权先于取行**：非管理员一律 403，**连不存在的 pk 也是 403**（T01-T03）。
    反过来先取行再判权限，403 与 404 的差异就能把主键空间摸一遍。
 2. **可改字段只有 5 个**：靠 ``PresetPatchIn`` 里**没有该字段**来锁，
    不是靠"校验时忽略"（T06/T07）。白名单式的 schema 锁比黑名单可靠一个数量级。
-3. **红线与 tokens 绝不出库**：展示只走 ``guardrails.card_items``（T09/T10）。
+3. **用户端对 preset 只读**：``PATCH /api/roles/{pk}`` 与
+   ``POST /api/roles/{pk}/guardrails/soft`` 对 preset 一律 403（T23 / T31）。
+   这两条是**审计旁路**—— 走它们能改平台预设却不留任何痕迹，
+   而preset 是全平台共享行。更严重的是 ``PATCH /api/roles/{pk}``：
+   ``RoleIn`` 里三个字段默认 ``""`` 而 ``update_role`` 无条件整体覆写，
+   所以只传 ``{"name": ...}`` 就会**把description / system_prompt /
+   tts_voice 全清空**（T31-b 用DB 快照逐字守这条）。
+4. **红线与 tokens 绝不出库**：展示只走 ``guardrails.card_items``（T09/T10）。
    ``regenerate_locked`` 多返回一个 ``tokens``，那是 ``assert_present()``
    做 fail-closed 自检的判定基准 —— 泄漏它等于把"门禁怎么判"交出去。
-4. **审计与业务写同事务**：4 个写入点逐一验证（T18/T20/T24/T25）。
+5. **审计与业务写同事务**：4 个写入点逐一验证（T18/T20/T24/T25）。
    审计丢一次就永远丢了 —— 那等于没有审计。
-5. **启动期净改动 = 0**：运营改的值必须活过重启（T14），下架的预设不能
+6. **启动期净改动 = 0**：运营改的值必须活过重启（T14），下架的预设不能
    在重启后凭空多出一个新的（T27）。这两条是本设计**最重要的回归断言**：
    一旦破坏，运营的所有调优会在下次重启时静默消失，而库里会堆积重复的"小暖"。
-6. **preview 不落库**（T21）："预览"一旦落库就变成"草稿"，
+7. **preview 不落库**（T21）："预览"一旦落库就变成"草稿"，
    用户以为没保存其实改了。
 
 ⚠️ **为什么全部从外部走 HTTP**：越权与"schema 里没有该字段"这两类问题的
@@ -234,6 +241,36 @@ def _raw_column(table: str, pk: int, column: str, value):
         eng.dispose()
 
 
+def _db_preset_snapshot(pk: int) -> dict | None:
+    """**直连 DB** 读一条 preset 行的关键列，返回 ``None`` 表示读不到。
+
+    为什么T31-b 一定要用 DB 快照而不是再 GET 一次接口
+    --------------------------------------------------
+    "有没有被连带清空"这件事必须以**库里的字节**为准。若改成再 GET 一次
+    ``/api/admin/presets/{pk}``，就变成"用管理端的读口径去证明用户端的写
+    没生效"—— 万一某天管理端读路径也出了bug（比如把空值渲染成默认值），
+    断言会因为**两边一起错**而绿。这类"用同一份实现互相印证"的断言在
+    QA 评审里被明确点过名（T10 起初就是栽在这类自证上）。
+
+    另外 PATCH 响应体里压根没有那些字段（403 时更没有），从响应里比是比不出来的。
+    """
+    db_url = os.environ.get("ELDER_DB", "").strip() or f"sqlite:///{DB_PATH.as_posix()}"
+    if not db_url.startswith("sqlite"):
+        return None
+    from sqlalchemy import create_engine, text
+
+    eng = create_engine(db_url)
+    try:
+        with eng.connect() as conn:
+            row = conn.execute(
+                text("SELECT id, name, description, system_prompt, tts_voice,"
+                     " deleted_at, archived_at FROM ai_providers WHERE id = :i"),
+                {"i": pk}).mappings().first()
+        return dict(row) if row is not None else None
+    finally:
+        eng.dispose()
+
+
 def main() -> int:
     external_db = os.environ.get("ELDER_DB", "").strip()
     db_url = external_db or f"sqlite:///{DB_PATH.as_posix()}"
@@ -395,6 +432,73 @@ def main() -> int:
                 w13_ok = False
         check("W13 number 型 value 是档位**上界**（末项==max 且递增）",
               w13_ok, str([[o["value"] for o in s["options"]] for s in num_specs]))
+
+        # ==================================================== T31 用户端写入口堵死
+        print("── T31 用户端 PATCH 不能改 preset（审计旁路 + 连带清空）──")
+        # 先把 preset 调成"运营调优过"的状态，才测得出"连带清空"
+        req("PATCH", f"/api/admin/presets/{pk}", {
+            "name": "小暖（平台预设）", "description": "运营写的简介",
+            "system_prompt": "母版人格提示词（运营调优过）",
+            "tts_voice": "zh-CN-XiaoyiNeural"}, admin)
+        # ⚠️ 基线取自**DB 快照**而非再 GET 一次管理端接口，理由见
+        # _db_preset_snapshot 的 docstring（"用同一份实现互相印证"会让
+        # 断言在两边一起错时变绿）。
+        snap_before = _db_preset_snapshot(pk)
+        n_audit_t31 = len(req("GET", f"/api/admin/presets/{pk}/audits?limit=200",
+                              token=admin)[1] or [])
+        # T31-d：**只传 name** —— 这个 body 本身就是触发清空的那个组合
+        #（RoleIn 里 description/system_prompt/tts_voice 默认 ""，
+        #  而 update_role 对它们是无条件整体覆写）。
+        # 所以这条断言必须用这个 body，用完整 body 反而测不到清空路径。
+        code, body = req("PATCH", f"/api/roles/{pk}", {"name": "只改了名字"}, admin)
+        check("T31-a ★ admin 走用户端 PATCH preset -> 403",
+              code == 403, f"code={code} {str(body)[:60]}")
+        check("T31-a detail 是中文**字符串**且指向管理端",
+              isinstance(body, dict) and isinstance(body.get("detail"), str)
+              and "管理端" in body["detail"],
+              repr(body.get("detail") if isinstance(body, dict) else None))
+        # T31-b：**DB 快照**逐字比对，不看 PATCH 响应体（403 响应里没有这些字段）
+        snap_after = _db_preset_snapshot(pk)
+        watched = ("name", "description", "system_prompt", "tts_voice",
+                   "deleted_at", "archived_at")
+        changed = ([] if snap_before is None or snap_after is None else
+                   [k for k in watched if snap_before.get(k) != snap_after.get(k)])
+        check("T31-b ★ DB 快照逐字未变（description/system_prompt/tts_voice "
+              "任一被清空即红；只看 403 抓不到，因为清空发生在 200 分支里）",
+              bool(snap_before) and bool(snap_after) and not changed,
+              f"变化列={changed}")
+        # T31-c：审计条数前后不增加 —— 审计旁路的直接证据
+        n_audit_after = len(req("GET", f"/api/admin/presets/{pk}/audits?limit=200",
+                                token=admin)[1] or [])
+        check("T31-c ★ 这次调用未新增任何审计记录"
+              "（走审计的路径必然会留痕；一条不留 = 绕过了审计）",
+              n_audit_after == n_audit_t31,
+              f"{n_audit_t31} -> {n_audit_after}")
+        # T31-e：非 admin 对 preset 的**同一条** PATCH。
+        # ⚠️ 实测口径是 404 而不是 403，这里如实断言 404 并把理由钉住，
+        # 免得将来有人按"preset 的 DELETE / soft 都返 403"的类比把它改成 403：
+        #   require_role(write=True) 先跑，can_write(preset) 对非 admin 直接
+        #   False⇒ 在 deps.py:111 就raise 404 了，**根本走不到 reject_preset_write**。
+        # 而 deps.py:75-76 论证的那个 403 例外只针对"这条产品规则本身要给用户看"
+        # 的场景（DELETE / soft 有明确的用户可见提示语）；越权访问 preset 主键
+        # 沿用"一律 404、不泄露主键存在性"的规则，与 preset 无关。
+        # ⇒ 403 只对**已通过鉴权**的 admin 成立（= T31-a），这里守的是另一半。
+        code, _ = req("PATCH", f"/api/roles/{pk}", {"name": "x"}, u1)
+        check("T31-e 非 admin 走同一条 PATCH 是 404（越权一律 404；"
+              "403 例外只给 admin —— 非 admin 在 deps 层就被拦，走不到守卫）",
+              code == 404, f"code={code}")
+        # 反向自检：这条断言组确实是因为守卫而红，不是恒绿
+        code, own_role = req("POST", "/api/roles",
+                             {"name": "我自己的角色", "system_prompt": "我的话"}, u1)
+        own_id = own_role.get("id", 0) if isinstance(own_role, dict) else 0
+        code, patched_own = req("PATCH", f"/api/roles/{own_id}",
+                                {"name": "改名了", "system_prompt": "改过了"}, u1)
+        check("T31 反向自检：**自己的普通角色仍然能正常 PATCH 且不牵连清空"
+              "（守卫不能误伤正常路径，否则这条断言会因为'全都 403'而绿）",
+              code == 200
+              and patched_own.get("name") == "改名了"
+              and patched_own.get("system_prompt") == "改过了",
+              f"code={code}")
 
         # ==================================================== T21-T22 preview
         print("── T21-T22 preview 不落库且 fail-closed ──")
