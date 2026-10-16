@@ -71,6 +71,8 @@ __all__ = [
     "EXIT_CONTAMINATED",
     "MutationSandbox",
     "SandboxFile",
+    "ConditionalRestore",
+    "install_global_sandbox",
     "sha256_bytes",
 ]
 
@@ -739,3 +741,121 @@ class MutationSandbox:
 def workspace_md5(relpath: str) -> str:
     """返回工作区某文件的 md5（诊断用，短摘要）。"""
     return hashlib.md5((WORKSPACE / relpath).read_bytes()).hexdigest()
+
+
+class ConditionalRestore:
+    """给「已经以裸 :class:`~pathlib.Path` 操作」的脚本用的条件写回包装。
+
+    用途
+    ----
+    有一批脚本内部到处传``Path`` 对象（``CATALOG`` / ``BASELINE`` …），
+    把它们全部改写成 :class:`SandboxFile` 会引入大量无关改动。改法是
+    **只替换写回那一行**：把
+
+        p.write_bytes(mutated)
+        try:
+            ...
+        finally:
+            p.write_bytes(original)      # ← 无条件写回，很危险
+
+    换成
+
+        g = ConditionalRestore(p)
+        g.write(mutated)
+        try:
+            ...
+        finally:
+            g.restore()                  # ← 条件写回
+
+    ``restore()`` 只有在文件当前内容**仍等于** ``write()`` 写入的字节时
+    才复原；否则跳过 + 报警。这样「测试窗口期内别人改了同一文件」不再
+    会被我们的 ``finally`` 整段抹掉。
+    """
+
+    __slots__ = ("path", "label", "_original", "_written")
+
+    def __init__(self, path: Path, label: str | None = None) -> None:
+        self.path = path
+        self.label = label or path.name
+        self._original = path.read_bytes() if path.exists() else None
+        self._written: bytes | None = None
+
+    def write(self, data: bytes) -> None:
+        """写入变异内容并记录。"""
+        self.path.write_bytes(data)
+        self._written = data
+
+    def write_text(self, text: str, eol: bytes = b"\n") -> None:
+        """写入文本（按 ``eol`` 指定行尾风格）。"""
+        self.write(text.replace("\r\n", "\n").replace("\n", eol.decode()).encode("utf-8"))
+
+    @property
+    def original(self) -> bytes:
+        """写入前的原始字节。"""
+        assert self._original is not None
+        return self._original
+
+    @property
+    def written(self) -> bool:
+        """是否已写入过（即是否处于变异态）。"""
+        return self._written is not None
+
+    def restore(self) -> bool:
+        """条件复原。返回 ``False`` 表示拒绝覆盖并已打印报警。"""
+        if self._written is None:
+            return True
+        current = self.path.read_bytes() if self.path.exists() else None
+        if current != self._written:
+            print("=" * 74, file=sys.stderr)
+            print(f"[!! 拒绝复原] 文件被第三方改动：{self.label}", file=sys.stderr)
+            print(f"     我写入的 sha256: "
+                  f"{sha256_bytes(self._written)[:16]}", file=sys.stderr)
+            print(f"     当前磁盘 sha256: "
+                  f"{sha256_bytes(current or b'')[:16]}", file=sys.stderr)
+            print("     -> 保留磁盘现状，不覆盖。", file=sys.stderr)
+            print("=" * 74, file=sys.stderr)
+            self._written = None
+            return False
+        self.path.write_bytes(self.original)
+        self._written = None
+        return True
+
+
+def install_global_sandbox(label: str) -> MutationSandbox:
+    """建立一个**模块级**沙箱，并把清理与基线复核挂到解释器退出时。
+
+    给那些在导入期就计算 ``ROOT`` / ``SERVER`` / ``CATALOG`` 等常量的
+    脚本使用：只要在常量定义**之前**调用本函数，那些常量就会自动指向
+    沙箱副本，无需改动后续所有引用。
+
+    用法::
+
+        _SB = install_global_sandbox("qa7_redline_gate")
+        ROOT = _SB.root
+        SERVER = _SB.server
+        CATALOG = SERVER / "app" / "persona" / "catalog.py"
+    """
+    sb = MutationSandbox(label)
+    sb.__enter__()
+    atexit.register(_sandbox_finalizer, sb)
+    return sb
+
+
+def _sandbox_finalizer(sb: MutationSandbox) -> None:
+    """解释器退出时的收尾：复核基线 + 清理。"""
+    try:
+        contaminated = sb.verify_workspace()
+    except Exception:
+        return
+    if contaminated:
+        sb._report_contamination()
+        try:
+            sys.stdout.flush()
+            sys.stderr.flush()
+        except Exception:
+            pass
+        os._exit(EXIT_CONTAMINATED)
+    try:
+        sb.cleanup()
+    except OSError:
+        pass

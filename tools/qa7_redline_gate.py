@@ -6,7 +6,18 @@
 它就变红」。本脚本对第四轮新增/加固的每条断言各跑一组变异，并要求：
 
 * 期望变红的，**必须红**，且必须指出**是靠哪条断言挡住的**；
-* 变异后**无条件复原**（bytes 级），退出前自检复原结果。
+* 变异后**条件复原**（仅当内容仍等于我的变异版），退出前自检复原结果。
+
+🛡️ 隔离说明
+-----------
+所有变异只发生在 :mod:`mutation_sandbox` 建立的**本次运行独有**的临时
+副本里，``ROOT`` / ``SERVER`` / ``CATALOG`` 等常量在导入期就已指向沙箱。
+**工作区 ``server/app/persona/catalog.py`` 全程只读。**
+
+改造前这里是「原地改写工作区 + ``finally`` 无条件写回」。无条件写回有个
+更隐蔽的危害：若测试窗口期内别的 agent 改了同一文件，那行 ``write_text``
+会把**对方的改动整段抹掉**。现在改为条件写回——内容不再等于我的变异版
+就跳过并报警。宁可人工介入，不可覆盖别人的工作。
 
 ⚠️ 复原失败立刻 exit 3 —— 比门禁红更严重：工作区被污染了，
 后面所有结论都不可信。（Windows 上 ``Path.write_text`` 会把 LF 悄悄转成
@@ -19,14 +30,24 @@ from __future__ import annotations
 
 import json
 import os
-import shutil
 import subprocess
 import sys
 import tempfile
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent.parent
-SERVER = ROOT / "server"
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from mutation_sandbox import (  # noqa: E402
+    EXIT_CONTAMINATED,
+    ConditionalRestore,
+    install_global_sandbox,
+)
+
+# 建立本次运行独有的沙箱；下面所有常量都指向副本而非工作区。
+_SB = install_global_sandbox("qa7_redline_gate")
+
+ROOT = _SB.root
+SERVER = _SB.server
 CATALOG = SERVER / "app" / "persona" / "catalog.py"
 GUARD = SERVER / "app" / "persona" / "guardrails.py"
 COMPILER = SERVER / "app" / "persona" / "compiler.py"
@@ -47,6 +68,10 @@ def _read(p: Path) -> str:
 
 
 def _write_exact(p: Path, text: str) -> None:
+    """以 bytes 写回，不做任何行尾转换。
+
+    ⚠️ 仅用于**沙箱副本**。工作区文件永远不经过这里。
+    """
     p.write_bytes(text.encode("utf-8"))
 
 
@@ -54,27 +79,24 @@ def _norm(t: str) -> str:
     return t.replace("\r\n", "\n")
 
 
-# ⚠️ 锚点一律用 **LF** 书写。catalog.py 在 Windows 上是 CRLF，
-# 而 with_mutation 只对**文件内容**做归一化 —— 锚点字面量如果自带 CRLF，
-# 归一后反而对不上（这正是第一版「3 组变异全部锚点不命中」的根因：
-# 报告看起来像跑过了，实际一组都没执行 —— 又一次假绿）。
-# 所以：写锚点时永远用 \n，不要从文件里复制粘贴。
-
-
 def run_eval() -> tuple[int, str]:
-    env = dict(os.environ)
-    env.pop("MSYSTEM", None)
-    env["PYTHONIOENCODING"] = "utf-8"
-    tmp = tempfile.mkdtemp(prefix="qa7_eval_")
-    env["TMPDIR"] = env["TEMP"] = env["TMP"] = tmp
+    """在沙箱里跑一次 eval（PYTHONPATH / cwd 均指向副本）。"""
+    env = _SB.subprocess_env()
     try:
         p = subprocess.run(
             [PY, str(ROOT / "tools" / "eval_persona.py")],
             cwd=str(ROOT), env=env, capture_output=True, text=True,
             encoding="utf-8", errors="replace", timeout=300)
         return p.returncode, (p.stdout or "") + (p.stderr or "")
-    finally:
-        shutil.rmtree(tmp, ignore_errors=True)
+    except subprocess.TimeoutExpired:
+        return 124, "[TIMEOUT] eval 超过 300s 未返回"
+
+
+# ⚠️ 锚点一律用 **LF** 书写。catalog.py 在 Windows 上是 CRLF，
+# 而 with_mutation 只对**文件内容**做归一化 —— 锚点字面量如果自带 CRLF，
+# 归一后反而对不上（这正是第一版「3 组变异全部锚点不命中」的根因：
+# 报告看起来像跑过了，实际一组都没执行 —— 又一次假绿）。
+# 所以：写锚点时永远用 \n，不要从文件里复制粘贴。
 
 
 def which_assertions(out: str) -> list[str]:
@@ -121,11 +143,13 @@ def with_mutation(target: Path, old: str, new: str, label: str,
     if old_n not in src_n:
         return check(f"{label}：变异前置条件命中", False,
                      f"目标片段已变（{target.name}），脚本需更新")
-    _write_exact(target, src_n.replace(old_n, new_n, 1).replace("\n", eol))
+    # 条件写回：只有内容仍等于我的变异版才复原，否则跳过 + 报警
+    guard = ConditionalRestore(target, label=f"{target.name}（{label}）")
+    guard.write(src_n.replace(old_n, new_n, 1).replace("\n", eol).encode("utf-8"))
     try:
         code, out = run_eval()
     finally:
-        _write_exact(target, src)
+        guard.restore()
     red = code != 0
     detail = f"exit={code}"
     if red:
@@ -156,13 +180,16 @@ def with_json_mutation(pairs: list[tuple[str, str]], label: str,
             mut_cat = mut_cat.replace(_norm(old), _norm(new), 1)
         elif _norm(old) in mut_base:
             mut_base = mut_base.replace(_norm(old), _norm(new), 1)
-    _write_exact(CATALOG, mut_cat.replace("\n", cat_eol))
-    _write_exact(BASELINE, mut_base)
+    # 条件写回：两个文件各自独立判断，只复原仍等于我变异版的那个
+    g_cat = ConditionalRestore(CATALOG, "catalog.py")
+    g_base = ConditionalRestore(BASELINE, "redline_baseline.json")
+    g_cat.write(mut_cat.replace("\n", cat_eol).encode("utf-8"))
+    g_base.write(mut_base.encode("utf-8"))
     try:
         code, out = run_eval()
     finally:
-        _write_exact(CATALOG, cat_src)
-        _write_exact(BASELINE, base_src)
+        g_cat.restore()
+        g_base.restore()
     red = code != 0
     detail = f"exit={code}"
     if red:
@@ -185,15 +212,18 @@ def with_mutation_multi(edits: list[tuple[Path, str, str]], label: str,
     if missing:
         return check(f"{label}：变异前置条件命中", False,
                      f"锚点不存在：{missing[0][:70]!r}")
+    # 条件写回：每个文件独立判断，仍是我的变异版才复原
+    guards = {p: ConditionalRestore(p, p.name) for p in originals}
     try:
         for path, old, new in edits:
             src = _norm(originals[path])
             eol = "\r\n" if "\r\n" in originals[path] else "\n"
-            _write_exact(path, src.replace(_norm(old), _norm(new), 1).replace("\n", eol))
+            guards[path].write(
+                src.replace(_norm(old), _norm(new), 1).replace("\n", eol).encode("utf-8"))
         code, out = run_eval()
     finally:
-        for path, src in originals.items():
-            _write_exact(path, src)
+        for path in originals:
+            guards[path].restore()
     red = code != 0
     detail = f"exit={code}"
     if red:
@@ -287,23 +317,24 @@ def main() -> int:
     tampered = _norm(orig_rb).replace(
         "import ast\n",
         "import ast\nfrom app.persona import catalog  # 故意：同源自证\n", 1)
-    _write_exact(rb, tampered.replace("\n", eol))
+    g_rb = ConditionalRestore(rb, "redline_baseline.py")
+    g_rb.write(tampered.replace("\n", eol).encode("utf-8"))
     try:
         code, out = run_eval()
     finally:
-        _write_exact(rb, orig_rb)
+        g_rb.restore()
     check("R5 黄金副本被改成 import 运行期常量 -> 期望变红",
           code != 0, f"exit={code} | 靠：{'、'.join(which_assertions(out))}")
 
     print("\n── R6 只改黄金副本（代码不动）-> 也必须红 ──")
-    orig_base = _read(BASELINE)
-    tampered_base = _norm(orig_base).replace(
+    tampered_base = _norm(_read(BASELINE)).replace(
         '"hedging_words": [', '"hedging_words": [], "_removed": [', 1)
-    _write_exact(BASELINE, tampered_base)
+    g_base = ConditionalRestore(BASELINE, "redline_baseline.json")
+    g_base.write(tampered_base.encode("utf-8"))
     try:
         code, out = run_eval()
     finally:
-        _write_exact(BASELINE, orig_base)
+        g_base.restore()
     check("R6 削弱词黑名单被清空（正文一个字未改）-> 期望变红",
           code != 0, f"exit={code} | 靠：{'、'.join(which_assertions(out))}")
 

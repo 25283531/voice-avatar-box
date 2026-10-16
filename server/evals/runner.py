@@ -15,6 +15,28 @@ live        真调一次 LLM 的实际回复        是        ❌（--live-samp
 
 report 类断言失败只打印 ⚠️ 与退化清单，**exit code 仍然 0**。
 这是用户拍板的 Q4：医疗安全类硬失败，长度/用词类仅报告。
+
+================================ 报告必须分层计数 ====================================
+三段的**判定对象**不同，混在一起报一个「通过 N 条」会骗人：
+
+* ``compiled`` —— 判**真实编译产物**（PromptCompiler 的输出），是机器验证；
+* ``reply``    —— 判**手写样本字符串**（"这句话像不像人话"），**不是**机器验证；
+* ``live``    —— 未接线（需真实 LLM）。**显式计「未执行」，不算「通过」也不计「失败」**。
+
+⚠️ **不要把 reply 段计入「覆盖」**
+--------------------------------------------------
+reply 判的是 ``sample_reply`` —— 那是**人写在套件 JSON 里的固定字符串**，
+把它改成任何东西都能让它通过或失败，与模型真实输出无关。
+把它算进覆盖，等于宣称「模型输出已被验证」，而它一次都没被调用过。
+
+⚠️ **不要因为 live「没跑所以没失败」就当它不存在**
+--------------------------------------------------
+未执行是一种**独立状态**，不是「通过」。渲染时必须显式打印条数与 id，
+否则一个只看 summary 的人会以为「全部通过」——
+本轮之前门禁就踩过这个坑（``must_negation`` 宣称有、实际不存在）。
+
+一句话：**夸大门禁比没有门禁更危险。** 没有门禁时人会去人工复核；
+夸大的门禁会让人**不再**复核。无判定的段必须看起来像「无判定」。
 """
 from __future__ import annotations
 
@@ -59,6 +81,33 @@ class Report:
     def exit_code(self) -> int:
         """只有 block 级失败才让 CI 红。"""
         return 1 if self.failed_block else 0
+
+    # ---------------------------------------------------------------- 分层计数
+    # 为什么必须分层：**「通过 N 条」这个数字单独看会骗人。**
+    #   compiled —— 判的是真实编译产物（PromptCompiler 输出），是机器验证；
+    #   reply    —— 判的是**手写的样本字符串**（"这句话像不像人话"），不是机器验证；
+    #   live     —— 未接线，显式计 0/未执行，不能因为"没跑所以没失败"就当它不存在。
+    # 把 reply 段混进「覆盖」会让人以为模型输出被验证过了，而它没有。
+    # 详见模块顶部与 team-lead 的「夸大门禁比没有门禁更危险」。
+    def passed_by_kind(self, kind: str) -> int:
+        """按 kind 统计通过的条数。"""
+        return sum(1 for r in self.passed if r.kind == kind)
+
+    def tier_lines(self) -> list[str]:
+        """三段式计数，每段一句话说明**它在验什么**。
+
+        「在验什么」这句不能省：只给数字的话，读者无从判断该不该信任它。
+        """
+        n_c = self.passed_by_kind("compiled")
+        n_r = self.passed_by_kind("reply")
+        n_l = len(self.live_skipped)
+        return [
+            f"  · compiled 通过 {n_c} —— 判真实编译产物（PromptCompiler 输出），机器验证",
+            f"  · reply    通过 {n_r} —— 判手写 sample_reply 样本（如「像不像人话」），"
+            f"**不是**机器验证，不计入覆盖",
+            f"  · live     未执行 {n_l} —— 判真实模型输出，需接 LLM；"
+            f"未执行即**未判定**，不算通过",
+        ]
 
     def summary(self) -> str:
         base = (f"{self.suite}（policy {self.policy_version}）："
@@ -248,6 +297,11 @@ class EvalRunner:
         lines.append("=" * 72)
         lines.append(rep.summary())
         lines.append("=" * 72)
+        # 分层计数放在最前面：先让人知道「这三条分别验的是什么」，
+        # 再看下面的失败清单。否则「通过 53」这个数字会先入为主。
+        lines.append("")
+        lines.append("分层计数（口径不同，不可合并成一个「覆盖率」）：")
+        lines.extend(rep.tier_lines())
         if rep.failed_block:
             lines.append("")
             lines.append(f"❌ 硬失败（CI 会红）{len(rep.failed_block)} 条：")
@@ -279,7 +333,17 @@ class EvalRunner:
                 lines.append(f"   - {n}")
         if not rep.failed_block and not rep.failed_report:
             lines.append("")
-            lines.append(f"✅ 全部 {len(rep.passed)} 条断言通过")
+            if rep.live_skipped:
+                # ⚠️ 有未执行的 live 时**不能说「全部通过」** ——
+                # 那 N 条不是通过了，是没跑。不区分这两种状态正是「夸大门禁」
+                # 的起点：读者会把「没失败」当成「已验证」。
+                lines.append(f"✅ 已执行的 {len(rep.passed)} 条断言通过"
+                             f"（compiled {rep.passed_by_kind('compiled')}"
+                             f" / reply {rep.passed_by_kind('reply')}）")
+                lines.append(f"🚫 另有 {len(rep.live_skipped)} 条 live 断言**未执行**，"
+                             f"它们既没通过也没失败 —— 是**未判定**。")
+            else:
+                lines.append(f"✅ 全部 {len(rep.passed)} 条断言通过")
         lines.append("")
         lines.append(f"结论：{'FAIL（存在硬失败）' if rep.failed_block else 'PASS'}"
                      f"，exit code = {rep.exit_code}")
