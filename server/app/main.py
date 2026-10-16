@@ -24,7 +24,7 @@ from .config import APP_NAME, APP_VERSION, CORS_ORIGINS
 from .db import SessionLocal, init_db
 from .models import Avatar
 from .routers import (admin_presets, avatars, auth, device_api, devices, home, mail,
-                      membership, providers, reminders, roles, stats, support)
+                      membership, providers, reminders, roles, stats, support, usage)
 from .schema_patch import run_all as run_schema_upgrade
 from .security import hash_password
 # 记忆的 router 单独导入，**不从 .memory 包里取**：
@@ -331,6 +331,11 @@ for r in (auth.router, devices.router, reminders.router, avatars.router,
 
 # 会员系统：用户端 /api/membership、管理端 /api/admin/membership、设备端 /api/device/quota 等
 for r in (membership.router, membership.admin_router, membership.device_router):
+    app.include_router(r)
+
+# token 用量：用户端 /api/usage（只看自己设备）、管理端 /api/admin/usage（全量+聚合）。
+# 计量数据由调用方（语音链路等）经 app.usage 落库，表结构见 models.ModelUsage 类注释。
+for r in (usage.router, usage.admin_router):
     app.include_router(r)
 
 # 邮箱服务：管理端 SMTP 配置 /api/admin/mail、找回密码 /api/auth/password/reset、
