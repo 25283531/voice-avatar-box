@@ -89,7 +89,8 @@
     <input id="lp" v-model="loginForm.password" type="password" style="width:100%;margin-bottom:14px" @keyup.enter="doLogin" />
     <button id="lb" class="primary" style="width:100%" :disabled="busy" @click="doLogin">登 录</button>
     <p class="muted" style="margin-top:12px;font-size:12px">
-      账号在手机 APP 注册。这是面向家庭用户的界面；平台管理员请访问 <a href="/">管理后台</a>。
+      账号目前由平台管理员在管理后台开通，也可以下载手机 APP 注册。
+      这是面向家庭用户的界面；平台管理员请访问 <a href="/">管理后台</a>。
     </p>
   </div>
 
@@ -119,13 +120,35 @@
         <h2>添加设备</h2>
         <p class="muted" style="font-size:12px;margin:0 0 10px">
           先登记设备（填设备标识），再点「激活码」让设备屏幕显示 13 位码，
-          在手机 APP 输入该码即完成绑定。激活码 10 分钟内有效。
+          在本页输入该码即完成绑定。激活码 10 分钟内有效。
         </p>
         <div class="row">
           <div><label>设备标识（eFuse MAC）</label><input v-model="devForm.device_id" placeholder="aabbccddeeff" /></div>
           <div><label>名称</label><input v-model="devForm.name" placeholder="客厅陪伴助手" /></div>
           <button class="primary" :disabled="busy" @click="createDevice">添加</button>
         </div>
+      </div>
+
+      <!-- 激活码绑定：设备端（或 APP）显示 13 位码，用户在本页输入即可完成绑定，
+           绑定后设备归到当前账号名下，随即出现在下方「我的设备」列表。
+           通用码场景下设备还没登记，用可选的「设备标识」现场建档。 -->
+      <div class="card">
+        <h2>输入激活码绑定设备</h2>
+        <p class="muted" style="font-size:12px;margin:0 0 10px">
+          让设备屏幕（或手机 APP）显示 13 位激活码，在本页输入即可完成绑定。
+          码的格式是 1 位字母 + 12 位数字，带不带短横线空格都行。
+        </p>
+        <div class="row">
+          <div><label>激活码</label>
+            <input id="bdCode" v-model="bindForm.code" placeholder="A-3829-4471-0056"
+                   style="width:220px;text-transform:uppercase" @keyup.enter="bindDeviceByCode" /></div>
+          <div><label>设备标识（设备未登记时必填）</label>
+            <input id="bdDevId" v-model="bindForm.device_id" placeholder="留空表示该设备已登记" style="width:220px" /></div>
+          <div><label>备注名称（选填）</label>
+            <input id="bdAlias" v-model="bindForm.alias" placeholder="客厅陪伴助手" style="width:180px" /></div>
+          <button id="bdBtn" class="primary" :disabled="busy" @click="bindDeviceByCode">绑定到我的账号</button>
+        </div>
+        <div v-if="bindMsg" class="muted" style="font-size:12px;margin-top:8px;color:var(--ok)">{{bindMsg}}</div>
       </div>
       <div class="card">
         <h2>我的设备</h2>
@@ -143,8 +166,8 @@
                 </select>
               </td>
               <td>
-                <!-- 设备详情接口不返回当前 agent_id，绑定态只在本页内存里记，
-                     刷新后回到「未设置」显示；以设备实际生效的设置为准。 -->
+                <!-- 人格角色绑定态来自列表接口。刷新页面后若这里显示「未设置」，
+                     重新在下拉里选一次即可（以设备实际生效的设置为准）。 -->
                 <select :value="agentBind[d.id]||''" @change="bindAgent(d,$event)">
                   <option value="">未设置</option>
                   <option v-for="r in allRoles" :key="r.id" :value="r.id">{{r.name}}</option>
@@ -164,7 +187,7 @@
         <div class="modal">
           <button class="close" @click="codeBox=null">&times;</button>
           <h2>设备激活码</h2>
-          <p class="muted">让设备屏幕显示该码，或在手机 APP 里输入。<b>10 分钟内有效</b>，过期请重新获取。</p>
+          <p class="muted">让设备屏幕显示该码，或在本页输入。<b>10 分钟内有效</b>，过期请重新获取。</p>
           <div class="big-code">{{codeBox.display}}</div>
           <p class="muted" style="font-size:12px">原始码：<code>{{codeBox.code}}</code> · 结构：1 位字母 + 12 位数字（末位 Luhn 校验位）</p>
           <div class="row"><button class="primary" @click="copy(codeBox.code)">复制</button></div>
@@ -198,39 +221,123 @@
             <div class="n">¥{{p.price_yuan}}</div>
             <div class="l">{{p.months}} 个月 / {{p.days}} 天</div>
             <div class="muted" style="font-size:12px;margin-top:6px">{{(p.benefits||[]).join(' · ')}}</div>
+            <div class="row" style="margin-top:10px">
+              <button class="primary" :id="'buy-'+p.code" :disabled="busy" @click="placeOrder(p)">
+                {{membership && membership.is_vip ? '续费会员' : '开通会员'}}
+              </button>
+            </div>
           </div>
         </div>
+        <div v-if="!plans.length" class="empty">暂无可选套餐</div>
         <p class="muted" style="font-size:12px;margin:10px 0 0">
-          下单与支付请在手机 APP 内完成：APP 生成订单号 → 按下方收款信息转账 →
-          管理员核对到账后自动开通。
+          在本页下单，转账后点「我已付款」通知管理员核对：下单会生成 4 位订单号和一个专属金额 →
+          按订单弹窗里的收款信息转账 → 管理员核对到账后自动开通。
         </p>
       </div>
 
-      <div class="card" v-if="payment && (payment.account || payment.payee_name)">
+      <div class="card" v-if="payment && (payment.account || payment.payee_name || payment.qr_url)">
         <h2>收款信息</h2>
         <div class="muted" style="font-size:13px;line-height:2">
           <div v-if="payment.channel">方式：{{payment.channel}}</div>
           <div v-if="payment.payee_name">收款人：{{payment.payee_name}}</div>
-          <div v-if="payment.account">账号：<code>{{payment.account}}</code></div>
+          <div v-if="payment.account">账号：<code>{{payment.account}}</code>
+            <button @click="copy(payment.account)">复制</button></div>
           <div v-if="payment.note">备注：{{payment.note}}</div>
+        </div>
+        <div v-if="payment.qr_url" style="margin-top:10px">
+          <label>收款二维码</label>
+          <img :src="payment.qr_url" alt="收款二维码"
+               style="max-width:220px;max-height:220px;border:1px solid var(--line);border-radius:8px" />
         </div>
       </div>
 
       <div class="card">
         <h2>我的订单</h2>
         <table v-if="orders.length">
-          <thead><tr><th>订单号</th><th>套餐</th><th class="num">金额</th><th>状态</th><th>创建时间</th></tr></thead>
+          <thead><tr><th>订单号</th><th>套餐</th><th class="num">金额</th><th>状态</th><th>创建时间</th><th>操作</th></tr></thead>
           <tbody>
             <tr v-for="o in orders" :key="o.id">
               <td><code>{{o.code}}</code></td>
               <td>{{o.plan_name||o.plan_code}}</td>
               <td class="num">¥{{o.amount_yuan}}</td>
-              <td><span class="tag" :class="orderClass(o.status)">{{orderStatusName(o.status)}}</span></td>
+              <td><span class="tag" :class="orderClass(o.status)">{{orderStatusName(o.status)}}</span>
+                <div class="muted" style="font-size:12px" v-if="o.status==='notified'">等待管理员核对到账</div>
+                <div class="muted" style="font-size:12px" v-if="o.status==='rejected' && o.admin_note">
+                  驳回原因：{{o.admin_note}}</div>
+              </td>
               <td class="muted">{{fmt(o.created_at)}}</td>
+              <td class="row">
+                <button v-if="o.status==='pending'" class="primary" :disabled="busy" @click="notifyPaid(o)">我已付款</button>
+                <button v-if="o.status==='pending' || o.status==='notified'" class="danger"
+                        :disabled="busy" @click="cancelOrder(o)">放弃订单</button>
+                <span class="muted" style="font-size:12px"
+                      v-if="o.status!=='pending' && o.status!=='notified'">已结束</span>
+              </td>
             </tr>
           </tbody>
         </table>
         <div v-else class="empty">还没有订单</div>
+      </div>
+
+      <!-- 订单弹窗：付款指引 + 订单状态操作。支付是线下转账 + 管理员人工核销，
+           所以这里必须把订单号、专属金额、收款信息（含二维码）一次说清楚。 -->
+      <div v-if="orderBox" class="mask" @click.self="closeOrder">
+        <div class="modal" style="max-width:560px">
+          <button class="close" @click="closeOrder">&times;</button>
+          <h2>请按下方金额付款</h2>
+          <div v-if="orderBox.error" class="err">{{orderBox.error}}</div>
+
+          <div class="row" style="justify-content:space-between">
+            <div>
+              <label>订单号（转账时请备注）</label>
+              <div class="big-code" id="ordCode">{{orderBox.code}}</div>
+            </div>
+            <div style="text-align:right">
+              <label>应付金额</label>
+              <div style="font-size:26px;font-weight:700;color:var(--brand)" id="ordAmt">¥{{orderBox.amount_yuan}}</div>
+              <div class="muted" style="font-size:12px">请务必按此金额付款，便于管理员核对</div>
+            </div>
+          </div>
+
+          <div class="row" style="margin-bottom:10px">
+            <span class="tag" :class="orderClass(orderBox.status)">{{orderStatusName(orderBox.status)}}</span>
+            <span class="muted" style="font-size:12px">套餐：{{orderBox.plan_name||orderBox.plan_code}}</span>
+            <span class="muted" style="font-size:12px">有效期至 {{fmt(orderBox.expires_at)}}</span>
+          </div>
+
+          <div class="grid g2">
+            <div>
+              <label>收款信息</label>
+              <div class="muted" style="font-size:13px;line-height:1.9">
+                <div v-if="orderBox.payment && orderBox.payment.channel">方式：{{orderBox.payment.channel}}</div>
+                <div v-if="orderBox.payment && orderBox.payment.payee_name">收款人：{{orderBox.payment.payee_name}}</div>
+                <div v-if="orderBox.payment && orderBox.payment.account">账号：<code>{{orderBox.payment.account}}</code>
+                  <button id="ordCopyAcc" @click="copy(orderBox.payment.account)">复制</button></div>
+                <div v-if="orderBox.payment && orderBox.payment.note">备注：{{orderBox.payment.note}}</div>
+              </div>
+            </div>
+            <div v-if="orderBox.payment && orderBox.payment.qr_url">
+              <label>收款二维码</label>
+              <img :src="orderBox.payment.qr_url" alt="收款二维码"
+                   style="max-width:200px;max-height:200px;border:1px solid var(--line);border-radius:8px" />
+            </div>
+          </div>
+          <div v-if="!(orderBox.payment && (orderBox.payment.account || orderBox.payment.qr_url))"
+               class="muted" style="font-size:13px">
+            管理员尚未配置收款方式，请联系客服。
+          </div>
+
+          <div class="row" style="margin-top:14px;justify-content:flex-end">
+            <button id="ordCopyCode" @click="copy(orderBox.code)">复制订单号</button>
+            <button class="danger" v-if="orderBox.status==='pending' || orderBox.status==='notified'"
+                    id="ordCancel" :disabled="busy" @click="cancelOrder(orderBox, true)">放弃订单</button>
+            <button class="primary" v-if="orderBox.status==='pending'" id="ordNotify" :disabled="busy"
+                    @click="notifyPaid(orderBox, true)">我已付款，通知管理员</button>
+            <span class="muted" style="font-size:12px" v-if="orderBox.status==='notified'">
+              已通知管理员，核对到账后会自动开通，请稍候</span>
+            <span class="tag ok" v-if="orderBox.status==='confirmed'">已开通</span>
+          </div>
+        </div>
       </div>
     </section>
 
@@ -665,9 +772,12 @@ createApp({
       loginForm: { username:'', password:'' },
       // 设备
       devices: [], devForm: { device_id:'', name:'我的陪伴助手' },
+      bindForm: { code:'', device_id:'', alias:'' }, bindMsg: '',
       codeBox: null, agentBind: {},
       // 会员
       membership: null, plans: [], payment: null, orders: [],
+      // 订单弹窗：{code, amount_yuan, plan_code, plan_name, status, expires_at, payment, error}
+      orderBox: null,
       // 提醒
       curDeviceId: null, reminders: [], events: [],
       rBox: null, rForm: null, timesText:'', weekText:'', monthText:'',
@@ -766,6 +876,29 @@ createApp({
         this.codeBox = await this.api('/api/devices/'+d.id+'/code', {method:'POST'});
       }catch(e){ this.err = e.message; }
     },
+    // 激活码绑定：客户端只做「去分隔符 + 转大写 + 长度 13」的粗筛，
+    // 真正的 Luhn 校验位由服务端判定（security.verify_activation_code），
+    // 这里不重复实现，避免两套规则漂移。
+    async bindDeviceByCode(){
+      const code = (this.bindForm.code||'').replace(/[^0-9a-zA-Z]/g,'').toUpperCase();
+      if (code.length !== 13){
+        this.err = '激活码应为 13 位（1 位字母 + 12 位数字）';
+        return;
+      }
+      this.busy = true; this.err = '';
+      try{
+        const body = {code: code};
+        if (this.bindForm.device_id) body.device_id = this.bindForm.device_id.trim();
+        if (this.bindForm.alias) body.alias = this.bindForm.alias.trim();
+        const r = await this.api('/api/devices/bind', {method:'POST', body:JSON.stringify(body)});
+        if (!r) return;
+        this.bindForm = {code:'', device_id:'', alias:''};
+        await this.loadDevices();
+        this.err = '';
+        this.bindMsg = '已绑定设备「' + r.name + '」，可在下方列表中看到它';
+      }catch(e){ this.err = '绑定失败：' + e.message; }
+      finally{ this.busy = false; }
+    },
     async applyAvatar(d, ev){
       const v = ev.target.value;
       try{
@@ -811,11 +944,98 @@ createApp({
       return '已用 ' + used + ' 分钟 / 上限 ' + limit + ' 分钟';
     },
     orderStatusName(s){
-      return {pending:'待支付', notified:'已通知，待核对', confirmed:'已开通',
-              rejected:'已驳回', cancelled:'已取消', expired:'已过期'}[s] || s;
+      return {pending:'等待付款', notified:'待管理员核对', confirmed:'已开通',
+              rejected:'已被驳回', cancelled:'已放弃', expired:'已过期'}[s] || s;
     },
     orderClass(s){
-      return s==='confirmed' ? 'ok' : (s==='rejected'||s==='expired') ? 'bad' : '';
+      return s==='confirmed' ? 'ok'
+           : (s==='rejected'||s==='expired'||s==='cancelled') ? 'bad'
+           : (s==='notified') ? 'warn' : '';
+    },
+
+    // ---- 会员下单（支付只有线下转账 + 管理员人工核销，无在线支付）----
+    // 4 位订单号本地生成：优先 crypto.getRandomValues，降级 Math.random。
+    genOrderCode(){
+      const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
+      let out = '';
+      try{
+        const g = window.crypto || window.msCrypto;
+        if (g && typeof g.getRandomValues === 'function'){
+          const buf = new Uint32Array(4);
+          g.getRandomValues(buf);
+          for (let i = 0; i < 4; i++) out += chars[buf[i] % chars.length];
+          return out;
+        }
+      }catch(e){ /* 降级到 Math.random */ }
+      for (let i = 0; i < 4; i++) out += chars[Math.floor(Math.random() * chars.length)];
+      return out;
+    },
+    // 下单。订单号 48 小时内已被占用时服务端返回 409，换一个号重试，最多 4 次。
+    async placeOrder(p){
+      if (this.busy) return;
+      this.busy = true; this.err = '';
+      try{
+        let lastMsg = '';
+        for (let i = 0; i < 4; i++){
+          try{
+            const o = await this.api('/api/membership/orders', {
+              method:'POST',
+              body: JSON.stringify({code: this.genOrderCode(), plan_code: p.code})
+            });
+            if (!o) return;
+            this.orderBox = {
+              code: o.code, amount_yuan: o.amount_yuan, amount_cents: o.amount_cents,
+              plan_code: o.plan_code, plan_name: o.plan_name, status: o.status,
+              expires_at: o.expires_at, tip: o.tip,
+              // 下单响应自带一份收款信息；为空时回落到页面已加载的 payment
+              payment: (o.payment_info && (o.payment_info.account || o.payment_info.qr_url))
+                       ? o.payment_info : this.payment,
+              error: ''
+            };
+            await this.loadMembership();
+            return;
+          }catch(e){
+            lastMsg = e.message || '下单失败';
+            if (lastMsg.indexOf('409') >= 0 || lastMsg.indexOf('已存在') >= 0) continue;
+            break;
+          }
+        }
+        this.err = '下单失败：' + lastMsg;
+      }finally{ this.busy = false; }
+    },
+    closeOrder(){ this.orderBox = null; },
+    // 「我已付款」：订单转 notified，等管理员核对到账。
+    // fromModal=true 表示从订单弹窗点的，顺手把弹窗里的状态也刷新掉。
+    async notifyPaid(o, fromModal){
+      if (!confirm('确认已按金额 ¥' + o.amount_yuan + ' 完成付款？\n'
+                 + '管理员核对到账后会自动开通会员。')) return;
+      if (fromModal) { if (this.orderBox) this.orderBox.error = ''; } else this.err = '';
+      this.busy = true;
+      try{
+        const r = await this.api('/api/membership/orders/' + encodeURIComponent(o.code) + '/notify',
+                                  {method:'POST', body:'{}'});
+        if (!r) return;
+        if (fromModal && this.orderBox) this.orderBox = Object.assign({}, this.orderBox, r, {error:''});
+        await this.loadMembership();
+      }catch(e){
+        const m = '通知失败：' + e.message;
+        if (fromModal && this.orderBox) this.orderBox.error = m; else this.err = m;
+      }finally{ this.busy = false; }
+    },
+    async cancelOrder(o, fromModal){
+      if (!confirm('放弃订单 ' + o.code + '？\n放弃后如仍要开通，需要重新下单。')) return;
+      if (fromModal) { if (this.orderBox) this.orderBox.error = ''; } else this.err = '';
+      this.busy = true;
+      try{
+        const r = await this.api('/api/membership/orders/' + encodeURIComponent(o.code) + '/cancel',
+                                  {method:'POST', body:'{}'});
+        if (!r) return;
+        if (fromModal) this.orderBox = null;
+        await this.loadMembership();
+      }catch(e){
+        const m = '放弃失败：' + e.message;
+        if (fromModal && this.orderBox) this.orderBox.error = m; else this.err = m;
+      }finally{ this.busy = false; }
     },
 
     // -------- 提醒（与管理后台同一套表单与端点）--------
