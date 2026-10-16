@@ -1155,12 +1155,13 @@ createApp({
           this.loginForm = {username:u, password:''};
         }
       }catch(e){
-        // 服务端可能加「是否开放公开注册」的开关并返 403/404 —— 翻成人话，
-        // 不能把 HTTP 状态码或堆栈甩给用户；其余错误（如「用户名已存在」）
-        // 原样显示后端给的中文 detail。
+        // 服务端「是否开放公开注册」开关关闭时返 403 + 中文 detail
+        // （config.REGISTER_CLOSED_DETAIL，注释里写明就是给前端直接弹的）：
+        // 有中文就原样显示后端原文，只有拿不到人话（裸 HTTP 403/404）时才回落到
+        // 固定文案 —— 绝不把状态码或堆栈甩给用户，也不白屏。
         const m = (e && e.message) || '';
-        this.err = /403|404|未开放|不允许|已关闭/.test(m)
-          ? '当前未开放自助注册，请联系管理员' : m;
+        this.err = /[一-龥]/.test(m) ? m
+          : (/403|404/.test(m) ? '当前未开放自助注册，请联系管理员' : m);
       }finally{ this.busy = false; }
     },
     logout(){ this.token=''; localStorage.removeItem('elder_token'); },
