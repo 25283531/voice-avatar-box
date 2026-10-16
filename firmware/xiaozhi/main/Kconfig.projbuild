@@ -2,9 +2,22 @@ menu "Xiaozhi Assistant"
 
 config OTA_URL
     string "Default OTA URL"
-    default "https://api.tenclass.net/xiaozhi/ota/"
+    default "https://voice.2508866.xyz/api/voice/ota"
     help
         The application will access this URL to check for new firmwares and server address.
+
+        ⚠️ 必须指向**本项目自己的服务端**（Docker 镜像内的 /api/voice/ota，
+        见 server/app/config.py 的 VOICE_OTA_PATH）。
+
+        曾经的默认值指向第三方（api.tenclass.net）——那意味着：设备的 OTA
+        请求（含 MAC / UUID / 板子信息）发给第三方；更糟的是 OTA 响应里的
+        websocket 地址与 token 由**第三方**下发，等于把整条语音链路的控制权
+        交出去。第三方一旦限流或切断，全部设备同时失声，而我们没有任何
+        侧信道能通知设备改地址。故默认值只能是自己的服务。
+
+        部署在别的域名或局域网时：改 sdkconfig 的 CONFIG_OTA_URL；固件运行时
+        优先读 NVS（settings("wifi") 的 ota_url，见 ota.cc 的
+        GetCheckVersionUrl），写该 NVS 项即可覆盖，不必重新烧录。
 
 choice
     prompt "Flash Assets"
