@@ -691,6 +691,59 @@ class ChatUsage(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
 
 
+class ModelUsage(Base):
+    """模型调用用量计量（token 级）：每一次 LLM/ASR/TTS 调用落一行。
+
+    为什么单独建表而不并进 chat_usage
+    ---------------------------------
+    chat_usage 是「陪聊秒数」的**设备日汇总**，服务配额判定；这里是
+    「token 数」的**调用级流水**，服务成本对账与「设备 token 用量」展示。
+    粒度（秒 vs 次）、用途（配额 vs 对账）、保留策略都不同，硬合进一张表
+    会让两件事都做不好。
+
+    为什么不给 provider_id 建外键
+    -----------------------------
+    平台配置行（ai_providers）允许被删除 / 重建，而计量数据必须留存对账 ——
+    外键级联会把账本删出洞来。provider_name / model 冗余存字符串，正是为了
+    配置行消失之后这一行仍然自解释。
+
+    新表由 init_db 的 create_all 自动创建（老库升级同样生效），
+    不需要 schema_patch 补列。
+    """
+
+    __tablename__ = "model_usage"
+    __table_args__ = (
+        Index("ix_usage_device_created", "device_id", "created_at"),
+        Index("ix_usage_user_created", "user_id", "created_at"),
+        Index("ix_usage_created", "created_at"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    # 调用来源：voice = 语音链路 WS 会话；http = 服务内其它调用（记忆抽取等）
+    source: Mapped[str] = mapped_column(String(16), default="", index=True)
+    # 用途，取值见 model_catalog.USAGE_*（chat / light / asr / tts / embed / rerank）
+    usage: Mapped[str] = mapped_column(String(16), default="", index=True)
+    # 设备 / 用户 / 角色上下文：可空（启动期或后台调用没有这些）
+    device_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    user_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    agent_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    provider_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    provider_name: Mapped[str] = mapped_column(String(64), default="")
+    model: Mapped[str] = mapped_column(String(128), default="")
+    prompt_tokens: Mapped[int] = mapped_column(Integer, default=0)
+    completion_tokens: Mapped[int] = mapped_column(Integer, default=0)
+    total_tokens: Mapped[int] = mapped_column(Integer, default=0)
+    # 一次 LLM 调用的追踪 id（同一语音会话内多轮可串起来）；ASR/TTS 可为空
+    request_id: Mapped[str] = mapped_column(String(40), default="", index=True)
+    session_id: Mapped[str] = mapped_column(String(40), default="")
+    # 失败调用也落一行（ok=False + error）：排查「为什么用量是 0」时，
+    # 「调用过但失败了」与「从来没调用过」必须可区分。
+    ok: Mapped[bool] = mapped_column(Boolean, default=True)
+    error: Mapped[str] = mapped_column(String(255), default="")
+    elapsed_ms: Mapped[int] = mapped_column(Integer, default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
 class ReminderKeyword(Base):
     """服药/提醒关键词表，下发给设备做本地意图判定（命中则不占用陪聊配额）。"""
 
