@@ -79,18 +79,50 @@
 <body>
 <div id="app">
 
-  <!-- ============================ 登录 ============================ -->
+  <!-- ============================ 登录 / 注册 ============================ -->
+  <!-- 注册走 POST /api/auth/register（无鉴权）。页面以登录为主，底部一句
+       「还没有账号？注册」切到注册态；注册成功后直接拿用户名密码调登录接口
+       换取 token 进入主体，不让用户再输一遍。
+       ⚠️ 服务端未来可能加「是否开放公开注册」的开关并返 403/404，
+       这里统一翻译成一句人话，不做堆栈、不白屏。 -->
   <div v-if="!token" class="card" style="max-width:380px;margin:80px auto">
-    <h2>登录用户端</h2>
-    <div v-if="err" class="err">{{err}}</div>
-    <label>用户名</label>
-    <input id="lu" v-model="loginForm.username" style="width:100%;margin-bottom:10px" @keyup.enter="doLogin" />
-    <label>密码</label>
-    <input id="lp" v-model="loginForm.password" type="password" style="width:100%;margin-bottom:14px" @keyup.enter="doLogin" />
-    <button id="lb" class="primary" style="width:100%" :disabled="busy" @click="doLogin">登 录</button>
+    <h2>{{regMode ? '注册新账号' : '登录用户端'}}</h2>
+    <div v-if="err" class="err" id="lerr">{{err}}</div>
+
+    <template v-if="!regMode">
+      <label>用户名</label>
+      <input id="lu" v-model="loginForm.username" style="width:100%;margin-bottom:10px" @keyup.enter="doLogin" />
+      <label>密码</label>
+      <input id="lp" v-model="loginForm.password" type="password" style="width:100%;margin-bottom:14px" @keyup.enter="doLogin" />
+      <button id="lb" class="primary" style="width:100%" :disabled="busy" @click="doLogin">登 录</button>
+      <div style="margin-top:12px;text-align:center">
+        <a href="#" id="toReg" @click.prevent="switchReg(true)" style="font-size:13px">还没有账号？注册</a>
+      </div>
+    </template>
+
+    <template v-else>
+      <label>用户名（3-64 位，登录时用）</label>
+      <input id="ru" v-model="regForm.username" style="width:100%;margin-bottom:10px" />
+      <label>昵称（选填，机器人称呼你用的名字）</label>
+      <input id="rn" v-model="regForm.nickname" style="width:100%;margin-bottom:10px" placeholder="留空则与用户名相同" />
+      <label>密码（至少 6 位）</label>
+      <input id="rp" v-model="regForm.password" type="password" style="width:100%;margin-bottom:10px" />
+      <label>确认密码</label>
+      <input id="rp2" v-model="regForm.password2" type="password" style="width:100%;margin-bottom:10px"
+             @keyup.enter="doRegister" />
+      <div class="grid g2" style="margin-bottom:14px">
+        <div><label>手机（选填）</label><input id="rph" v-model="regForm.phone" style="width:100%" /></div>
+        <div><label>邮箱（选填，找回与工单回复用）</label><input id="rem" v-model="regForm.email" style="width:100%" /></div>
+      </div>
+      <button id="rb" class="primary" style="width:100%" :disabled="busy" @click="doRegister">注册并登录</button>
+      <div style="margin-top:12px;text-align:center">
+        <a href="#" id="toLogin" @click.prevent="switchReg(false)" style="font-size:13px">已有账号？登录</a>
+      </div>
+    </template>
+
     <p class="muted" style="margin-top:12px;font-size:12px">
-      账号目前由平台管理员在管理后台开通，也可以下载手机 APP 注册。
-      这是面向家庭用户的界面；平台管理员请访问 <a href="/">管理后台</a>。
+      不装手机 APP 也能在浏览器里完成全部操作：绑定设备、开通会员、设置提醒、提交工单。
+      平台管理员请访问 <a href="/">管理后台</a>。
     </p>
   </div>
 
@@ -104,6 +136,9 @@
       <div class="row">
         <a v-if="user.is_admin" href="/" style="font-size:12px">管理后台</a>
         <span class="muted" style="font-size:12px">{{user.username}}</span>
+        <!-- 账户设置（改密码 / 换邮箱）放弹窗而不是新增 tab：tab 已经 9 个，
+             再多一行就看不过来了，而这两项都属于低频的「顺手改一下」操作。 -->
+        <button id="acctBtn" @click="openAccount">账户设置</button>
         <button @click="logout">退出</button>
       </div>
     </header>
@@ -747,6 +782,221 @@
         <div v-else class="empty">暂无调用记录</div>
       </div>
     </section>
+
+    <!-- ---------------------- 交互统计 + 今日概况 ---------------------- -->
+    <!-- GET /api/stats/overview 必填 device_pk（设备主键，不是 device_id 标识串），
+         所以必须先有设备才能拉；GET /api/home/summary 无参，一次给齐设备 /
+         服药 / 会员三块。字段名全部按 schemas.py 的 StatsOverview /
+         HomeSummaryOut 实际定义渲染，不做二次映射。 -->
+    <section v-if="tab==='stats'">
+      <div class="card">
+        <div class="row" style="justify-content:space-between">
+          <h2>交互统计</h2>
+          <div class="row">
+            <select id="stDev" v-model="statsDeviceId" @change="loadStats">
+              <option v-for="d in devices" :key="d.id" :value="d.id">{{d.name}}</option>
+            </select>
+            <select id="stDays" v-model.number="statsDays" @change="loadStats">
+              <option :value="7">近 7 天</option>
+              <option :value="14">近 14 天</option>
+              <option :value="30">近 30 天</option>
+            </select>
+            <button id="stBtn" :disabled="busy" @click="loadStats">刷新</button>
+          </div>
+        </div>
+
+        <template v-if="stats">
+          <div class="row" style="margin-bottom:10px">
+            <span class="tag" :class="stats.online?'ok':''">{{stats.online?'在线':'离线'}}</span>
+            <span class="muted" style="font-size:12px">{{stats.device_name}}</span>
+            <span class="muted" style="font-size:12px" v-if="stats.last_seen_at">
+              最后上线：{{fmt(stats.last_seen_at)}}</span>
+          </div>
+          <div class="grid g4" id="stKpi">
+            <div class="kpi"><div class="n">{{stats.today_total}}</div><div class="l">今日交互次数</div></div>
+            <div class="kpi"><div class="n">{{stats.today_dialog}}</div><div class="l">今日陪聊</div></div>
+            <div class="kpi"><div class="n" style="color:var(--ok)">{{stats.today_confirm}}</div>
+              <div class="l">今日已确认</div></div>
+            <div class="kpi"><div class="n" :style="{color:stats.today_miss?'var(--bad)':'var(--text)'}">
+              {{stats.today_miss}}</div><div class="l">今日漏服 / 未确认</div></div>
+            <div class="kpi"><div class="n">{{stats.total_7d}}</div><div class="l">近 7 天总交互</div></div>
+            <div class="kpi"><div class="n">{{stats.pending_reminders}}</div><div class="l">生效中的提醒</div></div>
+            <div class="kpi"><div class="n" :style="{color:stats.missed_today?'var(--bad)':'var(--text)'}">
+              {{stats.missed_today}}</div><div class="l">今日待办未完成</div></div>
+          </div>
+
+          <div style="margin-top:14px">
+            <h2 style="font-size:14px">每日交互次数</h2>
+            <div class="bars" v-if="(stats.series||[]).length" id="stBars">
+              <div v-for="p in stats.series" :key="p.date" style="flex:1">
+                <div class="b" :style="{height:statsBarHeight(p.total)+'px'}"
+                     :title="p.date+' 共 '+p.total+' 次（唤醒'+p.wake+' 陪聊'+p.dialog
+                             +' 确认'+p.confirm+' 漏服'+p.miss+'）'"></div>
+                <div class="x">{{String(p.date).slice(5)}}</div>
+              </div>
+            </div>
+            <div v-else class="empty">近 {{statsDays}} 天还没有交互记录</div>
+          </div>
+        </template>
+        <div v-else class="empty" id="stEmpty">
+          {{devices.length ? '该设备暂无统计数据' : '还没有设备，先到「我的设备」登记一台'}}
+        </div>
+      </div>
+
+      <div class="card" v-if="home">
+        <h2>今日概况</h2>
+        <div class="grid g3" style="margin-bottom:12px">
+          <div class="kpi"><div class="n">{{home.medicine_today.total_count}}</div><div class="l">今日服药总次数</div></div>
+          <div class="kpi"><div class="n" style="color:var(--ok)">{{home.medicine_today.confirmed_count}}</div>
+            <div class="l">已确认</div></div>
+          <div class="kpi">
+            <div class="n" :style="{color:home.medicine_today.pending_count?'var(--warn)':'var(--text)'}">
+              {{home.medicine_today.pending_count}}</div>
+            <div class="l">待服药{{(home.medicine_today.pending_times||[]).length
+              ? '（' + home.medicine_today.pending_times.join(' ') + '）' : ''}}</div></div>
+        </div>
+
+        <div class="row" style="margin-bottom:10px">
+          <span class="tag" :class="home.membership.is_vip?'ok':''">
+            {{home.membership.is_vip?'会员生效中':'免费用户'}}</span>
+          <span class="muted" style="font-size:12px" v-if="home.membership.plan">
+            套餐：{{home.membership.plan}}</span>
+          <span class="muted" style="font-size:12px" v-if="home.membership.is_vip">
+            剩 {{home.membership.days_left}} 天（{{fmt(home.membership.expires_at)}}）</span>
+        </div>
+
+        <table v-if="(home.devices||[]).length">
+          <thead><tr><th>设备</th><th>状态</th><th>IP</th><th>固件</th><th>角色</th><th>形象</th><th>最后上线</th></tr></thead>
+          <tbody>
+            <tr v-for="d in home.devices" :key="d.id">
+              <td>{{d.name}}</td>
+              <td><span class="tag" :class="d.online?'ok':''">{{d.online?'在线':'离线'}}</span></td>
+              <td><code>{{d.ip||'—'}}</code></td>
+              <td class="muted">{{d.fw_version||'—'}}</td>
+              <td class="muted">{{d.agent_name||'未设置'}}</td>
+              <td class="muted">{{d.avatar_name||'未设置'}}</td>
+              <td class="muted">{{fmt(d.last_seen_at)}}</td>
+            </tr>
+          </tbody>
+        </table>
+        <div v-else class="empty">还没有设备</div>
+      </div>
+    </section>
+
+    <!-- ---------------------- 帮助与工单 ---------------------- -->
+    <!-- POST /api/support/tickets（201）+ GET /api/support/tickets/mine。
+         分类只落英文短码，中文展示直接用后端给的 category_text / status_text，
+         前端不做二次映射，避免两边文案漂移。 -->
+    <section v-if="tab==='support'">
+      <div class="card">
+        <h2>提交问题</h2>
+        <p class="muted" style="font-size:12px;margin:0 0 10px">
+          遇到问题说明一下，平台管理员会看到并回复到你留的邮箱。匿名也能提交，但必须留邮箱。
+        </p>
+        <div class="grid g2">
+          <div><label>联系邮箱（必填）</label>
+            <input id="tkEmail" v-model="tkForm.email" style="width:100%" placeholder="you@example.com" /></div>
+          <div><label>问题分类</label>
+            <select id="tkCat" v-model="tkForm.category" style="width:100%">
+              <option value="other">其它</option>
+              <option value="payment">会员支付</option>
+              <option value="device">设备故障</option>
+              <option value="reminder">提醒异常</option>
+              <option value="account">账号问题</option>
+            </select></div>
+        </div>
+        <div style="margin-top:10px">
+          <label>标题</label>
+          <input id="tkTitle" v-model="tkForm.title" style="width:100%" placeholder="一句话说明问题" />
+        </div>
+        <div style="margin-top:10px">
+          <label>详细描述</label>
+          <textarea id="tkContent" v-model="tkForm.content" placeholder="什么时候出现、做了什么操作、期望什么结果"></textarea>
+        </div>
+        <div style="margin-top:10px">
+          <label>关联设备标识（选填，如 aabbccddeeff）</label>
+          <input id="tkDev" v-model="tkForm.device_id" style="width:240px" placeholder="留空表示不指定" />
+        </div>
+        <div class="row" style="margin-top:12px">
+          <button class="primary" id="tkBtn" :disabled="busy" @click="submitTicket">提交问题</button>
+          <span v-if="tkMsg" id="tkMsg" class="muted" style="font-size:12px;color:var(--ok)">{{tkMsg}}</span>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="row" style="justify-content:space-between">
+          <h2>我的工单</h2>
+          <button id="tkRefresh" @click="loadTickets">刷新</button>
+        </div>
+        <table v-if="tickets.length" id="tkTable">
+          <thead><tr><th>编号</th><th>分类</th><th>标题</th><th>内容</th><th>状态</th><th>提交时间</th><th>管理员回复</th></tr></thead>
+          <tbody>
+            <tr v-for="t in tickets" :key="t.id">
+              <td><code>#{{t.id}}</code></td>
+              <!-- 后端已经给了中文展示文案，直接显示 -->
+              <td><span class="tag">{{t.category_text||t.category}}</span></td>
+              <td>{{t.title}}</td>
+              <td class="muted" style="white-space:pre-wrap;max-width:320px">{{t.content}}</td>
+              <td>
+                <span class="tag" :class="ticketClass(t.status)">{{t.status_text||t.status}}</span>
+                <div class="muted" style="font-size:12px" v-if="t.replied_at">回复于 {{fmt(t.replied_at)}}</div>
+              </td>
+              <td class="muted">{{fmt(t.created_at)}}</td>
+              <td class="muted">{{t.admin_reply || '—'}}</td>
+            </tr>
+          </tbody>
+        </table>
+        <div v-else class="empty">还没有提交过问题</div>
+      </div>
+    </section>
+
+    <!-- ---------------------- 账户设置弹窗 ---------------------- -->
+    <!-- 改密码 POST /api/auth/password（原密码错 -> 400「原密码不正确」，
+         新密码不足 6 位 -> 422）；换邮箱 PATCH /api/auth/email（格式非法 -> 422，
+         与他人重复 -> 409）。每一步各自 try/catch，只红弹窗里的错误条。 -->
+    <div v-if="acctBox" class="mask" @click.self="acctBox=false">
+      <div class="modal" style="max-width:540px">
+        <button class="close" @click="acctBox=false">&times;</button>
+        <h2>账户设置</h2>
+        <div v-if="acctErr" class="err" id="acctErr">{{acctErr}}</div>
+        <div v-if="acctMsg" class="muted" id="acctMsg" style="color:var(--ok);font-size:13px">{{acctMsg}}</div>
+
+        <div class="muted" style="font-size:13px;line-height:1.9;margin-bottom:6px">
+          <div>用户名：<code>{{user.username}}</code></div>
+          <div>绑定邮箱：{{user.email || '未设置'}}</div>
+        </div>
+
+        <hr style="border:none;border-top:1px solid var(--line);margin:14px 0" />
+
+        <h2 style="font-size:15px">修改密码</h2>
+        <div class="grid g3">
+          <div><label>当前密码</label>
+            <input id="pwOld" v-model="pwForm.old_password" type="password" style="width:100%" /></div>
+          <div><label>新密码（至少 6 位）</label>
+            <input id="pwNew" v-model="pwForm.new_password" type="password" style="width:100%" /></div>
+          <div><label>确认新密码</label>
+            <input id="pwNew2" v-model="pwForm.new_password2" type="password" style="width:100%" /></div>
+        </div>
+        <div class="row" style="margin-top:10px">
+          <button class="primary" id="pwBtn" :disabled="busy" @click="changePassword">修改密码</button>
+        </div>
+
+        <hr style="border:none;border-top:1px solid var(--line);margin:14px 0" />
+
+        <h2 style="font-size:15px">更换绑定邮箱</h2>
+        <p class="muted" style="font-size:12px;margin:0 0 8px">
+          私有化家庭部署，邮箱只做展示与找回线索，不发验证邮件，改完即时生效。
+        </p>
+        <div class="row">
+          <input id="emNew" v-model="emailForm.email" style="width:260px" placeholder="new@example.com" />
+          <button class="primary" id="emBtn" :disabled="busy" @click="changeEmail">保存邮箱</button>
+        </div>
+
+        <div class="row" style="margin-top:16px;justify-content:flex-end">
+          <button @click="acctBox=false">关闭</button>
+        </div>
+      </div>
+    </div>
   </template>
 </div>
 
@@ -766,10 +1016,13 @@ createApp({
       tabs: [
         {k:'devices',n:'我的设备'},{k:'membership',n:'会员情况'},{k:'reminders',n:'提醒'},
         {k:'memory',n:'记忆管理'},{k:'avatars',n:'形象'},{k:'roles',n:'人格预设'},
-        {k:'usage',n:'用量统计'}
+        {k:'usage',n:'用量统计'},{k:'stats',n:'交互统计'},{k:'support',n:'帮助与工单'}
       ],
       err: '', busy: false,
+      // 登录 / 注册：regMode=false 是登录态（默认），true 切到注册态
+      regMode: false,
       loginForm: { username:'', password:'' },
+      regForm: { username:'', nickname:'', password:'', password2:'', phone:'', email:'' },
       // 设备
       devices: [], devForm: { device_id:'', name:'我的陪伴助手' },
       bindForm: { code:'', device_id:'', alias:'' }, bindMsg: '',
@@ -790,7 +1043,16 @@ createApp({
       deriveBox: null, deriveName: '',
       rEditBox: false, rEdit: null,
       // 用量
-      usageSummary: null, usageRows: [], usageFilter: ''
+      usageSummary: null, usageRows: [], usageFilter: '',
+      // 交互统计（GET /api/stats/overview?device_pk=&days=）+ 首页聚合（GET /api/home/summary）
+      stats: null, statsDeviceId: null, statsDays: 7, home: null,
+      // 工单
+      tickets: [], tkMsg: '',
+      tkForm: { email:'', title:'', content:'', category:'other', device_id:'' },
+      // 账户设置弹窗：改密码 / 换邮箱
+      acctBox: false, acctErr: '', acctMsg: '',
+      pwForm: { old_password:'', new_password:'', new_password2:'' },
+      emailForm: { email:'' }
     };
   },
   computed: {
@@ -829,15 +1091,31 @@ createApp({
       }
       return 'HTTP ' + status;
     },
+    switchReg(v){
+      this.regMode = !!v;
+      this.err = '';
+      if (v){
+        // 从登录态切过来时，把已经填的用户名带过去，少打一遍
+        if (!this.regForm.username) this.regForm.username = this.loginForm.username || '';
+      }else{
+        if (!this.loginForm.username) this.loginForm.username = this.regForm.username || '';
+      }
+    },
     async doLogin(){
+      const u = (this.loginForm.username||'').trim();
+      if (!u || !this.loginForm.password){ this.err = '请填写用户名和密码'; return; }
+      await this.loginWith(u, this.loginForm.password);
+    },
+    // 登录并进入主体。注册成功后也走这里，实现「注册完直接进，不用再输一遍」。
+    async loginWith(username, password){
       this.busy = true; this.err = '';
       try{
         const r = await fetch('/api/auth/login', {
           method:'POST', headers:{'Content-Type':'application/json'},
-          body: JSON.stringify(this.loginForm)
+          body: JSON.stringify({username: username, password: password})
         });
         const d = await r.json();
-        if (!r.ok) throw new Error(d.detail || '登录失败');
+        if (!r.ok) throw new Error((d && typeof d.detail === 'string' && d.detail) || '登录失败');
         this.token = d.access_token;
         this.user = {username:d.username, id:d.user_id, is_admin:d.is_admin};
         localStorage.setItem('elder_token', this.token);
@@ -845,6 +1123,45 @@ createApp({
         await this.loadAll();
       }catch(e){ this.err = e.message; }
       finally{ this.busy = false; }
+    },
+    // 注册：POST /api/auth/register 无鉴权，成功返 201 + UserOut（不含 token），
+    // 所以紧接着用同一份用户名密码调登录接口拿 token。
+    async doRegister(){
+      const f = this.regForm;
+      const u = (f.username||'').trim();
+      if (u.length < 3 || u.length > 64){ this.err = '用户名需 3-64 个字符'; return; }
+      if ((f.password||'').length < 6){
+        // 后端 min_length=6 会返 422，这里先拦下，给用户一句人话
+        this.err = '密码至少 6 位'; return;
+      }
+      if (f.password !== f.password2){ this.err = '两次输入的密码不一致'; return; }
+      if (f.email && !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(f.email.trim())){
+        this.err = '邮箱格式不正确'; return;
+      }
+      this.busy = true; this.err = '';
+      try{
+        await this.api('/api/auth/register', {
+          method:'POST',
+          body: JSON.stringify({
+            username: u, password: f.password,
+            nickname: (f.nickname||'').trim(),
+            phone: (f.phone||'').trim(),
+            email: (f.email||'').trim()
+          })
+        });
+        await this.loginWith(u, f.password);
+        if (this.token){
+          this.regForm = {username:'', nickname:'', password:'', password2:'', phone:'', email:''};
+          this.loginForm = {username:u, password:''};
+        }
+      }catch(e){
+        // 服务端可能加「是否开放公开注册」的开关并返 403/404 —— 翻成人话，
+        // 不能把 HTTP 状态码或堆栈甩给用户；其余错误（如「用户名已存在」）
+        // 原样显示后端给的中文 detail。
+        const m = (e && e.message) || '';
+        this.err = /403|404|未开放|不允许|已关闭/.test(m)
+          ? '当前未开放自助注册，请联系管理员' : m;
+      }finally{ this.busy = false; }
     },
     logout(){ this.token=''; localStorage.removeItem('elder_token'); },
     async loadAll(){
@@ -1271,6 +1588,104 @@ createApp({
       return {chat:'对话', light:'轻任务', embed:'向量化', rerank:'重排'}[u] || u || '—';
     },
 
+    // -------- 交互统计 + 今日概况 --------
+    async loadStats(){
+      this.err = '';
+      const id = this.statsDeviceId || (this.devices[0] && this.devices[0].id);
+      if (!id){ this.stats = null; return; }
+      try{
+        this.stats = await this.api('/api/stats/overview?device_pk=' + id + '&days=' + this.statsDays);
+      }catch(e){ this.err = '交互统计加载失败：' + e.message; this.stats = null; }
+    },
+    async loadHome(){
+      try{
+        // home/summary 是三块聚合，故障时不连累统计卡片：各自 try/catch
+        this.home = await this.api('/api/home/summary');
+      }catch(e){ this.err = '今日概况加载失败：' + e.message; }
+    },
+    statsBarHeight(n){
+      const arr = (this.stats && this.stats.series) ? this.stats.series : [];
+      const max = Math.max(1, ...arr.map(s => s.total || 0));
+      return Math.round(8 + ((n || 0) / max) * 100);
+    },
+
+    // -------- 工单 --------
+    async loadTickets(){
+      this.err = '';
+      try{
+        const r = await this.api('/api/support/tickets/mine?limit=50');
+        this.tickets = r || [];
+      }catch(e){ this.err = '工单列表加载失败：' + e.message; }
+    },
+    async submitTicket(){
+      const f = this.tkForm;
+      const email = (f.email||'').trim();
+      if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)){ this.err = '请填写正确的联系邮箱'; return; }
+      if (!(f.title||'').trim()){ this.err = '请填写问题标题'; return; }
+      if (!(f.content||'').trim()){ this.err = '请填写问题描述'; return; }
+      this.busy = true; this.err = ''; this.tkMsg = '';
+      try{
+        const t = await this.api('/api/support/tickets', {
+          method:'POST',
+          body: JSON.stringify({
+            email: email, title: (f.title||'').trim(), content: (f.content||'').trim(),
+            category: f.category || 'other', device_id: (f.device_id||'').trim()
+          })
+        });
+        this.tkForm = {email:email, title:'', content:'', category:'other', device_id:''};
+        this.tkMsg = '已提交（编号 #' + (t && t.id) + '），管理员会回复到 ' + email;
+        await this.loadTickets();
+      }catch(e){ this.err = '提交失败：' + e.message; }
+      finally{ this.busy = false; }
+    },
+    ticketClass(s){
+      return s === 'resolved' ? 'ok'
+           : (s === 'open' ? 'warn' : (s === 'closed' ? 'bad' : ''));
+    },
+
+    // -------- 账户设置（改密码 / 换邮箱）--------
+    openAccount(){
+      this.acctBox = true; this.acctErr = ''; this.acctMsg = '';
+      this.pwForm = {old_password:'', new_password:'', new_password2:''};
+      this.emailForm = {email: this.user.email || ''};
+    },
+    async changePassword(){
+      const f = this.pwForm;
+      this.acctErr = ''; this.acctMsg = '';
+      if (!f.old_password){ this.acctErr = '请填写当前密码'; return; }
+      if ((f.new_password||'').length < 6){ this.acctErr = '新密码至少 6 位'; return; }
+      if (f.new_password !== f.new_password2){ this.acctErr = '两次输入的新密码不一致'; return; }
+      if (f.new_password === f.old_password){ this.acctErr = '新密码不能与当前密码相同'; return; }
+      this.busy = true;
+      try{
+        // 原密码错误后端返 400（不是 401，避免被请求层当成登录态失效踢出去）
+        await this.api('/api/auth/password', {
+          method:'POST',
+          body: JSON.stringify({old_password:f.old_password, new_password:f.new_password})
+        });
+        this.pwForm = {old_password:'', new_password:'', new_password2:''};
+        this.acctMsg = '密码已修改，下次登录请使用新密码';
+      }catch(e){ this.acctErr = e.message; }
+      finally{ this.busy = false; }
+    },
+    async changeEmail(){
+      this.acctErr = ''; this.acctMsg = '';
+      const email = (this.emailForm.email||'').trim();
+      if (!email){ this.acctErr = '请填写邮箱'; return; }
+      if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)){ this.acctErr = '邮箱格式不正确'; return; }
+      this.busy = true;
+      try{
+        // 返回体与 GET /api/auth/me 同构，直接拿返回值刷新本地账户卡片
+        const r = await this.api('/api/auth/email', {method:'PATCH', body:JSON.stringify({email:email})});
+        if (r && r.email){
+          this.user = Object.assign({}, this.user, {email: r.email});
+          localStorage.setItem('elder_user', JSON.stringify(this.user));
+        }
+        this.acctMsg = '绑定邮箱已更新为 ' + email;
+      }catch(e){ this.acctErr = e.message; }
+      finally{ this.busy = false; }
+    },
+
     // -------- 展示辅助 --------
     fmt(v){
       if (!v) return '—';
@@ -1305,6 +1720,8 @@ createApp({
       if (t === 'reminders') this.loadReminders();
       if (t === 'memory') this.loadMemory();
       if (t === 'usage') this.loadUsage();
+      if (t === 'stats'){ if (!this.statsDeviceId && this.devices.length) this.statsDeviceId = this.devices[0].id; this.loadStats(); this.loadHome(); }
+      if (t === 'support') this.loadTickets();
     }
   },
   async mounted(){
