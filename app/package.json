@@ -104,7 +104,7 @@
     "sm-crypto": "^0.3.13",
     "vue": "^3.4.21",
     "wot-design-uni": "^1.9.1",
-    "z-paging": "2.8.7"
+    "z-paging": "2.8.8"
   },
   "devDependencies": {
     "@alova/wormhole": "^1.0.8",
