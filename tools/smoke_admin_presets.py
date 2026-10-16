@@ -1,7 +1,7 @@
 """管理端 · **平台人格预设运营后台**冒烟（``/api/admin/presets``）。
 
 这个脚本存在的理由不是"再测一遍接口"，而是把**七条边界钉成可执行的断言**。
-每条断言在名字里带编号（T01..T31），与 ``docs/架构设计-人格预设运营后台.md``
+每条断言在名字里带编号（T01..T32），与 ``docs/架构设计-人格预设运营后台.md``
 §8.2 的清单一一对应 —— 将来对不上时，**以设计文档为准**，因为那里记着
 每条断言"防的是哪类事故"。
 
@@ -22,7 +22,8 @@
    ``regenerate_locked`` 多返回一个 ``tokens``，那是 ``assert_present()``
    做 fail-closed 自检的判定基准 —— 泄漏它等于把"门禁怎么判"交出去。
 5. **审计与业务写同事务**：4 个写入点逐一验证（T18/T20/T24/T25）。
-   审计丢一次就永远丢了 —— 那等于没有审计。
+   审计丢一次就永远丢了 —— 那等于没有审计。T32 补上**结果断言抓不到的
+   那一半**：用 AST 静态守住"不许拆成两次 commit"（业务先提交、再补审计）。
 6. **启动期净改动 = 0**：运营改的值必须活过重启（T14），下架的预设不能
    在重启后凭空多出一个新的（T27）。这两条是本设计**最重要的回归断言**：
    一旦破坏，运营的所有调优会在下次重启时静默消失，而库里会堆积重复的"小暖"。
@@ -42,6 +43,7 @@
 """
 from __future__ import annotations
 
+import ast
 import json
 import os
 import subprocess
@@ -59,7 +61,7 @@ sys.path.insert(0, str(SERVER))
 PY = sys.executable
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from smoke_ports import (  # noqa: E402
+from smoke_ports import (
     detect_addr_in_use,
     guard_port,
     release_port,
@@ -119,14 +121,18 @@ def req(method: str, path: str, body: dict | None = None,
             if text:
                 try:
                     payload = json.loads(text)
-                except Exception:
+                except Exception:  # noqa: BLE001  harness 有意吞掉一切
+                    # 解析异常：响应体可能是 HTML/纯文本，解析失败按原文
+                    # 返回即可，断言只看 status code。窄化异常类型只会
+                    # 让漏网的形式把整个脚本崩掉。
                     payload = text
             return resp.status, (text if raw else payload)
     except urllib.error.HTTPError as e:
         text = e.read().decode("utf-8")
         try:
             payload = json.loads(text)
-        except Exception:
+        except Exception:  # noqa: BLE001  同上一处：4xx 的 body 格式
+            # 不受我们控制，解析失败按原文返回，判定只看 status code。
             payload = text
         return e.code, (text if raw else payload)
 
@@ -145,7 +151,9 @@ def wait_ready(timeout: float = 120.0, proc=None) -> bool:
         try:
             if req("GET", "/api/health")[0] == 200:
                 return True
-        except Exception:
+        except Exception:  # noqa: BLE001, S110  轮询语义：服务未就绪时
+            # 连接被拒是常态，静默地试到超时为止正是这里的设计；真正的
+            # 失败由 timeout 后返回 False 兜底（调用方随即退出并打印日志）。
             pass
         time.sleep(0.6)
     return False
@@ -185,11 +193,13 @@ def _spawn(env: dict):
     if wait_ready(proc=proc):
         if detect_addr_in_use(_read_log_tail()):
             print(f"[boot] ✗ 端口 {PORT} bind 失败（占位未生效）。本次结果不可信，直接退出。")
-            print(f"[boot]   请换端口重跑：python tools/smoke_admin_presets.py <其它端口>")
+            print("[boot]   请换端口重跑：python tools/smoke_admin_presets.py <其它端口>")
             try:
                 proc.terminate()
                 proc.wait(timeout=5)
-            except Exception:
+            except Exception:  # noqa: BLE001  terminate 竞态：进程恰在
+                # 此刻自行退出时 wait() 抛异常，兜底走 kill()。harness
+                # 不需要区分"被我们终止的"还是"自己死的"。
                 proc.kill()
             return None
         return proc
@@ -271,6 +281,133 @@ def _db_preset_snapshot(pk: int) -> dict | None:
         eng.dispose()
 
 
+# ================================================================ T32 用：
+# 审计与业务写同事务的**源码结构**断言（AST）
+#
+# 为什么结果断言不够（QA 离线变异验证过的盲区）
+# ----------------------------------------
+# T18/T20/T24/T25 验的是"审计写没写、写得对不对"，全是**结果**断言：
+# 审计行在，它们就绿。把实现改成"业务 commit 完再写审计"（两次 commit），
+# **一条都不红** —— 业务成功了、审计也写上了，只是分属两个事务。
+# 而那个失效模式的真实危害是：业务 commit 成功之后、审计写入之前，
+# 进程若死掉（或审计写入抛异常），就留下"改成功了但没有任何痕迹"——
+# 审计丢一次就永远丢了，那等于没有审计。
+#
+# 为什么用 AST 而不是运行时
+# --------------------------
+# 冒烟脚本是**外部 HTTP 打子进程服务**，没法 monkeypatch Session.commit；
+# 而"同事务"的两种失效形态（端点里两句 commit 且 record 在后 / record
+# 自行 commit）恰好都是**源码结构**特征，静态判对症。
+# 更强的运行时形态（monkeypatch record() 抛异常、断言业务写回滚）是
+# 进程内故障注入测试，不在本脚本职责内 —— 这条边界必须写清，
+# 否则下一个人会把 T32 当成"事务已经验过了"。
+#
+# 判据（两条，对应两层防线）
+# --------------------------
+# 1. ``admin_audit.record()`` 函数体内**不存在任何 commit 调用** ——
+#    record 只许 db.add()，提交由调用方负责（该模块 docstring 的承诺）；
+# 2. 每个**同时包含** ``admin_audit.record(...)`` 与 ``db.commit()`` 的
+#    端点函数内，``record(...)`` 的行号必须**小于每一个** ``db.commit()``
+#    的行号 —— 任何一笔 commit 排在 record 之前，就是"先提交业务再补审计"。
+_AUDIT_MODULE = ROOT / "server" / "app" / "persona" / "admin_audit.py"
+_AUDIT_CALLERS = (
+    ROOT / "server" / "app" / "routers" / "admin_presets.py",
+    ROOT / "server" / "app" / "routers" / "roles.py",
+)
+
+
+def _dotted(node: ast.AST) -> str:
+    """把调用目标还原成点分名字（``admin_audit.record`` / ``db.commit``）。
+
+    只认 ``Name`` / ``Name.attr`` / ``Name.attr.attr`` 形态 —— 本项目的
+    调用写法就是这两种。更复杂的形态（``getattr`` 动态派发、别名重绑定）
+    静态判不了，那是本断言的边界，由进程内故障注入测试兜底。
+    """
+    parts: list[str] = []
+    while isinstance(node, ast.Attribute):
+        parts.append(node.attr)
+        node = node.value
+    if isinstance(node, ast.Name):
+        parts.append(node.id)
+        return ".".join(reversed(parts))
+    return ""
+
+
+def _is_audit_record_call(call: ast.Call) -> bool:
+    """是否是审计写入调用。
+
+    同时认 ``admin_audit.record(...)``（当前写法）与裸 ``record(...)``
+    （将来若改成 from-import）。少认一种写法，断言就会在有人改变 import
+    风格后**静默漏判** —— 静态断言最怕的不是误报，是悄悄不再匹配。
+    """
+    dotted = _dotted(call.func)
+    return dotted in ("admin_audit.record", "record")
+
+
+def _is_commit_call(call: ast.Call) -> bool:
+    """是否是 ``db.commit()`` 调用。"""
+    return _dotted(call.func) == "db.commit"
+
+
+def _audit_transaction_check() -> tuple[list[str], int]:
+    """AST 体检：审计与业务写是否同一个事务。
+
+    Returns:
+        ``(违规列表, 匹配到的 record+commit 写入口函数数)``。第二个返回值
+        供反向自检用：匹配到 0 个函数说明路径或匹配条件写错了 ——
+        那种情况下主断言"没有违规"是**恒绿**，比没有断言更坏。
+
+    解析失败（文件不存在 / 语法错误）按违规计：fail-closed，
+    绝不因为"读不到源码"就放行。
+    """
+    problems: list[str] = []
+    pairs = 0
+
+    # ---- 判据一：record() 自己不许 commit ----
+    try:
+        audit_tree = ast.parse(_AUDIT_MODULE.read_text(encoding="utf-8"))
+    except (OSError, SyntaxError) as exc:
+        problems.append(f"admin_audit.py 解析失败（fail-closed 计为违规）：{exc}")
+        audit_tree = None
+    if audit_tree is not None:
+        for fn in ast.walk(audit_tree):
+            if (isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef))
+                    and fn.name == "record"):
+                for node in ast.walk(fn):
+                    if isinstance(node, ast.Call) and _is_commit_call(node):
+                        problems.append(
+                            f"admin_audit.record() 内部第 {node.lineno} 行出现 "
+                            f"commit 调用 —— record 只许 db.add()，提交必须由"
+                            f"调用方与业务写同一个事务完成")
+
+    # ---- 判据二：端点内 record(...) 必须先于所有 db.commit() ----
+    for path in _AUDIT_CALLERS:
+        try:
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+        except (OSError, SyntaxError) as exc:
+            problems.append(
+                f"{path.name} 解析失败（fail-closed 计为违规）：{exc}")
+            continue
+        for fn in ast.walk(tree):
+            if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            calls = [n for n in ast.walk(fn) if isinstance(n, ast.Call)]
+            records = [c for c in calls if _is_audit_record_call(c)]
+            commits = [c for c in calls if _is_commit_call(c)]
+            if not records or not commits:
+                continue  # 不写审计的端点（用户端写入口）不归本断言管
+            pairs += 1
+            for rec in records:
+                for com in commits:
+                    if rec.lineno >= com.lineno:
+                        problems.append(
+                            f"{path.name}:{fn.name}() 的 record()（第 "
+                            f"{rec.lineno} 行）不在 db.commit()（第 "
+                            f"{com.lineno} 行）之前 —— 业务先提交再补审计 = "
+                            f"两次 commit，业务成功而审计丢失时不会回滚")
+    return problems, pairs
+
+
 def main() -> int:
     external_db = os.environ.get("ELDER_DB", "").strip()
     db_url = external_db or f"sqlite:///{DB_PATH.as_posix()}"
@@ -304,7 +441,9 @@ def main() -> int:
                 with _OPENER.open(
                         urllib.request.Request(BASE + "/api/health"), timeout=1):
                     time.sleep(0.5)
-            except Exception:
+            except Exception:  # noqa: BLE001  旧进程的端口尚未释放时
+                # 连接被拒 = 它已经退出，break 进去起新的。轮询语义同
+                # wait_ready，超时由外层 40 次循环兜底。
                 break
         new_proc = _spawn(env)
         if new_proc is None:
@@ -341,7 +480,7 @@ def main() -> int:
         pk = rows[0]["id"]
 
         # 记录出厂基线（后面 reset / 重启都要跟它比）
-        from app.persona import catalog  # noqa: E402  只读常量，不碰 DB
+        from app.persona import catalog  # 只读常量，不碰 DB
         dflt_prompt = catalog.DEFAULT_PRESET_PROMPT
         dflt_traits = dict(catalog.DEFAULT_TRAITS)
         dflt_voice = catalog.DEFAULT_PRESET_TTS_VOICE
@@ -499,6 +638,26 @@ def main() -> int:
               and patched_own.get("name") == "改名了"
               and patched_own.get("system_prompt") == "改过了",
               f"code={code}")
+
+        # ==================================================== T32 同事务（AST）
+        print("── T32 审计与业务写同事务（AST 静态断言）──")
+        # 存在理由与边界见文件里 _audit_transaction_check 上方的长注释：
+        # 结果断言（T18/T20/T24/T25）抓不到"拆两次 commit"，QA 离线变异
+        # 验证过那条路一条都不会红；这里用源码结构补上。
+        violations, n_pairs = _audit_transaction_check()
+        check("T32 ★ 审计与业务写同事务（AST：record() 内无 commit；"
+              "端点内 record(...) 行号 < 每一个 db.commit() 行号）",
+              not violations,
+              "; ".join(violations) if violations
+              else f"{n_pairs} 个写入口均合规")
+        # 反向自检：这条断言必须**有匹配对象**才算数。匹配到 0 个函数
+        # 意味着路径写错或匹配条件失效 —— 那时"没有违规"是恒绿。
+        # 数量钉死为 4：新增带审计的写入口必须显式改这里并 review 其
+        # 事务结构（与 T28"恰好 10 个 trait 维度"同一条纪律）。
+        check("T32 反向自检：AST 匹配到 4 个 record+commit 写入口"
+              "（匹配不到 = 断言在对着空气开炮；数量变了说明新增了带审计的"
+              "端点，请 review 其事务结构后显式改期望值）",
+              n_pairs == 4, f"{n_pairs} 个")
 
         # ==================================================== T21-T22 preview
         print("── T21-T22 preview 不落库且 fail-closed ──")
@@ -689,7 +848,7 @@ def main() -> int:
               not _find_tokens_key(aud_text), str(_find_tokens_key(aud_text)))
         # 反向自检：确认"结构判据本身不是空断言"——
         # 真的调一次 regenerate_locked，它确实多出 tokens 键。
-        from app.persona import guardrails as _gr  # noqa: E402
+        from app.persona import guardrails as _gr
         check("T10 反向自检：regenerate_locked 确实比 card_items 多 tokens 键"
               "（否则上面三条断言就是在测一个不存在的泄漏形态）",
               bool(_find_tokens_key(_gr.regenerate_locked({}))),
@@ -737,7 +896,7 @@ def main() -> int:
               isinstance(body, dict) and isinstance(body.get("detail"), str)
               and "管理端" in body["detail"],
               repr(body.get("detail") if isinstance(body, dict) else None))
-        code, soft_bad = req("POST", f"/api/admin/presets/{pk}/soft-guardrails",
+        code, _soft_bad = req("POST", f"/api/admin/presets/{pk}/soft-guardrails",
                              {"guardrail_id": "随便编一条", "enabled": True}, admin)
         check("软约束只接受白名单 id -> 400"
               "（自由文本无法校验，且可能与硬红线直接冲突）",
@@ -804,7 +963,7 @@ def main() -> int:
         with _raw_column("ai_providers", pk, "guardrails", '{"hard": []}'):
             code, d8 = req("GET", f"/api/admin/presets/{pk}", token=admin)
             hard_items = (d8 or {}).get("guardrails_hard", [])
-            code2, pr = req("GET", f"/api/roles/{pk}/prompt", token=admin)
+            _code2, pr = req("GET", f"/api/roles/{pk}/prompt", token=admin)
             pr_prompt = (pr or {}).get("prompt", "") if isinstance(pr, dict) else ""
         check("T08 ★ 库里 hard 被清空后，管理端展示仍有 5 条红线"
               "（红线是代码常量再生，DB 文本压根不被信任）",
@@ -853,7 +1012,7 @@ def main() -> int:
               rd.get("to") == dflt_prompt, str(rd.get("to"))[:40])
         check("T18 审计 diff 的 from 是运营改过的值",
               rd.get("from") == "运营又改了一次", str(rd.get("from")))
-        code, again = req("POST", f"/api/admin/presets/{pk}/reset", {}, admin)
+        code, _again = req("POST", f"/api/admin/presets/{pk}/reset", {}, admin)
         check("对已是默认值的 preset 再 reset -> 仍 200（幂等，不报错）",
               code == 200, f"code={code}")
         code, auds2 = req("GET", f"/api/admin/presets/{pk}/audits?limit=200",

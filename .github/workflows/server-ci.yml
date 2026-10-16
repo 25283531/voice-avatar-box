@@ -76,7 +76,7 @@ jobs:
       - name: 角色与权限冒烟（含 P0 安全断言）
         run: python tools/smoke_roles.py 8101
 
-      # 人格预设运营后台（/api/admin/presets，97 条断言）。
+      # 人格预设运营后台（/api/admin/presets，105 条断言）。
       # 之所以必须挂在 SQLite job 而不是 mysql-smoke job：它**直连 sqlite3
       # 改库**注入脏数据（T08「把 guardrails.hard 清空后红线是否仍齐全」——
       # 那个值没有任何接口能写出来，只能像老库那样直接改列），且它会
