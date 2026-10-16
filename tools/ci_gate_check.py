@@ -13,8 +13,11 @@ CI 与本地跑同一份代码，才不会出现「CI 绿本地红」或反过�
 2. **关键路径覆盖断言**：硬编码一份关键路径清单（启动期写表 / 启动 seed /
    连库 / 人格红线 / 黄金副本 / CI 本体），按 CODEOWNERS 模式匹配规则
    断言每条关键路径都被**某条非通配规则**覆盖。有人删掉这些行就红。
-3. **workflows 全部可解析**：``.github/workflows/*.yml`` 逐个过
-   ``yaml.safe_load``。
+3. **workflows 结构**：``.github/workflows/*.yml`` 逐个过 ``yaml.safe_load``，
+   并断言「有 ``on`` 触发块」「``jobs`` 非空」「每个步骤都有 ``uses`` 或
+   ``run``」。最后一条来自真实事故：一个悬空空步骤会让**整个 workflow
+   启动失败** → jobs=0 → PR 上不产出任何检查项 → 后端业务冒烟静默失效，
+   而它在 diff 里看起来只是一行无害的 ``name``。
 
 匹配口径（与 GitHub 真实语义的关系，必须读）
 --------------------------------------------
@@ -185,11 +188,106 @@ def check_critical_coverage(rules: list[Rule], report: CheckReport) -> None:
 
 
 # ---------------------------------------------------------------------------
-# 检查 3：workflows YAML 可解析
+# 检查 3：workflows 结构 —— 可解析 + 有触发块 + jobs 非空 + 每个步骤非空
 # ---------------------------------------------------------------------------
+# 事故链路（本项目真实发生过，GitHub Actions run 22/23/24 连续三次
+# conclusion=failure、jobs=0）：
+#
+#   mysql-smoke 末尾一个「只有 name、没有 uses/run」的悬空步骤
+#     → Actions 遇到没有 uses/run 的步骤，会让**整个 workflow 启动失败**
+#       （不是只红那一步）
+#     → jobs = 0，PR 上**一个检查项都不产出**
+#     → 后端业务冒烟（smoke_server / smoke_roles / eval_persona / qa3_*
+#       与整个 MySQL job）全部静默失效
+#
+# 而它在 diff 里只是几行注释 + 一个孤零零的 name，看起来完全无害。
+# 最危险的地方：失败形态是「PR 上没有检查项」，**看起来像通过** ——
+# 比红更危险，红至少会有人去看。
+#
+# 「jobs 为空」「缺 on 触发块」是同一类缺陷：不产出任何检查项的 workflow
+# 等于没有 workflow，而且同样表现为「什么都没发生」。
+#
+# ⚠️ 本检查的边界（不写清就会被当成它不是的东西）
+# 它只判「结构上会不会被 Actions 拒绝」，**不判步骤会不会真的跑**：
+#   * run 里的命令写错、脚本自己假绿 —— 判不出来；
+#   * 触发条件写窄了（例如 paths 过滤漏掉某个目录）—— 判不出来；
+#   * 步骤的语义对不对、够不够 —— 判不出来。
+# 那些靠 CI 实跑与人工 review。一个只判结构、不判语义的断言不是没用的，
+# 但它**不能**被当成「CI 已经覆盖住了」的证据。
 
-def check_workflows_parse(report: CheckReport) -> None:
-    """`.github/workflows/*.yml` 逐个 yaml.safe_load。"""
+def _find_trigger_key(doc: dict) -> object | None:
+    """找出 workflow 的触发块键。
+
+    ⚠️ PyYAML 遵循 YAML 1.1，会把裸键 ``on`` 解析成布尔 ``True``
+    （本地实测：``yaml.safe_load("on:\\n  push:")`` 的键是 ``True`` 而非
+    ``"on"``）。所以这里同时接受布尔 True 与任意大小写的字符串 "on" ——
+    只认字符串会让这个断言在**每一个**合法 workflow 上假红。
+    """
+    for key in doc:
+        if key is True:
+            return key
+        if isinstance(key, str) and key.lower() == "on":
+            return key
+    return None
+
+
+def check_workflow_structure(doc: dict, rel: str, report: "CheckReport") -> None:
+    """单个 workflow 的结构断言：触发块 / jobs 非空 / 每个步骤有 uses 或 run。"""
+    # ---- 触发块存在 ----
+    if _find_trigger_key(doc) is None:
+        report.fail(f"{rel} 缺 on 触发块 —— 不产检查项的 workflow 等于没有")
+    else:
+        report.ok(f"{rel} 存在 on 触发块")
+
+    # ---- jobs 非空 ----
+    jobs = doc.get("jobs")
+    if not isinstance(jobs, dict) or not jobs:
+        report.fail(
+            f"{rel} 的 jobs 为空或不是映射 —— Actions 不会为它跑出任何检查项"
+        )
+        return
+    report.ok(f"{rel} jobs 非空（{len(jobs)} 个）")
+
+    # ---- 每个步骤都必须有 uses 或 run ----
+    for job_id, job in jobs.items():
+        if not isinstance(job, dict):
+            report.fail(f"{rel} 的 job {job_id!r} 不是映射")
+            continue
+        if "steps" not in job:
+            # job 用 `uses:` 调复用工作流是合法的，没有 steps
+            if job.get("uses"):
+                continue
+            report.fail(
+                f"{rel} 的 job {job_id!r} 既没有 steps 也没有 uses —— "
+                "该 job 不会执行任何东西"
+            )
+            continue
+        steps = job["steps"]
+        if not isinstance(steps, list) or not steps:
+            report.fail(f"{rel} 的 job {job_id!r} 的 steps 为空")
+            continue
+        ok = True
+        for index, step in enumerate(steps, start=1):
+            if not isinstance(step, dict):
+                report.fail(f"{rel} 的 job {job_id!r} 第 {index} 个步骤不是映射")
+                ok = False
+                continue
+            if not step.get("uses") and not step.get("run"):
+                name = step.get("name") or "<未命名>"
+                report.fail(
+                    f"{rel} 的 job {job_id!r} 第 {index} 个步骤「{name}」"
+                    "既无 uses 也无 run —— 空步骤会让整个 workflow 启动失败、"
+                    "PR 上无任何检查项（看起来像通过，比红更危险）"
+                )
+                ok = False
+        if ok:
+            report.ok(
+                f"{rel} 的 job {job_id!r} {len(steps)} 个步骤均有 uses 或 run"
+            )
+
+
+def check_workflows(report: "CheckReport") -> None:
+    """遍历 `.github/workflows/*.yml`：解析 + 结构断言。"""
     try:
         import yaml  # noqa: PLC0415 —— 延迟导入，缺依赖时给出可执行提示
     except ImportError:
@@ -211,11 +309,17 @@ def check_workflows_parse(report: CheckReport) -> None:
     for path in files:
         rel = path.relative_to(ROOT).as_posix()
         try:
-            yaml.safe_load(path.read_text(encoding="utf-8"))
+            doc = yaml.safe_load(path.read_text(encoding="utf-8"))
         except yaml.YAMLError as exc:
             report.fail(f"{rel} 不是合法 YAML：{exc}")
-        else:
-            report.ok(f"{rel} 可通过 yaml.safe_load 解析")
+            continue
+        if not isinstance(doc, dict):
+            report.fail(
+                f"{rel} 顶层不是映射（解析结果为 {type(doc).__name__}）"
+            )
+            continue
+        report.ok(f"{rel} 可通过 yaml.safe_load 解析")
+        check_workflow_structure(doc, rel, report)
 
 
 # ---------------------------------------------------------------------------
@@ -224,7 +328,7 @@ def check_workflows_parse(report: CheckReport) -> None:
 
 def main() -> int:
     print("=" * 72)
-    print("守门人自检：CODEOWNERS 覆盖 + workflows 可解析")
+    print("守门人自检：CODEOWNERS 覆盖 + workflows 结构")
     print("=" * 72)
 
     report = CheckReport()
@@ -249,7 +353,7 @@ def main() -> int:
         check_critical_coverage(rules, report)
 
     # ---- 检查 3 ----
-    check_workflows_parse(report)
+    check_workflows(report)
 
     print("-" * 72)
     print(f"通过 {len(report.passes)} 项，失败 {len(report.failures)} 项")

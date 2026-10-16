@@ -210,7 +210,16 @@ jobs:
       # 要补这三条，正确做法是先把那三份脚本改成尊重外部 ELDER_DB
       # （并给sqlite3 直连加方言分支），属于独立一轮工作，
       # 在那之前这里必须保持为空。
-      - name: 角色与权限冒烟（mysql+pymysql）
+      #
+      # ⚠️ 这段注释**下面不允许再挂任何 step**。上一轮曾在这里留过一个
+      # 「- name: 角色与权限冒烟（mysql+pymysql）」的空步骤（无 uses、无 run），
+      # 后果不是「那一步红」而是**整个 workflow 启动失败**：
+      #   空步骤 → workflow 启动失败 → jobs=0 → PR 上根本没有检查项
+      #   → 后端业务冒烟（smoke_server / smoke_roles / eval_persona /
+      #     qa3_* 与整个 MySQL job）全部静默失效
+      # 而它在 diff 里只是几行注释 + 一个孤零零的 name，看起来完全无害；
+      # 失败形态还是「PR 上没有检查项」，**看起来像通过** —— 这比红更危险。
+      # tools/ci_gate_check.py 的「步骤非空」断言现在会当场拦下它。
 
   # 两个 compose 文件的语法校验。
   # 必要性：MySQL 变体是 overlay 叠加文件（docker-compose.mysql.yml 不能单独用），
