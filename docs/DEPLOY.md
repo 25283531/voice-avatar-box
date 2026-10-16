@@ -70,17 +70,53 @@ docker volume inspect server_elder-data      # 看 Mountpoint，即卷在宿主�
 docker compose exec elder-server ls -l /data # 容器视角
 ```
 
-### 1.6 顺带起语音链路（可选）
+### 1.6 语音链路（内置，无需额外操作）
 
-```bash
-docker compose --profile xiaozhi up -d
-#  8000  小智 WebSocket 语音通道
-#  8002  小智智控台
-#  8003  OTA / 视觉分析
-#  8064  本服务（业务面 + 管理后台）
+语音链路是**本镜像自带**的（自研 WebSocket 服务端 `server/app/voice/`），
+和 API 在同一个进程、**同一个端口**，随 `docker compose up -d` 一起就绪，没有第二个容器要起。
+
+```
+8064  本服务：业务 API + 管理后台 + 语音 WebSocket（/api/voice/v1/ws）+ OTA
 ```
 
-### 1.7 不用 Docker 的本地开发
+> 历史版本曾额外拉一个 `xiaozhi-esp32-server` 官方容器跑语音链路（`--profile xiaozhi`），
+> 那意味着角色、音色、记忆、大模型调用都在第三方进程里。**该 profile 已删除**，
+> 现在只有 8064 一个端口。若你手上是旧部署，升级后请同步调整防火墙与反代规则：
+> 放行 WebSocket 升级即可，不再需要 8000 / 8002 / 8003。
+
+### 1.7 配置邮件服务（找回密码 / 用户反馈依赖它）
+
+> **这一步不做，用户就找不回密码。** APP 的找回密码、提交问题都走邮件，
+> 而 SMTP 未配置时这两条链路会明确失败，不会静默假装成功。
+
+SMTP **不在 compose 里配**，也不在 `.env` 里配 —— 存在数据库里，管理员登录后配一次即可：
+
+```
+管理后台 → 邮件设置 → 填 SMTP（host / port / 用户名 / 密码 / TLS / 发件人）→ 点「发送测试邮件」
+```
+
+配完**务必点一次「发送测试邮件」**。SMTP 配错的概率极高（端口 465/587 混淆、TLS 开关、
+邮箱服务商要用授权码而非登录密码），这是唯一能立刻发现问题的方式。
+
+常见组合：
+
+| 服务商 | host | port | 加密 |
+| --- | --- | --- | --- |
+| QQ 邮箱 | `smtp.qq.com` | `465` | SSL |
+| 163 邮箱 | `smtp.163.com` | `465` | SSL |
+| 阿里云企业邮 | `smtp.qiye.aliyun.com` | `465` | SSL |
+| Gmail | `smtp.gmail.com` | `587` | STARTTLS |
+
+> ⚠️ 国内邮箱大多要用**授权码**（在邮箱网页端生成），不是你的登录密码。
+> 这是最常见的配置失败原因。
+
+**环境变量** `ELDER_MAIL_FAKE` 是给 CI / 本机测试用的：设为 `1` 时邮件不真发，
+写进进程内发件箱，管理员可从 `GET /api/admin/mail/outbox` 读出来核对。
+**生产必须留空或设 `0`**，否则用户点了找回密码永远收不到邮件。
+
+排障见 [6.10 用户收不到密码重置邮件](#610-用户收不到密码重置邮件)。
+
+### 1.8 不用 Docker 的本地开发
 
 ```bash
 pip install -r requirements.txt
@@ -321,6 +357,27 @@ server {
 
     client_max_body_size 20m;
 
+    # ---------------------------------------------------------- 语音 WebSocket
+    # ⚠️ 这一段不能省。语音链路和 API 共用 8064，设备会往
+    #    /api/voice/v1/ws 发起 WebSocket 升级。Nginx 默认不转发 Upgrade 头，
+    #    漏了这三行的表现是：设备能配网、能心跳（HTTP 正常），
+    #    但一开口说话就断连，看日志是 200 而不是 101 —— 很容易误判成固件问题。
+    #    另外 read_timeout 要放宽到远大于一次对话的长度，
+    #    否则老人说到一半被 Nginx 掐掉连接。
+    location /api/voice/ {
+        proxy_pass http://127.0.0.1:8064;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade    $http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host              $host;
+        proxy_set_header X-Real-IP         $remote_addr;
+        proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_read_timeout 3600s;   # 一次语音对话可能很长；不要设成几十秒
+        proxy_send_timeout 3600s;
+        proxy_buffering off;        # Opus 音频不能攒着发，否则明显延迟
+    }
+
     location / {
         proxy_pass http://127.0.0.1:8064;
         proxy_http_version 1.1;
@@ -346,7 +403,11 @@ server {
 - **`ELDER_CORS` 要跟着改**：`*` 在开发时方便，上线后建议写成 `https://voice.2508866.xyz`（多个来源用逗号分隔）。
   FastAPI 的 CORS 中间件在 `allow_origins=["*"]` 时不会带 `Allow-Credentials`，若前端要传凭证必须写明确来源。
 - 反向代理之后，容器内仍然认为自己是 HTTP，不需要在应用侧开 TLS。
+- **WebSocket 必须显式放行 Upgrade**：见上面 `location /api/voice/` 那段。这是本项目最容易踩的坑。
+- **语音链路不需要单独的域名或端口**：它和 `/api/` 同源。如果出于某种原因把它拆出去部署，
+  才需要配 `ELDER_VOICE_PUBLIC_BASE`。
 - 8064 不需要对公网开放，只监听 `127.0.0.1` 更安全：把 compose 里的端口映射改成 `127.0.0.1:${ELDER_HTTP_PORT:-8064}:8080`。
+  注意语音链路也随之走了反代，上面那段 WebSocket 配置就是必需的，不能偷懒直接暴露 8064。
 
 ---
 
@@ -366,10 +427,13 @@ server {
 | `ELDER_TZ` | `Asia/Shanghai` | 业务时区，改了会整体影响提醒时间计算 |
 | `MYSQL_ROOT_PASSWORD` | `123456` | 仅在使用自带 `elder-db` 容器时生效，**生产必须改** |
 | `ELDER_ORDER_TTL_HOURS` | `48` | 会员订单（人工核销）占用有效期，超时置 `expired` 并释放号段与金额 |
-| `ELDER_XIAOZHI_WS` | `ws://xiaozhi-server:8000/xiaozhi/v1/` | 下发给设备的语音通道地址 |
-| `ELDER_XIAOZHI_OTA` | `http://xiaozhi-server:8003/xiaozhi/ota/` | 下发给设备的 OTA 地址 |
+| `ELDER_VOICE_PUBLIC_BASE` | 留空（自动推导） | 语音链路对外地址。自研链路与 API 同源同端口，服务端按请求 Host 推导，**默认不用配**；仅在反代未透传 Host 时填 `https://voice.2508866.xyz`（会自动换成 `wss://`） |
 | `ELDER_SCHEDULE_AHEAD_HOURS` | `36` | 服务端预生成提醒实例的提前量 |
 | `ELDER_DB_ECHO` | `0` | 设为 `1` 打印所有 SQL，排查问题时开，平时关 |
+| `ELDER_MAIL_FAKE` | `0` | **测试专用**。设为 `1` 时邮件不真投递、写进进程内发件箱。**生产必须为 `0`**，留空等同 `0` |
+| `ELDER_VOICE_PUBLIC_BASE` | 留空（自动推导） | 语音链路对外地址，见 1.6 |
+
+> **SMTP 不在环境变量里** —— 存数据库，在管理后台配，见 1.7。
 
 完整清单以 `server/app/config.py` 为准。
 
@@ -474,6 +538,71 @@ docker inspect --format '{{.State.ExitCode}}' elder-server
    ```
 
 4. 补完重启：`docker compose restart elder-server`。
+
+### 6.9 设备配网正常、心跳也正常，但一开口说话就断线
+
+这是语音链路合并到单一端口之后**最常见**的部署故障。现象很有迷惑性：
+注册设备、拉取提醒、`/api/device/sync` 全都成功，只有说话时 WebSocket 连不上或秒断。
+
+按这个顺序排查：
+
+1. **看 Nginx 有没有放行 Upgrade**：这是首要原因。旧的部署说明里语音链路走独立端口
+   （8000），反代只配了普通 HTTP；现在语音复用 8064，必须加 `location /api/voice/` 那一段。
+   验证方法（改完 `nginx -s reload`）：
+
+   ```bash
+   curl -i -N -H "Connection: Upgrade" -H "Upgrade: websocket" \
+        -H "Sec-WebSocket-Version: 13" -H "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==" \
+        https://voice.2508866.xyz/api/voice/v1/ws
+   # 正确：HTTP/1.1 101 Switching Protocols
+   # 错误：HTTP/1.1 200 或 400 —— 说明 Upgrade 头被反代吃掉了
+   ```
+
+2. **确认 `proxy_read_timeout` 没有设太小**：有限值小于一次对话时长时，
+   表现是"能说第一句，说到一半断开"。建议 ≥ 3600s。
+
+3. **`proxy_buffering off` 有没有配**：忘了开会有明显的语音延迟（音频被攒够一批才发）。
+
+4. **确认设备拿到的地址对不对**：调一次心跳看 `ws_url` 字段：
+
+   ```bash
+   docker compose logs elder-server | grep -i voice
+   ```
+   走 HTTPS 域名时必须是 `wss://voice.2508866.xyz/api/voice/v1/ws`。
+   如果显示的是内网 IP 或 `ws://`（非加密），说明 Host 头没透传、也没有配
+   `ELDER_VOICE_PUBLIC_BASE`，此时需要在 compose 里显式设置它。
+
+5. 若完全没有到 `/api/voice/` 的日志，检查容器的 8064 端口映射是否已发布、
+   以及有没有别的进程抢占了它。
+
+> 注：`ws` 与 `wss` **不能混用**。页面/设备在 HTTPS 下拒绝建立非加密的 WebSocket，
+> 服务端已经按请求 scheme 自动推导，一般不需要手配。
+
+### 6.10 用户收不到密码重置邮件
+
+按顺序排查：
+
+1. **先在管理后台点「发送测试邮件」**。这一步能挡掉 80% 的问题，而且会**原样返回失败原因**
+   （比翻日志快得多）。典型的失败：`Connection refused`（端口错）、
+   `Application-specific password required`（用了登录密码而非授权码）、
+   `STARTTLS required`（该用 STARTTLS 却配了 SSL，或反之）。
+2. **检查端口与加密的组合**：`465` 配 SSL，`587` 配 STARTTLS。两者弄混是最常见错误。
+3. **检查 `ELDER_MAIL_FAKE`**：如果被人设成了 `1`，邮件会全部进假发件箱而不投递。
+   `docker compose exec elder-server env | grep MAIL_FAKE` 确认。
+4. **用户侧：先让他看垃圾邮件箱**。自建 SMTP 首次发信很容易被判垃圾邮件。
+5. **看服务日志**：邮件发送失败不会让请求失败（设计上不允许把 500 抛给用户），
+   所以必须查日志，关键字 `mailer`。
+
+   ```bash
+   docker compose logs elder-server | grep -i mailer
+   ```
+
+6. 若验证码压根没生成，检查该用户**注册时填的邮箱是否为空** ——
+   老用户（邮箱字段上线前注册的）`email` 是空串，找回密码时无法投递。这种情况引导他联系管理员后台处理。
+
+> 另外提醒一个安全设计：`POST /api/auth/password/reset/request` 对**已注册和未注册的邮箱
+> 返回完全相同的响应**，这是刻意的账号枚举防护。所以调用成功不代表那个邮箱一定注册过，
+> 排查时别被这点误导。
 
 ---
 

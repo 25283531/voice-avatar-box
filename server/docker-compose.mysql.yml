@@ -71,8 +71,9 @@ services:
       ELDER_DB_WAIT_SEC: ${ELDER_DB_WAIT_SEC:-180}
       ELDER_JWT_SECRET: ${ELDER_JWT_SECRET:-please-change-this-secret-in-production}
       ELDER_CORS: ${ELDER_CORS:-*}
-      ELDER_XIAOZHI_WS: ${ELDER_XIAOZHI_WS:-ws://xiaozhi-server:8000/xiaozhi/v1/}
-      ELDER_XIAOZHI_OTA: ${ELDER_XIAOZHI_OTA:-http://xiaozhi-server:8003/xiaozhi/ota/}
+      # 语音链路是本服务自带的（与 API 同进程同端口），不需要也不能再指向外部容器。
+      # 只有在反代后面 Host 透传异常时才配 ELDER_VOICE_PUBLIC_BASE，参见主文件注释。
+      ELDER_VOICE_PUBLIC_BASE: ${ELDER_VOICE_PUBLIC_BASE:-}
     depends_on:
       elder-db:
         condition: service_healthy

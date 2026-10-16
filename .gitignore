@@ -46,6 +46,10 @@ firmware/xiaozhi/sdkconfig.old
 firmware/xiaozhi/components/elder/
 
 # ---------------------------------------------------------- 杂项
+# QA 补丁前备份 / 临时探针：一次性产物，历史已踩过「临时脚本混进 commit 后
+# 自删、留下无法解释的历史」，一律不入库
+tools/_orig_*
+tools/_tmp_*
 # 本地会话/记忆数据，不进仓库
 .workbuddy/
 Setup Log*.txt

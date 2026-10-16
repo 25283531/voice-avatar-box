@@ -2,7 +2,8 @@
  * 老人陪伴助手业务后端 API。
  * 接口与 server/app/routers 一一对应。
  */
-import { elderDelete, elderGet, elderPatch, elderPost } from '@/http/elder'
+import { elderDelete, elderGet, elderPatch, elderPost, elderRequestRaw } from '@/http/elder'
+import type { ElderRawResult } from '@/http/elder'
 
 // ============================================================ 类型
 export interface ElderUser {
@@ -308,27 +309,197 @@ export function changeEmail(email: string) {
   return elderPatch<ElderAccount>('/api/auth/email', { email })
 }
 
-// ============================================================ 自有 agent 角色
+// ============================================================ 角色（人格）
+// ⚠️ 角色与平台 AI 配置已彻底拆分（后端 A1+A2）：
+//   * 角色 -> /api/roles（分区返回 presets / mine，含人格与 traits）
+//   * 平台配置 -> /api/providers（**仅管理员**，返回带 api_key）
+// 改造前这里走的是 /api/providers/safe，那个接口会把平台配置的
+// provider/endpoint/model 连同角色一起返回，且任何人都能删 —— 见 P0-1/P0-2。
 export interface AgentRole {
   id: number
   name: string
   description: string
   system_prompt: string
   tts_voice: string
-  is_default: boolean
+  avatar_id?: number | null
+  /** 'preset' = 平台预设（小暖）；'role' = 用户原创或派生 */
+  record_type: 'preset' | 'role'
+  owner_id?: number | null
+  /** 派生来源；null = 原创 */
+  parent_id?: number | null
+  /** 只存「与母版不同」的项（overlay） */
+  traits: Record<string, any>
+  /** 叠加母版后的生效值，页面显示"实际是什么"用这个 */
+  traits_effective: Record<string, any>
+  /** 硬红线版本；变了代表承诺卡需要重新确认 */
+  guardrail_version: string
+  guardrail_acked: boolean
 }
 
-export function listAgentRoles() {
-  return elderGet<AgentRole[]>('/api/providers/safe')
+/** GET /api/roles 的分区结构：平台推荐 + 我的角色 */
+export interface AgentRoleList {
+  presets: AgentRole[]
+  mine: AgentRole[]
 }
 
+/** 列出角色（默认 preset + mine 都要，页面分区渲染） */
+export function listAgentRoles(scope: 'all' | 'preset' | 'mine' = 'all') {
+  return elderGet<AgentRoleList>(`/api/roles?scope=${scope}`)
+}
+
+/** 只取平台预设（公开只读，仍需登录） */
+export function listPresetRoles() {
+  return elderGet<AgentRole[]>('/api/roles/presets')
+}
+
+/** 新建**原创**角色。派生角色请用 deriveAgentRole */
 export function createAgentRole(data: Partial<AgentRole>) {
-  return elderPost<AgentRole>('/api/providers', data)
+  return elderPost<AgentRole>('/api/roles', data)
+}
+
+/**
+ * 从预设或自己的角色派生一份新的（copy-on-write 物理复制）。
+ * inherit 默认 true：复制家属对母版的手动交代，不复制统计值。
+ */
+export function deriveAgentRole(roleId: number, name: string, inherit = true) {
+  return elderPost<AgentRole>(`/api/roles/${roleId}/derive`, { name, inherit })
+}
+
+/** 改角色（owner 或管理员）。traits 只传要改的项 */
+export function updateAgentRole(roleId: number, data: Partial<AgentRole>) {
+  return elderPatch<AgentRole>(`/api/roles/${roleId}`, data)
+}
+
+/** 软删角色（画像与审计保留，设备自动解绑）。平台预设不可删，走下架 */
+export function deleteAgentRole(roleId: number) {
+  return elderDelete(`/api/roles/${roleId}`)
+}
+
+/** 还原为预设：清空 traits overlay、恢复 system_prompt/tts_voice，保留画像与示例 */
+export function restoreAgentRole(roleId: number) {
+  return elderPost<AgentRole>(`/api/roles/${roleId}/restore`, {})
+}
+
+/** 编译产物预览：家属可见的"所以机器人现在按什么在说话" */
+export function getAgentRolePrompt(roleId: number) {
+  return elderGet<{ role_id: number; role_name: string; prompt: string }>(
+    `/api/roles/${roleId}/prompt`)
+}
+
+/** 安全承诺卡：人话红线列表 + 是否已确认 */
+export function getAgentRoleGuardrails(roleId: number) {
+  return elderGet<any>(`/api/roles/${roleId}/guardrails`)
+}
+
+/** 确认安全承诺卡（红线版本变化后需要重新确认） */
+export function ackAgentRoleGuardrails(roleId: number) {
+  return elderPost<any>(`/api/roles/${roleId}/guardrails/ack`, {})
+}
+
+/** 10 个性格维度的档位定义（含后果说明）。APP 不硬编码档位文案，跟这个接口走 */
+export function getAgentRoleTraits() {
+  return elderGet<any>('/api/roles/traits')
 }
 
 /** 把某个 agent 角色绑定到设备（一台设备一个生效角色） */
 export function bindAgentRole(devicePk: number, roleId: number) {
   return elderPost(`/api/devices/${devicePk}/agent`, { role_id: roleId })
+}
+
+// ============================================================ 找回密码（邮箱验证码，全流程在 APP 完成）
+export interface PasswordResetRequestOut {
+  ok: boolean
+  /** 重发冷却秒数（默认 60） */
+  cooldown_sec: number
+  /** 验证码有效时长（秒，默认 15 分钟） */
+  expires_in_sec: number
+}
+
+/** 验证码校验失败时 detail 的结构（成功时是 { ok, username }） */
+export interface PasswordResetFail {
+  message: string
+  attempts_left: number
+}
+
+/**
+ * 第一步：提交邮箱，请求发送验证码。
+ *
+ * ⚠️ 后端对「已注册邮箱」和「未注册邮箱」返回**完全相同**的响应（防账号枚举），
+ * 所以这里拿不到任何「邮箱是否存在」的信息，UI 上绝不能出现"该邮箱未注册"。
+ * 未登录也要能调用，故 auth: 'optional'。
+ */
+export function requestPasswordReset(email: string) {
+  return elderRequestRaw<PasswordResetRequestOut>(
+    '/api/auth/password/reset/request',
+    { method: 'POST', data: { email }, auth: false, toast: false },
+  )
+}
+
+/**
+ * 第二步：验证码 + 新密码 -> 重置。
+ * 返回原始响应，由页面按状态码说人话（400 要看 attempts_left，429/503 各不相同）。
+ */
+export function verifyPasswordReset(data: { email: string, code: string, new_password: string }) {
+  return elderRequestRaw<PasswordResetFail | { ok: boolean, username: string }>(
+    '/api/auth/password/reset/verify',
+    { method: 'POST', data, auth: false, toast: false },
+  )
+}
+
+/** 判断校验响应是不是失败体（失败体里才有 message 字段） */
+export function isResetFail(res: ElderRawResult<any>): res is ElderRawResult<PasswordResetFail> {
+  return res.statusCode >= 400 && !!res.data && typeof (res.data as PasswordResetFail).message === 'string'
+}
+
+// ============================================================ 帮助与反馈（工单）
+
+/** 工单分类：与后端 TicketCategory 保持一致，未知值后端按"其它"处理 */
+export const TICKET_CATEGORIES: { value: string, label: string }[] = [
+  { value: 'payment', label: '会员支付' },
+  { value: 'device', label: '设备故障' },
+  { value: 'reminder', label: '提醒异常' },
+  { value: 'account', label: '账号问题' },
+  { value: 'other', label: '其它' },
+]
+
+export interface SupportTicket {
+  id: number
+  user_id: number | null
+  email: string
+  title: string
+  content: string
+  category: string
+  category_text: string
+  device_id: string
+  status: string
+  status_text: string
+  admin_reply: string
+  created_at: string
+  updated_at: string
+  replied_at: string | null
+}
+
+/**
+ * 提交问题。**匿名也能提交**（auth: 'optional'）：忘记密码的人登不进 APP，
+ * 工单是他最后的求助通道，所以不能强制登录。登录时带上 token，后端会自动
+ * 把这条工单关联到账号，管理端就能看到是谁提的。
+ */
+export function createSupportTicket(data: {
+  email: string
+  title: string
+  content: string
+  category?: string
+  device_id?: string
+}) {
+  return elderRequestRaw<SupportTicket>(
+    '/api/support/tickets',
+    { method: 'POST', data, auth: 'optional', toast: false },
+  )
+}
+
+/** 我提交过的问题（需登录，按提交时间倒序） */
+export function mySupportTickets(limit = 50) {
+  return elderGet<SupportTicket[]>('/api/support/tickets/mine', { limit })
 }
 
 // ============================================================ 首页聚合

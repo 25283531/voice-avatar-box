@@ -62,8 +62,54 @@ jobs:
               print(f"OK {url} -> {got}")
           PY
 
+      # 端口必须与 tools/smoke_ports.py 的 DEFAULT_PORTS 一致（那里是唯一真源）。
+      # 同一 job 内两个脚本用不同端口，MySQL job 整体又与 SQLite job 错开 ——
+      # 虽然它们跑在不同 runner 上不会真撞车，但保持全表唯一才能在本地
+      # 「并行跑全部冒烟」时也确定不冲突。
       - name: 运行业务闭环冒烟测试
-        run: python tools/smoke_server.py 8099
+        run: python tools/smoke_server.py 8100
+
+      # 角色域冒烟：/api/roles 全闭环 + 四条 P0 越权断言。
+      # 之所以单列一步而不是塞进 smoke_server：这四类缺陷（P0-1~4）曾经
+      # **全部是活的**，而它们的特点是「接口照常返回 200，只是返回了别人的
+      # 数据 / 真的删了别人的配置」，业务闭环冒烟**发现不了**。
+      - name: 角色与权限冒烟（含 P0 安全断言）
+        run: python tools/smoke_roles.py 8101
+
+      # 人格 eval 门禁：**必须挂在 smoke job 里**（而不是另开一个）——
+      # 这样复用已装好的依赖，且与 SQLite 冒烟同环境。
+      # 分级：医疗安全类失败 -> 本步红；长度/用词类只打印⚠️ -> 本步绿。
+      - name: 人格 eval 门禁（医疗安全类硬失败）
+        run: python tools/eval_persona.py
+
+      # ---- 以下三步守的是「只有老库 / 只有重启才暴露」的缺陷 ----
+      # 它们曾经**全部是活的**，而当时 CI 是绿的 —— 因为门禁里没有它们。
+      # 每一份对应一个真实事故，不是「保险性冗余」：
+      #   qa3_r2_restart     服务重启把用户派生角色永久刷成 preset
+      #                      → 角色变只读 + **全平台可见**（跨用户信息泄漏）
+      #   qa3_migration      模型加了列但忘登记 schema_patch.NEW_COLUMNS
+      #                      → **只在老库升级时炸**，全新部署永远看不出来
+      #   qa3_device_binding 新建设备重启后被自动绑上平台预设角色
+      # ⚠️ **这三步只在 SQLite job 里跑，不要复制到 mysql-smoke job** ——
+      # 不是漏了，是**跑不了**：三个脚本都直连 `sqlite3`（构造老库 / 改列 / 读行），
+      # 且各自 `boot()` 里无条件 `env["ELDER_DB"] = f"sqlite:///{DB}"`，
+      # **会覆盖掉 CI 传入的 mysql 连接串**。硬塞进 mysql-smoke job 的话，
+      # 步骤名写着 mysql+pymysql、实际跑的是 SQLite ——
+      # 那正是本项目最该防的「假绿」，比不接更坏。
+      # MySQL 侧由 qa3_migration 的 T6（MySQL DDL 静态体检）
+      # 加上 mysql-smoke job 里 smoke_server/smoke_roles 的真实 MySQL 往返共同覆盖。
+      #
+      # 端口：三个脚本都不占冒烟端口段 —— qa3_r2_restart=8113、
+      # qa3_device_binding=8114（qa3_migration 不起服务），
+      # 均由 tools/smoke_ports.py 统一登记，与冒烟的 8100-8106 无冲突。
+      - name: 重启不变式（回填不改角色归属）
+        run: python tools/qa3_r2_restart.py
+
+      - name: 迁移完整性（ORM 列与 NEW_COLUMNS 对账）
+        run: python tools/qa3_migration.py
+
+      - name: 设备绑定归属（重启不被绑上平台预设）
+        run: python tools/qa3_device_binding.py
 
   # 用真实 MySQL 再跑一遍同一套业务闭环。
   # 必要性：SQLite 覆盖不到 pymysql 的连接/握手路径，而线上部署踩的坑正是
@@ -123,10 +169,57 @@ jobs:
           sys.exit(1)
           PY
 
+      # 端口同 SQLite job（8100/8101）—— 端口表全局唯一，不因换数据库就换端口。
+      # 早先这里写的是 8098/8096，恰好与 smoke_membership 的默认 8098、
+      # smoke_models/smoke_mail 的默认 8096 撞车，等于留了两套互相冲突的端口表。
       - name: 跑业务闭环（mysql+pymysql）
         env:
           ELDER_DB: mysql+pymysql://root:smoke-pass@127.0.0.1:3306/elder_companion?charset=utf8mb4
-        run: python tools/smoke_server.py 8098
+        run: python tools/smoke_server.py 8100
+
+      # MySQL 变体必须重跑角色域冒烟与 eval：
+      # SQLite 覆盖不到 JSON 列与 ALTER TABLE 的方言差异，而本轮新增的
+      # traits / guardrails / agent_key 全都是 JSON / 补列相关 ——
+      # 「SQLite 绿、MySQL 炸」正是这套迁移最容易出问题的地方。
+      - name: 角色与权限冒烟（mysql+pymysql）
+        env:
+          ELDER_DB: mysql+pymysql://root:smoke-pass@127.0.0.1:3306/elder_companion?charset=utf8mb4
+        run: python tools/smoke_roles.py 8101
+
+      - name: 人格 eval 门禁（mysql+pymysql）
+        env:
+          ELDER_DB: mysql+pymysql://root:smoke-pass@127.0.0.1:3306/elder_companion?charset=utf8mb4
+        run: python tools/eval_persona.py
+
+      # ⚠️ 这里**故意不**放 qa3_r2_restart / qa3_migration / qa3_device_binding。
+      # 理由不是「MySQL 不重要」，而是那三份脚本**跑不到 MySQL**：
+      #   * 它们直连 `sqlite3`（构造老库 DDL、改列、读行做指纹比对）；
+      #   * 各自 boot() 里无条件 `env["ELDER_DB"] = f"sqlite:///{DB}"`，
+      #     会**静默覆盖**下面这个 mysql 连接串。
+      # 放进来 = 步骤名写着 mysql+pymysql、实际全程跑 SQLite，
+      # 在日志里显示为「MySQL 路径已验证」—— 这是**假绿**，
+      # 比不接更坏：它会让人以为 JSON 列 / ALTER TABLE ADD COLUMN ... JSON
+      # 已在真 MySQL 上验过，从而不再去查那个真正的风险。
+      #
+      # MySQL 侧的真实覆盖现状（勿夸大）：
+      #   * JSON 列与补列方言差异 → 由上面 smoke_server / smoke_roles
+      #     在真 MySQL 上的往返间接覆盖；
+      #   * MySQL DDL 片段静态体检 → qa3_migration 的 T6（纯静态，不连库）；
+      #   * ⚠️ **老库升级真跑 MySQL、UPDATE 的 rowcount 幂等性、
+      #     JSON 列写入非 dict 的行为差异 —— 目前无人覆盖**。
+      # 要补这三条，正确做法是先把那三份脚本改成尊重外部 ELDER_DB
+      # （并给sqlite3 直连加方言分支），属于独立一轮工作，
+      # 在那之前这里必须保持为空。
+      #
+      # ⚠️ 这段注释**下面不允许再挂任何 step**。上一轮曾在这里留过一个
+      # 「- name: 角色与权限冒烟（mysql+pymysql）」的空步骤（无 uses、无 run），
+      # 后果不是「那一步红」而是**整个 workflow 启动失败**：
+      #   空步骤 → workflow 启动失败 → jobs=0 → PR 上根本没有检查项
+      #   → 后端业务冒烟（smoke_server / smoke_roles / eval_persona /
+      #     qa3_* 与整个 MySQL job）全部静默失效
+      # 而它在 diff 里只是几行注释 + 一个孤零零的 name，看起来完全无害；
+      # 失败形态还是「PR 上没有检查项」，**看起来像通过** —— 这比红更危险。
+      # tools/ci_gate_check.py 的「步骤非空」断言现在会当场拦下它。
 
   # 两个 compose 文件的语法校验。
   # 必要性：MySQL 变体是 overlay 叠加文件（docker-compose.mysql.yml 不能单独用），

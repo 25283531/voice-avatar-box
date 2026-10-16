@@ -1,7 +1,7 @@
 """后端冒烟测试：本地起服务（SQLite），跑通业务闭环。
 
 用法：
-    python tools/smoke_server.py [--port 8099]
+    python tools/smoke_server.py [--port 8100]
 
 覆盖：健康检查 -> 注册/登录 -> 建设备 -> 申请激活码 -> 校验 Luhn
       -> 绑定设备 -> 建服药提醒（复杂规则）-> 排期 -> 设备同步
@@ -23,13 +23,47 @@ ROOT = Path(__file__).resolve().parent.parent
 SERVER = ROOT / "server"
 PY = sys.executable
 
-# 跨平台默认落点（原来写死 D:\espdev 在 Linux CI 上会直接失败）
-DB_PATH = Path(os.environ.get("SMOKE_DB", str(Path(tempfile.gettempdir()) / "elder_smoke.db")))
+# 默认端口统一由 tools/smoke_ports.py 托管（唯一真源），各脚本不再各写一份 ——
+# 早先 smoke_home/smoke_roles/smoke_memory 都是 8097、smoke_models/smoke_mail
+# 都是 8096，并行跑必然撞车，且会连到残留进程上产生假失败。
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from smoke_ports import (  # noqa: E402
+    detect_addr_in_use,
+    guard_or_die,
+    guard_port,
+    release_port,
+    resolve_port,
+)
+
+# ⚠️ **本地请求绝不走代理**（工程师核实：本机设了 http_proxy，urllib 默认会读它，
+# 于是「访问自己刚起的 127.0.0.1 服务」被绕到代理一跳 —— 代理不通就 TimeoutError
+# 且零断言失败，极易被误判成代码回归；CI runner 常注入代理，还会造成
+# 「本地全绿、CI 超时」。显式关闭代理让请求一定直连本机。
+_LOCAL_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+
+# 跨平台默认落点（原来写死 D:\espdev 在 Linux CI 上会直接失败）。
+# 默认文件名带 PID：多人/CI 并行跑时固定文件名会互相抢同一个文件，
+# Windows 上直接 PermissionError（另一个进程正占用）。要固定路径就用
+# SMOKE_DB_DIR 覆盖目录，或 SMOKE_DB 指定完整路径。
+DB_DIR = Path(os.environ.get("SMOKE_DB_DIR", str(Path(tempfile.gettempdir()))))
+DB_PATH = Path(os.environ.get("SMOKE_DB", str(DB_DIR / f"elder_smoke_{os.getpid()}.db")))
 if DB_PATH.exists():
     DB_PATH.unlink()
 
-PORT = int(next((a for a in sys.argv[1:] if a.isdigit()), 8099))
+PORT = resolve_port("smoke_server")
 BASE = f"http://127.0.0.1:{PORT}"
+
+# ⚠️ 子进程输出**绝不能**用 `subprocess.PIPE` +「只在启动失败时读一次」——
+# 日志量超过管道缓冲区（Windows 匿名管道 4096 字节）后，
+# **服务端会被永久阻塞**，而客户端只看到「读超时」。
+# 症状具有强误导性：看起来像网络/DNS/端口问题，实际是测试基础设施缺陷。
+# → 输出必须落文件。
+# 本仓已付出过真金代价：smoke_mail.py 曾长期稳定在第 66 条断言后抛 TimeoutError，
+# 先后被误判为公网 SMTP / DNS / 端口 / scheduler / 异步任务问题（三轮全错），
+# 真因就是这里：服务端日志共 4122 字节，最后一行起始偏移 3999、长度 123，
+# 只剩 97 字节塞得进去 —— 恰好卡在 4096 边界上。
+SERVER_LOG = DB_PATH.with_name(DB_PATH.stem + "_server.log")
 
 results: list[tuple[str, bool, str]] = []
 
@@ -46,7 +80,7 @@ def req(method: str, path: str, body: dict | None = None, token: str | None = No
     if token:
         r.add_header("Authorization", "Bearer " + token)
     try:
-        with urllib.request.urlopen(r, timeout=20) as resp:
+        with _LOCAL_OPENER.open(r, timeout=20) as resp:
             raw = resp.read().decode("utf-8")
             return resp.status, (json.loads(raw) if raw else None)
     except urllib.error.HTTPError as e:
@@ -72,6 +106,23 @@ def wait_ready(timeout: float = 120.0) -> bool:
     return False
 
 
+def _read_log_tail(max_bytes: int = 8192) -> str:
+    """读子进程日志（:data:`SERVER_LOG`）的尾部，供启动失败/bind 失败判定。
+
+    本脚本刻意把子进程输出**重定向到文件**而不是 PIPE（原因见 SERVER_LOG
+    常量处：PIPE 会被日志写满导致服务端永久阻塞）。代价是拿不到 ``proc.stdout``，
+    所以诊断一律从文件读。
+
+    ⚠️ 必须**按路径另开一个句柄**读，不能复用传给子进程的那个 ``log_fp``：
+    它被子进程继承并持有写位置、且带缓冲，用它 read() 会拿到**空内容**。
+    读不到就返回空串（宁可漏判，也不要把正常启动误报成失败）。
+    """
+    try:
+        return SERVER_LOG.read_text(encoding="utf-8", errors="replace")[-max_bytes:]
+    except OSError:
+        return ""
+
+
 def main() -> int:
     env = dict(os.environ)
     env.pop("MSYSTEM", None)
@@ -85,17 +136,63 @@ def main() -> int:
     env["PYTHONIOENCODING"] = "utf-8"
 
     print(f"[boot] starting server on :{PORT} (db: {db_url.split('@')[-1]})")
+    # ---- 三段式端口守卫（QA 第 4 轮「假绿」修复）----
+    # 端口被占时 uvicorn 的 socket bind 会失败，**但进程不退出**（活着、只是没在
+    # 监听）；而 /api/health **永远返回 200** -> wait_ready 会探到**别人的服务**
+    # -> 全部断言打到别人身上、用自己从未 seed 过的 DB（QA 第 4 轮实测 184320 vs
+    # 65536 bytes：一方 seed 过、一方从没初始化过）。
+    #
+    # ⚠️ **这里为什么不能只调 guard_or_die()**：它内部拿到占位 socket 后**立刻**
+    # release（见 smoke_ports.py 末两行），于是阶段②的占位只覆盖了「检查→释放」
+    # 这一瞬间，等于**没有占位**。所以下面显式持有 guard_port() 返回的 hold，
+    # 一直攥到 spawn 前的那一刻才release_port()。
+    # guard_or_die 仍保留：它负责「被占就立刻 SystemExit(1)+打印换端口提示」。
+    #
+    # ⚠️ **三段加起来仍然不是绝对保证**（务必读完再用）：
+    #   ①事前检查与真正 bind 之间存在**不可消除的竞态窗口** —— 检查刚通过，
+    #     别人就把端口抢走了，本模块只能把这段距离压到最小，压到最小 ≠ 消除；
+    #   ②占位 socket 在 release_port() 到 uvicorn 真正 bind 之间仍有间隙；
+    #   ③即使 bind 失败，uvicorn 进程**可能仍活着**（只是没在监听）。
+    # **别因为「加了预检」就认为并发跑已经安全** —— architect 栽的正是这个坑：
+    # 以为静态查表不重复就等于运行时没被占。真正的绝对保证是让服务**自证身份**
+    # （启动生成 run_id、/api/health 回传、冒烟比对是否一致），那要改生产代码，
+    # 留给下一轮。
+    guard_or_die(PORT, "smoke_server.py")
+    hold, hold_hint = guard_port(PORT)
+    if hold is None:            # 理论上 guard_or_die 已挡住，这里是第二道保险
+        print("[boot] " + hold_hint.replace("\n", "\n[boot] "))
+        return 1
+
+    # 阶段②收尾：**必须在 spawn 之前**释放，否则自己把端口挡住了
+    release_port(hold, PORT)
+
+    # ⚠️ stdout/stderr 必须**落文件**，绝不能接成无人消费的 PIPE。
+    # Windows 匿名管道缓冲区只有 4KB：管道写满后，服务端进程写日志会被
+    # 永久阻塞，表现成「服务端整体失去响应」，而客户端只看到读超时。
+    # 见 SERVER_LOG 常量处的完整说明。
+    log_fp = SERVER_LOG.open("w", encoding="utf-8", errors="replace")
     proc = subprocess.Popen(
         [PY, "-m", "uvicorn", "app.main:app", "--host", "127.0.0.1", "--port", str(PORT),
          "--log-level", "warning"],
         cwd=str(SERVER), env=env,
-        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding="utf-8",
+        stdout=log_fp, stderr=subprocess.STDOUT, text=True, encoding="utf-8",
         errors="replace",
     )
     try:
         if not wait_ready():
-            out = proc.stdout.read() if proc.stdout else ""
-            print("[boot] server did not become ready. output:\n" + out[-3000:])
+            print(f"[boot] server did not become ready. log tail ({SERVER_LOG}):")
+            print(_read_log_tail())
+            return 1
+        # 阶段③：即使就绪了，也要确认输出里**没有 bind 失败的痕迹**。
+        # 必须做：bind 失败的进程可能「活着但没在监听」，而 wait_ready 探到的
+        # 是**别人的服务** —— 这是假绿，比超时危险（超时会让人去查，假绿会让人
+        # 相信结论）。此前本步骤只import 了 detect_addr_in_use 却**从未调用**，
+        # 等于第三段形同虚设，这里补上真正的调用。
+        # 本脚本的子进程输出走 SERVER_LOG 文件（不是 PIPE，见上），所以从文件读。
+        if detect_addr_in_use(_read_log_tail()):
+            print(f"[boot] ✗ 端口 {PORT} bind 失败（占位未生效，疑似被别人抢占）。")
+            print("[boot]   为避免把断言打到别人的服务上，本次结果**不可信**，直接退出。")
+            print("[boot]   请换端口重跑：python tools/smoke_server.py <其它端口>")
             return 1
         print("[boot] ready\n")
 
@@ -235,6 +332,15 @@ def main() -> int:
             proc.wait(timeout=10)
         except subprocess.TimeoutExpired:
             proc.kill()
+        try:
+            log_fp.close()
+        except OSError:
+            pass
+        # 失败时把服务端日志尾部打出来：定位卡点/500 最直接的证据
+        failed = [r for r in results if not r[1]]
+        if failed:
+            print(f"\n[diag] ---- server log tail ({SERVER_LOG}) ----")
+            print(_read_log_tail())
 
     passed = sum(1 for _, ok, _ in results if ok)
     total = len(results)

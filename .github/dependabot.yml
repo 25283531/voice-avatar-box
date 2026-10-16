@@ -1,0 +1,42 @@
+# ============================================================================
+# Dependabot —— 依赖与 CI 动作的例行更新
+# ============================================================================
+# 四个生态各管各的目录，互不重叠：
+#   pip            server/requirements.txt（后端依赖）
+#   github-actions /（含 .github/workflows/ 下的 CI 动作版本）
+#   docker         server/Dockerfile（基础镜像）
+#   npm            app/package.json（uni-app 前端）
+#
+# commit-message 统一 deps 前缀，依赖类 PR 一眼可辨，不与功能 PR 混淆。
+# 均为 weekly：本项目迭代节奏下，daily 只会制造噪音。
+# ============================================================================
+version: 2
+
+updates:
+  - package-ecosystem: pip
+    directory: /server
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: deps
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: deps
+
+  - package-ecosystem: docker
+    directory: /server
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: deps
+
+  - package-ecosystem: npm
+    directory: /app
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: deps

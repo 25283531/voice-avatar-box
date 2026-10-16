@@ -12,6 +12,8 @@ import {
   changeEmail,
   changePassword,
   createAgentRole,
+  deriveAgentRole,
+  listPresetRoles,
   createMembershipOrder,
   genOrderCode,
   getMe,
@@ -191,9 +193,24 @@ async function onSubmitEmail() {
   catch { /* 已提示 */ }
 }
 
-/* ---------------- 创建 agent 角色 ---------------- */
+/* ---------------- 创建 / 派生角色 ---------------- */
+// ⚠️ 角色接口已从 /api/providers 拆到 /api/roles（后端 A1+A2）。
+// 继续走老接口会被 422 拒（/api/providers 只接受带 kind 的平台 AI 配置）。
 const showRole = ref(false)
 const roleForm = ref({ name: '', description: '', system_prompt: '', tts_voice: '' })
+/** 基于哪个平台预设派生；为空 = 原创 */
+const roleParent = ref<number | null>(null)
+const presetRoles = ref<any[]>([])
+
+async function onOpenRole() {
+  // 派生需要母版列表，所以打开弹窗时才去拉（首页不必为它多打一次请求）
+  if (!presetRoles.value.length) {
+    presetRoles.value = await listPresetRoles().catch(() => [])
+  }
+  roleParent.value = null
+  roleForm.value = { name: '', description: '', system_prompt: '', tts_voice: '' }
+  showRole.value = true
+}
 
 async function onSubmitRole() {
   if (!roleForm.value.name.trim()) {
@@ -201,10 +218,16 @@ async function onSubmitRole() {
     return
   }
   try {
-    await createAgentRole(roleForm.value)
-    uni.showToast({ title: '角色已创建', icon: 'success' })
+    if (roleParent.value) {
+      // 派生：copy-on-write 物理复制，inherit 默认 true（继承家属对母版的交代）
+      await deriveAgentRole(roleParent.value, roleForm.value.name.trim(), true)
+      uni.showToast({ title: '已基于平台角色创建', icon: 'success' })
+    }
+    else {
+      await createAgentRole(roleForm.value)
+      uni.showToast({ title: '角色已创建', icon: 'success' })
+    }
     showRole.value = false
-    roleForm.value = { name: '', description: '', system_prompt: '', tts_voice: '' }
   }
   catch (e: any) {
     uni.showToast({ title: e?.message || '创建失败', icon: 'none' })
@@ -332,7 +355,7 @@ onShow(() => { refresh() })
           <text class="menu-value">{{ account.email || '未绑定' }}</text>
           <text class="menu-arrow">›</text>
         </view>
-        <view class="menu-item" @click="showRole = true">
+        <view class="menu-item" @click="onOpenRole">
           <text class="menu-label">创建我的角色</text>
           <text class="menu-arrow">›</text>
         </view>
@@ -481,18 +504,35 @@ onShow(() => { refresh() })
       </view>
     </view>
 
-    <!-- 创建角色 -->
+    <!-- 创建 / 派生角色 -->
     <view v-if="showRole" class="mask" @click="showRole = false">
       <view class="modal" @click.stop>
         <view class="title">
           创建我的角色
         </view>
+        <!-- 基于平台角色派生（PRD Q3：默认继承调整已勾选）。
+             派生是 copy-on-write 物理复制：母版之后被改也不影响已派生的角色。 -->
+        <view class="group-label">从平台角色开始（可选）</view>
+        <view class="pick" @click="roleParent = null">
+          <text class="pick-name">完全原创</text>
+          <text class="pick-sub">从零设定一个角色</text>
+        </view>
+        <view v-for="p in presetRoles" :key="`p${p.id}`" class="pick" @click="roleParent = p.id">
+          <text class="pick-name">{{ p.name }}</text>
+          <text class="pick-sub">{{ p.description || '平台预设' }}</text>
+        </view>
         <input v-model="roleForm.name" class="input" placeholder="角色名称，如：贴心小棉袄" />
-        <input v-model="roleForm.description" class="input" placeholder="一句话描述（可选）" />
-        <textarea v-model="roleForm.system_prompt" class="input textarea" placeholder="角色设定（提示词），决定它怎么说话、怎么关心老人" />
-        <input v-model="roleForm.tts_voice" class="input" placeholder="音色（可选）" />
+        <!-- 派生时这两项由母版复制过来，不需要家属再填一遍 -->
+        <template v-if="roleParent === null">
+          <input v-model="roleForm.description" class="input" placeholder="一句话描述（可选）" />
+          <textarea v-model="roleForm.system_prompt" class="input textarea" placeholder="角色设定（提示词），决定它怎么说话、怎么关心老人" />
+          <input v-model="roleForm.tts_voice" class="input" placeholder="音色（可选）" />
+        </template>
+        <view class="tip left">
+          安全底线（不给医疗建议、不碰钱与隐私等）由平台统一设定，任何角色都不可关闭
+        </view>
         <button class="btn" @click="onSubmitRole">
-          创建角色
+          {{ roleParent === null ? '创建角色' : '基于平台角色创建' }}
         </button>
       </view>
     </view>

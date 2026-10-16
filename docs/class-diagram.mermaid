@@ -1,0 +1,133 @@
+%% 角色模型 · 类图
+%% 来源：docs/架构设计-角色模型与人格能力.md §3
+%% 关注点：同表三类归属（config / preset / role）与「人格不可被用户关闭」的双层结构
+
+classDiagram
+    class AIProvider {
+        +int id
+        +str name
+        +str kind
+        +str record_type
+        +int owner_id
+        +int parent_id
+        +int avatar_id
+        +str system_prompt
+        +str tts_voice
+        +dict traits
+        +dict guardrails
+        +datetime deleted_at
+        +datetime archived_at
+        +datetime created_at
+        +bool is_config()
+        +bool is_role()
+        +bool is_visible_to(user)
+        +bool can_write(user)
+        +dict traits_overlay()
+        +dict traits_effective()
+    }
+
+    class Avatar {
+        +int id
+        +str name
+        +str record_type
+        +int owner_id
+        +str eaf_pack_name
+        +dict clips
+        +dict emotion_lights
+        +int screen_width
+        +int screen_height
+        +datetime deleted_at
+    }
+
+    class RoleSpec {
+        +str role_id
+        +str name
+        +dict traits_overlay
+        +dict traits_declared
+        +dict guardrails_hard
+        +list guardrails_soft
+        +str system_prompt
+        +str tts_voice
+        +validate() void
+        +merge_traits(declared) dict
+    }
+
+    class TraitSpec {
+        +str name
+        +str label
+        +str kind
+        +list levels
+        +float min
+        +float max
+        +to_prompt_sentence(value) str
+    }
+
+    class GuardrailRegistry {
+        +str version
+        +list HARD_ITEMS
+        +locked_ids() list
+        +is_locked(id) bool
+        +render_head() str
+        +render_tail() str
+        +regenerate_locked(stored) dict
+        +assert_present(compiled) void
+    }
+
+    class PromptCompiler {
+        +compile(spec, profile, memory_ctx) str
+        +_section_header() str
+        +_section_identity(spec) str
+        +_section_traits(spec, profile) str
+        +_section_custom(spec) str
+        +_section_persona(profile) str
+        +_section_memory(ctx) str
+        +_section_footer() str
+    }
+
+    class ProfileMerger {
+        +merge(l1_global, l2_role, declared) dict
+        +manual_of(l2) dict
+        +stats_of(l1) dict
+    }
+
+    class RoleRepo {
+        +list_visible(db, user) list
+        +get_for_read(db, id, user) AIProvider
+        +create_original(db, user, payload) AIProvider
+        +derive(db, user, parent_id, inherit) AIProvider
+        +restore_to_preset(db, user, id) AIProvider
+        +soft_delete(db, user, id) None
+        +archive(db, admin, id) None
+        +effective_traits(db, id) dict
+    }
+
+    class EvalRunner {
+        +load_suite(path) Suite
+        +run(suite, mode) Report
+        +_judge(assertion, compiled, sample) Result
+    }
+
+    class Assertion {
+        +str id
+        +str category
+        +str severity
+        +str must_include
+        +str must_not_include
+        +int max_len
+        +int max_sentences
+    }
+
+    AIProvider "0..1" --> Avatar : 角色可选绑定形象
+    AIProvider "0..1" --> AIProvider : parent_id 派生自
+    AIProvider "1" --> "many" AgentPersonaProfile
+    AIProvider "1" --> "many" AgentPreferenceExample
+    AIProvider "1" --> "many" AgentPersonaAudit
+    RoleRepo ..> AIProvider : 读写
+    PromptCompiler ..> GuardrailRegistry : fail-closed 注入
+    PromptCompiler ..> ProfileMerger : 取合并画像
+    PromptCompiler ..> RoleSpec : 输入
+    RoleSpec "1" --> "many" TraitSpec
+    RoleSpec "1" --> GuardrailRegistry : locked 再生
+    EvalRunner ..> Assertion : 执行
+    EvalRunner ..> PromptCompiler : 编译产物断言
+    EvalRunner ..> RoleRepo : INV 断言（派生不改母版）

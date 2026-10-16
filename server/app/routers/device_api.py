@@ -9,15 +9,22 @@ from __future__ import annotations
 from datetime import timedelta
 from typing import Any
 
-from fastapi import APIRouter, Depends, status
+from fastapi import APIRouter, Depends, Request, status
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from .. import models
-from ..config import SCHEDULE_AHEAD_HOURS, XIAOZHI_OTA_URL, XIAOZHI_WS_URL
+from ..config import (
+    SCHEDULE_AHEAD_HOURS,
+    VOICE_OTA_PATH,
+    VOICE_PUBLIC_BASE,
+    VOICE_WS_PATH,
+)
 from ..db import get_db
 from ..deps import get_current_device
+from ..llm_gateway import resolve_row
 from ..membership import quota_snapshot
+from ..model_catalog import DEVICE_KINDS, KIND_LLM
 from ..models import EventState, Interaction, ReminderEvent, utcnow
 from ..schedule import local_now, materialize_events
 from ..schemas import (
@@ -34,8 +41,38 @@ from ..schemas import (
 router = APIRouter(prefix="/api/device", tags=["device"])
 
 
+def _voice_endpoints(request: Request) -> tuple[str, str]:
+    """推导下发给设备的语音通道与 OTA 地址。
+
+    自研语音链路和本 API 是**同一个服务、同一个端口**，所以地址天然同源，
+    只需要把请求里的 scheme（ws/wss）与 Host 组合出来，不必像以前那样
+    配一个指向外部容器的内网地址。这么做的好处：
+
+    - 部署时不用再解释「为什么还要填一个服务端的地址」，减少一类配置错误；
+    - 设备走 HTTPS 域名进来时自动得到 `wss://`，不会出现 ws/wss 混用
+      被拒的情况（放在反代后面尤其重要）；
+    - 单一镜像，没有第二个服务需要编排。
+
+    `VOICE_PUBLIC_BASE` 是逃生舱：极少数拓扑下反代没透传 Host，
+    或者需要从别的可达地址回来时，运维可以显式指定，优先级最高。
+    """
+    if VOICE_PUBLIC_BASE:
+        base = VOICE_PUBLIC_BASE
+        # 用户给的是 http(s) 地址，这里要换成同级的 ws(s)
+        ws_base = base.replace("https://", "wss://").replace("http://", "ws://")
+        return f"{ws_base}{VOICE_WS_PATH}", f"{base}{VOICE_OTA_PATH}"
+
+    scheme = "wss" if request.url.scheme == "https" else "ws"
+    http_scheme = "https" if request.url.scheme == "https" else "http"
+    host = request.headers.get("host") or request.url.netloc
+    return (
+        f"{scheme}://{host}{VOICE_WS_PATH}",
+        f"{http_scheme}://{host}{VOICE_OTA_PATH}",
+    )
+
+
 @router.post("/sync", response_model=DeviceSyncOut)
-def sync(fw_version: str = "", db: Session = Depends(get_db),
+def sync(request: Request, fw_version: str = "", db: Session = Depends(get_db),
          dev: models.Device = Depends(get_current_device)):
     """心跳 + 拉全量配置。"""
     dev.online = True
@@ -63,28 +100,66 @@ def sync(fw_version: str = "", db: Session = Depends(get_db),
     ).all()
 
     avatar = db.get(models.Avatar, dev.avatar_id) if dev.avatar_id else None
-    # 只下发真正的平台配置：ai_providers 里的 agent 角色（kind 为空）没有厂商与模型，
-    # 下发给设备会被当成一条可用的 LLM 配置，反而把真实配置顶掉。
-    providers = db.scalars(
+    # ⚠️⚠️ 下面这条查询是本项目最敏感的一行，**绝对不要**加 owner 或 record_type 条件。
+    #
+    # 理由（架构 §6.2/§13.7）：owner_id 是**角色归属**，而这里的行是**平台配置**
+    # —— 平台配置的 owner 恒为 NULL，设备不属于任何用户。若"顺手"加上
+    # `record_type == 'config'` 之外的 owner 条件（例如误写成
+    # `owner_id == dev.owner_id`），平台配置会被整体过滤掉，
+    # 设备心跳拿不到任何 LLM 配置 —— **设备直接失去对话能力，且不报错**。
+    #
+    # 为什么 `kind.in_(DEVICE_KINDS)` 就够了：角色行的 kind 是空串，天然不在
+    # DEVICE_KINDS 里。这是"恰好安全"而非"必然安全"，但 `kind` 列本身有
+    # 非空约束语义（schema 层已拒绝空 kind 建配置），所以不必再加条件 ——
+    # 每多一个条件就多一个能配错的机会。
+    rows = db.scalars(
         select(models.AIProvider)
         .where(models.AIProvider.enabled.is_(True),
-               models.AIProvider.kind.in_(("asr", "llm", "tts", "vad")))
+               models.AIProvider.kind.in_(DEVICE_KINDS))
         .order_by(models.AIProvider.kind, models.AIProvider.priority)
     ).all()
+    providers = [ProviderSafeOut.model_validate(r) for r in rows]
+
+    # 平滑过渡：新部署很可能只配了 llm_main / llm_light 而一条老式 llm 都没有。
+    # 这时用「默认对话模型」折算成一条 kind=llm 补位，保证设备手上永远有一条
+    # 可用的 LLM —— 升级前后固件逻辑不变，不会出现「昨天还能聊、今天没模型了」。
+    if not any(p.kind == KIND_LLM for p in providers):
+        row = resolve_row(db, "chat")
+        if row is not None:
+            out = ProviderSafeOut.model_validate(row)
+            providers.append(out.model_copy(update={"kind": KIND_LLM}))
+
+    # 角色与形象：只用于决定「外观 + 音色」，不参与上面那段平台配置查询。
+    # 软删的形象/角色在这里按「未绑定」处理 —— 直接不下发，而不是报错：
+    # 心跳失败会让设备退化成离线状态，代价远大于少一份外观配置。
+    if avatar is not None and avatar.deleted_at is not None:
+        avatar = None
+    role = db.get(models.AIProvider, dev.agent_id) if dev.agent_id else None
+    if role is not None and (not role.is_role() or role.deleted_at is not None
+                            or role.archived_at is not None):
+        role = None
 
     db.refresh(dev)
     # 规划文档 7.3：心跳时顺带下发当日陪聊配额（已用/上限/空闲切断/服药关键词）
     quota = DeviceQuotaOut(**quota_snapshot(db, dev.owner_id, device_ids=[dev.id]))
+    ws_url, ota_url = _voice_endpoints(request)
+    # 音色回落：**角色优先，形象兜底**（架构 §4.2）。
+    # 角色有自己选定的音色时用它；没选（或角色缺失/已删）才用形象的默认音色。
+    # 放在这里而不是存储层，是为了让 avatar 段保持"这个形象长什么样"的语义，
+    # 而音色是"这台设备现在该用谁的声音" —— 随角色变，不随形象变。
+    voice = (role.tts_voice if role is not None else "") or \
+            (avatar.tts_voice if avatar is not None else "")
     return DeviceSyncOut(
         server_time=now,
         device=dev,
         avatar=AvatarOut.model_validate(avatar) if avatar else None,
         reminders=[ReminderOut.model_validate(r) for r in rules],
         upcoming=[EventOut.model_validate(e) for e in upcoming],
-        providers=[ProviderSafeOut.model_validate(p) for p in providers],
-        ws_url=XIAOZHI_WS_URL,
-        ota_url=XIAOZHI_OTA_URL,
+        providers=providers,
+        ws_url=ws_url,
+        ota_url=ota_url,
         quota=quota,
+        tts_voice=voice,
     )
 
 

@@ -1,0 +1,24 @@
+{
+  "_meta": {
+    "how_to_verify": "python tools/qa_fingerprint.py  # 应输出「可测」；再跑 python tools/eval_persona.py # 应 exit 0",
+    "note": "verified_green 只描述记录那一刻；改动代码后它不会自动失效，所以 review 时仍需看下面的 hash 与当前 diff 是否一致。",
+    "recorded_at": "2026-10-16T02:45:40",
+    "verified_green": true
+  },
+  "server/app/main.py": "5d47ba2a",
+  "server/app/models.py": "90bb576b",
+  "server/app/persona/catalog.py": "b8f82b8c",
+  "server/app/persona/compiler.py": "b78f9066",
+  "server/app/persona/guardrails.py": "8f8ce184",
+  "server/app/persona/spec.py": "5175e0a1",
+  "server/app/routers/roles.py": "f2dce98d",
+  "server/app/schema_patch.py": "a1b0f7b1",
+  "server/app/schemas.py": "beebe143",
+  "server/evals/assertions.py": "46b5e306",
+  "server/evals/perm_invariants.py": "98b2c442",
+  "server/evals/redline_baseline.json": "df439622",
+  "server/evals/redline_baseline.py": "78c401d3",
+  "server/evals/runner.py": "afb92844",
+  "server/evals/suites/invariants.json": "e4fdd652",
+  "server/evals/suites/xiaozhi.json": "23c4c2bf"
+}

@@ -70,11 +70,22 @@ ACT_CODE_LEN = 13
 ACT_CODE_TTL_MINUTES = int(os.getenv("ELDER_ACT_TTL_MIN", "10"))
 LETTERS = "ABCDEFGHJKLMNPQRSTUVWXYZ"
 
-# ---------------------------------------------------------------- 小智语音链路
-# 语音/AI 链路复用 xiaozhi-esp32-server，本服务只做业务面，
-# 这里仅记录地址，供管理页面与设备下发配置时展示/透传。
-XIAOZHI_WS_URL = os.getenv("ELDER_XIAOZHI_WS", "ws://xiaozhi-server:8000/xiaozhi/v1/")
-XIAOZHI_OTA_URL = os.getenv("ELDER_XIAOZHI_OTA", "http://xiaozhi-server:8003/xiaozhi/ota/")
+# ---------------------------------------------------------------- 自研语音链路
+# ⚠️ 这里**不再是** xiaozhi-esp32-server。
+#
+# 历史沿革：早期为快速验证直接复用了小智的服务端容器，导致角色、音色、记忆、
+# 大模型调用全跑在外部进程里，属于「直接依赖第三方服务」，与本项目「自成一体」
+# 的目标相悖。现已改为**自研 WebSocket 服务端**（server/app/voice/），对外只保留
+# 同一套公开的 JSON-over-WebSocket 协议（hello/listen/stt/tts/mcp/abort + Opus），
+# 固件侧无需改动 —— 协议是公开的，谁都可以自己实现服务端，不绑定任何厂商。
+#
+# 设备配网后拿到的就是下面这两个地址，由本镜像自己提供。
+VOICE_WS_PATH = os.getenv("ELDER_VOICE_WS_PATH", "/api/voice/v1/ws")
+VOICE_OTA_PATH = os.getenv("ELDER_VOICE_OTA_PATH", "/api/voice/ota")
+
+# 对外通告的地址：留空时由服务端按请求 Host 自动推导（ws/wss 与 http/https 同源）。
+# 生产部署在 HTTPS 域名后面时要显式配成 wss://<域名>，否则浏览器/设备会拒绝混合内容。
+VOICE_PUBLIC_BASE = os.getenv("ELDER_VOICE_PUBLIC_BASE", "").rstrip("/")
 
 # ---------------------------------------------------------------- 提醒调度
 # 服务端预生成提醒实例的提前量（小时）。设备离线时靠本地 RTC 兜底触发，

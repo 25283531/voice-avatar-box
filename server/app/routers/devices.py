@@ -9,7 +9,7 @@ from sqlalchemy.orm import Session
 
 from .. import models
 from ..db import get_db
-from ..deps import get_current_user, require_device_owner
+from ..deps import get_current_user, require_device_owner, require_role
 from ..schemas import (
     ActivationCodeOut,
     BindIn,
@@ -91,7 +91,13 @@ def bind_agent(device_pk: int, payload: DeviceAgentIn, db: Session = Depends(get
 
     越权处理与 require_device_owner 略有不同：别人的设备这里统一返回 404
     而不是 403 —— 403 等于告诉调用方「这台设备存在，只是不是你的」，
-    会把设备主键是否存在这一信息泄露出去。
+    会把设备主键是否存在这一信息泄露出去。角色同理（deps.require_role）。
+
+    ⚠️ **P0-4 修复**：原先这里只做 ``db.get(AIProvider, role_id)`` 存在性校验，
+    于是**任何平台 LLM 配置都能被绑成角色**（kind 判空根本没查）。
+    后果是 build_persona_prompt 拿到一条空 system_prompt —— 设备"绑上了角色"
+    却按没有人格的方式说话，而且不报错，只是静默劣化。
+    现在统一走 deps.require_role：必须是角色行、且对当前用户可见。
 
     TODO: 目前只把 agent_id 落库。设备心跳（/api/device/sync）还没有把角色
     下发给固件，等端侧支持「按角色切换人格 / 音色」时，在 DeviceSyncOut 里
@@ -101,8 +107,9 @@ def bind_agent(device_pk: int, payload: DeviceAgentIn, db: Session = Depends(get
     if dev is None or (not user.is_admin and dev.owner_id != user.id):
         raise HTTPException(status.HTTP_404_NOT_FOUND, "设备不存在")
 
-    role = db.get(models.AIProvider, payload.role_id)
-    if role is None:
+    # 必须是**角色**且当前用户可见：平台配置在这里表现为"不存在"
+    role = require_role(db, payload.role_id, user)
+    if role.deleted_at is not None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "角色不存在")
 
     dev.agent_id = role.id
