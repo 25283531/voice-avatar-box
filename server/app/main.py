@@ -23,8 +23,8 @@ from sqlalchemy import select
 from .config import APP_NAME, APP_VERSION, CORS_ORIGINS
 from .db import SessionLocal, init_db
 from .models import Avatar
-from .routers import (avatars, auth, device_api, devices, home, mail, membership,
-                      providers, reminders, roles, stats, support)
+from .routers import (admin_presets, avatars, auth, device_api, devices, home, mail,
+                      membership, providers, reminders, roles, stats, support)
 from .schema_patch import run_all as run_schema_upgrade
 from .security import hash_password
 # 记忆的 router 单独导入，**不从 .memory 包里取**：
@@ -101,7 +101,14 @@ def _seed() -> None:
                 owner_id=None,
                 parent_id=None,
                 system_prompt=catalog.DEFAULT_PRESET_PROMPT,
-                tts_voice="zh-CN-XiaoxiaoNeural",
+                # ⚠️ 常量搬家，**值逐字不变**（"zh-CN-XiaoxiaoNeural"）。
+                # 为什么必须搬：运营后台的「恢复出厂默认」需要单一真源 ——
+                # 出厂默认散落在 catalog 与本文件两处时，reset 就得反向依赖
+                # main.py，而这里是**启动期写表**的路径，让请求路径依赖它
+                # 等于把两者耦合（那条路径历史上正是 P0 的发源地）。
+                # 幂等性与判据正确性论证见 docs/架构设计-人格预设运营后台.md §9.2：
+                # 判据一个字符未改、建行条件未改，故**不改任何业务数据**。
+                tts_voice=catalog.DEFAULT_PRESET_TTS_VOICE,
                 traits=dict(catalog.DEFAULT_TRAITS),
                 guardrails=guardrails.merge_stored(None),
                 enabled=True,
@@ -338,6 +345,11 @@ for r in (mail.admin_router, mail.auth_router, support.router, support.admin_rou
 # server/app/voice/ 尚未落地，所以这里只注册 HTTP 接口，不假装接线了语音（见 bridge.py）。
 for r in (memory_router.router, memory_router.admin_router):
     app.include_router(r)
+
+# 人格预设运营后台：/api/admin/presets（调整现有平台预设的 5 个可改字段 +
+# 恢复默认 + 软约束 + 只读红线展示 + 审计）。只对**现有**平台预设开放，
+# 不支持新建（设计 §2）。router 级 get_current_admin —— 非管理员 403。
+app.include_router(admin_presets.router)
 
 
 @app.get("/api/health")

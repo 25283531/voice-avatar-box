@@ -63,6 +63,31 @@
   .modal{background:#fff;border-radius:12px;padding:18px;width:100%;max-width:720px}
   .close{float:right;border:none;background:none;font-size:20px;cursor:pointer;color:var(--muted)}
   .empty{padding:20px;text-align:center;color:var(--muted)}
+  /* ---- 人格预设页专用 ---- */
+  /* 档位按钮组：10 维 traits 绝不让运营填 0-1 浮点，一律渲染成单选按钮组。
+     选中态用「实心主色」而不是「勾」，因为按钮组是单选语义，
+     勾容易被读成多选（多选会让人以为能同时设"很简短"和"详细"）。 */
+  .bands{display:flex;gap:6px;flex-wrap:wrap}
+  .bands button{font-size:12px;padding:5px 11px}
+  .bands button.on{background:var(--brand);border-color:var(--brand);color:#fff}
+  .bands button.on.bad{background:var(--bad);border-color:var(--bad)}
+  .traitrow{display:grid;grid-template-columns:78px1fr;gap:8px;align-items:start;
+        padding:7px 0;border-bottom:1px dashed var(--line)}
+  .traitrow .dim{font-size:13px;padding-top:5px}
+  .traitrow .eff{font-size:12px;color:var(--muted);margin-top:4px;line-height:1.5}
+  .fold{margin-top:12px;border:1px solid var(--line);border-radius:8px;overflow:hidden}
+  .fold>summary{cursor:pointer;padding:8px 12px;background:#f8fafc;font-size:13px;
+        list-style:none;user-select:none}
+  .fold>summary::-webkit-details-marker{display:none}
+  .fold>summary:before{content:"▸ ";color:var(--muted)}
+  .fold[open]>summary:before{content:"▾ "}
+  .fold .inner{padding:8px 12px}
+  .audit{border:1px solid var(--line);border-radius:8px;padding:8px 10px;margin-bottom:8px}
+  .audit pre{white-space:pre-wrap;word-break:break-all;background:#f8fafc;padding:6px 8px;
+        border-radius:6px;font-size:12px;margin:4px 0 0}
+  .drawer{position:fixed;top:0;right:0;bottom:0;width:420px;max-width:92vw;background:#fff;
+        border-left:1px solid var(--line);box-shadow:-6px 0 24px rgba(15,23,42,.12);
+        overflow:auto;padding:16px;z-index:20}
   @media(max-width:820px){.g3,.g4{grid-template-columns:repeat(2,minmax(0,1fr))}}
 </style>
 </head>
@@ -366,7 +391,171 @@
       </div>
     </section>
 
-    <!-- ---------------------- AI 接入 ---------------------- -->
+    <!-- ===== 人格预设（插在「形象」之后、「AI 接入」之前）===== -->
+    <section v-if="tab==='personas'">
+      <div class="card">
+        <div class="row" style="justify-content:space-between">
+          <h2>平台人格预设</h2>
+          <span class="muted" style="font-size:12px">红线版本 {{presetMeta.guardrail_version||'—'}}</span>
+        </div>
+        <p class="muted" style="font-size:12px;margin:0 0 10px">
+          调整的是<b>全平台共享</b>的这一行。设备不缓存人格，保存即对所有
+          <b>直接绑定本预设</b>的设备生效；已经派生出去的角色是独立副本，不会跟着变。
+        </p>
+        <table v-if="presets.length">
+          <thead><tr><th>名称</th><th>状态</th><th>话多程度</th><th>绑定设备</th>
+            <th>派生角色</th><th>偏离默认</th><th>操作</th></tr></thead>
+          <tbody>
+            <tr v-for="p in presets" :key="p.id">
+              <td>{{p.name}}<div class="muted" style="font-size:12px">{{p.description}}</div></td>
+              <td><span class="tag" :class="p.archived?'warn':'ok'">{{p.archived?'已下架':'正常'}}</span></td>
+              <td>{{traitLabel('verbosity', p.traits.verbosity)}}</td>
+              <td>{{p.bound_device_count}} 台</td>
+              <td>{{p.derived_role_count}} 个</td>
+              <td>
+                <span class="tag" :class="p.dirty_fields.length?'warn':'ok'">
+                  {{p.dirty_fields.length?'是':'否'}}</span>
+                <div v-if="p.dirty_fields.length" class="muted" style="font-size:11px">
+                  {{p.dirty_fields.map(f=>dirtyName(f)).join('、')}}</div>
+              </td>
+              <td class="row">
+                <button @click="openPreset(p)">编辑</button>
+                <button @click="resetPreset(p)">恢复默认</button>
+                <button class="danger" @click="archivePreset(p)">下架</button>
+                <button @click="openAudits(p)">审计</button>
+              </td>
+            </tr>
+          </tbody>
+        </table>
+        <div v-else class="empty">还没有平台预设</div>
+      </div>
+
+      <!-- 编辑弹窗：5 区（基本信息 / 提示词 / 性格 10 维 / 家属额外要求 / 安全底线） -->
+      <div v-if="pEditBox" class="mask" @click.self="closePreset">
+        <div class="modal" style="max-width:860px">
+          <button class="close" @click="closePreset">&times;</button>
+          <h2>编辑平台预设：{{pEdit.name}}</h2>
+
+          <div v-if="pEdit.bound_device_count>0" class="err"
+               style="background:#fdf3e3;color:var(--warn)">
+            ⚠️ 保存后立即对 <b>{{pEdit.bound_device_count}}</b> 台设备生效（系统不缓存人格）。
+            已派生出去的 {{pEdit.derived_role_count}} 个角色是独立副本，<b>不会</b>跟着变。
+          </div>
+
+          <!-- ① 基本信息 -->
+          <div class="grid g3" style="margin-top:10px">
+            <div><label>名称</label><input v-model="pEdit.name" style="width:100%" /></div>
+            <div><label>音色</label>
+              <input v-model="pEdit.tts_voice" style="width:100%" list="ttsVoiceList" />
+              <datalist id="ttsVoiceList"><option v-for="v in ttsVoices" :key="v" :value="v"></option></datalist>
+            </div>
+            <div><label>简介（给用户看）</label><input v-model="pEdit.description" style="width:100%" /></div>
+          </div>
+
+          <!-- ② 人格提示词 -->
+          <div style="margin-top:10px">
+            <label>人格提示词（运营/家属特别交代的语气要求）</label>
+            <textarea v-model="pEdit.system_prompt" style="min-height:110px"></textarea>
+            <div class="muted" style="font-size:12px">
+              提示词<b>不含</b>安全底线 —— 红线由平台代码常量在编译时注入，改这里动不了它。
+            </div>
+          </div>
+
+          <!-- ③ 性格 10 维：一律档位单选按钮组，绝不填 0-1 浮点 -->
+          <div style="margin-top:12px">
+            <label>性格 10 维（点档位即可，每格下面是这一档的实际行为）</label>
+            <div v-for="spec in presetMeta.trait_specs||[]" :key="spec.name" class="traitrow">
+              <div class="dim">{{spec.label}}</div>
+              <div>
+                <div class="bands">
+                  <button v-for="o in spec.options" :key="String(o.value)"
+                          :class="{on: isBandOn(spec, o.value)}"
+                          @click="setBand(spec, o.value)">{{o.label}}</button>
+                </div>
+                <div class="eff">{{bandEffect(spec, pEdit.traits[spec.name])}}</div>
+              </div>
+            </div>
+          </div>
+
+          <!-- ④ 家属额外要求（软约束） -->
+          <div style="margin-top:12px">
+            <label>家属额外要求（平台固定 7 项，勾选制）</label>
+            <div v-for="g in presetMeta.soft_guardrails||[]" :key="g.id"
+                 style="display:flex;gap:6px;align-items:center;font-size:13px;padding:3px 0">
+              <input type="checkbox" :checked="pEdit.guardrails_soft.indexOf(g.id)>=0"
+                     @change="toggleSoft(g.id, $event.target.checked)" />
+              <span>{{g.text}}</span>
+            </div>
+            <div class="muted" style="font-size:12px">
+              只能从平台固定 7 项里勾选，不能自定义文字 —— 自由文本无法校验，
+              且可能与硬红线直接冲突。
+            </div>
+          </div>
+
+          <!-- ⑤ 安全底线：只读、默认折叠（不隐藏的三条理由见 JS 侧注释） -->
+          <details class="fold">
+            <summary>🔒 安全底线（{{(presetMeta.hard_guardrails||[]).length}} 条 · 平台强制 · 不可修改）</summary>
+            <div class="inner">
+              <div v-for="h in pEdit.guardrails_hard||[]" :key="h.id" style="padding:4px 0;font-size:13px">
+                <b>{{h.label}}</b>：{{h.text}}
+              </div>
+              <div class="muted" style="font-size:12px;margin-top:6px">
+                这 5 条是平台的绝对底线，<b>不随运营调整变化</b>，也不在保存范围内。
+                想确认机器人现在到底带没带红线，用下面的「预览」。
+              </div>
+            </div>
+          </details>
+
+          <div class="row" style="margin-top:16px;justify-content:flex-end">
+            <button @click="closePreset">取消</button>
+            <button @click="previewPreset">预览编译产物</button>
+            <button class="primary" :disabled="presetBusy" @click="savePreset">保存并立即生效</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- 预览层：不落库，只展示编译结果 -->
+      <div v-if="pPreview" class="mask" @click.self="pPreview=null">
+        <div class="modal">
+          <button class="close" @click="pPreview=null">&times;</button>
+          <h2>预览：编译后的完整 system prompt（未保存）</h2>
+          <p class="muted" style="font-size:12px">
+            这就是保存后机器人真正收到的设定，含安全底线首尾两段。
+            预览<b>不会</b>落库 —— 关掉即丢弃。
+          </p>
+          <textarea :value="pPreview.prompt" readonly
+                    style="min-height:300px;font-family:ui-monospace,Consolas,monospace;font-size:12px"></textarea>
+        </div>
+      </div>
+
+      <!-- 审计抽屉 -->
+      <div v-if="auditBox" class="drawer">
+        <div class="row" style="justify-content:space-between">
+          <h2>操作审计：{{auditBox.name}}</h2>
+          <button @click="auditBox=null">关闭</button>
+        </div>
+        <p class="muted" style="font-size:12px">
+          谁在什么时候改了哪些字段，逐字段 from→to。<b>恢复默认也算变更</b>，所以也在这里。
+        </p>
+        <div v-if="!audits.length" class="empty">还没有审计记录</div>
+        <div v-for="a in audits" :key="a.id" class="audit">
+          <div style="font-size:12px">
+            <b>{{a.admin_username||a.admin_id}}</b> · {{actionName(a.action)}} · {{fmt(a.created_at)}}
+          </div>
+          <div class="muted" style="font-size:12px">
+            变更 {{a.changed_fields.length}} 项 · 红线版本 {{a.guardrail_version}}
+          </div>
+          <div style="font-size:12px;margin-top:2px">
+            <span v-for="f in a.changed_fields" :key="f" class="tag">{{diffName(f)}}</span>
+          </div>
+          <button style="margin-top:4px;font-size:12px" @click="showDiff[a.id]=!showDiff[a.id]">
+            {{showDiff[a.id]?'收起明细':'查看明细'}}</button>
+          <pre v-if="showDiff[a.id]">{{prettyDiff(a)}}</pre>
+        </div>
+      </div>
+    </section>
+
+    <!-- ---------------------- AI 接入 -------------------- -->
     <section v-if="tab==='providers'">
       <div class="card">
         <div class="row" style="justify-content:space-between">
@@ -526,7 +715,8 @@ createApp({
       tab: 'home',
       tabs: [
         {k:'home',n:'概览'},{k:'devices',n:'设备'},{k:'reminders',n:'提醒'},
-        {k:'avatars',n:'形象'},{k:'providers',n:'AI 接入'},{k:'stats',n:'统计'}
+        {k:'avatars',n:'形象'},{k:'personas',n:'人格预设'},
+        {k:'providers',n:'AI 接入'},{k:'stats',n:'统计'}
       ],
       err: '', busy: false,
       loginForm: { username:'', password:'' },
@@ -537,7 +727,14 @@ createApp({
       rBox: null, rForm: null, timesText:'', weekText:'', monthText:'',
       aBox: null, aForm: null, clipsText:'', lightsText:'',
       pBox: null, pForm: null, paramsText:'',
-      testUsage: 'chat', testResult: null
+      testUsage: 'chat', testResult: null,
+      // ---- 人格预设运营后台 ----
+      presets: [], presetMeta: {trait_specs:[], soft_guardrails:[],
+        hard_guardrails:[], guardrail_version:'', defaults:{}},
+      ttsVoices: ['zh-CN-XiaoxiaoNeural','zh-CN-XiaoyiNeural','zh-CN-YunjianNeural',
+                  'zh-CN-YunxiNeural','zh-CN-YunyangNeural'],
+      pEditBox: false, pEdit: null, presetBusy:false,
+      pPreview: null, auditBox:null, audits: [], showDiff:{}
     };
   },
   methods:{
@@ -552,8 +749,32 @@ createApp({
       const text = await res.text();
       let data = null;
       try { data = text ? JSON.parse(text) : null; } catch(e){ data = text; }
-      if (!res.ok){ throw new Error((data && data.detail) || ('HTTP '+res.status)); }
+      if (!res.ok){ throw new Error(this.errText(data, res.status)); }
       return data;
+    },
+    // 把后端的 detail 变成**人能读的一句话**。
+    //
+    // ⚠️ 为什么必须处理"detail 不是字符串"的三种形态（这三种在本仓都真实存在）：
+    //   ① detail 是字符串 —— 我们自己抛的 403/400/404（绝大多数）；
+    //   ② detail 是**数组** —— FastAPI 的 422 请求体校验失败，固定结构
+    //      `[{loc:[...], msg, type}, ...]`。直接 new Error(array) 会得到
+    //      一串毫无意义的字符串拼接，运营完全看不懂自己提交错了什么；
+    //   ③ detail 是对象 —— 历史上存在过的形态（如 archive 的引用清单）。
+    // 直接 `data.detail || ...` 只处理了第 ① 种，另两种都会渲染成
+    // [object Object] —— 那等于"报错信息等于没有"。
+    errText(data, status){
+      const d = data && data.detail;
+      if (typeof d === 'string' && d) return d;
+      if (Array.isArray(d)){
+        return d.map(it => {
+          const loc = Array.isArray(it && it.loc) ? it.loc.join('.') : '';
+          return (loc ? loc + '：' : '') + ((it && it.msg) || JSON.stringify(it));
+        }).join('；');
+      }
+      if (d && typeof d === 'object'){
+        try { return JSON.stringify(d); } catch(e){ /* 落到下面 */ }
+      }
+      return 'HTTP ' + status;
     },
     async doLogin(){
       this.busy = true; this.err = '';
@@ -576,6 +797,14 @@ createApp({
     async loadAll(){
       await Promise.all([this.loadDevices(), this.loadAvatars(), this.loadProviders()]);
       if (this.curDeviceId) await this.loadReminders();
+    },
+    // 人格预设页的数据**按需加载**（不进loadAll）：
+    // 全平台只有管理员能进这一页，而 loadAll 是登录后必跑的，
+    // 非管理员每次登录都白拉一次 403 只会污染全局 err 条。
+    async loadPersonas(){
+      this.err = '';
+      await this.loadPresetMeta();
+      await this.loadPresets();
     },
     async loadDevices(){
       const r = await this.api('/api/devices'); if(!r) return;
@@ -744,6 +973,159 @@ createApp({
       if (d) { console.log(d); alert('已导出到浏览器控制台，可复制到小智 config.yaml 的 selected_module 下'); }
     },
 
+    // -------- 人格预设运营后台 --------
+    // ⚠️⚠️ **number 型档位提交的是「档位上界」，原样回传 options[].value**
+    // ------------------------------------------------------------------
+    // `meta` 下发的 number 型 options[].value 就是 catalog 里 bands 的 **upper**
+    // （如 0.3/0.6/1.0），前端**不得**改成交"档位下界"。
+    // 两者与 `to_prompt_sentence` 的 `val <= upper` 取第一个档恰好自洽：
+    // 选"偶尔"提交 0.6 → 0.6 <= 0.6 命中第二档 → 渲染出"偶尔可以开个小玩笑"。
+    // 若换成下界，同一份 traits 会渲染成**另一句话**，而值域校验仍然通过、
+    // **没有任何断言会红**（设计边界 W13）——所以这条钉在这里。
+    //
+    // ⚠️ 为什么**一律不提供 0-1 浮点输入框**：档位值域是产品语义，不是数值语义。
+    // 运营看到"0.6"无法判断它意味着什么，而 `options[].label`（"偶尔"）+
+    // 下方灰字的行为描述才是他能据此做决定的东西。给输入框 = 把这个决定
+    // 推回给"谁也不知道 0.6 是多大"的运营。
+    isBandOn(spec, value){
+      const cur = this.pEdit ? this.pEdit.traits[spec.name] : undefined;
+      return String(cur) === String(value);
+    },
+    setBand(spec, value){
+      if(!this.pEdit) return;
+      // 原样回传，绝不四舍五入到别的档（见上方 W13 说明）
+      this.pEdit.traits[spec.name] = value;
+    },
+    // 当前档位的行为描述。**取不到就明说取不到**，不静默显示空白 ——
+    // 空白会被读成"这一维没有行为描述"，而真实原因是"当前值不在任何档位里"。
+    bandEffect(spec, value){
+      const hit = (spec.options||[]).filter(o => String(o.value) === String(value))[0];
+      if(!hit) return '⚠️ 当前值 ' + String(value) +
+        ' 不在任何档位里（出厂值可能落在档位之间），保存前请选一个档位。';
+      return hit.effect || hit.label;
+    },
+    traitLabel(name, value){
+      const spec = (this.presetMeta.trait_specs||[]).filter(s => s.name === name)[0];
+      if(!spec) return String(value);
+      const hit = (spec.options||[]).filter(o => String(o.value) === String(value))[0];
+      return hit ? hit.label : String(value);
+    },
+    dirtyName(f){
+      return {system_prompt:'人格提示词', traits:'性格 10 维', tts_voice:'音色'}[f] || f;
+    },
+    actionName(a){ return {update:'修改', reset:'恢复默认', archive:'下架'}[a] || a; },
+    diffName(f){
+      if(f.indexOf('traits.') === 0){
+        const spec = (this.presetMeta.trait_specs||[])
+          .filter(s => s.name === f.slice(7))[0];
+        return (spec ? spec.label : f.slice(7));
+      }
+      return {system_prompt:'人格提示词', tts_voice:'音色', name:'名称',
+              description:'简介', soft_guardrails:'家属额外要求',
+              archived_at:'下架时间'}[f] || f;
+    },
+    prettyDiff(a){
+      const d = a.diff || {};
+      return Object.keys(d).map(k => {
+        const it = d[k] || {};
+        return '· ' + this.diffName(k) + '\n    原：' + JSON.stringify(it.from) +
+               '\n    新：' + JSON.stringify(it.to);
+      }).join('\n') || '（无明细）';
+    },
+    async loadPresetMeta(){
+      const r = await this.api('/api/admin/presets/meta');
+      if(r) this.presetMeta = r;
+    },
+    async loadPresets(){
+      const r = await this.api('/api/admin/presets');
+      if(r) this.presets = r.presets || [];
+    },
+    openPreset(p){
+      // 深拷贝：直接改列表项会让"取消"也生效（Vue 响应式对象被就地改写）
+      this.pEdit = JSON.parse(JSON.stringify(p));
+      this.pEdit.traits = this.pEdit.traits || {};
+      this.pEdit.guardrails_soft = this.pEdit.guardrails_soft || [];
+      this.pEditBox = true;
+    },
+    closePreset(){ this.pEditBox = false; this.pEdit = null; },
+    toggleSoft(id, on){
+      const list = this.pEdit.guardrails_soft;
+      const i = list.indexOf(id);
+      if(on && i < 0) list.push(id);
+      if(!on && i >= 0) list.splice(i, 1);
+    },
+    // 软约束走**独立端点**：整体覆写会让"忘带这个字段 = 全部清空"成为可能，
+    // 而且它需要独立的审计条目（见 admin_presets.py 的模块注释）。
+    async persistSoft(){
+      const remote = this.presets.filter(p => p.id === this.pEdit.id)[0];
+      const remoteSoft = (remote && remote.guardrails_soft) || [];
+      const mine = this.pEdit.guardrails_soft || [];
+      const added = mine.filter(x => remoteSoft.indexOf(x) < 0);
+      const removed = remoteSoft.filter(x => mine.indexOf(x) < 0);
+      for(const id of added){
+        await this.api('/api/admin/presets/'+this.pEdit.id+'/soft-guardrails',
+          {method:'POST', body:JSON.stringify({guardrail_id:id, enabled:true})});
+      }
+      for(const id of removed){
+        await this.api('/api/admin/presets/'+this.pEdit.id+'/soft-guardrails',
+          {method:'POST', body:JSON.stringify({guardrail_id:id, enabled:false})});
+      }
+    },
+    async previewPreset(){
+      try{
+        const r = await this.api('/api/admin/presets/'+this.pEdit.id+'/preview', {
+          method:'POST',
+          body: JSON.stringify({name:this.pEdit.name, description:this.pEdit.description,
+                                system_prompt:this.pEdit.system_prompt,
+                                tts_voice:this.pEdit.tts_voice, traits:this.pEdit.traits})
+        });
+        if(r) this.pPreview = r;
+      }catch(e){ this.err = e.message; }
+    },
+    async savePreset(){
+      const n = this.pEdit.bound_device_count || 0;
+      // 保存是"影响他人但可秒回滚"→ 只在N>0 时确认（N=0 时确认框是纯噪音，
+      // 而噪音确认框会训练运营闭眼点确定，那才是真风险）。
+      if(n > 0 &&
+         !confirm('保存后立即对 ' + n + ' 台设备生效，确定？')) return;
+      this.presetBusy = true; this.err = '';
+      try{
+        await this.api('/api/admin/presets/'+this.pEdit.id, {
+          method:'PATCH',
+          body: JSON.stringify({name:this.pEdit.name, description:this.pEdit.description,
+                                system_prompt:this.pEdit.system_prompt,
+                                tts_voice:this.pEdit.tts_voice, traits:this.pEdit.traits})
+        });
+        await this.persistSoft();
+        this.pEditBox = false; this.pEdit = null;
+        await this.loadPresets();
+      }catch(e){ this.err = e.message; }
+      finally{ this.presetBusy = false; }
+    },
+    async resetPreset(p){
+      // 无条件二次确认：恢复出厂是**破坏性写入**，把运营之前的全部调整抹掉。
+      if(!confirm('将把「人格提示词 / 性格 10 维 / 音色」恢复为出厂默认。\n' +
+                  '已经派生出去的角色是独立副本，不会跟着变。\n确定恢复？')) return;
+      try{
+        await this.api('/api/admin/presets/'+p.id+'/reset', {method:'POST', body:'{}'});
+        await this.loadPresets();
+      }catch(e){ this.err = e.message; }
+    },
+    async archivePreset(p){
+      // 无条件二次确认：下架是结构性变化（预设不再出现在用户可选列表里）。
+      if(!confirm('下架后该预设不再出现在用户的可选列表里。\n确定下架？')) return;
+      try{
+        await this.api('/api/roles/'+p.id+'/archive', {method:'POST', body:'{}'});
+        await this.loadPresets();
+      }catch(e){ this.err = e.message; }
+    },
+    async openAudits(p){
+      this.auditBox = {id:p.id, name:p.name};
+      this.showDiff = {};
+      const r = await this.api('/api/admin/presets/'+p.id+'/audits?limit=50');
+      this.audits = r || [];
+    },
+
     // -------- 展示辅助 --------
     fmt(v){
       if (!v) return '—';
@@ -771,7 +1153,13 @@ createApp({
     methodName(m){ return ['—','语音','按键','手机端','自动'][m] || '—'; }
   },
   watch:{
-    curDeviceId(){ this.loadReminders(); }
+    curDeviceId(){ this.loadReminders(); },
+    tab(t){
+      // 进入人格预设页时才拉数据（理由见 loadPersonas 的注释）
+      if(t === 'personas'){
+        this.loadPersonas().catch(e => { this.err = e.message; });
+      }
+    }
   },
   mounted(){
     if (this.token) this.loadAll().catch(e => { this.err = e.message; });

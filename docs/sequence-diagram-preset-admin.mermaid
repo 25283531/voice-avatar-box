@@ -1,0 +1,146 @@
+%% 人格预设运营后台 · 时序图
+%% 来源：docs/架构设计-人格预设运营后台.md §11
+%% 四条主线：① PATCH 更新（含审计同事务）② preview（不落库）③ reset（恢复出厂）④ 启动流程（净改动 = 0）
+
+%% ============ 11.1 PATCH 更新平台预设 ============
+sequenceDiagram
+    autonumber
+    participant U as 管理员（控制台）
+    participant F as index.html（Vue）
+    participant R as routers/admin_presets.py
+    participant D as deps.require_role
+    participant S as spec.from_row
+    participant G as persona.guardrails
+    participant C as PromptCompiler
+    participant DB as ai_providers
+    participant A as admin_preset_audits
+
+    U->>F: 编辑弹窗点「保存并立即生效」
+    F->>F: confirm('保存后立即对 N 台设备生效，确定？')（N>0 才问）
+    F->>R: PATCH /api/admin/presets/{pk} {system_prompt, traits, ...}
+    Note over R: router 级 get_current_admin 先行（非 admin 直接 403）
+
+    R->>D: require_role(db, pk, admin, write=True, allow_archived=True)
+    alt 非 preset 行（role / config / 不存在）
+        D-->>R: 404「角色不存在」
+        R-->>F: 404，detail 为中文字符串
+    end
+    D-->>R: row (is_preset() == True)
+
+    R->>DB: 读旧值（system_prompt / traits / name / ...）
+    R->>R: 逐项校验 traits（catalog.TRAIT_SPECS.is_valid）
+    Note over R: 未知维度 / 非法值 -> 400「性格维度 … 取值非法」<br/>此时事务尚未提交，库里旧值仍在
+
+    R->>S: from_row(row) 组装旧 spec
+    S->>S: validate()
+    R->>R: build_spec_for_preset(row, candidate=新值)
+    Note over R: ★ PATCH 与 preview 共用这一个装配函数
+
+    R->>C: compile(spec, profile={}, examples="")
+    C->>G: regenerate_locked(spec.guardrails_hard)
+    Note over G: 不读 DB 文本，一律从 catalog.HARD_GUARDRAILS 重建
+    C->>C: render_head / render_tail
+    C->>G: assert_present(compiled)
+    alt 红线 token 缺失
+        G-->>C: GuardrailViolation
+        C-->>R: 抛错 -> 500，且事务不提交（fail-closed）
+    end
+    C-->>R: compiled（仅用于校验可编译，不返回给前端）
+
+    R->>DB: 写 row.system_prompt / row.traits / ...
+    R->>A: 写一条 audit（action='update'，diff 逐字段 from→to）
+    Note over R,A: ★ 同一个事务、同一次 commit<br/>理由：审计与业务分离写会出现「业务成功但审计丢了」
+
+    R->>R: db.refresh(row)
+    R->>DB: count(devices where agent_id=pk) / count(parent_id=pk)
+    R-->>F: 200 PresetOut（新值 + 影响面统计 + dirty_fields）
+    F-->>U: 关闭弹窗，刷新列表
+    Note over DB,C: 编译无缓存 -> 下一次对话立即用新值，无需重启
+
+%% ============ 11.2 preview（不落库） ============
+sequenceDiagram
+    autonumber
+    participant U as 管理员
+    participant F as index.html
+    participant R as routers/admin_presets.py
+    participant C as PromptCompiler
+    participant G as persona.guardrails
+    participant DB as ai_providers
+
+    U->>F: 点「预览编译产物」
+    F->>R: POST /api/admin/presets/{pk}/preview（与 PATCH 同构的候选值）
+    R->>R: get_current_admin + require_role(write=True) + is_preset()
+    Note over R: ★ 全程只读，不 add 不 commit
+
+    R->>DB: 读当前行
+    R->>R: build_spec_for_preset(row, candidate=候选值)
+    R->>C: compile(spec, profile={}, examples="")
+    C->>G: assert_present(compiled)
+    alt 红线缺失
+        G-->>C: GuardrailViolation
+        C-->>R: 抛错 -> 500（预览不返回缺红线的 prompt）
+    end
+    C-->>R: compiled + sections
+    R-->>F: 200 {prompt, sections, guardrail_version}
+    F-->>U: 弹层展示；列表数据一个字节都没变
+
+    Note over R,DB: 冒烟断言 T21：preview 前后<br/>db.get(AIProvider, pk).system_prompt 逐字未变
+
+%% ============ 11.3 reset（恢复出厂默认） ============
+sequenceDiagram
+    autonumber
+    participant U as 管理员
+    participant F as index.html
+    participant R as routers/admin_presets.py
+    participant K as persona/catalog.py
+    participant A as admin_preset_audits
+
+    U->>F: 点「恢复默认」
+    F->>U: confirm('将把人格提示词/性格10维/音色恢复为出厂默认。已派生角色是独立副本，不会跟着变。确定恢复？')
+    U-->>F: 确认
+    F->>R: POST /api/admin/presets/{pk}/reset {fields?}
+    R->>R: get_current_admin + require_role(write=True) + is_preset()
+
+    R->>K: DEFAULT_PRESET_PROMPT / DEFAULT_TRAITS / DEFAULT_PRESET_TTS_VOICE
+    Note over R: ★ 全部来自代码常量，不碰 main._seed()<br/>（出厂默认必须有单一真源）
+
+    R->>R: 逐字段计算 old -> new
+    alt 该字段已是默认值
+        R->>R: 跳过，不进 changed_fields
+    end
+
+    R->>R: row.system_prompt = DEFAULT_PRESET_PROMPT
+    R->>R: row.traits = dict(DEFAULT_TRAITS)
+    R->>R: row.tts_voice = DEFAULT_PRESET_TTS_VOICE
+    R->>A: 写 audit（action='reset'，diff 记 from=运营值 to=默认值）
+    R->>R: 一次 db.commit()（业务 + 审计同事务）
+
+    R-->>F: 200 PresetOut
+    F-->>U: 提示「已恢复出厂默认；已派生角色不受影响」
+    Note over R: ★ reset 不重置 archived_at（下架 ≠ 恢复）<br/>★ reset 不重置软约束与 guardrails 任何段
+
+%% ============ 11.4 启动流程（本次改动后净改动 = 0） ============
+sequenceDiagram
+    autonumber
+    participant M as main.lifespan
+    participant P as schema_patch.run_all
+    participant S as _seed
+    participant SM as _seed_migration
+    participant DB as ai_providers / avatars / devices
+
+    M->>P: run_schema_upgrade()
+    Note over P: 补列 + 索引（幂等无副作用）<br/>回填类已登记 patch_meta「只跑一次」<br/>★ 本次未改动一个字
+    P->>DB: ADD COLUMN / CREATE INDEX / 回填（首次）
+
+    M->>S: _seed()
+    Note over S: 查找 WHERE kind=='' ORDER BY id LIMIT 1<br/>命中 -> 什么都不做（运营改的 traits/system_prompt 保留）<br/>未命中 -> 建行（tts_voice 改用 catalog.DEFAULT_PRESET_TTS_VOICE，值等价）
+    S->>DB: create-if-missing
+
+    M->>SM: _seed_migration()
+    Note over SM: 步骤2「仅当 system_prompt 为空才写」<br/>步骤4 回填边界 = 母版 created_at（本次未动）
+    SM->>DB: 可能清空 Avatar.system_prompt / 回填存量设备
+
+    M->>DB: create_all -> 幂等创建 admin_preset_audits（checkfirst 跳过已存在）
+    Note over DB: ★ 新表由 create_all 建，不登记 NEW_COLUMNS<br/>★ 审计的 4 个写入点全在请求路径，启动期不写审计
+
+    Note over M,DB: 自问「第二次启动还会改数据吗」-><br/>新增：否（表已存在）｜提取常量：否（判据未变）｜审计：不在启动路径
