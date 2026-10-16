@@ -1199,3 +1199,56 @@ class TicketOut(ORMBase):
     updated_at: datetime
     # 提交者用户名（匿名提交为空串），管理端列表看得到是谁提的
     username: str = ""
+
+
+# ============================================================ 模型用量计量
+# 字段口径与 app.usage.usage_summary / recent_usage_rows 的返回**逐字对齐** ——
+# 「设备 token 用量」要在管理端、用户端、后续可能的设备配额三处展示，
+# 聚合口径的单一真源在 usage.py；router 不做二次加工，schema 也不另起名字。
+class UsageDayOut(ORMBase):
+    """按天汇总的一项（usage_summary(by_day=True) 的 by_day 元素）。"""
+
+    date: str
+    total_tokens: int = 0
+
+
+class UsageSummaryOut(ORMBase):
+    """token 用量聚合。
+
+    by_day 由 router 恒以 by_day=True 查询填足（schema 有这个字段，
+    各端自己决定传不传就会漂移）；调用数为 0 时其余各项为 0 / 空，
+    不是 null —— 前端可以直接 render，不用判空。
+    """
+
+    calls: int = 0
+    failed_calls: int = 0
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    total_tokens: int = 0
+    by_usage: dict[str, int] = Field(default_factory=dict)
+    by_day: list[UsageDayOut] = Field(default_factory=list)
+
+
+class UsageRowOut(ORMBase):
+    """一条调用流水（ModelUsage 行的出参）。
+
+    ⚠️ **刻意不含 prompt / 回复正文**：ModelUsage 表本来就不存正文，
+    这个 schema 也不许加 —— 用户端看得到自己的用量，看不到内容；
+    管理端看得到调用级对账，同样看不到。要存正文是另一个决策
+    （隐私评审），不是"顺手加个字段"。
+    """
+
+    id: int
+    created_at: datetime
+    source: str = ""
+    usage: str = ""
+    device_id: int | None = None
+    user_id: int | None = None
+    provider_name: str = ""
+    model: str = ""
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    total_tokens: int = 0
+    ok: bool = True
+    error: str = ""
+    elapsed_ms: int = 0

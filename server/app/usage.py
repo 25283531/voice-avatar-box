@@ -197,7 +197,7 @@ def record_from_result(
         provider_name=str(getattr(result, "provider_name", "") or ""),
         model=str(getattr(result, "model", "") or ""),
         prompt_tokens=prompt,
-        completion_tokens=completion_tokens,
+        completion_tokens=completion,
         total_tokens=total,
         request_id=request_id,
         session_id=session_id,

@@ -76,6 +76,10 @@ from .model_catalog import (
     describe_kinds,
     protocol_of,
 )
+# usage.py 只依赖 models/db，不 import 本模块 —— 这个方向不成环
+# （已复查：models 不 import llm_gateway，usage 的 import 表里也没有它）。
+# 若将来 usage 反向依赖网关，这里要改函数内局部 import 并把原因写进注释。
+from .usage import normalize_usage
 
 log = logging.getLogger("elder.llm_gateway")
 
@@ -212,6 +216,19 @@ class ChatResult:
     elapsed_ms: int = 0
     attempts: list[dict[str, Any]] = field(default_factory=list)
     raw: dict[str, Any] = field(default_factory=dict)
+    # ---- token 用量（2026-10 计量建设）----
+    # ⚠️ 上面的 ``usage`` 是**用途字符串**（"chat"/"light"/…），与下面三个
+    # token 数字不是一回事，别混淆。
+    # 厂商没返 usage 段时三者全为 0（调用方据此判断"这家不返用量"，
+    # 可选择记 0 或记 estimated）。归一化口径唯一真源是
+    # ``app.usage.normalize_usage``，这里不自己解析。
+    # ⚠️ 边界：``VectorResult`` / ``RankResult`` **本轮不接**（embed/rerank
+    # 的 raw 里同样有 usage，但接一个能力要连它的记账方一起接，半接半不接
+    # 比不接更危险）—— 留作后续增量，要接时连 ``record_from_result`` 的
+    # 调用方一起改，并补对应的冒烟断言。
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    total_tokens: int = 0
 
 
 @dataclass
@@ -686,10 +703,17 @@ def chat(db: Session, usage: str, messages: list[dict[str, Any]], *,
         _, raw = _http_post(row, path, body, timeout)
         payload = _load_json(raw)
         text, finish = _extract_text(protocol, payload)
+        # token 用量从响应体提取（OpenAI/Anthropic/Gemini/Ollama 四种形状
+        # 由 normalize_usage 统一归一）。厂商不返 usage 段时是 (0, 0, 0)，
+        # 记账方（usage.record_from_result）按 0 落库 —— "调用过但没用量"
+        # 与 "没调用过"由 ModelUsage 行的存在性区分，不由 token 数区分。
+        prompt_tokens, completion_tokens, total_tokens = normalize_usage(payload)
         return ChatResult(
             text=text, provider_pk=row.id, provider_name=row.name, kind=kind,
             model=row.model, usage=usage, finish_reason=finish,
             elapsed_ms=int((time.monotonic() - started) * 1000), raw=payload,
+            prompt_tokens=prompt_tokens, completion_tokens=completion_tokens,
+            total_tokens=total_tokens,
         )
 
     result, attempts = _run(db, usage, invoke)
