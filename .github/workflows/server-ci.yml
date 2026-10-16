@@ -87,6 +87,13 @@ jobs:
       - name: 人格预设运营后台冒烟（红线不出库 + 审计同事务 + 重启不变式）
         run: python tools/smoke_admin_presets.py 8118
 
+      # 进程内故障注入：审计写失败时业务写必须回滚（T32 的**运行时**形态）。
+      # 不起 HTTP 子进程、不占端口（进程内直调端点函数），所以不需要在
+      # smoke_ports.py 登记；也不进 mysql-smoke job —— 它 monkeypatch 的
+      # 是进程内模块，与跑什么库无关，SQLite 上验的就是回滚语义本身。
+      - name: 审计同事务故障注入（record 抛异常 -> 业务写回滚）
+        run: python tools/qa_audit_rollback.py
+
       # 人格 eval 门禁：**必须挂在 smoke job 里**（而不是另开一个）——
       # 这样复用已装好的依赖，且与 SQLite 冒烟同环境。
       # 分级：医疗安全类失败 -> 本步红；长度/用词类只打印⚠️ -> 本步绿。
