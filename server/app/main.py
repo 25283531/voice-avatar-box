@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import secrets
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -21,13 +22,20 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy import select
 
-from .config import APP_NAME, APP_VERSION, CORS_ORIGINS
+from .config import (
+    APP_NAME,
+    APP_VERSION,
+    CORS_ORIGINS,
+    DEFAULT_ADMIN_PASSWORDS,
+    RESET_ADMIN_PASSWORD,
+    SEED_ADMIN_PASSWORD,
+)
 from .db import SessionLocal, init_db
 from .models import Avatar
 from .routers import (admin_presets, avatars, auth, device_api, devices, home, mail,
                       membership, providers, reminders, roles, stats, support, usage)
 from .schema_patch import run_all as run_schema_upgrade
-from .security import hash_password
+from .security import hash_password, verify_password
 # 记忆的 router 单独导入，**不从 .memory 包里取**：
 # memory/__init__.py 是算法层门面（client/store/retrieve/persona），刻意不引 FastAPI，
 # 这样任何地方想用记忆算法都不必把 HTTP 栈拖进来。
@@ -43,6 +51,40 @@ logging.basicConfig(
 log = logging.getLogger("elder")
 
 STATIC_DIR = Path(__file__).parent / "static"
+
+# 三条安全日志的**稳定标记**：运维要 grep、冒烟要断言，改文案时这三个串不许动
+# （tools/smoke_auth.py 里各有一份逐字对齐的副本，改了那边会红）。
+#: 种子管理员的随机初始口令，形如 ``ELDER-INITIAL-PASSWORD=<pwd>``
+SEED_PASSWORD_MARKER = "ELDER-INITIAL-PASSWORD"
+#: 存量默认口令体检告警，形如 ``ELDER-DEFAULT-PASSWORD-ALERT user=admin``
+DEFAULT_PASSWORD_ALERT_MARKER = "ELDER-DEFAULT-PASSWORD-ALERT"
+#: 一次性轮换已执行，形如 ``ELDER-ADMIN-PASSWORD-ROTATED user=admin``
+PASSWORD_ROTATED_MARKER = "ELDER-ADMIN-PASSWORD-ROTATED"
+
+
+def _seed_admin_password() -> tuple[str, bool]:
+    """种子管理员的初始口令，返回 ``(口令, 是否由本进程随机生成)``。
+
+    随机分支用 ``secrets.token_urlsafe(16)``（22 个字符 / 128 bit 熵），
+    不用 ``random`` —— 后者是 Mersenne Twister，**可预测**，拿它发口令等于没发。
+    """
+    if SEED_ADMIN_PASSWORD:
+        return SEED_ADMIN_PASSWORD, False
+    return secrets.token_urlsafe(16), True
+
+
+def _hit_default_password(password_hash: str) -> str | None:
+    """该口令哈希是否命中「已知默认口令」；命中则返回命中的那个明文，否则 None。
+
+    ⚠️ 判定**必须**用 ``verify_password``（PBKDF2 重新算一遍再 compare_digest），
+    不能把 ``password_hash`` 拿去做字符串比较：hash 里带 16 字节随机盐，同一个
+    口令两次 hash 出来的字符串完全不同，字符串比对会**恒 False**
+    -> 存量库全员漏报 -> 这条体检等于没写（最危险的失效形态）。
+    """
+    for weak in DEFAULT_ADMIN_PASSWORDS:
+        if verify_password(weak, password_hash):
+            return weak
+    return None
 
 
 def _as_utc(dt: datetime | None) -> datetime | None:
@@ -80,14 +122,32 @@ def _seed() -> None:
 
     with SessionLocal() as db:
         if db.query(models.User).count() == 0:
+            pwd, generated = _seed_admin_password()
             admin = models.User(
                 username="admin",
-                password_hash=hash_password("admin123"),
+                password_hash=hash_password(pwd),
                 nickname="管理员",
                 is_admin=True,
             )
             db.add(admin)
-            log.info("seed: created default admin / admin123  <- 请登录后立即修改密码")
+            if generated:
+                # ⚠️ **必须打印**：随机口令只在这一次存在，重启后无法复现。
+                # 运维的第一现场是 docker logs，把它只写进文档等于没写 ——
+                # 结果是新部署没人拿得到初始口令。
+                # 级别取 WARNING 而不是 INFO：docker logs 里 INFO 会被大量启动
+                # 日志淹没，而这条是"不看就登不进去"的级别。
+                log.warning(
+                    "【安全】种子管理员已创建：用户名 admin，"
+                    "%s=%s\n"
+                    "    ⚠️ 这是唯一的初始口令，请立即保存并登录后修改 —— "
+                    "重启不会再显示，丢了只能靠 ELDER_RESET_ADMIN_PASSWORD 重置。\n"
+                    "    新部署想自己指定：部署前设 ELDER_SEED_ADMIN_PASSWORD=<口令>。",
+                    SEED_PASSWORD_MARKER, pwd)
+            else:
+                # 口令来自配置，**刻意不回显**：它已经在 .env / compose 里躺成明文了，
+                # 再往日志里抄一份只是多一个泄露面。
+                log.info("seed: 已按 ELDER_SEED_ADMIN_PASSWORD 创建种子管理员"
+                         " admin（口令不打印）")
 
         # ---- 平台预设角色（人格的唯一落点）----
         # 判定条件用 kind == ''（而不是 record_type == 'preset'）：
@@ -152,6 +212,85 @@ def _seed() -> None:
             db.add(av)
             log.info("seed: created default avatar")
         db.commit()
+
+
+def _admin_password_audit() -> None:
+    """启动体检 + 一次性轮换：**只针对存量部署**里口令仍是默认口令的管理员。
+
+    为什么非有这一段不可
+    --------------------
+    ``_seed()`` 只在**空库**时建管理员。也就是说"把种子改成随机口令"对**已经跑
+    起来的库**一点用都没有 —— 存量部署（含正在运行的生产库）里那个 admin 的口令
+    **现在就是 admin123**。只改进种子 = 只修将来、不修现在，所以这里必须给出
+    存量手段：**体检（每次启动告警）+ 一次性轮换**。
+
+    两段逻辑（顺序不能反）
+    ----------------------
+      1. 轮换：``ELDER_RESET_ADMIN_PASSWORD`` 有值 -> 把命中者换成该值；
+      2. 体检：**轮换之后**再扫一遍，命中者打 WARNING 并给出可照抄的处置命令。
+
+    ⚠️ 只对**命中者**告警
+    ----------------------
+    已经改过密码的管理员、以及普通用户**完全不受影响**：不告警、不被轮换、
+    能照常登录。误伤一个正常账号比漏报更难被接受 —— 那会把一次安全整改变成
+    一次线上事故。
+
+    ⚠️ 幂等性（为什么不会每次 boot 都改一遍）
+    ------------------------------------------
+    触发条件**本身**就是「口令还是默认口令」：轮换成功后它不再成立，后续启动
+    自然不动手。额外的护栏是「配置值自己就是默认口令则拒绝轮换」—— 挡住
+    ``ELDER_RESET_ADMIN_PASSWORD=admin123`` 这种手滑导致的每 boot 改写（配置漂移）。
+    """
+    from . import models
+
+    with SessionLocal() as db:
+        admins = db.scalars(
+            select(models.User).where(models.User.is_admin.is_(True))
+        ).all()
+
+        # ---- 1) 一次性轮换 ----
+        if RESET_ADMIN_PASSWORD and RESET_ADMIN_PASSWORD in DEFAULT_ADMIN_PASSWORDS:
+            log.warning(
+                "【安全】ELDER_RESET_ADMIN_PASSWORD 的值自己就是已知默认口令，"
+                "**已拒绝轮换**（否则每次启动都会改一遍口令，属于配置漂移）。"
+                "请换成一个强口令后重启。")
+        elif RESET_ADMIN_PASSWORD:
+            rotated: list[str] = []
+            for u in admins:
+                # 幂等的全部秘密在这一行：口令已经不是默认值的账号**不在**轮换范围，
+                # 所以轮换成功后下次启动自然不会再改（无需额外的"已处理"标记）。
+                if _hit_default_password(u.password_hash) is not None:
+                    u.password_hash = hash_password(RESET_ADMIN_PASSWORD)
+                    rotated.append(u.username)
+            if rotated:
+                db.commit()
+                log.warning(
+                    "【安全】%s user=%s —— 已把该管理员的口令轮换为 "
+                    "ELDER_RESET_ADMIN_PASSWORD 的值。\n"
+                    "    ★ 用完即删：现在就把 ELDER_RESET_ADMIN_PASSWORD 从 .env / "
+                    "compose 里删掉再重启一次，否则新口令会以明文长期留在配置文件里。",
+                    PASSWORD_ROTATED_MARKER, "、".join(rotated))
+
+        # ---- 2) 体检（轮换之后，已修好的不再告警）----
+        for u in admins:
+            hit = _hit_default_password(u.password_hash)
+            if hit is None:
+                continue
+            log.warning(
+                "【安全】%s user=%s id=%s —— 该管理员的口令仍是已知默认口令「%s」。\n"
+                "    → 任何知道这个默认值的人都能以**平台管理员**身份登录：改 AI 配置"
+                "（含厂商 API Key 的读写口径）、核销会员订单、查看全部用户用量与记忆。\n"
+                "    → 处置 A（登录后自己改）：带 token 调 "
+                "POST /api/auth/password  {\"old_password\":\"%s\","
+                "\"new_password\":\"<强口令>\"}\n"
+                "    → 处置 B（一次性轮换，适合口令已泄露/无法登录）：\n"
+                "        # 在 server/.env（或 compose 的 environment）里加一行\n"
+                "        ELDER_RESET_ADMIN_PASSWORD='<强口令>'\n"
+                "        docker compose up -d        # 日志出现 %s 即成功\n"
+                "        # ★ 然后删掉这一行，再 docker compose up -d 一次\n"
+                "    → 只要它还命中，本告警**每次启动都会打**。",
+                DEFAULT_PASSWORD_ALERT_MARKER, u.username, u.id, hit,
+                hit, PASSWORD_ROTATED_MARKER)
 
 
 def _seed_migration() -> None:
@@ -306,6 +445,11 @@ async def lifespan(app: FastAPI):
     # 随后 _seed() 看到 kind=='' 行已存在便不再补写 —— 结果是**全新部署的
     # 平台预设角色没有人格**。反序还不会报错，只是静默少一段话，很难发现。
     _seed()
+    # ⚠️ 体检必须在 _seed() **之后**：全新库的管理员是 _seed() 这一趟刚建的，
+    # 放到前面会漏掉它 —— 而「ELDER_SEED_ADMIN_PASSWORD 填的就是 admin123」
+    # 恰恰是最该被告警的情形（那就是旧代码的行为）。
+    # 放到 _seed_migration() 之前则不成立任何依赖，两者互不相干，顺序随意。
+    _admin_password_audit()
     _seed_migration()
     _seed_membership()
     from . import scheduler

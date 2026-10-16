@@ -22,6 +22,21 @@ jobs:
     name: 后端冒烟测试
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    env:
+      # ⚠️⚠️ **这里的弱口令是刻意的，不要照抄到生产。** 逐条说清：
+      #
+      #  1. 为什么要设：tools/ 下 8 个冒烟脚本（smoke_server / roles / home /
+      #     models / mail / memory / usage / admin_presets）**硬依赖**
+      #     admin/admin123 登录。改造它们会让范围失控，于是改在这里集中供一次。
+      #  2. 为什么弱口令在这里**没有现实风险**：GitHub 托管的 runner 是**一次性
+      #     虚拟机**、跑完即销毁，且**不可从公网访问**；它连的数据库是 runner 本地
+      #     的 SQLite / 临时 MySQL，跑完一起没。不存在"攻击者能用它登录"。
+      #  3. ⚠️ 反过来说：**这个变量的语义是"我明确接受一个新装库使用弱种子口令"**，
+      #     生产/内网/任何长期存在的环境**都不该**设它 —— 不设才会走随机口令分支
+      #     （`secrets.token_urlsafe(16)`，启动日志 WARNING 打一次）。
+      #  4. ⚠️ 它只在**空库**建种子账号时生效，对存量库没用。存量库请走
+      #     `ELDER_RESET_ADMIN_PASSWORD` 一次性轮换（见 docs/DEPLOY.md §5.2）。
+      ELDER_SEED_ADMIN_PASSWORD: admin123
     defaults:
       run:
         working-directory: .
@@ -78,6 +93,22 @@ jobs:
       # 「并行跑全部冒烟」时也确定不冲突。
       - name: 运行业务闭环冒烟测试
         run: python tools/smoke_server.py 8100
+
+      # 注册 / 鉴权安全边界冒烟（65 条断言）：
+      #   - 匿名注册开关 + "第一个注册者=管理员" 的老规则不再复活；
+      #   - **种子管理员不再是可猜测口令**：空库未配 ELDER_SEED_ADMIN_PASSWORD 时
+      #     admin/admin123 必须登不上，随机口令以 WARNING 打进日志且能登录；
+      #   - 存量库（口令已是 admin123）每次启动告警、只对命中者告警；
+      #   - ELDER_RESET_ADMIN_PASSWORD 一次性轮换 + 幂等 + 不误伤其它账号。
+      #
+      # ⚠️ 为什么它**必须**挂在这个 job 里：上面 job 级的
+      # ELDER_SEED_ADMIN_PASSWORD=admin123 会一路继承进来，导致"随机口令"分支
+      # 在 CI 上永远走不到。脚本里对每个需要随机口令的场景都显式
+      # `env.pop("ELDER_SEED_ADMIN_PASSWORD")` 来触发，所以挂进来才有意义 ——
+      # 不挂的话整套断言就是"只在本机能跑"。
+      # 端口 8121 已在 tools/smoke_ports.py 登记。
+      - name: 注册 / 鉴权 / 种子口令冒烟（含 P0 默认口令断言）
+        run: python tools/smoke_auth.py 8121
 
       # 角色域冒烟：/api/roles 全闭环 + 四条 P0 越权断言。
       # 之所以单列一步而不是塞进 smoke_server：这四类缺陷（P0-1~4）曾经

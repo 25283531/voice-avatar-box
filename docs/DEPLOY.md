@@ -33,11 +33,20 @@ docker compose up -d
 
 默认只起 **一个** 服务 `elder-server`，不会再拉数据库容器。数据库是镜像内置的 SQLite 文件，落在命名卷 `elder-data` 里的 `/data/elder.db`。
 
-首次启动会自动建表并写入种子数据（默认管理员、默认形象、会员套餐等），日志里能看到：
+首次启动会自动建表并写入种子数据（默认形象、会员套餐、种子管理员等）。
+
+**种子管理员的初始口令是随机的**（`secrets.token_urlsafe(16)`），只在启动日志里出现**一次**，形如：
 
 ```
-seed: created default admin / admin123  <- 请登录后立即修改密码
+WARNING elder | 【安全】种子管理员已创建：用户名 admin，ELDER-INITIAL-PASSWORD=5B5PwvJQwCjKGCtK-LuIwQ
+    ⚠️ 这是唯一的初始口令，请立即保存并登录后修改 —— 重启不会再显示，丢了只能靠 ELDER_RESET_ADMIN_PASSWORD 重置。
 ```
+
+> ⚠️ **这条 WARNING 是唯一一次拿到初始口令的机会**，重启后无法复现，所以第一件事是：
+> ```bash
+> docker compose logs elder-server | grep ELDER-INITIAL-PASSWORD
+> ```
+> 想自己指定初始口令，部署前设 `ELDER_SEED_ADMIN_PASSWORD=<口令>`（见 §5.2）。
 
 ### 1.3 访问
 
@@ -47,7 +56,12 @@ seed: created default admin / admin123  <- 请登录后立即修改密码
 | 接口文档 | `http://<host>:8064/docs` |
 | 健康检查 | `http://<host>:8064/api/health`（应返回 `{"ok":true,...}`） |
 
-默认账号 `admin` / `admin123`，**登录后立刻改密码**。
+默认账号用户名 `admin`，口令见启动日志（§1.2）。**登录后立刻改密码**。
+
+> ⚠️ **历史部署必看**：2026-10 之前的代码用硬编码常量 `admin123` 作种子管理员口令。
+> 那段代码只在**空库**时执行，所以**已经跑起来的库里那个 admin 的口令至今仍是
+> `admin123`** —— 升级代码不会自动改掉它。这一版会在每次启动时告警，
+> 处置命令见 §5.2。
 
 ### 1.4 常用运维命令
 
@@ -432,6 +446,8 @@ server {
 | `ELDER_DB_ECHO` | `0` | 设为 `1` 打印所有 SQL，排查问题时开，平时关 |
 | `ELDER_ALLOW_PUBLIC_REGISTER` | `1`（开启） | **是否开放匿名自助注册**。设为 `0`/`false`/`no`/`off`/空串即关闭，关闭时 `POST /api/auth/register` 返回 `403` + 「当前未开放自助注册，请联系管理员开通账号」。详见 §5.1 |
 | `ELDER_BOOTSTRAP_ADMIN_USERNAME` | 空（未配置） | **初始管理员（bootstrap）的用户名**。只有用户名**逐字等于**它的注册者会成为管理员；未配置时**任何人注册都不是管理员**。详见 §5.1 |
+| `ELDER_SEED_ADMIN_PASSWORD` | 空（随机生成） | **空库首次启动时种子管理员 `admin` 的初始口令**。留空 = `secrets.token_urlsafe(16)` 随机生成，并以 **WARNING** 打进启动日志（唯一一次可见）；设置 = 用它。**生产不要设**，设了且值是弱口令会每次启动被体检告警。详见 §5.2 |
+| `ELDER_RESET_ADMIN_PASSWORD` | 空（不轮换） | **存量管理员口令的一次性轮换开关**。设置后，下次启动把所有「口令仍是已知默认口令」的管理员轮换成该值；轮换成功后**必须删掉**。幂等：轮换后条件不再成立，后续启动不会再改。详见 §5.2 |
 | `ELDER_MAIL_FAKE` | `0` | **测试专用**。设为 `1` 时邮件不真投递、写进进程内发件箱。**生产必须为 `0`**，留空等同 `0` |
 | `ELDER_VOICE_PUBLIC_BASE` | 留空（自动推导） | 语音链路对外地址，见 1.6 |
 
@@ -464,9 +480,10 @@ ELDER_ALLOW_PUBLIC_REGISTER=0
 
 **初始管理员怎么来（三种方式，任选其一）**：
 
-1. **默认种子账号**：空库首次启动会自动建 `admin` / `admin123`（见 §1.3），
-   它已经是管理员。**上线第一件事就是改掉这个密码** —— 密码是代码里的硬编码
-   常量，任何知道它的人都有完整管理权限。
+1. **默认种子账号**：空库首次启动会自动建管理员 `admin`，口令**随机生成并打进日志**
+   （见 §1.2）；也可在部署前用 `ELDER_SEED_ADMIN_PASSWORD` 指定。
+   > ⚠️ 这里曾经是硬编码的 `admin123`（口令写死在代码里，任何知道它的人都有完整
+   > 管理权限）。**已在本轮移除**，但只对**新装库**有效 —— 存量库见 §5.2。
 2. **运维直接改库**：把某个现有用户的 `users.is_admin` 置为真。适合绝大多数情况。
 3. **`ELDER_BOOTSTRAP_ADMIN_USERNAME`**：想让"某个特定用户名注册进来就是管理员"
    时用它。
@@ -487,6 +504,109 @@ ELDER_BOOTSTRAP_ADMIN_USERNAME=zhangjiashu_admin
 > `select(User).limit(1) is None`）。在匿名可注册的公网部署上，它等于
 > **把管理员发给第一个点开注册页的路人**，已在本轮移除。
 > 回归网在 `tools/smoke_auth.py`（含一条专门甄别该规则的最小场景）。
+
+### 5.2 种子管理员口令与**存量**默认口令处置（P0）
+
+#### 背景：为什么"改种子"救不了存量库
+
+旧代码在 `main._seed()` 里写死了 `password_hash=hash_password("admin123")`。
+那段代码**只在空库首次启动时执行**，于是：
+
+* **新装库**：本版已换成随机口令（或 `ELDER_SEED_ADMIN_PASSWORD` 指定的值）；
+* **已经跑起来的库**（含正在运行的生产库）：那个 `admin` 的口令**至今仍是 `admin123`**，
+  升级代码**不会**自动改掉它 —— 因为根本不会再走 `_seed()`。
+
+本服务是公开部署的（`voice.2508866.xyz`，APP 把 `BASE_URL` 写死成它），
+所以存量的 `admin/admin123` 等于"任何人都能当平台管理员"：改 AI 配置（含厂商
+API Key 的读写口径）、核销会员订单、查看全部用户用量与记忆。
+
+#### 一、先确认你的库是不是中招
+
+启动日志里**每次**都会体检（只要还命中就一直喊）：
+
+```bash
+docker compose logs elder-server | grep ELDER-DEFAULT-PASSWORD-ALERT
+```
+
+命中时长这样（WARNING 级）：
+
+```
+WARNING elder | 【安全】ELDER-DEFAULT-PASSWORD-ALERT user=admin id=1 —— 该管理员的口令仍是已知默认口令「admin123」。
+    → 任何知道这个默认值的人都能以**平台管理员**身份登录：...
+    → 处置 A（登录后自己改）：带 token 调 POST /api/auth/password ...
+    → 处置 B（一次性轮换，适合口令已泄露/无法登录）：...
+```
+
+判定用的是 `verify_password()`（PBKDF2 重算比对），**不是**字符串比对 ——
+hash 带随机盐，同一个口令两次 hash 出来的字符串不同，字符串比对必然漏报。
+**只对命中者告警**：已经改过口令的管理员、普通用户完全不受影响。
+
+#### 二、处置命令（抄走即用）
+
+**方式 A —— 能登录，直接改密码**（最推荐）
+
+```bash
+# 1) 拿 token
+TOKEN=$(curl -s -X POST https://voice.2508866.xyz/api/auth/login \
+  -H 'Content-Type: application/json' \
+  -d '{"username":"admin","password":"admin123"}' | python -c 'import sys,json;print(json.load(sys.stdin)["access_token"])')
+
+# 2) 改密码（新口令自己换掉）
+curl -X POST https://voice.2508866.xyz/api/auth/password \
+  -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"old_password":"admin123","new_password":"换成你的强口令"}'
+```
+
+**方式 B —— 一次性轮换**（口令已泄露、或登不进去时用）
+
+```bash
+# 1) 在 server/.env（或 compose 的 environment）里**临时**加一行
+echo "ELDER_RESET_ADMIN_PASSWORD='换成你的强口令'" >> server/.env
+
+# 2) 重启一次 —— 日志出现下面这行即成功
+docker compose up -d
+docker compose logs elder-server | grep ELDER-ADMIN-PASSWORD-ROTATED
+#    WARNING elder | 【安全】ELDER-ADMIN-PASSWORD-ROTATED user=admin —— 已把该管理员的口令轮换为 ELDER_RESET_ADMIN_PASSWORD 的值。
+
+# 3) ★ 立刻把那一行删掉，再重启一次（否则新口令会以明文长期留在配置文件里）
+sed -i '/ELDER_RESET_ADMIN_PASSWORD/d' server/.env
+docker compose up -d
+
+# 4) 确认告警消失
+docker compose logs elder-server | grep ELDER-DEFAULT-PASSWORD-ALERT   # 应无输出
+```
+
+**方式 C —— 直接改库**（前两种都不可行时）
+
+```bash
+# 容器内用本项目的 hash 算法重写 password_hash，别手写 bcrypt/明文
+docker compose exec elder-server python - <<'PY'
+from app.security import hash_password, verify_password
+from app.db import SessionLocal
+from app.models import User
+with SessionLocal() as db:
+    u = db.query(User).filter(User.username == "admin").one()
+    assert verify_password("admin123", u.password_hash), "该账号口令已不是默认值，无需处置"
+    u.password_hash = hash_password("换成你的强口令")
+    db.commit()
+    print("admin 口令已重置")
+PY
+```
+
+#### 三、幂等性与护栏（别踩）
+
+* **幂等**：轮换的触发条件是「口令仍是已知默认口令」。轮换成功后该条件不再成立，
+  所以后续每次启动**不会再改** —— 不需要额外的"已处理"标记。把
+  `ELDER_RESET_ADMIN_PASSWORD` 忘在 `.env` 里不会导致反复改口令。
+* **护栏**：若它的值自己就是已知默认口令（比如手滑写成 `admin123`），
+  **拒绝轮换**并打印「已拒绝轮换」—— 否则会退化成每次启动改一遍的配置漂移。
+* **新装库**想指定初始口令用 `ELDER_SEED_ADMIN_PASSWORD`，不要用
+  `ELDER_RESET_ADMIN_PASSWORD`（后者只对**已存在**且口令是默认值的管理员生效，
+  对新装库不起作用）。
+
+> 回归网：`tools/smoke_auth.py` 场景 4~7（65 条断言，含"随机口令分支"、"存量告警"、
+> "轮换幂等"、"不误伤其它账号"）。
 
 ---
 
