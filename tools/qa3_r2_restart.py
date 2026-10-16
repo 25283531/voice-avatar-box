@@ -1,36 +1,62 @@
-"""QA 第 2 轮：**重启后用户派生角色变成只读** —— 疑似严重回归，定位用。
+"""QA 第 2 轮 · **重启不变式回归门禁**：启动流程不得改写用户角色。
 
-现象（qa3_r2_e2e.py 观察到）
+它守什么（一句话）
+------------------
+同一个用户派生角色（``record_type='role'``、``kind=''``、``owner_id=U``），
+**重启服务后必须原样仍是 'role'**：owner 仍能读/写/删，其他用户仍看不到。
+
+历史：它曾经是「缺陷复现器」
 --------------------------
-对同一个用户派生角色（record_type='role', kind='', owner_id=U），
-**重启服务**后：
-    GET  /api/roles/{id}          -> 200（读得到）
-    GET  /api/roles/{id}/diff     -> 404（写路径被拒）
-    POST /api/roles/{id}/guardrails/soft -> 404
-    GET  /api/roles/{id}/prompt   -> 404
+2026-10 的 P0：``schema_patch.backfill_record_types()`` 的判据只看
+``kind``，而角色行的 ``kind`` 恒为空串（角色不参与下发/导出）—— 于是
+每次启动都把用户派生角色刷成 ``preset``：
 
-同一个 token、同一个 id，读得到却写不了 —— 只能是 ``can_write`` 变了。
+* 角色变只读（``can_write`` 对 preset 只认管理员，改不了也删不了）；
+* preset 对全平台可见 = **跨用户信息泄漏**（A 家人的角色设定 B 家人能看到）；
+* 且**不可逆** —— PATCH 刻意不改归属，没有任何接口能改回 'role'。
 
-假设
-----
-``schema_patch.backfill_record_types()`` 里有这么一条：
-    UPDATE ai_providers SET record_type = 'preset'
-    WHERE (kind IS NULL OR kind = '') AND (record_type != 'preset')
+本脚本最初就是为定位这个缺陷而写（查库确认"重启后 record_type 被改写"）。
 
-而**用户派生角色的 kind 恒为空串**（角色不参与下发/导出）。于是每次启动
-都会把**所有用户派生角色**的 record_type 从 'role' 刷成 'preset'，
-而 ``can_write`` 对 preset 只认管理员 —— 于是用户自己的角色突然变成只读。
+修复落地了**两层独立防线**（缺一不可，详见 ``schema_patch.py`` 顶部注释）：
 
-后果：家属派生一个角色、重启一次服务，角色就废了（改不了、删不了），
-且因为被判成 preset，它还会**对全平台所有用户可见**。
+1. **判据层**：刷 preset 的 WHERE 带 ``owner_id IS NULL`` —— 用户角色
+   必然有 owner（``create_role`` / ``derive_role`` 写死 ``owner_id=user.id``），
+   永不匹配；
+2. **只执行一次层**：``patch_meta`` 表的
+   ``record_type_owner_guard_v1`` 标记（``_is_applied``）—— 第二次启动
+   直接返回，一行数据都不碰。判据正确**不能**替代只执行一次：将来 WHERE
+   被改错一处（review 里几乎看不出来），P0 会立刻重演。
 
-本脚本直接查库确认这个假设。
+缺陷修复后，本脚本从「复现器」改造为「回归门禁」（2026-10-16 主理人拍板）：
+它不再期待缺陷复现，而是把上述不变式钉成具名断言 ——
+**任何一条不成立 = P0 重演 = FAIL（exit 2）**。旧版的失败形态是
+"测出了防线有效却报成'未复现'"：判定要求 ``changed`` 非空，而防线有效时
+``changed`` 恒为空 —— 那正说明脚本测的是"缺陷在不在"，而门禁该测的是
+"防线还在不在"。
+
+它守不住什么（写清楚，防止被当成它不是的东西）
+--------------------------------------------
+* 只覆盖 ``record_type`` 归属回填**这一条路径**（``ai_providers`` 的
+  ``kind=''`` 分支）。不验证 ``patch_meta`` 登记表本身是否被正确写入
+  （归 qa3_migration / 迁移完整性）；
+* 不验证 avatars 的回填分支、``dedupe_persona_globals`` 等其它启动期
+  数据改写；
+* 不验证「老库里 owner_id 为 NULL 的历史角色行」被归为 preset 的行为
+  —— 那是安全侧的**显式选择**（无法证明归属的行判给平台，而不是猜一个
+  owner），不是缺陷；
+* 场景是最简形态：全新库 + 单用户 + 派生/原创各一个角色。多角色、多用户、
+  老库升级不在本场景内。
+
+判据口径
+--------
+**不用时间戳挑行**：同秒写入的 ``created_at`` 在 SQLite 下无法区分先后，
+按时间挑行会让结论随机翻转（见 ``dump_rows`` / ``uniqueness_of`` 注释）。
+一律按 **id 唯一键**比 ``record_type`` / ``owner_id`` / 行数。
 """
 from __future__ import annotations
 
 import json
 import os
-import shutil
 import sqlite3
 import subprocess
 import sys
@@ -69,7 +95,9 @@ def req(method, path, body=None, token=None):
         raw = e.read().decode("utf-8")
         try:
             return e.code, json.loads(raw)
-        except Exception:
+        except Exception:  # noqa: BLE001  harness 有意吞掉一切解析异常：
+            # 4xx 的 body 可能是 HTML/纯文本，解析失败按原文返回即可，
+            # 断言只看 status code。宁要一次降级返回，不要整个脚本崩掉。
             return e.code, raw
 
 
@@ -79,7 +107,9 @@ def wait_ready(timeout=120.0):
         try:
             if req("GET", "/api/health")[0] == 200:
                 return True
-        except Exception:
+        except Exception:  # noqa: BLE001, S110  服务未就绪时连接被拒是
+            # 常态，轮询语义就是"试到超时为止"；静默是这里的正确行为，
+            # 真正的失败由 120s 超时兜底（返回 False -> 调用方 return 1）。
             pass
         time.sleep(0.6)
     return False
@@ -136,7 +166,7 @@ def dump_rows(tag):
     print(f"\n  -- {tag} --")
     print(f"  {'id':>3} {'kind':<10} {'record_type':<12} {'owner':>5}  name")
     for r in rows:
-        print(f"  {r[0]:>3} {(r[2] or '')!r:<12} {r[3]!r:<14} {str(r[4]):>5}  {r[1]}")
+        print(f"  {r[0]:>3} {(r[2] or '')!r:<12} {r[3]!r:<14} {r[4]!s:>5}  {r[1]}")
     return rows
 
 
@@ -196,17 +226,25 @@ def main() -> int:
     if not ready:
         print("\n[2] 重启后服务未就绪")
         return 1
+    # 判据变量**先于一切查询与请求**初始化（2026-10-16 门禁化改造）。
+    # 门禁语义：查库或 HTTP 任一环节抛异常时，下方判定块拿到的必须是
+    # 空值（每条具名判据自然判 FAIL），而不是"沿用上一次查询的旧值"
+    # —— 后者是假绿，比崩溃更坏（崩溃会有人去查，假绿会让人相信结论）。
+    changed: list[tuple[int, object, object]] = []
+    moved: list[tuple[int, object, object]] = []
+    rows_unchanged = False
+    c_read = c_write = c_del = c_other = -1
+    probe_error = ""
     try:
         rows2 = dump_rows("★ 重启后（第二次跑 backfill_record_types）")
         after = {r[0]: r[3] for r in rows2}
         after_uniq, after_n = uniqueness_of(rows2)
         print()
-        changed = []
         for k, v in before.items():
             if after.get(k) != v:
                 changed.append((k, v, after.get(k)))
         if changed:
-            print("  ★★★ record_type 被改写的行：")
+            print("  ★★★ record_type 被改写的行（FAIL）：")
             for k, a, b in changed:
                 print(f"      id={k}: {a!r} -> {b!r}")
         else:
@@ -216,19 +254,21 @@ def main() -> int:
         # 行数变了 = 启动流程增删了行；归属变了 = P0 的核心症状。
         # 这两条与上面的 record_type 比对互补：那一条查「类型」，
         # 这一条查「这一行还是不是原来那个角色、还有没有别的行」。
-        if before_n != after_n:
+        rows_unchanged = before_n == after_n
+        if not rows_unchanged:
             print(f"  ★★★ 行数被改写：{before_n} -> {after_n}"
                   f"（启动流程增删了角色行）")
         else:
             print(f"  行数未被改写（{after_n} 行）")
-        moved = [(k, v, after_uniq.get(k)) for k, v in before_uniq.items()
-                 if after_uniq.get(k) != v]
+        for k, v in before_uniq.items():
+            if after_uniq.get(k) != v:
+                moved.append((k, v, after_uniq.get(k)))
         if moved:
-            print("  ★★★ (record_type, owner_id) 被改写的行：")
+            print("  ★★★ (record_type, owner_id) 被改写的行（FAIL）：")
             for k, a, b in moved:
                 print(f"      id={k}: {a} -> {b}")
 
-        # 用HTTP 验证这个改写是否真的伤害了用户
+        # 用 HTTP 验证不变式的用户侧观感：owner 自己的角色仍可读写删
         _, t = req("POST", "/api/auth/login",
                    {"username": "r2b", "password": "test123456"})
         ua2 = t.get("access_token", "")
@@ -236,12 +276,12 @@ def main() -> int:
         c_write, _ = req("PATCH", f"/api/roles/{rid}",
                          {"name": "改个名"}, ua2)
         c_del, _ = req("DELETE", f"/api/roles/{rid}", token=ua2)
-        print(f"\n  ★ 重启后，owner 自己的派生角色：")
-        print(f"      GET    /roles/{rid}          -> {c_read}（读得到）")
-        print(f"      PATCH  /roles/{rid}          -> {c_write}（应200，实际被拒）")
-        print(f"      DELETE /roles/{rid}          -> {c_del}（应 204）")
+        print("\n  ★ 重启后，owner 自己的派生角色：")
+        print(f"      GET    /roles/{rid}          -> {c_read}（不变式：200）")
+        print(f"      PATCH  /roles/{rid}          -> {c_write}（不变式：200）")
+        print(f"      DELETE /roles/{rid}          -> {c_del}（不变式：204）")
 
-        # 可见性是否也泄露了：另一个用户能看到这个角色吗？
+        # 可见性不变式：另一个用户不能看到这个角色
         req("POST", "/api/auth/register",
             {"username": "r2c", "password": "test123456", "nickname": "r2c"})
         _, t2 = req("POST", "/api/auth/login",
@@ -249,14 +289,37 @@ def main() -> int:
         ub = t2.get("access_token", "")
         c_other, _ = req("GET", f"/api/roles/{rid}", token=ub)
         print(f"\n  ★ 另一个用户读这个角色 -> {c_other}"
-              f"（**不应可见**；200 = 泄露）")
+              f"（不变式：404；200 = 泄露）")
+    except Exception as exc:  # noqa: BLE001  门禁语义：探针异常 = FAIL，
+        # 不是崩溃、更不是沿用旧值。harness 有意吞掉一切异常，但这里必须
+        # 留下类型与信息，让判定块能把失败归因到真因（probe_error）。
+        probe_error = f"{type(exc).__name__}: {exc}"
+        print(f"\n  ★★★ 重启后探针执行失败（按 FAIL 计）：{probe_error}")
     finally:
         stop(proc)
 
+    # ======================================================== 回归门禁判定
+    # 通过条件 = 重启不变式逐条保持。每条都有名字：红一条就能指认坏在哪，
+    # 而不是一坨"未复现"。``clean`` 参与每一条：探针异常时没有任何一条
+    # 有资格判 PASS（fail-closed）。
     print("\n" + "=" * 72)
-    verdict = bool(changed) and c_write == 404 and c_other == 200
-    print("判定：" + ("**确认严重回归**" if verdict else "未复现（需进一步定位）"))
-    return 0
+    clean = not probe_error
+    gates = [
+        ("G1 record_type 未被改写", clean and not changed),
+        ("G2 行数未被改写", clean and rows_unchanged),
+        ("G3 (record_type, owner_id) 归属未被改写", clean and not moved),
+        ("G4 owner 仍可读（200）", clean and c_read == 200),
+        ("G5 owner 仍可写（200）", clean and c_write == 200),
+        ("G6 owner 仍可删（204）", clean and c_del == 204),
+        ("G7 他人仍不可见（404）", clean and c_other == 404),
+    ]
+    for name, g in gates:
+        print(f"  [{'PASS' if g else 'FAIL'}] {name}")
+    ok = all(g for _, g in gates)
+    print("=" * 72)
+    print("判定：" + ("回归门禁通过（重启不变式保持）" if ok
+                     else "**回归！重启流程改写了用户角色（P0 重演）**"))
+    return 0 if ok else 2
 
 
 if __name__ == "__main__":
