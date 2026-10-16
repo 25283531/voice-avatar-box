@@ -1,0 +1,152 @@
+%% 人格预设运营后台 · 类图
+%% 来源：docs/架构设计-人格预设运营后台.md §10
+%% 关注点：运营可改字段白名单 / 审计表记什么不记什么 / 红线「展示口径」与「生效口径」的分离
+
+classDiagram
+    class AIProvider {
+        +int id
+        +str name
+        +str description
+        +str system_prompt
+        +str tts_voice
+        +int avatar_id
+        +str kind
+        +str record_type
+        +int owner_id
+        +int parent_id
+        +dict traits
+        +dict guardrails
+        +datetime deleted_at
+        +datetime archived_at
+        +str guardrail_ack_version
+        +is_config() bool
+        +is_role() bool
+        +is_preset() bool
+        +is_alive() bool
+        +is_visible_to(user) bool
+        +can_write(user) bool
+    }
+
+    class AdminPresetAudit {
+        +int id
+        +int preset_id
+        +int admin_id
+        +str admin_username
+        +str action
+        +list changed_fields
+        +dict diff
+        +str guardrail_version
+        +datetime created_at
+    }
+
+    class PresetOut {
+        +int id
+        +str name
+        +str description
+        +str system_prompt
+        +str tts_voice
+        +dict traits
+        +dict guardrails_hard
+        +list guardrails_soft
+        +str guardrail_version
+        +bool archived
+        +int bound_device_count
+        +int derived_role_count
+        +list dirty_fields
+    }
+
+    class PresetPatchIn {
+        +str? name
+        +str? description
+        +str? system_prompt
+        +str? tts_voice
+        +dict? traits
+    }
+
+    class PresetResetIn {
+        +list? fields
+    }
+
+    class SoftGuardrailIn {
+        +str guardrail_id
+        +bool enabled
+    }
+
+    class PresetMetaOut {
+        +list trait_specs
+        +list soft_guardrails
+        +list hard_guardrails
+        +str guardrail_version
+        +dict defaults
+    }
+
+    class PresetAuditOut {
+        +int id
+        +int preset_id
+        +str preset_name
+        +str admin_username
+        +str action
+        +list changed_fields
+        +dict diff
+        +str guardrail_version
+        +datetime created_at
+    }
+
+    class User {
+        +int id
+        +str username
+        +bool is_admin
+    }
+
+    class catalog {
+        <<module>>
+        +HARD_GUARDRAILS
+        +SOFT_GUARDRAILS
+        +TRAIT_SPECS
+        +DEFAULT_TRAITS
+        +DEFAULT_PRESET_PROMPT
+        +DEFAULT_PRESET_TTS_VOICE
+        +GUARDRAIL_VERSION
+    }
+
+    class guardrails {
+        <<module>>
+        +regenerate_locked(stored) list
+        +merge_stored(stored) dict
+        +toggle_soft(stored, gid, enabled) dict
+        +card_items(role_id, name) dict
+        +assert_present(compiled) None
+    }
+
+    class PromptCompiler {
+        +compile(spec, profile, memory_ctx, examples) str
+        +compile_sections(spec, profile, memory_ctx, examples) list
+    }
+
+    class RoleSpec {
+        +int role_id
+        +str system_prompt
+        +dict traits_declared
+        +dict traits_overlay
+        +list guardrails_hard
+        +list guardrails_soft
+        +bool is_preset
+        +validate() RoleSpec
+        +traits_effective() dict
+        +trait_sentences() list
+    }
+
+    AIProvider "1" <-- "0..1" AdminPresetAudit : "被审计（preset_id）"
+    AIProvider "1" <-- "0..*" Device : "被绑定为 agent_id"
+    AIProvider "0..1" <-- "0..*" AIProvider : "parent_id（copy-on-write 派生）"
+    User ..> AdminPresetAudit : "admin_id（操作人，用户名为快照）"
+    PresetPatchIn ..> PresetOut : "更新/预览后返回"
+    PresetResetIn ..> PresetOut : "reset 后返回"
+    SoftGuardrailIn ..> PresetOut : "软约束开关后返回"
+    catalog --> TRAIT_SPECS
+    catalog ..> RoleSpec : "from_row 组装 + validate"
+    catalog ..> PresetMetaOut : "档位/白名单/红线/默认值全部由此下发"
+    guardrails ..> PresetOut : "card_items（展示口径，无 tokens）"
+    guardrails ..> RoleSpec : "regenerate_locked（生效口径）"
+    RoleSpec ..> PromptCompiler : "编译输入"
+    PromptCompiler ..> guardrails : "assert_present（fail-closed）"

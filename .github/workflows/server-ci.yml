@@ -76,6 +76,17 @@ jobs:
       - name: 角色与权限冒烟（含 P0 安全断言）
         run: python tools/smoke_roles.py 8101
 
+      # 人格预设运营后台（/api/admin/presets，97 条断言）。
+      # 之所以必须挂在 SQLite job 而不是 mysql-smoke job：它**直连 sqlite3
+      # 改库**注入脏数据（T08「把 guardrails.hard 清空后红线是否仍齐全」——
+      # 那个值没有任何接口能写出来，只能像老库那样直接改列），且它会
+      # **重启服务两次**（T14/T27）。塞进 mysql job 的话，步骤名写着 mysql、
+      # 实际跑的是 SQLite —— 正是本项目最该防的假绿。
+      #
+      # 端口 8118 已在 tools/smoke_ports.py 登记（唯一真源），与 8110-8117 错开。
+      - name: 人格预设运营后台冒烟（红线不出库 + 审计同事务 + 重启不变式）
+        run: python tools/smoke_admin_presets.py 8118
+
       # 人格 eval 门禁：**必须挂在 smoke job 里**（而不是另开一个）——
       # 这样复用已装好的依赖，且与 SQLite 冒烟同环境。
       # 分级：医疗安全类失败 -> 本步红；长度/用词类只打印⚠️ -> 本步绿。

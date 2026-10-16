@@ -1183,6 +1183,54 @@ class AgentPersonaAudit(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
+# ================================================================ 管理操作审计
+class AdminPresetAudit(Base):
+    """**管理员改平台人格预设**的审计（逐字段 from→to）。
+
+    ⚠️ 这张表里**绝对不出现**的东西（设计 §3.2，将来有人要加字段时必读）
+    ------------------------------------------------------------------
+    * **硬红线正文**：红线不在可改字段集合里，diff 里天然不会有；但必须守住
+      —— 否则红线文案会从代码常量流进一张可变的、可被管理端读走的表。
+    * **红线 tokens**：``catalog.HARD_GUARDRAILS[*].tokens`` 是
+      ``guardrails.assert_present()`` 做 fail-closed 自检的**唯一判定基准**。
+      把它写进审计表 = 把"门禁怎么判"写进一张运营可读的表。断言 T10 守。
+    * **任何用户派生角色的内容**：派生角色带 ``owner_id``，抄进来这张表就
+      成了跨用户数据表，而它只受 ``get_current_admin`` 保护，比 ``ai_providers``
+      的行级可见性保护更弱。
+    * **编译产物全文**（画像摘要、偏好示例、家属写的话）：那是运行时数据，
+      含用户与家属的私密内容。审计表绝不能成为用户内容的副本。
+
+    ``admin_username`` 是**快照**而不是 join 查：用户改名后审计必须仍然
+    回答"当时是谁改的"。``preset_id`` 不设 ON DELETE —— preset 只能 archive，
+    不能硬删（``/api/roles/{id}`` 的 DELETE 对 preset 永远 403）。
+    """
+
+    __tablename__ = "admin_preset_audits"
+    __table_args__ = (
+        # 「这个预设历史上被改过什么」与「最近的操作流水」是两条最常见的查询
+        Index("ix_admin_preset_audits_preset_created",
+              "preset_id", "created_at"),
+        Index("ix_admin_preset_audits_created", "created_at"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    preset_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("ai_providers.id"), nullable=False)
+    admin_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("users.id"), nullable=False)
+    # 快照，不 join（理由见类注释）
+    admin_username: Mapped[str] = mapped_column(String(64), default="")
+    # update / reset / archive
+    action: Mapped[str] = mapped_column(String(16), default="update")
+    # ["system_prompt", "traits.humor", "soft_guardrails"]
+    changed_fields: Mapped[list[str]] = mapped_column(JSON, default=list)
+    # {"system_prompt": {"from": ..., "to": ...}, "traits.humor": {...}}
+    diff: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    # 操作当时的红线版本：改红线语义后要能回答"这条改动是在哪版红线下做的"
+    guardrail_version: Mapped[str] = mapped_column(String(32), default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
 # ================================================================ 迁移登记（不是业务表）
 class PatchMeta(Base):
     """记录「哪些**会改业务数据**的迁移**已经执行过**」。

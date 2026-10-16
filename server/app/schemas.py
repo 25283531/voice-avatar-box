@@ -477,6 +477,165 @@ class ModelTestOut(ORMBase):
     attempts: list[dict[str, Any]] = Field(default_factory=list)
 
 
+# ============================================================ 人格预设运营后台
+# ⚠️ 本段所有 schema 的第一原则：**可改字段用「schema 里没有」来锁**，而不是
+# 「校验时忽略非法字段」。后者会被下一个写入口漏掉，前者不可能被绕过
+# （与 RoleIn 不含 guardrails 是同一手法、同一理由）。
+class PresetPatchIn(ORMBase):
+    """运营调整平台预设。**只有这 5 个字段可改**，逐项依据见设计 §13.1。
+
+   ⚠️⚠️ ``extra="forbid"`` 是这个类**成立的前提**，不是可选加固
+   ------------------------------------------------------------------
+   Pydantic v2 的默认是 ``extra="ignore"``（本机实测：``A(x=1, y=2)``
+   静默丢掉 ``y`` 而不报错）。也就是说：**若不显式 forbid，
+   "schema 里没有该字段" 并不等于 "提交会被拒绝"，而是"提交被静默丢弃"**
+   —— 那等于根本没有锁：本轮第一次实跑时``{"guardrails": {"hard": []}}``
+   返回的是 **200**，运营会以为红线改掉了（实际被丢掉），红线看起来
+   "可改"这件事本身就是最大的风险。
+
+   与 ``RoleIn`` 不同（那边是既有 APP 契约，宁可忽略也不能突然422），
+   本类是**新建的管理端入参**，没有任何历史客户端，所以直接 forbid。
+
+   刻意**不在**本 schema 里（提交即 422，物理上不可提交）：
+
+    * ``guardrails`` —— 硬红线是代码常量，编译时由 ``regenerate_locked``
+      无条件再生，DB 文本一律不信（红线段同理，改它必须是独立一轮设计）；
+    * ``record_type`` / ``owner_id`` / ``parent_id`` / ``kind`` ——
+      归属与派生关系。改归属是 P0 安全边界（"用户角色被刷成 preset"那次事故
+      的形状），不能靠 PATCH 顺手改掉；
+    * ``archived_at`` / ``deleted_at`` —— 生命周期走 archive 端点；
+    * ``is_default`` —— 它是"APP 新建角色时的默认选中"，改它会让**所有用户**
+      的默认角色静默变化；
+    * ``enabled`` —— preset 行不参与任何下发判定，是死字段，改它只会制造
+      "我关了它怎么没变"的困惑；
+    * ``avatar_id`` —— 形象有独立生命周期，形象页已能编辑；
+    * ``guardrail_ack_*`` —— 那是**用户**的确认回执，运营替用户确认是造假。
+    """
+
+    name: str | None = Field(default=None, min_length=1, max_length=64)
+    description: str | None = None
+    # 人格提示词（软性）。红线由代码常量注入，不在这里。
+    system_prompt: str | None = None
+    tts_voice: str | None = None
+    # **整体覆写**（与 PATCH /api/roles/{id} 同一语义）：partial 语义会让
+    # "取消勾选"无法表达。写入前逐项 is_valid 校验，非法值 400 且不落库。
+    traits: dict[str, Any] | None = None
+
+    # 见类注释：extra="forbid" 是「白名单式schema 锁」成立的前提
+    model_config = ConfigDict(from_attributes=True, extra="forbid")
+
+
+class PresetResetIn(ORMBase):
+    """恢复出厂默认。``fields`` 缺省 = 全部可重置字段。
+
+    ⚠️ 可重置的**只有 3 个**：``system_prompt`` / ``traits`` / ``tts_voice``。
+    不含 ``name``（运营的品牌标识，"恢复出厂"不该把它改回"小暖（平台预设）"）、
+    不含 ``description``（运营文案，重置会让精心写的介绍消失）、
+    **不含 ``archived_at``**（下架≠ 恢复，reset 一个已下架的预设不该把它复活）、
+    不含软约束（运营自己勾的，reset 掉等于替他做决定）。
+    """
+
+    fields: list[str] | None = None
+
+    # 同PresetPatchIn：不可重置的字段提交即422，而不是"静默忽略后全部重置"
+    #（后者危险得多：运营传{"fields": ["name", "traits"]} 会被当成
+    #  {"fields": ["traits"]} 执行，他以为name 也被重置了）。
+    model_config = ConfigDict(from_attributes=True, extra="forbid")
+
+
+class SoftGuardrailIn(ORMBase):
+    """软约束开关。**单独端点**，不合进 PresetPatchIn。
+
+    为什么不合进：软约束是"勾选型"操作，并入整体覆写后
+    "忘带这个字段 = 全部清空"成为可能；且它需要独立的审计条目。
+    """
+
+    guardrail_id: str
+    enabled: bool = True
+
+    # 同上：多传一个 text 字段不能被静默丢弃 ——
+    # 运营以为自定义了一条软约束，实际库里仍是白名单那条。
+    model_config = ConfigDict(from_attributes=True, extra="forbid")
+
+
+class PresetOut(ORMBase):
+    """平台预设详情 / 列表项。
+
+    ⚠️ ``guardrails_hard`` **不含 tokens**（构造口径见设计 §6.3）：
+    只允许走 ``guardrails.card_items``，**绝不能**用 ``regenerate_locked``
+    —— 后者的返回结构里多了 ``tokens``，那是 ``assert_present()`` 做
+    fail-closed 自检的判定基准，出库等于把门禁怎么判暴露给浏览器。
+    断言 T10 守这条。
+    """
+
+    id: int
+    name: str
+    description: str = ""
+    system_prompt: str = ""
+    tts_voice: str = ""
+    traits: dict[str, Any] = Field(default_factory=dict)
+    # 只读展示：每项 {id, label, text, locked: true}
+    guardrails_hard: list[dict[str, Any]] = Field(default_factory=list)
+    # 已勾选的软约束 id 列表（不是文案：文案是代码常量，前端从 meta 取）
+    guardrails_soft: list[str] = Field(default_factory=list)
+    guardrail_version: str = ""
+    archived: bool = False
+    # 影响面：直接绑定本预设的设备数（改 personality 后立刻变化）、派生副本数
+    bound_device_count: int = 0
+    derived_role_count: int = 0
+    # 与出厂默认不一致的字段（后端算，前端不做比较）
+    dirty_fields: list[str] = Field(default_factory=list)
+
+
+class PresetListOut(ORMBase):
+    """GET /api/admin/presets的分区返回。"""
+
+    presets: list[PresetOut] = Field(default_factory=list)
+
+
+class PresetMetaOut(ORMBase):
+    """GET /api/admin/presets/meta：档位 / 白名单 / 红线**一次性下发**。
+
+    为什么必须由后端下发（前端零硬编码）：``TraitSpec.as_option()`` 的档位
+    与文案是 ``catalog`` 的唯一真源。前端硬编码一份，加/删档位后后台会显示
+    错位，而那种错位**不会报错**，只会让运营在错的档位上做决定。
+
+    ⚠️ ``trait_specs[].options[].value`` 的语义：**enum = 枚举值本身；
+    number = 该档位的上界（bands 的 upper）**。前端提交时必须原样回传这个
+    value，不得改成交"档位下界"—— ``to_prompt_sentence`` 的分档判定是
+    ``val <= upper`` 取第一个，两者恰好自洽；换成下界同一份 traits 会渲染成
+    另一句话，而值域校验仍然通过、**没有任何断言会红**（设计边界 W13）。
+    """
+
+    trait_specs: list[dict[str, Any]] = Field(default_factory=list)
+    # 7 条软约束白名单：[{id, text}]
+    soft_guardrails: list[dict[str, Any]] = Field(default_factory=list)
+    # 5 条硬红线（只读展示口径，不含 tokens）：[{id, label, text}]
+    hard_guardrails: list[dict[str, Any]] = Field(default_factory=list)
+    guardrail_version: str = ""
+    # 出厂默认（reset 的基线）：{system_prompt, traits, tts_voice}
+    defaults: dict[str, Any] = Field(default_factory=dict)
+
+
+class PresetAuditOut(ORMBase):
+    """GET /api/admin/presets/{id}/audits 的一行。
+
+    ``preset_name`` 取**当前行**而不存快照：改名后审计显示新名是可接受的，
+    且避免"审计里一个名、预设上另一个名"这种更难查的不一致。
+    """
+
+    id: int
+    preset_id: int
+    preset_name: str = ""
+    admin_id: int
+    admin_username: str = ""
+    action: str = ""
+    changed_fields: list[str] = Field(default_factory=list)
+    diff: dict[str, Any] = Field(default_factory=dict)
+    guardrail_version: str = ""
+    created_at: datetime
+
+
 # ============================================================ 首页聚合
 class HomeDeviceOut(ORMBase):
     """首页设备卡片：状态 + 设备时间 + 当前生效的角色 / 形象名。

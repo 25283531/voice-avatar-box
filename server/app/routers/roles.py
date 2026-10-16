@@ -37,7 +37,7 @@ from .. import models
 from ..db import get_db
 from ..deps import get_current_admin, get_current_user, require_role
 from ..memory.persona import build_persona_prompt, copy_l2_manual, merge_profiles
-from ..persona import catalog, guardrails
+from ..persona import admin_audit, catalog, guardrails
 from ..persona import spec as spec_mod
 from ..persona.compiler import ProfileMerger, PromptCompiler, effective_traits
 from ..persona.spec import TraitValueError, from_row
@@ -81,6 +81,60 @@ def _parent_traits(db: Session, row: models.AIProvider) -> dict[str, Any]:
 def _spec_of(db: Session, row: models.AIProvider):
     """装配 RoleSpec（校验失败抛 400）。"""
     spec = from_row(row, _parent_traits(db, row) if row.parent_id else None)
+    try:
+        spec.validate()
+    except TraitValueError as exc:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
+    return spec
+
+
+class _CandidateRow:
+    """``from_row`` 的输入替身：只提供它读到的那几个属性。
+
+    为什么不用 ORM 行也不用 dataclass：``from_row`` 一律用 ``getattr`` 读，
+    所以任何提供同名属性的对象都行。用一个显式的小类（而不是 ``SimpleNamespace``）
+    是为了让"这里到底提供哪些字段"在代码里一目了然 —— 将来 ``from_row``
+    新增一个 ``getattr(row, ...)`` 时，本类不会静默少提供而让装配结果失真。
+    """
+
+    def __init__(self, attrs: dict[str, Any]) -> None:
+        for key, value in attrs.items():
+            setattr(self, key, value)
+
+
+def build_spec_for_preset(row: models.AIProvider,
+                          candidate: dict[str, Any] | None = None):
+    """装配**平台预设**的 RoleSpec，可叠加一层「候选值」。
+
+    ★ PATCH 与 preview **必须都调这一个函数**
+    ------------------------------------------------
+    如果 preview 走一条装配路径、真正保存后编译走另一条，那么预览就没有
+    「所见即所得」的意义 —— 运营在预览里看到的效果不等于保存后的效果，
+    而这种偏差**没有任何断言会红**（它不是 bug，是两条路慢慢分家）。
+    所以这是一条**约定**，收在这里的 docstring 里让评审必查（设计边界 W10）。
+
+    :param candidate: ``{字段名: 新值}``；``None`` 的键视为「未提供」。
+        注意 ``""`` 与 ``{}`` 都**是**有效的新值（清空 description / traits），
+        所以不能用 ``if not v`` 判空。
+    :raises HTTPException: traits 含未知维度或非法值时 400（事务未提交）。
+    """
+    attrs: dict[str, Any] = {
+        "id": int(row.id),
+        "record_type": row.record_type,
+        "guardrails": row.guardrails,
+        # 平台预设没有母版：preset 行的 parent_id 恒为空，且本函数只服务
+        # preset 端点，所以不传 parent_traits（from_row 会把 traits 当完整声明）。
+        "parent_id": None,
+        "name": str(row.name or ""),
+        "description": str(row.description or ""),
+        "system_prompt": str(row.system_prompt or ""),
+        "tts_voice": str(row.tts_voice or ""),
+        "traits": dict(row.traits) if isinstance(row.traits, dict) else {},
+    }
+    for key, value in (candidate or {}).items():
+        if key in attrs and value is not None:
+            attrs[key] = value
+    spec = from_row(_CandidateRow(attrs))
     try:
         spec.validate()
     except TraitValueError as exc:
@@ -540,6 +594,11 @@ def archive_role(role_pk: int, db: Session = Depends(get_db),
     有派生角色或设备绑定时返回 **409 + 引用方清单** —— 这是**引导性错误**
     而不是安全边界，所以给出足够信息让管理员去处理（先迁移派生、再下架），
     而不是一句"有引用无法下架"。
+
+    ⚠️ 本次**新增一行审计写入**（``action='archive'``），不新增端点面。
+    下架是结构性变化（预设不再出现在用户可选列表里），最需要留痕；
+    而它唯一的写入口就是这个已有端点，所以审计也必须落在这里 ——
+    审计与业务写**同一个事务**（理由见 ``persona/admin_audit`` 模块注释）。
     """
     row = require_role(db, role_pk, admin, write=True, allow_archived=True)
     if not row.is_preset():
@@ -552,19 +611,37 @@ def archive_role(role_pk: int, db: Session = Depends(get_db),
         models.Device.agent_id == row.id)).all())
 
     if derived or bound:
+        # ⚠️ detail 必须是**字符串**（A19：前端 api() 直接 new Error(data.detail)，
+        # dict 会渲染成 [object Object]），所以引用清单拼进这句话里，
+        # 而不是塞一个 dict 出去。
+        #
+        # ⚠️⚠️ 这里是本轮修掉的**既有 bug**（归属 7200c28 baseline，非本次引入）
+        # ----------------------------------------------------------------------
+        # 原写法是 ``HTTPException(409, "该预设仍有引用，请先处理", detail={...})``
+        # —— **detail 被传了两次**。``HTTPException.__init__`` 的第二个形参就叫
+        # ``detail``，于是 Python 在**构造异常的那一行**就抛
+        # ``TypeError: got multiple values for argument 'detail'``，
+        # 端点变成 **500 而不是 409**（本机Python 3.14 + FastAPI 实测）。
+        #
+        # 为什么一直没人发现：这条分支要求「预设**同时**有派生角色或设备绑定」
+        # 才进得去，而既有冒烟从未在**有引用**的状态下试过 archive。
+        # 也就是说这是一条**从未被执行过**的代码路径 ——
+        # 与 server-ci 那个「空步骤 → jobs=0」同一类问题：
+        # **没跑过的代码不等于对的代码。** 本轮 T26 断言把它第一次跑起来。
+        refs: list[str] = []
+        if derived:
+            refs.append("派生角色 " + "、".join(
+                f"{d.name}(id={d.id})" for d in derived))
+        if bound:
+            refs.append("绑定设备 " + "、".join(
+                f"{d.device_id or d.id}(id={d.id})" for d in bound))
         raise HTTPException(
             status.HTTP_409_CONFLICT,
-            "该预设仍有引用，请先处理",
-            detail={
-                "derived_roles": [
-                    {"id": d.id, "name": d.name, "owner_id": d.owner_id}
-                    for d in derived],
-                "bound_devices": [
-                    {"id": d.id, "device_id": d.device_id, "owner_id": d.owner_id}
-                    for d in bound],
-            },
-        )
+            "该预设仍有引用，请先处理后下架 —— " + "；".join(refs))
+    before = admin_audit.snapshot(row)
     row.archived_at = models.utcnow()
+    after = admin_audit.snapshot(row)
+    admin_audit.record(db, admin, row, "archive", before, after)
     db.commit()
     return {"ok": True, "id": row.id, "archived_at": row.archived_at}
 
@@ -710,8 +787,27 @@ def toggle_soft_guardrail(role_pk: int, payload: GuardrailIn, db: Session = Depe
 
     只允许平台白名单里的 id（架构 §12 U4）：自由文本无法校验，
     而且可能与硬红线直接冲突 —— 一条能自我否定的安全配置比没有配置更糟。
+
+    ⚠️ 目标为**平台预设**时一律403（本次的行为变更，断言 T23 守）
+    ------------------------------------------------------------------
+    改之前这里是**能改的**：`require_role(write=True)` → ``can_write``
+    对 preset 是 ``bool(user.is_admin)`` ⇒ **任何管理员都能从这条用户端
+    路径改平台预设的软约束，而``admin_preset_audits`` 里一条记录都不会留**。
+    两条写路径、只有一条写审计，等于审计可以被从旁边绕过 —— 那等于没有审计。
+
+    所以：**改 preset 的软约束只能走** ``POST /api/admin/presets/{id}/soft-guardrails``。
+    影响面：现状该路径**没有任何 UI 入口**（管理台无角色页、APP 未接），
+    实际调用方为零。
+
+    为什么是 403 而不是 404：这是**产品规则**不是安全边界 ——
+    "平台预设的软约束归管理端管"这条规则本身就是要给管理员看的，
+    与 preset 的 DELETE 返回 403 同理（``deps`` 模块注释已论证过这个例外）。
     """
     row = require_role(db, role_pk, user, write=True)
+    if row.is_preset():
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            "平台预设的软约束请在管理端调整（人格预设 → 编辑 → 家属额外要求）")
     try:
         row.guardrails = guardrails.toggle_soft(row.guardrails, payload.guardrail_id,
                                                 bool(payload.enabled))

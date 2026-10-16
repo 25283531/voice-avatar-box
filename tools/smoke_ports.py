@@ -103,6 +103,11 @@ DEFAULT_PORTS: dict[str, int] = {
     "qa3_false_green": 8115,       # 复现「连到别人的服务却全绿」
     "qa4_dirty_all_readpoints": 8116,  # 全读点 × 脏形态 + role_diff 兼容
     "qa_probe_memory": 8117,       # 记忆域探针
+    # ---- 业务域（本仓自有CI 脚本）----
+    # 人格预设运营后台：97 条断言里有多条要**重启服务**（T14/T27），
+    # 且它会直连 SQLite 改库注入脏数据（T08），跑得比其他脚本久，
+    # 所以排在 QA 段之后独占 8118。
+    "smoke_admin_presets": 8118,   # 管理端 · 平台人格预设运营后台
 }
 
 
