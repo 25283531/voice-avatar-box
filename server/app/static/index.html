@@ -50,6 +50,8 @@
   .tag.ok{background:#e8f7ee;color:var(--ok)}
   .tag.bad{background:#fdeaea;color:var(--bad)}
   .tag.warn{background:#fdf3e3;color:var(--warn)}
+  /* 已取消 / 已过期：终态，不该再抢注意力，用中性灰 */
+  .tag.dim{background:#f1f5f9;color:var(--muted)}
   .kpi{background:var(--brand-soft);border-radius:var(--radius);padding:12px}
   .kpi .n{font-size:24px;font-weight:700;color:var(--brand);line-height:1.2}
   .kpi .l{font-size:12px;color:var(--muted)}
@@ -705,6 +707,197 @@
       </div>
     </section>
 
+    <!-- ===== 会员订单（人工核销，仅管理员）===== -->
+    <!-- 为什么把「按金额反查」放在订单列表**上面**而不是做成 tab 里的小功能：
+         下单时服务端会在金额区间内随机分配一个精确到分的应付金额（见
+         app/membership.py 的 pick_amount_cents），所以管理员手上只有一条
+         银行/微信收款记录，**没有任何标识能把钱和订单对应起来**。
+         金额反查是唯一手段，就必须是这个页面的第一屏第一行。 -->
+    <section v-if="tab==='membership'">
+      <div v-if="mNote" class="card" style="background:#e8f7ee;border-color:#bfe6cd;padding:10px 14px">
+        <span style="color:var(--ok)">✓ {{mNote}}</span>
+      </div>
+      <div class="card">
+        <h2>按到账金额反查订单</h2>
+        <p class="muted" style="font-size:12px;margin:0 0 10px">
+          用户下单时，系统会在配置的金额区间内随机分配一个<b>精确到分</b>的应付金额。
+          打开银行 / 微信 / 支付宝的收款记录，把<b>实际到账金额</b>填到下面 → 反查出是哪笔订单、哪个用户付的款。
+          <b>金额不独占</b>，所以一个金额可能命中多笔订单，请结合<b>下单时间</b>和<b>用户名</b>判断；
+          反查结果里可以直接点「核销开通」。
+        </p>
+        <div class="row">
+          <div>
+            <label>到账金额（带小数点按<b>元</b>，如 <code>23.45</code>；纯整数按<b>分</b>，如 <code>2345</code>）</label>
+            <input id="mba" v-model="mAmount" style="width:170px" placeholder="23.45"
+                   @keyup.enter="lookupByAmount" />
+          </div>
+          <div>
+            <label>&nbsp;</label>
+            <label style="display:flex;gap:4px;align-items:center;margin:0;font-size:13px;color:var(--text)">
+              <input type="checkbox" v-model="mAmountAll" /> 一并翻出已核销 / 已过期等历史订单
+            </label>
+          </div>
+          <button id="mba-go" class="primary" :disabled="mBusy" @click="lookupByAmount">反 查</button>
+          <button :disabled="mBusy" @click="expireOrders">清理过期订单</button>
+        </div>
+        <div v-if="mHitLabel" class="muted" style="font-size:12px;margin-top:8px">{{mHitLabel}}</div>
+
+        <div v-if="mLoading" class="empty">正在加载订单…</div>
+        <template v-else-if="mHits">
+          <table v-if="mHits.length" style="margin-top:8px">
+            <thead><tr><th>订单号</th><th>用户</th><th>套餐</th><th class="num">应付到账</th>
+              <th>状态</th><th>下单时间</th><th>操作</th></tr></thead>
+            <tbody>
+              <tr v-for="o in mHits" :key="'h'+o.id">
+                <td><code>{{o.code}}</code></td>
+                <td>{{o.username||o.user_id}}<div class="muted" style="font-size:12px">{{o.nickname}}</div></td>
+                <td>{{o.plan_name||o.plan_code}}</td>
+                <td class="num">￥{{yuan(o)}}</td>
+                <td><span class="tag" :class="osClass(o.status)">{{osName(o.status)}}</span></td>
+                <td class="muted">{{fmt(o.created_at)}}</td>
+                <td class="row">
+                  <template v-if="o.status==='pending'||o.status==='notified'">
+                    <button class="primary" :disabled="mBusy" @click="confirmOrder(o)">核销</button>
+                    <button class="danger" :disabled="mBusy" @click="openReject(o)">驳回</button>
+                  </template>
+                  <span v-else class="muted" style="font-size:12px">已终态</span>
+                </td>
+              </tr>
+            </tbody>
+          </table>
+          <div v-else class="empty">
+            该金额<b>没有对应订单</b>。<br />
+            <span style="font-size:12px">若用户坚称已转账，多半是金额填错（漏了小数 / 多打了 0）——
+              让用户直接报订单号，再用上面的「按订单号查询」核对。</span>
+          </div>
+        </template>
+      </div>
+
+      <!-- 驳回原因：走页面内弹窗而不是原生 prompt ——
+           原生 prompt 无法填默认文案、样式与本后台不一致，且在部分内嵌 WebView
+           里会被静默拦掉，管理员就永远驳回不了。 -->
+      <div v-if="mRejectBox" class="mask" @click.self="mRejectBox=null">
+        <div class="modal" style="max-width:460px">
+          <button class="close" @click="mRejectBox=null">&times;</button>
+          <h2>驳回订单 {{mRejectBox.code}}</h2>
+          <p class="muted" style="font-size:12px">
+            金额 ￥{{yuan(mRejectBox)}} · 用户 {{mRejectBox.username}}。
+            驳回后用户会看到这条原因，<b>会员不会开通</b>；钱到没到请先按金额反查确认。
+          </p>
+          <label>驳回原因（会展示给用户）</label>
+          <textarea v-model="mRejectReason" placeholder="例：未查到该金额到账记录，请确认转账后重试"></textarea>
+          <div class="row" style="margin-top:14px;justify-content:flex-end">
+            <button @click="mRejectBox=null">取消</button>
+            <button class="danger" :disabled="mBusy" @click="doReject">确认驳回</button>
+          </div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="row" style="justify-content:space-between">
+          <h2>订单列表</h2>
+          <div class="row">
+            <select v-model="mStatus" @change="loadOrders">
+              <option value="">全部状态</option>
+              <option value="pending">待付款</option>
+              <option value="notified">已通知转账 · 待核销</option>
+              <option value="confirmed">已核销</option>
+              <option value="rejected">已驳回</option>
+              <option value="cancelled">已取消</option>
+              <option value="expired">已过期</option>
+            </select>
+            <button @click="loadOrders">刷新</button>
+          </div>
+        </div>
+        <div v-if="mLoading" class="empty">正在加载订单…</div>
+        <template v-else-if="mErr">
+          <div class="err">{{mErr}}</div>
+        </template>
+        <table v-else-if="mOrders.length">
+          <thead><tr><th>订单号</th><th>用户</th><th>套餐</th><th class="num">应付到账</th>
+            <th>状态</th><th>下单时间</th><th>支付截止</th><th>操作</th></tr></thead>
+          <tbody>
+            <tr v-for="o in mOrders" :key="o.id">
+              <td><code>{{o.code}}</code></td>
+              <td>{{o.username||o.user_id}}<div class="muted" style="font-size:12px">{{o.nickname}}</div></td>
+              <td>{{o.plan_name||o.plan_code}}</td>
+              <td class="num">￥{{yuan(o)}}</td>
+              <td>
+                <span class="tag" :class="osClass(o.status)">{{osName(o.status)}}</span>
+                <div v-if="o.admin_note" class="muted" style="font-size:12px">{{o.admin_note}}</div>
+              </td>
+              <td class="muted">{{fmt(o.created_at)}}</td>
+              <td class="muted">{{fmt(o.expires_at)}}</td>
+              <td class="row">
+                <template v-if="o.status==='pending'||o.status==='notified'">
+                  <button class="primary" :disabled="mBusy" @click="confirmOrder(o)">核销</button>
+                  <button class="danger" :disabled="mBusy" @click="openReject(o)">驳回</button>
+                </template>
+                <span v-else class="muted" style="font-size:12px">—</span>
+              </td>
+            </tr>
+          </tbody>
+        </table>
+        <div v-else class="empty">没有符合条件的订单</div>
+      </div>
+
+      <div class="card">
+        <h2>收款配置</h2>
+        <p class="muted" style="font-size:12px;margin:0 0 10px">
+          用户端「我的会员」页展示的就是这里。二维码填<b>图片 URL</b>（如
+          <code>https://…/qr.png</code>），本服务不做文件上传 —— 没有上传端点。
+        </p>
+        <div v-if="mErrCfg" class="err">{{mErrCfg}}</div>
+        <div v-if="mCfg" class="grid g2">
+          <div><label>渠道</label><input v-model="mCfg.payment.channel" style="width:100%" placeholder="微信 / 支付宝 / 对公转账" /></div>
+          <div><label>收款人姓名</label><input v-model="mCfg.payment.payee_name" style="width:100%" /></div>
+          <div><label>收款账号</label><input v-model="mCfg.payment.account" style="width:100%" /></div>
+          <div><label>收款码图片 URL</label><input v-model="mCfg.payment.qr_url" style="width:100%" placeholder="https://…" /></div>
+        </div>
+        <div v-if="mCfg" style="margin-top:10px">
+          <label>转账备注（给用户看，如「转账请备注订单号」）</label>
+          <textarea v-model="mCfg.payment.note" style="min-height:60px"></textarea>
+          <div v-if="mCfg.payment.qr_url" style="margin-top:10px">
+            <label>预览</label>
+            <img :src="mCfg.payment.qr_url" alt="收款码预览"
+                 style="max-width:180px;max-height:180px;border:1px solid var(--line);border-radius:8px" />
+          </div>
+          <div class="muted" style="font-size:12px;margin-top:10px">
+            随机金额区间：{{money(mCfg.amount_range.min_cents)}} ~ {{money(mCfg.amount_range.max_cents)}} 元
+            （{{mCfg.amount_range.enabled?'启用':'停用'}}）。区间与陪聊配额在服务端配置，此处只读展示。
+          </div>
+          <div class="row" style="margin-top:12px;justify-content:flex-end">
+            <button class="primary" :disabled="mBusy" @click="savePayment">保存收款配置</button>
+          </div>
+        </div>
+        <div v-else-if="!mErrCfg" class="empty">正在加载收款配置…</div>
+      </div>
+
+      <div class="card">
+        <h2>直接授予会员（应急兜底）</h2>
+        <p class="muted" style="font-size:12px;margin:0 0 10px">
+          亲友赠送 / 线下已收现金 / 测试补偿等<b>不走订单</b>的场景。
+          优先用上面的「核销开通」—— 走订单才有金额与时间留痕。
+        </p>
+        <div class="row">
+          <div>
+            <label>用户（下拉来自订单列表里的人；其他人直接填用户 ID）</label>
+            <select v-model="mGrant.sel">
+              <option value="">— 请选择 —</option>
+              <option v-for="u in grantCandidates" :key="u.id" :value="u.id">
+                {{u.username}}（ID {{u.id}}）</option>
+            </select>
+          </div>
+          <div><label>或直接填用户 ID</label>
+            <input v-model="mGrant.uid" style="width:120px" placeholder="如 3" /></div>
+          <div><label>天数</label><input v-model.number="mGrant.days" type="number" min="1" max="3650" style="width:90px" /></div>
+          <div><label>备注</label><input v-model="mGrant.note" placeholder="亲友赠送 / 补偿" /></div>
+          <button class="primary" :disabled="mBusy" @click="doGrant">授予会员</button>
+        </div>
+        <div v-if="mGrantMsg" class="muted" style="font-size:12px;margin-top:8px">{{mGrantMsg}}</div>
+      </div>
+    </section>
+
     <!-- ---------------------- token 用量（全平台，仅管理员） ---------------------- -->
     <section v-if="tab==='usage'">
       <div class="card">
@@ -831,6 +1024,7 @@ createApp({
         {k:'home',n:'概览'},{k:'devices',n:'设备'},{k:'reminders',n:'提醒'},
         {k:'avatars',n:'形象'},{k:'personas',n:'人格预设'},
         {k:'providers',n:'AI 接入'},{k:'stats',n:'统计'},
+        {k:'membership',n:'会员订单'},
         {k:'usage',n:'token 用量'}
       ],
       err: '', busy: false,
@@ -839,6 +1033,15 @@ createApp({
       curDeviceId: null, stat: null,
       // ---- token 用量（全平台，仅管理员）----
       usageSummary: null, usageRows: [], usageFilter: '',
+      // ---- 会员订单（人工核销，仅管理员）----
+      // mErrCfg 单独一个错误位：收款配置和订单列表是两个独立端点，
+      // 混进全局 err 会让「订单挂了」把「配置也挂了」盖掉，排查时看不出是两件事。
+      mOrders: [], mStatus: '', mLoading: false, mErr: '', mErrCfg: '',
+      mCfg: null, mBusy: false,
+      mAmount: '', mAmountAll: false, mHits: null, mHitLabel: '',
+      mNote: '',   // 操作成功回执（核销/驳回/清理/存配置的结论）
+      mRejectBox: null, mRejectReason: '',
+      mGrant: {sel:'', uid:'', days:30, note:''}, mGrantMsg: '',
       devForm: { device_id:'', name:'我的陪伴助手' },
       codeBox: null,
       rBox: null, rForm: null, timesText:'', weekText:'', monthText:'',
@@ -858,7 +1061,24 @@ createApp({
     // 是否管理员。user 来自 localStorage 的 elder_user（登录时由 doLogin 写入）。
     // 两个入口（/ 与 /user）共用这套登录态：普通用户在 /user 登录后打开 /，
     // 这里就是 false —— 看到横幅、看不到任何管理 tab，而不是又弹一次登录框。
-    isAdmin(){ return !!(this.user && this.user.is_admin); }
+    isAdmin(){ return !!(this.user && this.user.is_admin); },
+    // 授予页下拉的候选用户：只从**已加载的订单**里去重收集。
+    // 后端没有「列出全部用户」的管理端点，凭空造一个下拉就得靠猜 ——
+    // 与其给一个看着齐全其实漏人的列表，不如只列确定见过的人，
+    // 剩下的走「直接填用户 ID」。
+    //
+    // ⚠️ 必须是 computed 而不是 method：模板里 `v-for="u in grantCandidates"`
+    // 拿到的是**函数本身**，v-for 遍历函数不会调它 -> 下拉永远只有占位项，
+    // 而且页面上看不出任何报错（选项渲染成 0 个）。这类"静默失效"最难查。
+    grantCandidates(){
+      const seen = {};
+      for (const o of (this.mOrders || [])){
+        if (o.user_id != null && !seen[o.user_id]){
+          seen[o.user_id] = {id:o.user_id, username:(o.username || ('用户#' + o.user_id))};
+        }
+      }
+      return Object.keys(seen).map(k => seen[k]);
+    }
   },
   methods:{
     async api(path, opt){
@@ -1115,6 +1335,178 @@ createApp({
       return {chat:'对话', light:'轻任务', embed:'向量化', rerank:'重排'}[u] || u || '—';
     },
 
+    // -------- 会员订单：人工核销（仅管理员）--------
+    // 全部数据走 /api/admin/membership/*（router 级 Depends(get_current_admin)）。
+    // 这一页与 token 用量页一样**不进 loadAll**：非管理员不渲染这一页，
+    // 登录时白拉一次 403 只会污染全局错误条。
+    async loadMembership(){
+      await this.loadConfig();
+      await this.loadOrders();
+    },
+    async loadOrders(){
+      this.mLoading = true; this.mErr = '';
+      try{
+        const q = this.mStatus ? '?status=' + encodeURIComponent(this.mStatus) + '&limit=200' : '?limit=200';
+        const r = await this.api('/api/admin/membership/orders' + q);
+        this.mOrders = r || [];
+      }catch(e){ this.mErr = '订单列表加载失败：' + e.message; this.mOrders = []; }
+      finally{ this.mLoading = false; }
+    },
+    async loadConfig(){
+      this.mErrCfg = '';
+      try{
+        const c = await this.api('/api/admin/membership/config');
+        if(c) this.mCfg = c;
+      }catch(e){ this.mErrCfg = '收款配置加载失败：' + e.message; this.mCfg = null; }
+    },
+    // 按到账金额反查 —— 线下转账对账的主力入口。
+    // ⚠️ 必须打 /orders/by-amount 这个**字面量路径**：后端把它注册在
+    // /orders/{code} 之前（FastAPI 按注册顺序匹配），若哪天顺序被改动，
+    // "by-amount" 会被当成 code 去查详情并返回 404 —— 所以这里不拼成
+    // '/orders/' + code 形式，避免前端"顺手抽象"把它改坏。
+    // 单位判定：带小数点 = 元，纯整数 = 分。判据是"能不能直接当分用"，
+    // 而不是猜用户意图 —— 收款记录里 2345 分(23.45元) 与 23.45 元都合法，
+    // 猜错就是查不到订单，只能让用户重填。
+    async lookupByAmount(){
+      const raw = String(this.mAmount || '').trim();
+      if (!raw){ this.err = '请先填入收款记录里的实际到账金额'; return; }
+      const isYuan = raw.indexOf('.') >= 0;
+      const n = Number(raw);
+      if (!isFinite(n) || n < 0){
+        this.err = '金额格式非法：' + raw + '（带小数点按元，如 23.45；纯整数按分，如 2345）';
+        return;
+      }
+      const cents = isYuan ? Math.round(n * 100) : n;
+      this.err = ''; this.mBusy = true; this.mHits = null;
+      try{
+        const param = isYuan ? 'amount_yuan=' + encodeURIComponent(raw) : 'amount_cents=' + cents;
+        const extra = this.mAmountAll ? '&all=true' : '';
+        const r = await this.api('/api/admin/membership/orders/by-amount?' + param + extra);
+        this.mHits = r || [];
+        // 一并显示"按多少分查的"，管理员能立刻发现自己是按元填错还是按分填错
+        this.mHitLabel = '按 ' + this.money(cents) + ' 元反查，命中 ' + this.mHits.length + ' 笔。'
+          + (this.mAmountAll ? '（含历史终态订单）' : '')
+          + (this.mHits.length > 1 ? ' 金额不独占，请结合下单时间与用户名判断。' : '');
+      }catch(e){
+        this.err = '按金额反查失败：' + e.message;
+        this.mHits = [];
+        this.mHitLabel = '按 ' + this.money(cents) + ' 元反查失败。';
+      }finally{ this.mBusy = false; }
+    },
+    // 核销 = 确认到账并开通会员。无条件二次确认：这是**不可逆的写操作**
+    // （钱与会员的对应关系一旦落库就只能靠驳回/人工修），且管理员是在
+    // 照着收款记录点按钮 —— 确认框里必须把金额、用户、订单号都摆出来，
+    // 让人能拿它跟手里那条收款记录逐字对一遍。
+    async confirmOrder(o){
+      const extra = (o.status === 'notified')
+        ? '\n（用户已点「我已转账」）' : '\n（用户尚未点「我已转账」，请先按金额反查确认到账）';
+      if (!confirm('确认已收到该笔转账并开通会员？\n\n'
+        + '订单号：' + o.code + '\n'
+        + '金额：  ￥' + this.yuan(o) + '\n'
+        + '用户：  ' + (o.username || o.user_id) + '\n'
+        + '套餐：  ' + (o.plan_name || o.plan_code) + extra + '\n\n'
+        + '开通后用户立即生效。')) return;
+      this.mBusy = true; this.err = '';
+      try{
+        const r = await this.api('/api/admin/membership/orders/' + encodeURIComponent(o.code) + '/confirm',
+          {method:'POST', body:'{}'});
+        // activated=false 表示这笔之前核销过（幂等），要如实告诉管理员，
+        // 否则他会以为"这次又加了时长"
+        this.err = '';
+        this.mNote = '订单 ' + o.code + ' 已核销：'
+          + (r && r.activated ? '会员已开通' : '此前已核销过，未重复加时长（幂等）')
+          + '，有效期至 ' + this.fmt(r && r.membership && r.membership.expires_at) + '。';
+        this.mHits = null;
+        await this.loadOrders();
+      }catch(e){ this.err = '核销失败：' + e.message; }
+      finally{ this.mBusy = false; }
+    },
+    openReject(o){ this.mRejectBox = o; this.mRejectReason = ''; },
+    async doReject(){
+      const o = this.mRejectBox;
+      if (!o) return;
+      this.mBusy = true; this.err = '';
+      try{
+        await this.api('/api/admin/membership/orders/' + encodeURIComponent(o.code) + '/reject',
+          {method:'POST', body: JSON.stringify({reason: this.mRejectReason || ''})});
+        this.mRejectBox = null;
+        this.mHits = null;
+        this.mNote = '订单 ' + o.code + ' 已驳回。';
+        await this.loadOrders();
+      }catch(e){ this.err = '驳回失败：' + e.message; }
+      finally{ this.mBusy = false; }
+    },
+    async expireOrders(){
+      if (!confirm('把超时未支付的订单置为「已过期」？\n\n'
+        + '仅影响仍在 pending / notified 且已超过支付时限的订单，不会动任何已核销订单。')) return;
+      this.mBusy = true; this.err = '';
+      try{
+        const r = await this.api('/api/admin/membership/orders/expire', {method:'POST', body:'{}'});
+        this.mNote = '过期清理完成：订单 ' + (r ? r.expired_orders : '?')
+          + ' 笔，会员 ' + (r ? r.expired_memberships : '?') + ' 个。';
+        await this.loadOrders();
+      }catch(e){ this.err = '过期清理失败：' + e.message; }
+      finally{ this.mBusy = false; }
+    },
+    async savePayment(){
+      const p = this.mCfg && this.mCfg.payment;
+      if (!p) return;
+      this.mErrCfg = ''; this.mBusy = true;
+      try{
+        const r = await this.api('/api/admin/membership/config',
+          {method:'PATCH', body: JSON.stringify({payment:{
+            channel:p.channel, payee_name:p.payee_name, account:p.account,
+            qr_url:p.qr_url, note:p.note }})});
+        if (r) this.mCfg = r;   // 用服务端回读覆盖：保存成功后展示的一定是落库值
+        this.mNote = '收款配置已保存，用户端立即生效。';
+      }catch(e){ this.mErrCfg = '保存失败：' + e.message; }
+      finally{ this.mBusy = false; }
+    },
+    async doGrant(){
+      // GrantIn 要的是 user_id(int)，不是用户名，而后端**没有**按用户名查用户的
+      // 管理端点。所以优先用下拉（其 value 就是 user_id），
+      // 手动填 ID 作为下拉之外的兜底。
+      const uid = this.mGrant.sel ? Number(this.mGrant.sel)
+        : String(this.mGrant.uid || '').trim();
+      if (!uid || !isFinite(uid) || uid <= 0){
+        this.err = '请从下拉选用户，或直接填用户 ID（数字）'; return;
+      }
+      const days = Number(this.mGrant.days) || 30;
+      if (!confirm('直接给用户 ID ' + uid + ' 授予 ' + days + ' 天会员？\n\n'
+        + '不走订单、没有金额留痕。确认对方身份无误再继续。')) return;
+      this.mBusy = true; this.err = '';
+      try{
+        const m = await this.api('/api/admin/membership/grant', {
+          method:'POST',
+          body: JSON.stringify({user_id: uid, days, note: this.mGrant.note || '', plan: 'admin'})
+        });
+        this.mGrantMsg = '已授予：' + (m && m.plan || 'admin') + '，到期 '
+          + this.fmt(m && m.expires_at) + '，剩余 ' + (m && m.days_left != null ? m.days_left : '?') + ' 天。';
+      }catch(e){ this.err = '授予失败：' + e.message; }
+      finally{ this.mBusy = false; }
+    },
+    osName(s){
+      return {pending:'待付款', notified:'待核销', confirmed:'已核销',
+              rejected:'已驳回', cancelled:'已取消', expired:'已过期'}[s] || s || '—';
+    },
+    // 已核销=绿（成功终态）；待核销=橙（唯一的待办）；驳回=红；已取消/已过期=灰
+    // （终态不该再抢管理员的注意力）；pending 用默认蓝。
+    osClass(s){
+      return {confirmed:'ok', notified:'warn', rejected:'bad',
+              cancelled:'dim', expired:'dim'}[s] || '';
+    },
+    yuan(o){
+      const c = (o && o.amount_cents != null) ? o.amount_cents : o;
+      return this.money(c);
+    },
+    // 分 -> 元字符串。后端 amount_yuan 已经是字符串（它内部走 Decimal），
+    // 优先用它，避免前端 23.45 这类浮点在展示时出现 23.449999。
+    money(cents){
+      const n = Number(cents);
+      if (!isFinite(n)) return '—';
+      return (Math.round(n) / 100).toFixed(2);
+    },
+
     // -------- 人格预设运营后台 --------
     // ⚠️⚠️ **number 型档位提交的是「档位上界」，原样回传 options[].value**
     // ------------------------------------------------------------------
@@ -1303,6 +1695,12 @@ createApp({
       }
       if(t === 'usage'){
         this.loadUsage();
+      }
+      if(t === 'membership'){
+        // 每次进入都重拉：核销/驳回会改状态与会员时长，
+        // 沿用上一次的陈旧列表只会让管理员对着已核销的订单再点一次。
+        this.mNote = ''; this.mHits = null;
+        this.loadMembership().catch(e => { this.err = e.message; });
       }
     }
   },
