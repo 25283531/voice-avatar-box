@@ -23,6 +23,16 @@ RUN mkdir -p /data
 
 # tzdata 走 pip 安装，避免在 slim 镜像里 apt-get；
 # 没有它 zoneinfo.ZoneInfo("Asia/Shanghai") 会直接抛异常。
+#
+# libopus0 走 apt 而不是 pip —— 这与 tzdata 的选择**理由不同**，别"统一风格"：
+# tzdata 有纯数据等价物（pip 的 tzdata 就是同一份 IANA 数据），
+# 而 Opus 是 C 扩展，pip 生态里没有"纯数据"替代，可选只有自带 vendor 的
+# wheel（把同一份 C 代码装第二遍）。且 Debian slim 里 apt 的 libopus0 是
+# 官方维护包，能直接吃到安全更新。装完立刻清 apt 列表，别让层变大。
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends libopus0 \
+    && rm -rf /var/lib/apt/lists/*
+
 COPY requirements.txt ./
 RUN pip install --upgrade pip && pip install -r requirements.txt
 

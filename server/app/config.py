@@ -87,6 +87,34 @@ VOICE_OTA_PATH = os.getenv("ELDER_VOICE_OTA_PATH", "/api/voice/ota")
 # 生产部署在 HTTPS 域名后面时要显式配成 wss://<域名>，否则浏览器/设备会拒绝混合内容。
 VOICE_PUBLIC_BASE = os.getenv("ELDER_VOICE_PUBLIC_BASE", "").rstrip("/")
 
+# ---------------------------------------------------------------- 语音链路（自研）
+# 下行音频的采样率：握手里**声明 24000**，固件用自己声明的这个速率解码
+# （audio_service.cc:375-390 有"按服务端声明速率解码 -> 重采样到板子输出"的
+# 路径）。刻意不跟随设备上行的 16000：ASR 收 16k 就够，而 TTS 用 24k 出声
+# 对老人更清楚，两端各按自己的速率走，不必为了迁就一方而牺牲另一方。
+VOICE_OUTPUT_SAMPLE_RATE = int(os.getenv("ELDER_VOICE_SAMPLE_RATE", "24000"))
+# 帧长（毫秒）。Opus 只支持 2.5/5/10/20/40/60，60 是固件 audio_service.cc
+# 里写死的 OPUS_FRAME_DURATION_MS，改它等于换一套帧协商。
+VOICE_FRAME_DURATION_MS = int(os.getenv("ELDER_VOICE_FRAME_DURATION_MS", "60"))
+# ASR 语言。默认中文：本项目面向中文老人，且多数厂商不传会用默认（英文）。
+VOICE_ASR_LANGUAGE = os.getenv("ELDER_VOICE_ASR_LANGUAGE", "zh")
+
+# 服务端静音兜底阈值：连续静音超过它、且累计语音已达 VOICE_MIN_SPEECH_MS，
+# 就自动 finalize（等价于设备端 VAD 断句）。
+# 为什么需要它：① realtime 模式固件不做 VAD、等我们断句，而我们没有 AEC，
+#    只能靠能量判停；② auto 模式下设备若漏发 listen stop（丢包/重启），
+#    这一轮会永远挂在 listening 态，用户等不到回复。
+# 调太大 = 老人说完要干等；调太小 = 会被句子间的停顿误切。1500ms 是
+# 一句自然停顿的下界附近，实测 Sentence 之间极少有超过 1.2s 的停顿。
+VOICE_SILENCE_MS = int(os.getenv("ELDER_VOICE_SILENCE_MS", "1500"))
+# 触发兜底前至少要听到这么多语音，防止"一句都没说就静音触发"把环境噪声
+# 当成一整句送去 ASR（结果是识别出一串乱码，老人莫名其妙）。
+VOICE_MIN_SPEECH_MS = int(os.getenv("ELDER_VOICE_MIN_SPEECH_MS", "300"))
+
+# 会话内保留的历史轮数上限。语音链路每轮都要塞人格 + 记忆召回，窗口比
+# 纯文本更紧，且老人话题跳跃少、短会话即可；超过就丢最早的。
+VOICE_HISTORY_TURNS = int(os.getenv("ELDER_VOICE_HISTORY_TURNS", "4"))
+
 # ---------------------------------------------------------------- 提醒调度
 # 服务端预生成提醒实例的提前量（小时）。设备离线时靠本地 RTC 兜底触发，
 # 联网时以服务端生成的实例为准做对账。
