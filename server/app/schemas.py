@@ -96,6 +96,12 @@ class DeviceOut(ORMBase):
     name: str
     owner_id: int | None
     avatar_id: int | None
+    # agent_id：设备当前绑定的 agent 角色（ai_providers.record_type='role'）。
+    # **不是新泄露的口子** —— 设备详情本来就带 owner_id，而 require_device_owner
+    # 保证只有 owner 与管理员能拿到这条记录；前端设备表（user.html 的「人格角色」
+    # 下拉）就是靠它回显绑定态，此前缺这一列导致每次刷新都显示「未设置」，
+    # 用户重选一次才「像是生效了」。
+    agent_id: int | None
     online: bool
     last_seen_at: datetime | None
     fw_version: str

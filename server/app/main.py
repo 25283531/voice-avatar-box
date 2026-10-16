@@ -32,6 +32,9 @@ from .security import hash_password
 # memory/__init__.py 是算法层门面（client/store/retrieve/persona），刻意不引 FastAPI，
 # 这样任何地方想用记忆算法都不必把 HTTP 栈拖进来。
 from .memory import router as memory_router
+# 语音链路（自研）：import 本身**不注册任何路由**（见 voice/__init__.py 的 attach），
+# 这里只把模块引进来，真正接线在 app 定义之后的那一行 _voice.attach(app)。
+from . import voice as _voice
 
 logging.basicConfig(
     level=logging.INFO,
@@ -351,6 +354,13 @@ for r in (mail.admin_router, mail.auth_router, support.router, support.admin_rou
 # server/app/voice/ 尚未落地，所以这里只注册 HTTP 接口，不假装接线了语音（见 bridge.py）。
 for r in (memory_router.router, memory_router.admin_router):
     app.include_router(r)
+
+# 语音链路（自研，server/app/voice/）：WS 会话端点 + 设备 OTA 端点。
+# 这是**本服务自己的**实现，不转发、不依赖任何第三方语音服务器 ——
+# 固件的 CONFIG_OTA_URL 已指向本服务，OTA 响应里的 websocket:{url,token}
+# 也由我们自己签发（只给已绑定设备签，未绑定只给激活码，见 voice/__init__.py）。
+# attach() 自带幂等保护，冒烟脚本可提前自行调用。
+_voice.attach(app)
 
 # 人格预设运营后台：/api/admin/presets（调整现有平台预设的 5 个可改字段 +
 # 恢复默认 + 软约束 + 只读红线展示 + 审计）。只对**现有**平台预设开放，

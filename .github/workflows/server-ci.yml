@@ -41,6 +41,16 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r server/requirements.txt
 
+      # 语音链路要 ctypes 直连系统 libopus 编解码。**CI 必须装**，否则
+      # smoke_voice 里最关键的两条编解码断言会走 SKIP 分支变绿 —— 那是假绿：
+      # 编码/解码没真跑过，却显示「全过」。GitHub 的 ubuntu-latest 自带 libopus，
+      # 这里仍显式 apt 装一次：不依赖 runner 镜像的隐式状态，换 runner 也不会突然变 SKIP。
+      - name: 安装 libopus
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libopus0
+          ldconfig -p | grep -i opus || (echo "::error::libopus 未进入动态链接库缓存" && exit 1)
+
       # 挡住「用 urllib.parse.urlparse 解析 SQLite 连接串」的回退：
       # urlparse 会把 sqlite:///C:/a/b.db 的 path 解析成 /C:/a/b.db，
       # Windows 上 mkdir 直接抛 WinError 123（文件名、目录名或卷标语法不正确），
@@ -94,6 +104,28 @@ jobs:
       # 与跑什么库无关；MySQL 侧由 smoke_server/smoke_roles 的真实往返覆盖。
       - name: token 用量冒烟（网关提取 + 双端接口 + 越权隔离）
         run: python tools/smoke_usage.py 8120
+
+      # 语音链路冒烟（WS 协议逐字段对固件 + Opus 编解码 + OTA 签发口径）。
+      # 挂在 SQLite job：它直连 sqlite 造激活码/设备，且进程内起 uvicorn。
+      #
+  # ⚠️ 这一步有个**假绿陷阱**：smoke_voice 对 libopus 缺失是「打印警告后
+  # 跳过那两条编解码断言、其余照跑」，所以在没装 libopus 的机器上它照样
+  # 绿、只是少测了最核心的东西。因此上面那步装了还不够，**这里必须再加一道
+  # 断言**：libopus 没真加载上就直接 exit 1，让「编解码被跳过」变成红。
+  # 本机（Windows 开发环境）没装 libopus 时同理会红，这是有意为之 ——
+  # 想在本机跑通就装一个 opus dll 并设 ELDER_LIBOPUS_PATH。
+      - name: 语音链路冒烟（WS 协议 / Opus 编解码 / OTA）
+        run: |
+          python - <<'PY'
+          import sys
+          sys.path.insert(0, "server")
+          from app.voice.opus_codec import libopus_available
+          if not libopus_available():
+              print("::error::libopus 未加载，smoke_voice 的编解码断言会被 SKIP —— 拒绝假绿")
+              raise SystemExit(1)
+          print("libopus OK")
+          PY
+          python tools/smoke_voice.py 8119
 
       # 进程内故障注入：审计写失败时业务写必须回滚（T32 的**运行时**形态）。
       # 不起 HTTP 子进程、不占端口（进程内直调端点函数），所以不需要在
