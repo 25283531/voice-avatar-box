@@ -87,6 +87,14 @@ jobs:
       - name: 人格预设运营后台冒烟（红线不出库 + 审计同事务 + 重启不变式）
         run: python tools/smoke_admin_presets.py 8118
 
+      # token 用量：网关提取真实 usage + 双端接口（/api/usage 与 /api/admin/usage）
+      # + 越权隔离。进程内起服务（usage 路由在 main.py 已接线，冒烟另走进程内
+      # attach 覆盖同一份路由对象），端口 8120 已在 smoke_ports.py 登记。
+      # 挂 SQLite job 而不进 mysql-smoke：它验的是 token 归一化口径与权限边界，
+      # 与跑什么库无关；MySQL 侧由 smoke_server/smoke_roles 的真实往返覆盖。
+      - name: token 用量冒烟（网关提取 + 双端接口 + 越权隔离）
+        run: python tools/smoke_usage.py 8120
+
       # 进程内故障注入：审计写失败时业务写必须回滚（T32 的**运行时**形态）。
       # 不起 HTTP 子进程、不占端口（进程内直调端点函数），所以不需要在
       # smoke_ports.py 登记；也不进 mysql-smoke job —— 它 monkeypatch 的
