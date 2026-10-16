@@ -172,17 +172,55 @@ def resolve_port(script: str, argv: Iterable[str] | None = None) -> int:
     return DEFAULT_PORTS[key]
 
 
+def _set_bind_semantics(sock: socket.socket) -> None:
+    """按平台设置 bind 语义。**Windows 与 POSIX 的选项是相反的**，必须分平台。
+
+    Windows：设 ``SO_EXCLUSIVEADDRUSE``。
+        不设它时 ``SO_REUSEADDR`` 会让 bind 对**已被占用**的端口也成功 ——
+        那样就测不出冲突，守卫形同虚设。
+
+    POSIX（Linux / macOS）：设 ``SO_REUSEADDR``。
+        不设它时，端口上只要还有 **TIME_WAIT** 状态的 socket，bind 就直接
+        ``EADDRINUSE``（Windows 的 TIME_WAIT 不挡 bind，所以这个问题**只在
+        Linux/macOS 上发作**，本地 Windows 实跑永远复现不出来）。
+
+        ⚠️ **为什么加它不会削弱守卫的核心能力**（本次修改的正当性来源）
+        ------------------------------------------------------------------
+        Linux 上 ``SO_REUSEADDR`` **只绕过 TIME_WAIT** —— 那些 socket 对应的
+        监听进程**早已退出**，只是连接四元组还在冷却期。而要抢占一个**正在
+        LISTEN** 的套接字，必须用 ``SO_REUSEPORT``，``SO_REUSEADDR`` 做不到。
+
+        所以：「这个端口上有个别人的服务在跑」**仍然必然被测出来**，
+        守卫的核心判据（识别别人正在跑）**完全不受影响**。
+
+        ⚠️ 反过来，不设它就是**判据与服务端行为不一致**
+        ----------------------------------------------------
+        uvicorn / asyncio 建监听套接字时**自己就默认设 SO_REUSEADDR**，
+        也就是说：**服务端能绑上的端口，我们的校验却判它「被占用」。**
+        本项目已实测踩过：``smoke_roles.py`` 的 ``restart()`` terminate 自己
+        的服务后，TIME_WAIT 让 ``is_port_free()`` 返回 False，守卫把
+        **自己刚关掉的服务**当成别人的服务，重启直接失败
+        （CI run 38838222327 实测；本地 Windows 因平台语义差异不复现）。
+    """
+    if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+    else:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+
+
 def is_port_free(port: int, host: str = "127.0.0.1") -> bool:
     """检测端口当前是否空闲（能否 bind）。
 
     仅用于**诊断**：端口被占用说明有残留进程或有人正在并行跑同一个脚本，
     此时冒烟结果不可信（可能连到了别人的服务上）。
+
+    ⚠️ 这里只回答「此刻能不能 bind」，**不区分**占用方是「别人的服务」还是
+    「我自己刚 terminate 完、还挂在 TIME_WAIT 上的残留」。后者曾经导致
+    restart() 误判自己 —— 靠 POSIX 分支的 ``SO_REUSEADDR`` 消除该误判，
+    详见 :func:`_set_bind_semantics`。
     """
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        # Windows 上不设 SO_EXCLUSIVEADDRUSE 时，SO_REUSEADDR 会让 bind
-        # 对「已被占用」的端口也成功，那样就测不出冲突了。
-        if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        _set_bind_semantics(sock)
         try:
             sock.bind((host, port))
         except OSError:
@@ -286,14 +324,15 @@ def guard_port(port: int, host: str = "127.0.0.1") -> tuple[socket.socket | None
             f"    python tools/<本脚本>.py <其它端口>\n"
             f"  或先查占用方：python tools/smoke_ports.py --check"
         )
-    # 阶段②：立刻占住。bind 但不 listen，且用独占地址选项
-    # （Windows 上不设它，SO_REUSEADDR 会让 bind 对已占用端口也成功）。
+    # 阶段②：立刻占住。bind 但不 listen。
+    # 占位 socket 与 is_port_free() 必须用**同一套**平台语义，否则会出现
+    # 「检查说空闲、占位却 bind 不上」的自相矛盾（TIME_WAIT 场景，见
+    # _set_bind_semantics）。
     hold = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
-        try:
-            hold.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
-        except OSError:
-            pass
+    try:
+        _set_bind_semantics(hold)
+    except OSError:
+        pass
     try:
         hold.bind((host, port))
     except OSError as exc:

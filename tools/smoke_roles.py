@@ -313,14 +313,29 @@ def main() -> int:
         单次启动 —— 于是"用户角色被刷成 preset"这种**只在重启后出现**的破坏
         一次性逃过了全部 395 条断言。
         这里守的不变式是更根本的一条：**启动流程不得改写用户数据**。
+
+        ⚠️ 为什么**不用** `proc = _spawn(env)` 直接覆盖句柄
+        ----------------------------------------------------
+        ``_spawn`` 失败时返回 ``None``，覆盖后 ``proc`` 就成了 ``None``，
+        随后 ``finally`` 里的 ``proc.terminate()`` 会抛
+        ``AttributeError: 'NoneType' object has no attribute 'terminate'``
+        —— 而那个 AttributeError 会把**真实失败原因整个盖掉**：CI 上实际看到
+        的是一行崩溃堆栈，而不是守卫那句「端口 8101 已被占用」。
+
+        这在本项目是原则级问题：**假绿与假红都必须能归因到真因**。
+        一个把根因盖住的异常，比没有异常更坏 —— 它让人去修崩溃堆栈
+        （``proc.terminate()`` 怎么改都修不好），而不是修真正的问题。
+        所以失败时**保留旧句柄**（那个进程确实已被我们 terminate），
+        由 ``finally`` 的存活判断决定要不要再动它。
         """
         nonlocal proc
-        proc.terminate()
-        try:
-            proc.wait(timeout=15)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.wait(timeout=5)
+        if proc is not None and proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=15)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=5)
         time.sleep(0.5)
         # 端口可能还在 TIME_WAIT，等它释放
         for _ in range(40):
@@ -330,8 +345,11 @@ def main() -> int:
                     time.sleep(0.5)
             except Exception:
                 break
-        proc = _spawn(env)
-        return proc is not None
+        new_proc = _spawn(env)
+        if new_proc is None:
+            return False          # 句柄保持不变，绝不用 None 覆盖
+        proc = new_proc
+        return True
 
     try:
         # ==================================================== 准备
@@ -696,11 +714,16 @@ def main() -> int:
                       f"（跳过：{type(exc).__name__}）")
 
     finally:
-        proc.terminate()
-        try:
-            proc.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            proc.kill()
+        # ⚠️ 必须先判 None 与存活再 terminate：restart() 失败时句柄可能已被
+        # 换掉或从未成功赋值（见 restart() 内的说明）。无条件 terminate()
+        # 抛 AttributeError 会把真正的失败原因盖掉 —— 而本项目要求
+        # 失败必须能归因到真因，所以这里宁可什么都不做，也不制造噪音。
+        if proc is not None and proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                proc.kill()
         # 关掉所有轮次打开的日志句柄（restart() 可能开了多个）
         for fp in _LOG_FP:
             try:
