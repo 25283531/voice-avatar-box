@@ -819,10 +819,16 @@
               <div class="l">今日已确认</div></div>
             <div class="kpi"><div class="n" :style="{color:stats.today_miss?'var(--bad)':'var(--text)'}">
               {{stats.today_miss}}</div><div class="l">今日漏服 / 未确认</div></div>
-            <div class="kpi"><div class="n">{{stats.total_7d}}</div><div class="l">近 7 天总交互</div></div>
-            <div class="kpi"><div class="n">{{stats.pending_reminders}}</div><div class="l">生效中的提醒</div></div>
+            <!-- ⚠️ 字段名与展示文案按 routers/stats.py 的实际算法对齐，别望文生义：
+                 total_7d 其实是「series 窗口内的总和」（选 30 天就是 30 天），
+                 pending_reminders 是「待触发 + 已响铃未确认」的提醒**事件**条数
+                 （不是启用中的提醒规则数），missed_today 是今日超时未确认条数。 -->
+            <div class="kpi"><div class="n">{{stats.total_7d}}</div>
+              <div class="l">近 {{statsDays}} 天总交互</div></div>
+            <div class="kpi"><div class="n">{{stats.pending_reminders}}</div>
+              <div class="l">待触发 / 响铃中提醒</div></div>
             <div class="kpi"><div class="n" :style="{color:stats.missed_today?'var(--bad)':'var(--text)'}">
-              {{stats.missed_today}}</div><div class="l">今日待办未完成</div></div>
+              {{stats.missed_today}}</div><div class="l">今日超时未确认</div></div>
           </div>
 
           <div style="margin-top:14px">
