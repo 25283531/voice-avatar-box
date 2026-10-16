@@ -42,6 +42,8 @@
   table{width:100%;border-collapse:collapse;font-size:13px}
   th,td{text-align:left;padding:8px 6px;border-bottom:1px solid var(--line);vertical-align:top}
   th{color:var(--muted);font-weight:600;font-size:12px}
+  /* 数字列右对齐（token 用量对账场景，位数对齐才可比） */
+  th.num,td.num{text-align:right;font-variant-numeric:tabular-nums}
   code{background:#f1f5f9;padding:1px 5px;border-radius:4px;font-size:12px}
   .tag{display:inline-block;padding:1px 8px;border-radius:10px;font-size:12px;
        background:var(--brand-soft);color:var(--brand)}
@@ -99,17 +101,19 @@
     <h2>登录管理后台</h2>
     <div v-if="err" class="err">{{err}}</div>
     <label>用户名</label>
-    <input v-model="loginForm.username" style="width:100%;margin-bottom:10px" @keyup.enter="doLogin" />
+    <input id="lu" v-model="loginForm.username" style="width:100%;margin-bottom:10px" @keyup.enter="doLogin" />
     <label>密码</label>
-    <input v-model="loginForm.password" type="password" style="width:100%;margin-bottom:14px" @keyup.enter="doLogin" />
-    <button class="primary" style="width:100%" :disabled="busy" @click="doLogin">登 录</button>
+    <input id="lp" v-model="loginForm.password" type="password" style="width:100%;margin-bottom:14px" @keyup.enter="doLogin" />
+    <button id="lb" class="primary" style="width:100%" :disabled="busy" @click="doLogin">登 录</button>
     <p class="muted" style="margin-top:12px;font-size:12px">
       首次部署默认账号 <code>admin</code> / <code>admin123</code>，登录后请立即修改。
     </p>
   </div>
 
-  <!-- ============================ 主体 ============================ -->
-  <template v-else>
+  <!-- ============================ 主体（仅管理员） ============================ -->
+  <!-- 非管理员不走这条分支：见文件末尾的横幅模板。tab 也按 isAdmin 过滤，
+       双保险避免「外壳渲染出来再被 403 弹错误条」的旧体验。 -->
+  <template v-else-if="isAdmin">
     <header class="bar">
       <div>
         <h1>老人陪伴提醒助手 · 管理后台</h1>
@@ -700,6 +704,116 @@
         <div v-else class="empty">选择设备后查看统计</div>
       </div>
     </section>
+
+    <!-- ---------------------- token 用量（全平台，仅管理员） ---------------------- -->
+    <section v-if="tab==='usage'">
+      <div class="card">
+        <div class="row" style="justify-content:space-between">
+          <h2>token 用量</h2>
+          <div class="row">
+            <select v-model="usageFilter" @change="loadUsage">
+              <option value="">全部用途</option>
+              <option value="chat">chat 对话</option>
+              <option value="light">light 轻任务</option>
+              <option value="embed">embed 向量化</option>
+              <option value="rerank">rerank 重排</option>
+            </select>
+            <button @click="loadUsage">刷新</button>
+          </div>
+        </div>
+        <div v-if="usageSummary" class="grid g4">
+          <div class="kpi"><div class="n">{{usageSummary.calls}}</div><div class="l">总调用次数</div></div>
+          <div class="kpi"><div class="n">{{usageSummary.total_tokens}}</div><div class="l">总 tokens</div></div>
+          <div class="kpi">
+            <div class="n" :style="{color:usageSummary.failed_calls?'var(--bad)':'var(--ok)'}">
+              {{usageSummary.failed_calls}}</div>
+            <div class="l">失败次数</div>
+          </div>
+          <div class="kpi">
+            <div class="n" style="font-size:18px">
+              {{usageSummary.prompt_tokens}} / {{usageSummary.completion_tokens}}</div>
+            <div class="l">输入 / 输出 tokens</div>
+          </div>
+        </div>
+        <div v-else class="empty">暂无用量数据</div>
+      </div>
+
+      <div class="card" v-if="usageSummary && Object.keys(usageSummary.by_usage||{}).length">
+        <h2>按用途分布（tokens）</h2>
+        <table>
+          <thead><tr><th>用途</th><th class="num">tokens</th></tr></thead>
+          <tbody>
+            <tr v-for="(v,k) in usageSummary.by_usage" :key="k">
+              <td>{{usageName(k)}}</td>
+              <td class="num">{{v}}</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="card" v-if="usageSummary && (usageSummary.by_day||[]).length">
+        <h2>近 {{usageSummary.by_day.length}} 天 tokens</h2>
+        <div class="bars">
+          <div v-for="p in usageSummary.by_day" :key="p.date" style="flex:1">
+            <div class="b" :style="{height:barHeight(p.total_tokens)+'px'}"
+                 :title="p.date+' 共 '+p.total_tokens+' tokens'"></div>
+            <div class="x">{{p.date.slice(5)}}</div>
+          </div>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>最近调用流水</h2>
+        <table v-if="usageRows.length">
+          <thead><tr><th>时间</th><th>来源</th><th>用途</th><th>设备</th><th>模型</th>
+            <th class="num">tokens</th><th>结果</th></tr></thead>
+          <tbody>
+            <tr v-for="r in usageRows" :key="r.id">
+              <td class="muted">{{fmt(r.created_at)}}</td>
+              <td>{{r.source||'—'}}</td>
+              <td><span class="tag">{{usageName(r.usage)}}</span></td>
+              <td class="num">{{r.device_id||'—'}}</td>
+              <td>{{r.provider_name||'—'}}<div class="muted" style="font-size:12px">{{r.model}}</div></td>
+              <td class="num">{{r.total_tokens}}</td>
+              <td><span class="tag" :class="r.ok?'ok':'bad'">{{r.ok?'成功':'失败'}}</span></td>
+            </tr>
+          </tbody>
+        </table>
+        <div v-else class="empty">暂无调用记录</div>
+      </div>
+    </section>
+  </template>
+
+  <!-- ============================ 非管理员提示 ============================ -->
+  <!-- 已登录但不是管理员：醒目横幅 + 跳转 /user，不渲染任何管理 tab。
+       旧行为是把 tab 外壳渲染出来、点哪个都弹 403 错误条——既吓到人，
+       也等于告诉每个用户「管理功能有哪些」。 -->
+  <template v-else>
+    <header class="bar">
+      <div>
+        <h1>老人陪伴提醒助手 · 管理后台</h1>
+        <div class="muted" style="font-size:12px">业务面由本服务提供 · 语音链路走 xiaozhi-esp32-server</div>
+      </div>
+      <div class="row">
+        <span class="muted" style="font-size:12px">{{user.username}}</span>
+        <button @click="logout">退出</button>
+      </div>
+    </header>
+    <div class="card" style="max-width:680px;margin:40px auto;border-color:#f3c7c7">
+      <h2 style="color:var(--bad)">这是管理后台，仅平台管理员可用</h2>
+      <p style="font-size:14px;line-height:1.9;margin:0 0 6px">
+        您当前登录的账号（<b>{{user.username}}</b>）没有管理员权限。
+        设备登记核销、人格预设运营、AI 接入等管理功能仅对平台管理员开放。
+      </p>
+      <p style="font-size:14px;line-height:1.9;margin:0 0 16px">
+        您的个人界面在 <code>/user</code>：可以在那里添加设备、查看会员、设置提醒、
+        管理记忆与人格、查看用量统计。
+      </p>
+      <div class="row">
+        <a href="/user" class="primary" style="background:var(--brand);border-color:var(--brand);color:#fff;
+           border-radius:6px;padding:6px 14px;font-size:13px;text-decoration:none">前往我的界面 /user</a>
+      </div>
+    </div>
   </template>
 </div>
 
@@ -716,12 +830,15 @@ createApp({
       tabs: [
         {k:'home',n:'概览'},{k:'devices',n:'设备'},{k:'reminders',n:'提醒'},
         {k:'avatars',n:'形象'},{k:'personas',n:'人格预设'},
-        {k:'providers',n:'AI 接入'},{k:'stats',n:'统计'}
+        {k:'providers',n:'AI 接入'},{k:'stats',n:'统计'},
+        {k:'usage',n:'token 用量'}
       ],
       err: '', busy: false,
       loginForm: { username:'', password:'' },
       devices: [], avatars: [], providers: [], reminders: [], events: [],
       curDeviceId: null, stat: null,
+      // ---- token 用量（全平台，仅管理员）----
+      usageSummary: null, usageRows: [], usageFilter: '',
       devForm: { device_id:'', name:'我的陪伴助手' },
       codeBox: null,
       rBox: null, rForm: null, timesText:'', weekText:'', monthText:'',
@@ -736,6 +853,12 @@ createApp({
       pEditBox: false, pEdit: null, presetBusy:false,
       pPreview: null, auditBox:null, audits: [], showDiff:{}
     };
+  },
+  computed:{
+    // 是否管理员。user 来自 localStorage 的 elder_user（登录时由 doLogin 写入）。
+    // 两个入口（/ 与 /user）共用这套登录态：普通用户在 /user 登录后打开 /，
+    // 这里就是 false —— 看到横幅、看不到任何管理 tab，而不是又弹一次登录框。
+    isAdmin(){ return !!(this.user && this.user.is_admin); }
   },
   methods:{
     async api(path, opt){
@@ -973,6 +1096,25 @@ createApp({
       if (d) { console.log(d); alert('已导出到浏览器控制台，可复制到小智 config.yaml 的 selected_module 下'); }
     },
 
+    // -------- token 用量（全平台，仅管理员）--------
+    // 与管理端 /api/admin/usage 约定：summary 给聚合（calls/tokens/by_usage/by_day），
+    // rows 给最近流水。接口未上线时错误条友好提示，页面不白屏。
+    async loadUsage(){
+      this.err = '';
+      try{
+        const q = this.usageFilter ? '?usage=' + encodeURIComponent(this.usageFilter) : '';
+        const [s, rows] = await Promise.all([
+          this.api('/api/admin/usage/summary' + q),
+          this.api('/api/admin/usage/rows?limit=50' + (this.usageFilter ? '&usage=' + encodeURIComponent(this.usageFilter) : ''))
+        ]);
+        this.usageSummary = s;
+        this.usageRows = rows || [];
+      }catch(e){ this.err = '用量统计加载失败：' + e.message; }
+    },
+    usageName(u){
+      return {chat:'对话', light:'轻任务', embed:'向量化', rerank:'重排'}[u] || u || '—';
+    },
+
     // -------- 人格预设运营后台 --------
     // ⚠️⚠️ **number 型档位提交的是「档位上界」，原样回传 options[].value**
     // ------------------------------------------------------------------
@@ -1159,10 +1301,26 @@ createApp({
       if(t === 'personas'){
         this.loadPersonas().catch(e => { this.err = e.message; });
       }
+      if(t === 'usage'){
+        this.loadUsage();
+      }
     }
   },
-  mounted(){
-    if (this.token) this.loadAll().catch(e => { this.err = e.message; });
+  async mounted(){
+    if (!this.token) return;
+    // token 在但 user 对象不在（如只清了一半 localStorage）：先补身份再决定渲染哪套界面
+    if (!this.user || !this.user.id){
+      try{
+        const me = await this.api('/api/auth/me');
+        if (me){
+          this.user = {username:me.username, id:me.id, is_admin:me.is_admin};
+          localStorage.setItem('elder_user', JSON.stringify(this.user));
+        }
+      }catch(e){ this.err = e.message; }
+    }
+    // 非管理员不拉任何管理数据（loadProviders 等会 403，红条只会吓到人）；
+    // 他们的界面在 /user，这里只显示横幅。
+    if (this.isAdmin) this.loadAll().catch(e => { this.err = e.message; });
   }
 }).mount('#app');
 </script>
