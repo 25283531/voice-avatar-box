@@ -3,8 +3,9 @@
 职责边界
 --------
 - 本服务负责**业务面**：设备绑定、提醒规则与回执、形象与提示词、AI 供应商配置、交互统计。
-- 语音 / AI 链路复用 xiaozhi-esp32-server（WebSocket + OTA），本服务不重复造轮子，
-  仅在 /api/device/sync 里把 WS / OTA 地址下发给设备。
+- 语音链路是**自研**的（server/app/voice/，xiaozhi 公开协议的服务端实现），
+  与业务 API 同源同端口；设备在 /api/device/sync 里拿到的 WS / OTA 地址
+  指向本服务自己（推导逻辑见 routers/device_api.py 的 _voice_endpoints）。
 """
 from __future__ import annotations
 
@@ -315,7 +316,7 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title=APP_NAME, version=APP_VERSION, lifespan=lifespan,
-              description="老人陪伴 & 提醒助手业务后端（与 xiaozhi-esp32-server 协同）")
+              description="老人陪伴 & 提醒助手业务后端（业务 API + 管理后台 + 用户端 + 自研语音链路，同源同端口）")
 
 app.add_middleware(
     CORSMiddleware,
