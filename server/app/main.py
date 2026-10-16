@@ -386,6 +386,13 @@ if STATIC_DIR.is_dir():
     @app.get("/")
     def console():
         return FileResponse(str(STATIC_DIR / "index.html"))
+
+    # 用户端界面：面向普通用户（设备 / 会员 / 提醒 / 记忆 / 形象 / 角色 / 用量）。
+    # 与管理后台（/）是**两个入口**，不是同一页面按角色隐藏几个 tab ——
+    # 两者的信息架构本来就不一致（管理端管平台，用户端管自己）。
+    @app.get("/user")
+    def user_console():
+        return FileResponse(str(STATIC_DIR / "user.html"))
 else:  # pragma: no cover
     @app.get("/")
     def console_placeholder():
