@@ -111,6 +111,7 @@ DEFAULT_PORTS: dict[str, int] = {
     "smoke_admin_presets": 8118,   # 管理端 · 平台人格预设运营后台
     "smoke_voice": 8119,           # 自研语音链路：WS 协议 + Opus + 假上游 + 用量埋点
     "smoke_usage": 8120,           # token 用量：网关提取 + 双端接口对账
+    "smoke_auth": 8121,            # 注册/鉴权：公开开关 + 初始管理员引导（问题 A/B 的回归网）
 }
 
 
