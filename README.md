@@ -15,7 +15,7 @@
 | `android/` | Android 原生壳工程（WebView + `WebViewAssetLoader`），把 H5 打成 APK，不依赖 DCloud |
 | `firmware/` | ESP32-S3 固件（`components/elder` 为本项目新增组件，编译前需合入 xiaozhi 源码树） |
 | `tools/` | 辅助脚本：`smoke_server.py` 后端冒烟、`make_firmware.py` 合并烧录 bin、`idfwin.py` / `winrun.py` Windows 下的 IDF 包装 |
-| `docs/` | [`架构设计.md`](docs/架构设计.md) 平台整体架构与选型 · [`DEPLOY.md`](docs/DEPLOY.md) 部署与 MySQL 接入 · [`会员功能规划.md`](docs/会员功能规划.md) 会员与人工核销 · 烧录指南 · 手机 APP 开发说明 |
+| `docs/` | [`架构设计.md`](docs/架构设计.md) 平台整体架构与选型 · [`DEPLOY.md`](docs/DEPLOY.md) 部署与 MySQL 接入 · [`会员功能规划.md`](docs/会员功能规划.md) 会员与人工核销 · [`决策记录.md`](docs/决策记录.md) 用户拍板的决策及其边界 · 烧录指南 · 手机 APP 开发说明 |
 | `老人陪伴提醒助手-技术方案-v1.md` | 完整技术方案（硬件、形象引擎、激活码算法、风险清单） |
 
 ## 端口与地址约定
@@ -33,6 +33,7 @@
 
 | 工作流 | 触发 | 作用 |
 | --- | --- | --- |
+| `pr-gate.yml` | **每个 PR**（刻意不加 paths 过滤）+ push 到 `main` | 常驻门禁「守门人自检」：CODEOWNERS 覆盖 + workflows 可解析。分支保护的必需状态检查 |
 | `server-ci.yml` | push/PR 改动 `server/`、`tools/`；可手动 | 安装依赖跑 `tools/smoke_server.py`（21 项业务闭环）+ Dockerfile 语法检查 |
 | `docker-build.yml` | push/PR 改动 `server/`；可手动 | 构建镜像 → 起容器校验 `/api/health`；手动触发勾选 `publish` 才推送 `ghcr.io/25283531/voice-avatar-box` |
 | `app-build.yml` | push/PR 改动 `app/`；可手动 | 构建 H5 / 微信小程序并上传产物；校验后端地址已内联 |
@@ -59,6 +60,62 @@ APP 是给家属用的，不接入小智任何服务，业务后端地址在代�
 | 日程 | 服药提醒与日程提醒：新增 / 编辑 / 暂停 / 代老人确认 / 删除 |
 | 我的 | 账户名、修改密码、更换绑定邮箱、开通（续费）会员、创建自有 agent 角色、系统形象库、缓存管理、应用信息、隐私政策、用户协议 |
 - `android-build`：填版本号 → 产物 Artifacts 里的 `elder-app-android-apk`
+
+## 分支保护与 PR 流程
+
+仓库默认分支是 **`main`**（本地开发在 `master`）。流程固定为：
+
+```
+本地 master 开发 → 切功能分支（如 ci/gatekeeper）→ push 功能分支
+→ 开 PR 到 main → 评审批准 → 合并 → 删除功能分支
+```
+
+**不直接推 `main`**：`main` 开了分支保护，所有改动必须走 PR；合并要求
+「守门人自检」（`.github/workflows/pr-gate.yml` 的 job 名，GitHub 侧的必需
+状态检查）通过 + 至少一人批准。改必需状态检查名 = 保护失效，要改先改
+GitHub 仓库设置。
+
+推功能分支前，本地先跑一遍门禁判据（与 CI 同一个脚本，exit 0 才推）：
+
+```bash
+python tools/ci_gate_check.py
+```
+
+### 危险路径清单（改这些路径必须有人 review 后才能进 main）
+
+登记在 `.github/CODEOWNERS`（默认行 `* @25283531` + 下列显式条目）。
+「出事就是数据损坏」不是形容词，是事故链路的第一环：
+
+| 路径 | 为什么危险 |
+| --- | --- |
+| `server/app/schema_patch.py` | **启动期写表**：backfill / dedupe / `_patch_version` 登记跑在每次进程启动时，判据决定「哪些行会被改写」 |
+| `server/app/main.py` | 启动 seed 人格预设：平台预设角色的唯一来源（改一次发版一次，运营无法调人格） |
+| `server/app/db.py` | `init_db` / `wait_for_db`：建表与连库等待，是回填的执行环境 |
+| `server/app/persona/` | 人格红线目录：5 条硬红线（一律不给结论、不做判断、不推荐具体疗法或药品等）。红线被改坏不会自己变红 |
+| `server/evals/` | 红线黄金副本基准：评测判据的权威数据，与 `catalog.py` 必须同时改才自洽 |
+| `.github/workflows/` | CI 本体：改这里 = 改「什么能进 main」 |
+
+事故链路（真实发生过的 P0，不是假想）：
+
+```
+启动回填判据写错 → 重启时改写用户角色归属 → 用户派生角色被永久刷成 preset
+→ 角色变只读 + 全平台可见 = 跨用户数据泄漏
+```
+
+没有报警、没有堆栈，用户侧看不出任何异常，等发现时数据已被改写多轮。
+所以这些路径不能直接推 main：**它们出事时没有任何自动信号，唯一的防线是
+合并前有人看过 diff。**
+
+### 守门人自检守得住什么、守不住什么
+
+| 守得住（机械可判，CI 红） | 守不住（没有机械判据，靠人） |
+| --- | --- |
+| CODEOWNERS 存在且每条规则语法合法 | **同时篡改代码与基准的自洽绕过**（改 `catalog.py` 再重新生成黄金副本，diff 两处都变、门禁全绿）—— 靠人工 review 看 diff 全貌 |
+| 关键危险路径仍被显式（非通配）规则覆盖，删行就红 | **语义正确性**（判据写错但语法合法）—— 靠人工 review + 变异测试「证明它会红」的纪律 |
+| `.github/workflows/*.yml` 全部可被 `yaml.safe_load` 解析 | **覆盖 ≠ 真的有人看**——分支保护是否强制 review 是 GitHub 侧设置，CI 只代表文件层面完好 |
+
+本项目哲学：**不写清边界的断言是负债**。每个断言旁边都必须写清它守不住
+什么，否则下一个人会把「门禁是绿的」当成「代码是对的」。
 
 ## 服务器部署
 
