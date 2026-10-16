@@ -39,6 +39,8 @@ from smoke_ports import (  # noqa: E402
 
     detect_addr_in_use,
     guard_or_die,
+    guard_port,
+    release_port,
     resolve_port,
 )
 
