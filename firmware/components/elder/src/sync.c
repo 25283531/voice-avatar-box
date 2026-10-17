@@ -501,8 +501,13 @@ static bool upload_local_reminders(void)
     }
     if (n_local == 0) return true;
 
-    char body[1400];
-    int off = snprintf(body, sizeof(body), "[");
+    /* 请求体放到堆上，不占栈：同步任务栈只有 6KB（见 elder_sync_start 的
+     * xTaskCreatePinnedToCore），这里再压 1.4KB 局部数组有溢出风险。
+     * 上限按「16 条 × 每条约 90 字节」留足。 */
+    #define LOCAL_RPT_BODY_MAX (2 * 1024)
+    char *body = heap_caps_malloc(LOCAL_RPT_BODY_MAX, MALLOC_CAP_8BIT);
+    if (!body) return false;
+    int off = snprintf(body, LOCAL_RPT_BODY_MAX, "[");
     for (uint8_t i = 0; i < tbl->count && i < ELDER_REMINDER_MAX; i++) {
         const elder_rmd_item_t *it = &tbl->items[i];
         if (it->server_id != 0) continue;
@@ -524,24 +529,29 @@ static bool upload_local_reminders(void)
             }
         }
 
-        off += snprintf(body + off, sizeof(body) - (size_t)off,
+        off += snprintf(body + off, LOCAL_RPT_BODY_MAX - (size_t)off,
                         "%s{\"client_key\":\"%s\",\"title\":\"%s\",\"rtype\":%d,"
                         "\"schedule_kind\":%d,\"times_of_day\":[\"%s\"],"
                         "\"weekdays\":[%s],\"confirm_methods\":[\"voice\",\"button\"],"
                         "\"enabled\":true}",
                         off > 1 ? "," : "", key, it->label, (int)it->rtype,
                         (int)it->schedule_kind, tod, wd);
-        if (off < 0 || (size_t)off >= sizeof(body)) {
+        if (off < 0 || (size_t)off >= LOCAL_RPT_BODY_MAX) {
             ESP_LOGW(TAG, "本地上报体超长（%u 条），本次放弃，下个心跳重试", n_local);
+            heap_caps_free(body);
             return false;
         }
     }
-    off += snprintf(body + off, sizeof(body) - (size_t)off, "]");
+    off += snprintf(body + off, LOCAL_RPT_BODY_MAX - (size_t)off, "]");
 
     char *resp = heap_caps_malloc(ELDER_NET_RESP_MAX, MALLOC_CAP_8BIT);
-    if (!resp) return false;
+    if (!resp) {
+        heap_caps_free(body);
+        return false;
+    }
     size_t len = ELDER_NET_RESP_MAX;
     esp_err_t err = elder_net_post("/api/device/reminders/local", body, resp, &len, NULL);
+    heap_caps_free(body);
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "本地上报失败（%s），下次心跳重试；提醒仍在本地响铃不受影响",
                  esp_err_to_name(err));
