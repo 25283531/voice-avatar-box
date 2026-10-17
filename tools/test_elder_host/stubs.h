@@ -26,6 +26,15 @@ void stub_nvs_reset(void);
  * 断网设备最该守住的一条（把坏数据当成有效提醒表 = 老人照着乱码时间吃药）。*/
 void stub_nvs_corrupt(int ns_index, size_t offset, uint8_t xor_mask);
 
+/* 直接往 NVS 塞一个**指定长度**的 blob（绕过 elder_rminder_flush）。
+ * 唯一用途是模拟「设备上已经存着旧固件写下的 blob」—— 升级兼容路径
+ * 只有这样才测得到：正常流程写进去的永远是当前格式。 */
+void stub_nvs_write_raw(int ns_index, const void *buf, size_t len);
+
+/* 读回落盘的 blob 长度（判断「固件有没有把自己的表改写成新格式」）；
+ * 返回 0 表示该 namespace 里没有 blob。 */
+size_t stub_nvs_blob_len(int ns_index);
+
 /* 受控时钟：所有 time() 与 esp_timer 都由它推导 */
 void stub_time_set(time_t epoch);
 void stub_time_advance(int64_t sec);

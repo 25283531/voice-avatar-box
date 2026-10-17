@@ -80,6 +80,20 @@ void stub_nvs_corrupt(int ns_index, size_t offset, uint8_t xor_mask)
     s_nvs[ns_index][offset] ^= xor_mask;
 }
 
+void stub_nvs_write_raw(int ns_index, const void *buf, size_t len)
+{
+    if (ns_index < 0 || ns_index >= NVS_NS_MAX) return;
+    if (len == 0 || len > NVS_BLOB_MAX) return;
+    memcpy(s_nvs[ns_index], buf, len);
+    s_nvs_len[ns_index] = len;
+}
+
+size_t stub_nvs_blob_len(int ns_index)
+{
+    if (ns_index < 0 || ns_index >= NVS_NS_MAX) return 0;
+    return s_nvs_len[ns_index];
+}
+
 /* ---------------- 受控时钟 ---------------- */
 
 /* 固定在一个「可信」的时刻：本地 2026-03-05（周四）07:00 +08:00。

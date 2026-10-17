@@ -11,6 +11,7 @@
  *   T8  按键确认窗 30 秒超时回退 —— 按了键又不管了必须回到未确认
  *   T9  NVS CRC 校验 —— 坏数据绝不能被当成有效提醒表
  *   T10 上电首 tick 不做跨天重置 —— 否则每次上电都产生一次假「漏服」
+ *   T11 重启后不得二次响铃 —— 见 test_restart_no_refire 上方的失效链推演
  *
  * 全程**没有任何网络调用**：这正是要验证的场景。
  */
@@ -887,6 +888,578 @@ static void test_first_tick_day_guard(void)
           det("%s —— 跨天不重置 = 第二天提醒被当成已完成，从此再不响", dump_tbl(t)));
 }
 
+/* =================================================================== */
+/* T11：重启后不得二次响铃（当天已响过 / 已确认服药的事实必须持久化）    */
+/* =================================================================== */
+/* 这是本仓最贵的一条失效链，因为它**每天都在发生**且**没有任何告警**：
+ *
+ *   08:00  触发          -> set_state(PENDING)，152 行 done_today &= ~bit
+ *   08:05  老人确认服药  -> set_state(DONE)，   148 行 done_today |= bit
+ *          （elder_reminder_confirm_ex 里立刻 flush，done_today=0x0001 落盘）
+ *   ---- 同一天 09:00 断电重启（掉电/看门狗/OTA/弱电，老人设备掉电率不低）----
+ *   load() 读回表，done_today=0x0001 确实还在表里
+ *   但 state[] 靠 C 静态零初始化 = 全 IDLE，fired_today[] 同样全 false
+ *   （修复前这两个数组**从不落盘**）
+ *   重启后首个 tick：
+ *     203 行 !false && IDLE && now_min(540) >= due(480) => true
+ *       -> 二次 set_state(PENDING) -> done_today &= ~bit => 0x0001 变 0x0000
+ *       -> 222 行 (540-480)=60 >= 15 => **同一个 tick 内**推成 ESCALATED
+ *
+ * 后果：子女端收到假「漏服」MISSED 告警；老人已吃过药却被要求再吃一次。
+ * 重复服用降压/降糖/抗凝药有实际危险，这是医疗事故级的。
+ *
+ * 关键点：触发条件是 `now_min >= due`，**不是**「已确认过才不响」。
+ * 所以修复前只要当天重启时已过服药时刻，**连今天本来还没到点响过的提醒**
+ * 也会在开机瞬间补响一遍，然后立刻升级。本组用例把这个更宽的面也钉住。 */
+
+/* T11-1：08:00 响 → 08:05 确认服药 → 同日 09:00 重启 → 绝不二次响铃 */
+static void test_restart_no_refire(void)
+{
+    printf("\n[T11-1] 当天已确认服药后重启：不得二次响铃、不得升级告警\n");
+    stub_nvs_init();
+    stub_time_set(1772661600L);      /* 06:00 */
+    rec_reset();
+    stub_fx_reset();
+    elder_reminder_init(rec_cb, NULL);
+
+    elder_rmd_item_t m = mk_med(8, 0, "早上的药", 0);
+    check("新增 08:00 服药提醒", elder_reminder_add(&m) == ESP_OK, NULL);
+
+    /* 到点触发 */
+    stub_time_advance(2 * 3600);     /* 08:00 */
+    elder_reminder_tick_once();
+    check("08:00 正常触发为 PENDING",
+          g_last_st[0] == ELDER_RMD_PENDING,
+          det("状态=%s（08:00 没响 = 到点触发被破坏）", state_name(g_last_st[0])));
+
+    /* 老人长按确认：吃药 */
+    stub_time_advance(5 * 60);       /* 08:05 */
+    check("老人确认服药成功",
+          elder_reminder_confirm_ex(0, 2) == ESP_OK, NULL);
+    const elder_rmd_table_t *t = tbl();
+    check("确认后 done_today 有位且已落盘",
+          t && (t->done_today & 1u) != 0,
+          det("%s", dump_tbl(t)));
+    check("确认后当天响过的位也被记下",
+          t && (t->fired_today & 1u) != 0,
+          det("fired_today=0x%04x —— 这个位不落盘，重启后必然二次响铃",
+              t ? t->fired_today : 0xFFFF));
+
+    /* ---- 同一天 09:00 断电重启 ---- */
+    stub_time_advance(55 * 60);      /* 09:00 */
+    rec_reset();
+    stub_fx_reset();
+    elder_reminder_init(rec_cb, NULL);
+
+    uint16_t done_before = tbl()->done_today;
+    check("重启后服药记录仍在（先确认没丢表）",
+          (tbl()->done_today & 1u) != 0, det("%s", dump_tbl(tbl())));
+
+    /* 重启后的第一个 tick —— 二次响铃就发生在这一行 */
+    elder_reminder_tick_once();
+    t = tbl();
+
+    check("★重启后不得二次响铃（不得重新进入 PENDING）",
+          saw(0, ELDER_RMD_PENDING) == 0,
+          det("重启后又发生了 %d 次 PENDING —— 老人已吃过药却被要求再吃一次",
+              saw(0, ELDER_RMD_PENDING)));
+    check("★重启后不得升级成 ESCALATED（漏服 15 分钟的告警是假的）",
+          saw(0, ELDER_RMD_ESCALATED) == 0,
+          det("重启后发生了 %d 次 ESCALATED —— 子女端会收到假「漏服」告警",
+              saw(0, ELDER_RMD_ESCALATED)));
+    check("★elder_rgb_med_escalate() 不得被调用",
+          stub_rgb_escalate_count() == 0,
+          det("红灯升级被点亮 %d 次（老人已服药，红灯不该再亮）",
+              stub_rgb_escalate_count()));
+    check("★重启后 done_today 不得被清空（否则子女端看到假「漏服」）",
+          (t->done_today & 1u) != 0,
+          det("done_today 0x%04x -> 0x%04x —— 已服药记录被抹掉 = 假漏服告警",
+              done_before, t->done_today));
+    check("★重启后不得把提醒拉回待办",
+          (t->pending_today & 1u) == 0,
+          det("pending_today=0x%04x —— 已服药者被要求再吃一次",
+              t->pending_today));
+    check("重启后也不该重复点亮待确认红灯",
+          stub_rgb_pending_count() == 0,
+          det("med_pending 被点亮 %d 次", stub_rgb_pending_count()));
+
+    /* ---- 反向：跨到第二天必须重新响，否则就修成了「永不响」 ---- */
+    stub_time_set(1772661600L + 86400 + 2 * 3600);   /* 次日 08:00 */
+    rec_reset();
+    stub_fx_reset();
+    elder_reminder_tick_once();
+    check("反向：跨天之后 08:00 仍会正常重新响",
+          saw(0, ELDER_RMD_PENDING) == 1,
+          det("次日发生了 %d 次 PENDING（应为 1）—— 跨天后永远不响 = 提醒彻底失效",
+              saw(0, ELDER_RMD_PENDING)));
+}
+
+/* T11-2：07:00 重启（提醒 08:00 才到点）→ 不得提前响，到点后仍要正常响 */
+static void test_restart_before_due(void)
+{
+    printf("\n[T11-2] 未到点就重启：不得提前响，到点后仍会正常响\n");
+    stub_nvs_init();
+    stub_time_set(1772661600L);      /* 06:00 */
+    rec_reset();
+    elder_reminder_init(rec_cb, NULL);
+
+    elder_rmd_item_t m = mk_med(8, 0, "早上的药", 0);
+    elder_reminder_add(&m);
+
+    /* 先跑一次 tick 让引擎认下今天（与真实场景一致：设备一直在跑） */
+    stub_time_advance(3600);         /* 07:00 */
+    rec_reset();
+    stub_fx_reset();
+    elder_reminder_tick_once();
+    check("07:00 尚未到点，不应触发",
+          saw(0, ELDER_RMD_PENDING) == 0,
+          det("07:00 就触发了 —— 到点前响铃比不响更危险"));
+
+    /* 07:00 断电重启 */
+    rec_reset();
+    stub_fx_reset();
+    elder_reminder_init(rec_cb, NULL);
+    elder_reminder_tick_once();
+    check("★重启后不得提前响（提醒 08:00 才到点）",
+          saw(0, ELDER_RMD_PENDING) == 0 && stub_rgb_pending_count() == 0,
+          det("重启后 %d 次 PENDING、红灯 %d 次 —— 未到点就响 = 老人被无效打扰",
+              saw(0, ELDER_RMD_PENDING), stub_rgb_pending_count()));
+    check("未到点重启后不得把这条记成已完成",
+          (tbl()->done_today & 1u) == 0,
+          det("%s", dump_tbl(tbl())));
+
+    /* 到点后必须照常响 —— 修复不能变成「重启一次就再也不响」 */
+    stub_time_advance(3600);         /* 08:00 */
+    rec_reset();
+    stub_fx_reset();
+    elder_reminder_tick_once();
+    check("★08:00 到点后仍会正常触发（没被修成永不响）",
+          saw(0, ELDER_RMD_PENDING) == 1,
+          det("08:00 的 PENDING 次数 = %d（应为 1）—— 漏响 = 老人漏服药且无人知晓",
+              saw(0, ELDER_RMD_PENDING)));
+    check("到点触发后 done_today 仍为空（响不等于吃了）",
+          (tbl()->done_today & 1u) == 0, det("%s", dump_tbl(tbl())));
+
+    /* 15 分钟后仍要升级 —— 确认「响过」没有把升级路径也一起堵掉 */
+    stub_time_advance(16 * 60);
+    rec_reset();
+    elder_reminder_tick_once();
+    check("响过后 15 分钟仍会升级为 ESCALATED（漏服告警路径没被堵）",
+          saw(0, ELDER_RMD_ESCALATED) >= 1,
+          det("ESCALATED 次数 = %d —— 堵掉升级 = 漏服无人知晓",
+              saw(0, ELDER_RMD_ESCALATED)));
+}
+
+/* T11-3：跨天之后重启 → 新的一天要正常触发 */
+static void test_restart_across_day(void)
+{
+    printf("\n[T11-3] 跨过日界后重启：新的一天必须正常触发\n");
+    stub_nvs_init();
+    stub_time_set(1772661600L);      /* 06:00 */
+    rec_reset();
+    elder_reminder_init(rec_cb, NULL);
+
+    elder_rmd_item_t m = mk_med(8, 0, "早上的药", 0);
+    elder_reminder_add(&m);
+
+    /* 当天 08:00 响、08:05 确认吃药 */
+    stub_time_advance(2 * 3600);
+    elder_reminder_tick_once();
+    stub_time_advance(5 * 60);
+    elder_reminder_confirm_ex(0, 2);
+    check("首日确认服药成功", (tbl()->done_today & 1u) != 0,
+          det("%s", dump_tbl(tbl())));
+
+    /* 次日 07:00 重启（跨过日界）—— fired_today 若没随跨天重置清掉，
+     * 新一天这条提醒就会永远不再响（比二次响铃更难发现） */
+    stub_time_set(1772661600L + 86400 + 3600);   /* 次日 07:00 */
+    rec_reset();
+    stub_fx_reset();
+    elder_reminder_init(rec_cb, NULL);
+    elder_reminder_tick_once();
+    check("跨天重启后首日记录被正确重置",
+          (tbl()->done_today & 1u) == 0,
+          det("%s —— 跨天不重置 = 第二天提醒被当成已完成，从此再不响",
+              dump_tbl(tbl())));
+    check("跨天重启后 07:00 不得提前响",
+          saw(0, ELDER_RMD_PENDING) == 0, NULL);
+
+    /* 次日 08:00 必须响 */
+    stub_time_advance(3600);
+    rec_reset();
+    stub_fx_reset();
+    elder_reminder_tick_once();
+    check("★次日 08:00 正常触发（新的一天响铃未被 fired_today 误锁）",
+          saw(0, ELDER_RMD_PENDING) == 1,
+          det("次日 PENDING 次数 = %d（应为 1）—— 跨天后被 fired_today 锁死 = 提醒彻底静默",
+              saw(0, ELDER_RMD_PENDING)));
+
+    /* 当天重启一次，确认「跨天 + 重启」叠加也不锁死 */
+    rec_reset();
+    stub_fx_reset();
+    elder_reminder_init(rec_cb, NULL);   /* 次日 08:05 重启 */
+    elder_reminder_tick_once();
+    check("★跨天当天再重启也不得二次响铃",
+          saw(0, ELDER_RMD_PENDING) == 0 && (tbl()->done_today & 1u) == 0,
+          det("PENDING %d 次、done=0x%04x",
+              saw(0, ELDER_RMD_PENDING), tbl()->done_today));
+    check("跨天当天重启后仍处于待确认（红灯保持，15 分钟后会升级）",
+          (tbl()->pending_today & 1u) != 0,
+          det("pending_today=0x%04x —— 红灯熄灭 = 漏服无人知晓",
+              tbl()->pending_today));
+
+    /* ---- 最阴的一格：跨天重置跑完之后**再**重启 ----
+     * 跨天重置会把运行态的 fired_today[] 数组清成 false，但若落盘的位图
+     * 漏清（只改了数组、没改 table.fired_today），那么「重置 → 上电」这个
+     * 顺序下：RAM 数组是干净的，可落盘那份仍带着昨天的「响过」位。
+     * 下次 init() 从位图恢复出 fired=true + state=IDLE —— 这个组合
+     * 在语义上是「今天没响过但已经被标记成响过」，于是
+     * `!fired_today[i]` 永远为假，这条提醒**今天再也不会响**。
+     *
+     * 这个失效方向与「二次响铃」相反：老人当天彻底收不到这条服药提醒，
+     * 而且没有任何红灯、没有告警 —— 比二次响铃更难被发现。
+     * 所以必须专门走一遍「跨天重置 → 落盘 → 重启 → 到点」这个顺序。 */
+    stub_time_set(1772661600L + 2 * 86400 + 2 * 3600);   /* 第 3 天 08:00 */
+    rec_reset();
+    stub_fx_reset();
+    elder_reminder_tick_once();          /* 响一次，建立当天的 fired 位 */
+    elder_reminder_flush();              /* 确保位图真的落盘了 */
+    check("前置：第 3 天已响过并落盘",
+          (tbl()->fired_today & 1u) != 0,
+          det("fired_today=0x%04x", tbl()->fired_today));
+
+    /* 跨到第 4 天 07:00（**未到点**）→ 跨天重置在未到点时就会跑，
+     * 这正是「位图被清掉」的时机 */
+    stub_time_set(1772661600L + 3 * 86400 + 3600);       /* 第 4 天 07:00 */
+    rec_reset();
+    stub_fx_reset();
+    elder_reminder_tick_once();
+    check("前置：第 4 天跨天重置已执行",
+          (tbl()->fired_today & 1u) == 0,
+          det("fired_today=0x%04x —— 跨天若没清位图，本组就验不到那一格",
+              tbl()->fired_today));
+    elder_reminder_flush();
+
+    /* 就在这个状态下重启 —— 位图若没被清，落盘那份仍带着「响过」 */
+    rec_reset();
+    stub_fx_reset();
+    elder_reminder_init(rec_cb, NULL);   /* 第 4 天 07:00 重启 */
+    elder_reminder_tick_once();
+    check("跨天重启后 07:00 不得提前响",
+          saw(0, ELDER_RMD_PENDING) == 0, NULL);
+
+    stub_time_advance(3600);             /* 第 4 天 08:00 到点 */
+    rec_reset();
+    stub_fx_reset();
+    elder_reminder_tick_once();
+    check("★跨天重置后重启：当天到点必须仍能响（不得被昨天的 fired 位锁死）",
+          saw(0, ELDER_RMD_PENDING) == 1,
+          det("第 4 天 PENDING 次数 = %d（应为 1）—— 跨天漏清位图 = "
+              "提醒当天彻底静默，无红灯无告警", saw(0, ELDER_RMD_PENDING)));
+}
+
+/* T11-4：老设备升级 —— 旧格式 blob 一条提醒都不许丢 */
+static void test_legacy_blob_upgrade(void)
+{
+    printf("\n[T11-4] 老设备升级：旧格式 blob 的提醒与服药记录一条都不许丢\n");
+
+    /* ⚠️ 先把时钟钉住，再构造 blob：下面要用 stub_time_now() 算
+     * last_day_ordinal，而受控时钟是**跨用例保留**的（不像 NVS 那样
+     * 每个用例重置）。顺序反了就会拿到上一个用例留下的时刻，
+     * 算出的日序号对不上，升级后第一个 tick 会被误判成「新的一天」
+     * 而清掉全部当日记录 —— 那会让本组用例测的根本不是升级兼容。 */
+    stub_time_set(1772661600L + 3 * 3600);   /* 09:00：已过 08:00 */
+
+    /* ---- 构造一份「旧固件写下的」blob ----
+     * 直接手写 V1 布局而不是拿新结构去凑长度：这样才有「设备上存着的
+     * 确实是老格式」的意义。crc32 必须按 V1 的尺寸算 —— 这正是老固件
+     * 的做法，也是本条用例要验的核心（CRC 覆盖范围随 sizeof 变化）。 */
+    uint8_t raw[sizeof(elder_rmd_table_v1_t)];
+    memset(raw, 0, sizeof(raw));
+    elder_rmd_table_v1_t v1;
+    memset(&v1, 0, sizeof(v1));
+
+    v1.items[0] = mk_med(8, 0, "早上的药", 101);
+    v1.items[1] = mk_med(20, 0, "晚上的药", 102);
+    v1.count = 2;
+    /* 首日已经吃过早上的药，晚上那顿响过但还没确认 */
+    v1.done_today    = 0x0001;
+    v1.pending_today = 0x0002;
+    /* 与当前 tick 同一个本地日序号：让升级后第一个 tick 不误判跨天，
+     * 这样观察到的现象才是「升级本身有没有搞坏数据」而非日界效应。 */
+    {
+        time_t now = stub_time_now();
+        struct tm tm_now;
+        localtime_r(&now, &tm_now);
+        v1.last_day_ordinal = tm_now.tm_year * 366 + tm_now.tm_yday;
+    }
+    /* 老固件的 crc32 就是按 sizeof(V1) 对全结构算的 */
+    {
+        uint32_t c = 0xFFFFFFFF;
+        const uint8_t *p = (const uint8_t *)&v1;
+        for (size_t i = 0; i < sizeof(v1); i++) {
+            c ^= p[i];
+            for (int k = 0; k < 8; k++)
+                c = (c >> 1) ^ (0xEDB88320u & (uint32_t)(-(int32_t)(c & 1)));
+        }
+        v1.crc32 = ~c;
+    }
+    memcpy(raw, &v1, sizeof(v1));
+
+    /* ---- 前置条件：确认我们构造的确实是「更小的旧格式」 ---- */
+    check("前置：旧格式尺寸确实小于当前格式（迁移路径存在）",
+          sizeof(elder_rmd_table_v1_t) < sizeof(elder_rmd_table_t),
+          det("V1=%zu 字节, V2=%zu 字节", sizeof(elder_rmd_table_v1_t),
+              sizeof(elder_rmd_table_t)));
+
+    stub_nvs_init();
+    stub_nvs_write_raw(0, raw, sizeof(v1));
+    check("前置：NVS 里存的是旧尺寸 blob",
+          stub_nvs_blob_len(0) == sizeof(v1),
+          det("已写入 %zu 字节", stub_nvs_blob_len(0)));
+
+    rec_reset();
+    stub_fx_reset();
+    elder_reminder_init(rec_cb, NULL);   /* ← 模拟升级后第一次上电 */
+
+    const elder_rmd_table_t *t = tbl();
+    check("★升级后两条提醒一条都不丢",
+          t && t->count == 2 && find_idx(t, 8, 0, "早上的药") >= 0 &&
+                             find_idx(t, 20, 0, "晚上的药") >= 0,
+          det("count=%u —— 老用户升级后服药提醒消失 = 医疗事故级数据丢失；%s",
+              t ? t->count : 0, dump_tbl(t)));
+    check("★升级后 server_id 也保住（否则会与后端下发的那条重复）",
+          t && t->items[0].server_id == 101 && t->items[1].server_id == 102,
+          det("server_id = %u / %u", t ? t->items[0].server_id : 0,
+              t && t->count > 1 ? t->items[1].server_id : 0));
+    check("★升级后已完成的服药记录不丢（done_today 原样保住）",
+          t && t->done_today == 0x0001,
+          det("done_today = 0x%04x（应为 0x0001）—— 老人已吃过药，"
+              "记录丢了就是一次假「漏服」告警", t ? t->done_today : 0xFFFF));
+    check("★升级后未确认的待办记录不丢（pending_today 原样保住）",
+          t && t->pending_today == 0x0002,
+          det("pending_today = 0x%04x（应为 0x0002）—— 红灯熄灭 = 漏服无人知晓",
+              t ? t->pending_today : 0xFFFF));
+    check("★升级后 last_day_ordinal 不丢（否则当天被当成新的一天全清）",
+          t && t->last_day_ordinal == v1.last_day_ordinal,
+          det("last_day_ordinal = %d（应为 %d）", t ? t->last_day_ordinal : -1,
+              v1.last_day_ordinal));
+    check("★升级后 CRC 校验没有被结构变化误判（数据不是被判成坏表丢掉的）",
+          t && t->count == 2,
+          det("count=%u —— 若为 0 说明旧 CRC 按 V2 尺寸重算不匹配，"
+              "整张表被当成坏数据丢弃", t ? t->count : 0));
+    check("升级后已自动改写成新格式（下次重启走快路径）",
+          stub_nvs_blob_len(0) == sizeof(elder_rmd_table_t),
+          det("落盘 %zu 字节（应为 %zu）—— 没改写的话每次重启都要重走迁移",
+              stub_nvs_blob_len(0), sizeof(elder_rmd_table_t)));
+    check("升级后 fired_today 由当日位图反推出来（两条都响过）",
+          t && t->fired_today == 0x0003,
+          det("fired_today = 0x%04x（应为 0x0003 = done|pending）",
+              t ? t->fired_today : 0xFFFF));
+
+    /* ---- 升级后的第一个 tick：已完成的绝不能被拉回待办 ---- */
+    elder_reminder_tick_once();
+    t = tbl();
+    check("★升级后首个 tick：已服的那条不得被拉回待办",
+          (t->pending_today & 1u) == 0,
+          det("pending_today = 0x%04x —— 老人已吃过药却被要求再吃一次",
+              t->pending_today));
+    check("★升级后首个 tick：已服的不得升级为 ESCALATED",
+          saw(0, ELDER_RMD_ESCALATED) == 0 && stub_rgb_escalate_count() == 0,
+          det("ESCALATED %d 次、红灯升级 %d 次", saw(0, ELDER_RMD_ESCALATED),
+              stub_rgb_escalate_count()));
+    check("升级后首个 tick：20:00 那条维持待确认（响过未确认 = 红灯保持）",
+          (t->pending_today & 2u) != 0 || (t->done_today & 2u) == 0,
+          det("pending_today=0x%04x done_today=0x%04x", t->pending_today,
+              t->done_today));
+
+    /* ---- 反向：迁移之后，新的一天提醒仍要正常响 ---- */
+    stub_time_set(1772661600L + 86400 + 3600);   /* 次日 07:00 */
+    rec_reset();
+    stub_fx_reset();
+    elder_reminder_init(rec_cb, NULL);            /* 再上电一次（此时已是 V2） */
+    elder_reminder_tick_once();
+    check("反向：迁移后跨天 + 重启，次日 07:00 不得提前响",
+          saw(0, ELDER_RMD_PENDING) == 0,
+          det("次日 07:00 触发 %d 次", saw(0, ELDER_RMD_PENDING)));
+    stub_time_advance(3600);                      /* 次日 08:00 */
+    rec_reset();
+    stub_fx_reset();
+    elder_reminder_tick_once();
+    check("★反向：迁移后新的一天 08:00 照常触发（迁移没把提醒锁死）",
+          saw(0, ELDER_RMD_PENDING) == 1,
+          det("次日 08:00 的 PENDING 次数 = %d（应为 1）", saw(0, ELDER_RMD_PENDING)));
+    check("反向：迁移后跨天重置生效（新的一天 done 应清零）",
+          (tbl()->done_today & 1u) == 0,
+          det("%s", dump_tbl(tbl())));
+
+    /* ---- 坏 CRC 的旧表仍然必须被拒（迁移不得成为绕过校验的后门） ---- */
+    stub_nvs_init();
+    memcpy(raw, &v1, sizeof(v1));
+    raw[sizeof(v1) - 1] ^= 0xFF;      /* 破坏 crc32 */
+    stub_nvs_write_raw(0, raw, sizeof(v1));
+    rec_reset();
+    stub_fx_reset();
+    elder_reminder_init(rec_cb, NULL);
+    check("CRC 损坏的旧表仍被拒（迁移路径没有变成校验后门）",
+          tbl()->count == 0,
+          det("count=%u —— 坏数据被当成了有效提醒表 = 老人照着乱码时间吃药",
+              tbl()->count));
+    check("坏旧表被丢弃后不得凭空触发任何提醒",
+          saw(0, ELDER_RMD_PENDING) == 0 && stub_rgb_escalate_count() == 0,
+          det("PENDING %d 次、红灯升级 %d 次", saw(0, ELDER_RMD_PENDING),
+              stub_rgb_escalate_count()));
+}
+
+/* T11-5：replace_all 之后 fired_today 位图必须跟着新下标重算 */
+static void test_replace_all_recomputes_fired(void)
+{
+    printf("\n[T11-5] 后端同步（replace_all）后：响过位图必须跟着新下标重算\n");
+    stub_nvs_init();
+    stub_time_set(1772661600L);      /* 06:00 */
+    rec_reset();
+    elder_reminder_init(rec_cb, NULL);
+
+    /* 两条后端提醒：早上的药（idx 0）、晚上的药（idx 1） */
+    elder_rmd_item_t morning = mk_med(8, 0, "早上的药", 101);
+    elder_rmd_item_t evening = mk_med(20, 0, "晚上的药", 102);
+    elder_reminder_replace_all((const elder_rmd_item_t[]){morning, evening}, 2);
+
+    /* 08:00 触发 + 确认服药 */
+    stub_time_advance(2 * 3600);
+    rec_reset();
+    elder_reminder_tick_once();
+    elder_reminder_confirm_ex(0, 2);
+    check("前置：08:00 触发并确认服药",
+          (tbl()->done_today & 1u) != 0 && (tbl()->fired_today & 1u) != 0,
+          det("%s fired=0x%04x", dump_tbl(tbl()), tbl()->fired_today));
+    check("前置：20:00 那条今天还没响（fired_today 只有 bit0）",
+          (tbl()->fired_today & 2u) == 0,
+          det("fired_today=0x%04x", tbl()->fired_today));
+
+    /* ---- 关键：后端把两条**顺序调换**后同步下来 ----
+     * replace_all 按 server_id 匹配旧条目、把运行态搬到新下标上，
+     * 于是「早上的药」从 idx0 挪到 idx1。若位图不跟着重算，
+     * 落盘那份 fired_today 仍把 bit0 标成响过 —— 而 bit0 现在是
+     * 「晚上的药」。后果有二，方向都致命：
+     *   a) 早上的药（新 idx1）的「响过」位丢失 -> 重启后二次响铃；
+     *   b) 晚上的药（新 idx0）被误标成响过 -> 今天再也不会响。 */
+    elder_rmd_item_t swapped[2] = { evening, morning };
+    check("后端下发调换顺序的两条提醒",
+          elder_reminder_replace_all(swapped, 2) == ESP_OK, NULL);
+    const elder_rmd_table_t *t = tbl();
+    check("★同步后顺序确实调换了（新 idx0 应是晚上的药）",
+          t && t->count == 2 && t->items[0].server_id == 102 &&
+                               t->items[1].server_id == 101,
+          det("新 idx0 server_id=%u、新 idx1 server_id=%u",
+              t && t->count > 0 ? t->items[0].server_id : 0,
+              t && t->count > 1 ? t->items[1].server_id : 0));
+    check("★同步后 fired_today 位图必须跟着新下标重算（bit1 响过、bit0 没响）",
+          (t->fired_today & 2u) != 0 && (t->fired_today & 1u) == 0,
+          det("fired_today=0x%04x（应为 0x0002）—— bit 没跟着挪："
+              "早上的药会二次响铃，而晚上的药今天再也不会响",
+              t ? t->fired_today : 0xFFFF));
+    check("★同步后 done_today 同样跟着重算",
+          (t->done_today & 2u) != 0 && (t->done_today & 1u) == 0,
+          det("done_today=0x%04x（应为 0x0002）", t ? t->done_today : 0xFFFF));
+
+    /* ---- 落盘后重启：两个方向的后果都要钉住 ---- */
+    stub_time_advance(3600);         /* 09:00：已过 08:00 */
+    rec_reset();
+    stub_fx_reset();
+    elder_reminder_init(rec_cb, NULL);
+    elder_reminder_tick_once();
+    t = tbl();
+    check("★同步+重启后：早上的药（idx1）不得二次响铃",
+          saw(1, ELDER_RMD_PENDING) == 0,
+          det("idx1 的 PENDING 次数 = %d —— 已服用的药被要求再吃一次",
+              saw(1, ELDER_RMD_PENDING)));
+    check("★同步+重启后：已服记录仍在",
+          (t->done_today & 2u) != 0, det("%s", dump_tbl(t)));
+    check("★同步+重启后：不得升级告警",
+          stub_rgb_escalate_count() == 0,
+          det("红灯升级 %d 次", stub_rgb_escalate_count()));
+
+    /* 晚上的药 20:00 必须照常响（没被误标成「响过」而静默漏掉） */
+    stub_time_set(1772661600L + 14 * 3600);   /* 20:00 */
+    rec_reset();
+    stub_fx_reset();
+    elder_reminder_tick_once();
+    check("★同步+重启后：晚上的药 20:00 仍会正常响",
+          saw(0, ELDER_RMD_PENDING) == 1,
+          det("idx0 的 PENDING 次数 = %d（应为 1）—— 晚上那顿药被静默漏掉",
+              saw(0, ELDER_RMD_PENDING)));
+}
+
+/* T11-6：整点前一直关机的设备，开机后必须补响（别修成「永不响」） */
+static void test_restart_catchup_still_rings(void)
+{
+    printf("\n[T11-6] 到点时设备是关机的：开机后必须补响（漏服告警不能丢）\n");
+    /* 这条守的是修复的**另一半方向**。
+     *
+     * 触发条件是 `!fired_today && state==IDLE && now_min>=due`，其中
+     * `now_min >= due` 这一条**必须保留**：若把它也一并收紧成
+     * 「只在 now_min == due 的那一分钟响」，那么「到点时设备恰好断电/
+     * 看门狗复位/OTA 重启」的老人将在当天**永远收不到**这条服药提醒，
+     * 子女端也永远收不到漏服告警 —— 从「重复服药」变成「彻底漏服」，
+     * 两者都是医疗事故级，只是方向相反。
+     *
+     * 场景：老人设备在 07:00 到 09:00 之间断电（老人没理由知道/去充电），
+     * 09:00 插上电开机。早上的药还没吃，这条提醒今天响都没响过。 */
+    stub_nvs_init();
+    stub_time_set(1772661600L);      /* 06:00 */
+    rec_reset();
+    elder_reminder_init(rec_cb, NULL);
+
+    elder_rmd_item_t m = mk_med(8, 0, "早上的药", 0);
+    elder_reminder_add(&m);
+    check("前置：08:00 提醒已下发", tbl()->count == 1, det("%s", dump_tbl(tbl())));
+
+    /* 设备一直关到 09:00 才上电 —— 全程没有任何 tick */
+    stub_time_set(1772661600L + 3 * 3600);
+    rec_reset();
+    stub_fx_reset();
+    elder_reminder_init(rec_cb, NULL);       /* 09:00 开机 */
+    elder_reminder_tick_once();              /* 上电后第一个 tick */
+
+    check("★到点时关机的设备，开机后必须补响这条服药提醒",
+          saw(0, ELDER_RMD_PENDING) == 1,
+          det("开机后 PENDING 次数 = %d（应为 1）—— 漏服药且三方都以为没事，"
+              "这是比重复服药更隐蔽的事故", saw(0, ELDER_RMD_PENDING)));
+    check("补响后红灯点亮（med_pending），家人看得见",
+          stub_rgb_pending_count() >= 1,
+          det("med_pending %d 次 —— 补响了却没灯 = 老人不知道该吃药",
+              stub_rgb_pending_count()));
+    check("补响后被记为待办（子女端能看到这条未完成）",
+          (tbl()->pending_today & 1u) != 0,
+          det("%s —— 红灯不亮 = 漏服无人知晓", dump_tbl(tbl())));
+    check("补响不得被误记成已服用",
+          (tbl()->done_today & 1u) == 0,
+          det("%s（响不等于吃）", dump_tbl(tbl())));
+
+    /* 补响之后 15 分钟仍要升级：开机 09:00 距 08:00 已 60 分钟 */
+    check("补响后 15 分钟未确认必须升级为 ESCALATED（补响不等于豁免升级）",
+          saw(0, ELDER_RMD_ESCALATED) >= 1,
+          det("ESCALATED %d 次 —— 补响后免于升级 = 漏服药静默通过",
+              saw(0, ELDER_RMD_ESCALATED)));
+    check("elder_rgb_med_escalate() 被调用（子女端会收到 MISSED 告警）",
+          stub_rgb_escalate_count() >= 1,
+          det("红灯升级 %d 次", stub_rgb_escalate_count()));
+
+    /* 补响只发生一次：再 tick 若干次不得重复响 */
+    int pend_after = saw(0, ELDER_RMD_PENDING);
+    stub_time_advance(60);
+    rec_reset();
+    elder_reminder_tick_once();
+    stub_time_advance(60);
+    elder_reminder_tick_once();
+    check("补响之后不得反复重新触发（同一个 tick 只响一次）",
+          saw(0, ELDER_RMD_PENDING) == 0,
+          det("后续 tick 又触发了 %d 次 —— 反复响铃会持续骚扰老人",
+              saw(0, ELDER_RMD_PENDING)));
+    (void)pend_after;
+}
+
 int main(void)
 {
     /* 时区必须与固件一致（elder_bridge.cc 同样固定 CST-8）：
@@ -906,6 +1479,12 @@ int main(void)
     test_confirm_window_timeout();
     test_nvs_crc_rejects_corrupt();
     test_first_tick_day_guard();
+    test_restart_no_refire();
+    test_restart_before_due();
+    test_restart_across_day();
+    test_legacy_blob_upgrade();
+    test_replace_all_recomputes_fired();
+    test_restart_catchup_still_rings();
 
     printf("\n=== %d 通过 / %d 失败 ===\n", g_pass, g_fail);
     return g_fail ? 1 : 0;

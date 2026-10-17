@@ -87,24 +87,106 @@ static bool item_due_today(const elder_rmd_item_t *it, const struct tm *tm)
 
 /* ---------------- 持久化 ---------------- */
 
+/* 从 blob 里按 V1（老格式）布局解读。之所以必须用**独立的 V1 类型**而不是
+ * 「按新结构取前几个字段」，是因为 crc32 的覆盖范围随 sizeof 变化：
+ * 老固件是按 sizeof(V1) 算出来的，拿 sizeof(V2) 去重算必然不匹配。
+ * 所以校验与迁移都只在 V1 的字节数上进行。 */
+static bool table_v1_crc_ok(const uint8_t *raw, size_t len)
+{
+    if (len != sizeof(elder_rmd_table_v1_t)) return false;
+    /* 不能直接在 raw 上改 crc32 字段再算（raw 指向 g.table 的缓冲区时可写，
+     * 但依赖可写性太脆弱）；拷一份出来算，语义更清楚。 */
+    elder_rmd_table_v1_t v1;
+    memcpy(&v1, raw, sizeof(v1));
+    uint32_t saved = v1.crc32;
+    v1.crc32 = 0;
+    bool ok = (crc32_simple(&v1, sizeof(v1)) == saved);
+    v1.crc32 = saved;
+    return ok;
+}
+
+/* 把按 V1 解读出来的内容装进运行态，并就地升级成 V2。
+ * 老表的 items / count / done_today / pending_today / last_day_ordinal
+ * **逐字段原样保留** —— 这些正是老人已有的提醒与已确认记录，
+ * 迁移过程中任何一处丢失都等于提醒或服药记录消失。
+ * fired_today 从 done_today|pending_today 反推：这俩位图非零即证明
+ * 「今天响过」，用它们把重启后二次响铃堵住，同时不制造「响都没响
+ * 却说响过」的假抑制。 */
+static void migrate_v1_to_v2(const elder_rmd_table_v1_t *v1)
+{
+    memcpy(g.table.items, v1->items, sizeof(g.table.items));
+    g.table.count            = v1->count;
+    g.table.done_today       = v1->done_today;
+    g.table.pending_today    = v1->pending_today;
+    g.table.last_day_ordinal = v1->last_day_ordinal;
+    g.table.crc32            = v1->crc32;
+
+    /* 「今天响过」在 V1 里没有独立记录，只能从两个当日位图反推。
+     * done_today 的位=老人已确认吃过药；pending_today 的位=响过还没确认。
+     * 两者合起来正好覆盖「今天响过」的全体，且不会误判没到点的提醒。 */
+    g.table.fired_today = (uint16_t)(v1->done_today | v1->pending_today);
+    g.table.fmt_ver     = ELDER_RMD_FMT_V2;
+
+    ESP_LOGW(TAG, "迁移旧格式提醒表(V1) -> V2：%u 条，已完成 0x%04x / 待办 0x%04x / "
+                  "响过 0x%04x 全部保留", g.table.count,
+             g.table.done_today, g.table.pending_today, g.table.fired_today);
+}
+
 static esp_err_t load(void)
 {
     nvs_handle_t h;
     if (nvs_open(NVS_NS, NVS_READONLY, &h) != ESP_OK) return ESP_ERR_NOT_FOUND;
 
+    /* 按 V2 尺寸读。V1 是 V2 的逐字节前缀（有编译期断言），所以
+     * 老 blob 一定读得下，且读进来的前 sizeof(V1) 字节就是合法的 V1。 */
     size_t len = sizeof(g.table);
     esp_err_t err = nvs_get_blob(h, NVS_KEY, &g.table, &len);
     nvs_close(h);
-    if (err != ESP_OK || len != sizeof(g.table)) return ESP_ERR_NOT_FOUND;
+    if (err != ESP_OK) return ESP_ERR_NOT_FOUND;
 
-    uint32_t saved = g.table.crc32;
-    g.table.crc32 = 0;
-    if (crc32_simple(&g.table, sizeof(g.table)) != saved) {
-        ESP_LOGE(TAG, "NVS checksum mismatch, reset table");
+    /* ---- 版本判定 ----
+     * 先按长度分流，再校验各自那一段字节的 CRC。
+     * 为什么不能只看 fmt_ver：新 blob 写进来之前，V1/V2 的前 sizeof(V1)
+     * 字节完全相同，fmt_ver 在结构体末尾、读的时候根本还不知道它的值
+     * （nvs_get_blob 只告诉我们读到了多少字节）。长度是唯一可靠的信号。 */
+    if (len == sizeof(elder_rmd_table_t)) {
+        if (g.table.fmt_ver != ELDER_RMD_FMT_V2) {
+            ESP_LOGE(TAG, "未知提醒表版本 %u，按无数据处理", g.table.fmt_ver);
+            memset(&g.table, 0, sizeof(g.table));
+            return ESP_ERR_NOT_FOUND;
+        }
+        uint32_t saved = g.table.crc32;
+        g.table.crc32 = 0;
+        if (crc32_simple(&g.table, sizeof(g.table)) != saved) {
+            ESP_LOGE(TAG, "NVS checksum mismatch, reset table");
+            memset(&g.table, 0, sizeof(g.table));
+            return ESP_ERR_INVALID_CRC;
+        }
+        g.table.crc32 = saved;
+    } else if (len == sizeof(elder_rmd_table_v1_t)) {
+        /* ---- 老设备升级路径 ----
+         * 这里**绝不能**返回 NOT_FOUND：那会让 init() memset 掉整张表，
+         * 老用户升级固件后老人的服药提醒全部消失（医疗事故级）。
+         * CRC 必须按 V1 的尺寸重算 —— 老固件就是按 sizeof(V1) 算的。 */
+        if (!table_v1_crc_ok((const uint8_t *)&g.table, len)) {
+            ESP_LOGE(TAG, "旧格式提醒表 CRC 校验失败，reset table");
+            memset(&g.table, 0, sizeof(g.table));
+            return ESP_ERR_INVALID_CRC;
+        }
+        elder_rmd_table_v1_t v1;
+        memcpy(&v1, &g.table, sizeof(v1));
         memset(&g.table, 0, sizeof(g.table));
-        return ESP_ERR_INVALID_CRC;
+        migrate_v1_to_v2(&v1);
+        /* 迁移必须立刻落盘，否则下次重启又读到 V1 来一遍。 */
+        g.dirty = true;
+        elder_reminder_flush();
+    } else {
+        ESP_LOGE(TAG, "提醒表长度异常（%u 字节，既非 V1 也非 V2），按无数据处理",
+                 (unsigned)len);
+        memset(&g.table, 0, sizeof(g.table));
+        return ESP_ERR_NOT_FOUND;
     }
-    g.table.crc32 = saved;
+
     ESP_LOGI(TAG, "loaded %u reminder(s)", g.table.count);
     return ESP_OK;
 }
@@ -181,6 +263,11 @@ static void tick(void)
         ESP_LOGI(TAG, "new day: reset daily state");
         g.table.done_today = 0;
         g.table.pending_today = 0;
+        /* 「今天响过」也是**当日**事实，跨天必须一起清。
+         * 漏清的后果：新一天的第一次 tick 里，每条已经响过的提醒都会
+         * 因为 fired_today 那一位还留着而**当天再也不响** —— 老人从此
+         * 收不到当天任何一条服药提醒。方向与「二次响铃」相反，但同样致命。 */
+        g.table.fired_today = 0;
         for (int i = 0; i < ELDER_REMINDER_MAX; i++) {
             g.state[i] = ELDER_RMD_IDLE;
             g.fired_today[i] = false;
@@ -199,9 +286,18 @@ static void tick(void)
 
         int due = it->hour * 60 + it->minute;
 
-        /* 触发 */
+        /* 触发。三道闸门（缺一道就会在「当天重启」后二次响铃）：
+         *   1. !fired_today[i] —— 今天还没响过。这条位图现在**落盘**了，
+         *      所以「响过」这个事实在重启后依然成立。
+         *   2. state[i]==IDLE —— 没有正在进行/已完成的流程。
+         *   3. now_min >= due —— 到点了。
+         * 只有这三条同时成立才触发。若只保留第 3 条（本条修复之前的实际状态，
+         * 因为 fired_today 从不落盘），则**当天任意时刻重启、只要已过服药
+         * 时刻就会补响一遍**：连「本来今天还没到点响过」的提醒也会在开机
+         * 瞬间响一次，随后被升级分支立刻推成 ESCALATED。 */
         if (!g.fired_today[i] && g.state[i] == ELDER_RMD_IDLE && now_min >= due) {
             g.fired_today[i] = true;
+            g.table.fired_today |= (uint16_t)(1u << i);
             /* 记录本次到期时刻：后端回执靠 (reminder_id, due_at) 定位实例 */
             struct tm due_tm = tm_now;
             due_tm.tm_hour = it->hour;
@@ -247,6 +343,56 @@ static int64_t now_us(void) { return esp_timer_get_time(); }
 
 /* ---------------- 对外接口 ---------------- */
 
+/* 从落盘的「今日位图」把运行态恢复出来。
+ *
+ * 为什么必须恢复：state[] 与 fired_today[] 只活在 RAM 里，重启后靠 C 静态
+ * 零初始化变成「全 IDLE + 全没响过」。而 tick() 的触发条件是
+ *   `!fired_today[i] && state[i]==IDLE && now_min >= due`
+ * 于是当天任意时刻重启，只要已过服药时刻，这条提醒就会二次响铃，
+ * 并在同一个 tick 里被 `(now_min-due)>=15` 直接推成 ESCALATED：
+ *   done_today 里那一位在 set_state(PENDING) 时被 `&= ~bit` 清掉，
+ *   子女端看到假「漏服」并收到 MISSED 告警，老人已吃过药却被要求再吃一次。
+ *
+ * 恢复规则（保守：只从**确实落过盘**的事实推断，不凭空造状态）：
+ *   done_today  有位 -> DONE     （已确认服药，今天不该再响）
+ *   pending_today 有位 -> PENDING（响过但未确认，保持红灯等老人）
+ *   fired_today 有位 -> 至少已经响过，绝不二次触发
+ * 其余保持 IDLE。
+ *
+ * 注意这里**不调用 set_state()**：那会重放副作用（打灯、回调 sync 上报回执），
+ * 把「重启」本身变成一次「又一次触发了所有提醒」，正是本函数要消灭的故障。
+ * 直接写 g.state[]，并顺手把位图对齐（fired_today 必须覆盖 done/pending：
+ * 任何 done/pending 的条目按定义都响过）。 */
+static void restore_daily_state(void)
+{
+    uint16_t before = g.table.fired_today;
+    for (int i = 0; i < ELDER_REMINDER_MAX; i++) {
+        bool done    = (g.table.done_today    & (1u << i)) != 0;
+        bool pending = (g.table.pending_today & (1u << i)) != 0;
+        bool fired   = (g.table.fired_today   & (1u << i)) != 0;
+
+        /* 反向也补上：done/pending 的条目必然响过，即便 fired_today 那一位
+         * 丢了（V1 迁移、或历史数据不一致），也不能让它们二次响铃。 */
+        if (done || pending) fired = true;
+        if (fired) g.table.fired_today |= (uint16_t)(1u << i);
+
+        g.fired_today[i] = fired;
+        g.confirm_deadline_us[i] = 0;   /* 30s 确认窗跨重启无意义 */
+
+        if (done) {
+            g.state[i] = ELDER_RMD_DONE;
+        } else if (pending) {
+            g.state[i] = ELDER_RMD_PENDING;
+        } else {
+            g.state[i] = ELDER_RMD_IDLE;
+        }
+    }
+    /* 补齐过的位（done/pending 反推出 fired）必须落盘，否则下一次重启
+     * 又要靠同样的推断走一遍；更重要的是别让它在 V1 迁移那种
+     * fired_today 缺失的场景里反复靠猜。 */
+    if (g.table.fired_today != before) g.dirty = true;
+}
+
 esp_err_t elder_reminder_init(elder_rmd_cb_t cb, void *ctx)
 {
     memset(&g, 0, sizeof(g));
@@ -258,7 +404,13 @@ esp_err_t elder_reminder_init(elder_rmd_cb_t cb, void *ctx)
         memset(&g.table, 0, sizeof(g.table));
         ESP_LOGW(TAG, "no saved table, starting empty");
     }
-    for (int i = 0; i < ELDER_REMINDER_MAX; i++) g.state[i] = ELDER_RMD_IDLE;
+    /* 盖上版本号。任何**本固件写出**的表都必须是 V2：新建表与迁移表
+     * 走的是同一条路，load() 里靠 fmt_ver 判定读取布局，所以漏盖的后果
+     * 是「下一次重启把这张表当成未知版本丢弃」—— 即刚加的提醒白加。
+     * 放在 load() 之后统一盖，覆盖「无数据新建」与「迁移成功」两种情况。 */
+    g.table.fmt_ver = ELDER_RMD_FMT_V2;
+    /* 恢复当天运行态（旧表无数据时这里是全 IDLE，行为与修复前一致） */
+    restore_daily_state();
 
     xTaskCreatePinnedToCore(reminder_task, "elder_rmd", 3072, NULL, 5, &g.task, 1);
     ESP_LOGI(TAG, "reminder engine ready");
@@ -408,6 +560,11 @@ esp_err_t elder_reminder_replace_all(const elder_rmd_item_t *items, uint8_t coun
     g.table.count = n;
     g.table.done_today = 0;
     g.table.pending_today = 0;
+    /* fired_today 位图必须跟着重算，否则「今天响过」这个事实会与
+     * items[] 的新下标脱节：同步一次之后，旧下标 i 的那一位还在，
+     * 新下标 j 的那一位空着 —— 结果要么某条响过的提醒当天再也不响，
+     * 要么某条没响过的被误判成响过而静默漏掉。 */
+    g.table.fired_today = 0;
     for (uint8_t i = 0; i < n; i++) {
         if (g.state[i] == ELDER_RMD_DONE) {
             g.table.done_today |= (1u << i);
@@ -415,6 +572,7 @@ esp_err_t elder_reminder_replace_all(const elder_rmd_item_t *items, uint8_t coun
                    g.state[i] == ELDER_RMD_CONFIRM_WIN) {
             g.table.pending_today |= (1u << i);
         }
+        if (g.fired_today[i]) g.table.fired_today |= (1u << i);
     }
     /* ---- 6. 自检：本地自建条目一条都不许丢 ----
      * 这是本函数最容易写错、后果最重的一步。老人断网时亲手建的服药提醒

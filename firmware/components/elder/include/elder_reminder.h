@@ -3,6 +3,7 @@
 
 #include <stdint.h>
 #include <stdbool.h>
+#include <stddef.h>
 #include <time.h>
 #include "esp_err.h"
 
@@ -52,6 +53,21 @@ typedef struct {
     int64_t  fired_due_at;               /* 本次触发的到期时刻（unix 秒），回执用它定位实例 */
 } elder_rmd_item_t;
 
+/* NVS blob 的结构版本号。
+ *
+ * 表结构一旦变化，设备上可能还存着旧固件写下的 blob，尺寸与 CRC 覆盖范围
+ * 都不再相同。版本号 + 尺寸共同决定用哪套布局解读它。
+ *   V1：没有 fired_today / fmt_ver（历史布局，见下方 elder_rmd_table_v1_t，
+ *       升级时按老尺寸读出并迁移）
+ *   V2：新增 fired_today 位图 + 本版本号
+ *
+ * ⚠️ 加字段必须**只追加在结构体末尾**。V1 之所以能零成本迁移，
+ *    正是因为 V1 是 V2 的逐字节前缀（下方有编译期断言钉死它）——
+ *    一旦有人把新字段插到中间，老 blob 的尺寸和 CRC 就再也对不上，
+ *    load() 会判为「无数据」并清空整张表，老用户升级后服药提醒全部消失。 */
+#define ELDER_RMD_FMT_V1  1u
+#define ELDER_RMD_FMT_V2  2u
+
 typedef struct {
     elder_rmd_item_t items[ELDER_REMINDER_MAX];
     uint8_t          count;
@@ -59,8 +75,65 @@ typedef struct {
     uint16_t         done_today;
     uint16_t         pending_today;
     int32_t          last_day_ordinal;   /* 跨天检测用 */
-    uint32_t         crc32;              /* NVS 完整性校验 */
+    uint32_t         crc32;              /* NVS 完整性校验（覆盖整个结构体） */
+
+    /* ---- V2 新增字段（见上方「只追加在末尾」的约束）---- */
+
+    /* 「今天已经响过」位图：bit i = 1 表示 items[i] 今日已经响过铃。
+     *
+     * 为什么必须落盘：运行态的 fired_today[] 原本只活在 RAM 里，重启后靠
+     * C 静态零初始化变成全 false；而 tick() 的触发条件是
+     * `!fired_today[i] && state[i]==IDLE && now_min>=due`，
+     * 于是「当天任意时刻重启 + 已过服药时刻」就会让提醒二次响铃，
+     * 并因 `(now_min-due)>=15` 在同一 tick 内直接升级成 ESCALATED ——
+     * 子女端收到假「漏服」告警，老人已吃过药却被要求再吃一次。 */
+    uint16_t         fired_today;
+
+    /* 结构版本号，见 ELDER_RMD_FMT_* */
+    uint8_t          fmt_ver;
 } elder_rmd_table_t;
+
+/**
+ * @brief V1（历史）布局 —— **只为升级迁移而存在**，不是活跃数据结构。
+ *
+ * 老设备 NVS 里存的是这个布局的 blob：尺寸更小，且 crc32 是按
+ * `sizeof(elder_rmd_table_v1_t)` 算的。把它原样保留在头文件里，
+ * 是为了让「读旧 blob」这件事有一份**与当年布局逐字节一致**的定义可依，
+ * 而不是靠猜「大概是前 N 个字节」。
+ *
+ * ⚠️ 这个结构一旦与真实历史布局不符，老用户升级固件时就会读出垃圾数据
+ *    （服药时刻变成乱码 = 老人照着乱码吃药）。修改本文件前请先确认
+ *    git 历史里的定义确实与此处一致。
+ */
+typedef struct {
+    elder_rmd_item_t items[ELDER_REMINDER_MAX];
+    uint8_t          count;
+    uint16_t         done_today;
+    uint16_t         pending_today;
+    int32_t          last_day_ordinal;
+    uint32_t         crc32;
+} elder_rmd_table_v1_t;
+
+/* 编译期钉死：V1 必须是 V2 的**逐字节前缀**。
+ *
+ * 这条断言是「加字段安全」的全部依据：
+ *   - 尺寸：老 blob 读进 V2 的缓冲区时不会越界，且前 sizeof(V1) 字节
+ *     与按 V1 解读的结果完全一致（字段偏移没动）；
+ *   - CRC：老 crc32 按 sizeof(V1) 算出，按同一段字节重算必然吻合。
+ * 任何一次「把新字段插到 count 之前」都会让它编译失败 ——
+ * 那正是会让老设备升级后整张提醒表被清空（医疗事故级）的改法。
+ */
+typedef char elder_rmd_v1_prefix_assert[
+    (sizeof(elder_rmd_table_v1_t) == offsetof(elder_rmd_table_t, fired_today)) ? 1 : -1];
+
+/* 同理钉死：今日三个位图（done_today / pending_today / fired_today）都是
+ * uint16_t，一个 bit 对应一个 items[] 下标。把 ELDER_REMINDER_MAX 调大到
+ * 17 及以上时，第 17 条起的「今天响过 / 已完成 / 待办」就**存不下来** ——
+ * 而它们恰恰是重启后不二次响铃的唯一依据。
+ * 改成 32 位位图是一次真正的改动（连同 V3 布局与迁移），不是改个常量。
+ */
+typedef char elder_rmd_bitmap_width_assert[
+    (ELDER_REMINDER_MAX <= 16) ? 1 : -1];
 
 typedef void (*elder_rmd_cb_t)(const elder_rmd_item_t *item,
                                elder_rmd_state_t new_state, void *ctx);
