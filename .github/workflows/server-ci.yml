@@ -222,6 +222,13 @@ jobs:
       - name: 设备绑定归属（重启不被绑上平台预设）
         run: python tools/qa3_device_binding.py
 
+      # 会员制遗留五张表必须**真的**被删掉。
+      # 这条门禁是补 875b38c 留下的洞：当时删表函数整个被掏空，全仓 CI 依然全绿
+      # （qa3_migration 的老库 DDL 根本不建这五张表，删表分支恒为空操作）。
+      # 本脚本自己先按历史结构建出这五张表，再用「表还在不在」而不是函数返回值作判据。
+      - name: 会员遗留表真删（掏空实现必变红）
+        run: python tools/qa3_drop_tables.py
+
   # elder 组件的宿主单元测试：断网提醒链路的「离线可用」证据。
   #
   # 为什么必须是独立 job（而不是塞进 smoke）：
@@ -409,6 +416,23 @@ jobs:
         env:
           ELDER_DB: mysql+pymysql://root:smoke-pass@127.0.0.1:3306/elder_companion?charset=utf8mb4
         run: python tools/eval_persona.py
+
+      # ★ 这一条是**下面那段注释唯一的例外**，而且是有意的例外。
+      #
+      # 上面的注释说「故意不放 qa3_*，因为它们跑不到 MySQL」—— 这条仍然成立，
+      # 但 qa3_drop_tables 是**特意写来能跑 MySQL 的**：
+      #   * 它用 SQLAlchemy Core 的 Table(...) 建老库表，不是写死 SQLite DDL；
+      #   * 它尊重外部 ELDER_DB，MySQL 分支**新建专属库** elder_droptables_test，
+      #     跑完 DROP DATABASE 删掉，不污染共享库（不这么做的话，它会在库里留下
+      #     五张已删表的残留，后续 job 排查时分不清「表是谁留下的」）。
+      #
+      # 为什么要挂：此前 MySQL 侧执行 DROP 的次数是 **0 条** —— 新库 + 当前 ORM
+      # 已无这五张表的映射 ⇒ create_all 不建它们 ⇒ 删表分支恒为空操作。
+      # 挂上之后，这个 job 会真正发出 5 条 DROP，补齐方言覆盖。
+      - name: 会员遗留表真删（mysql+pymysql 真发 DROP）
+        env:
+          ELDER_DB: mysql+pymysql://root:smoke-pass@127.0.0.1:3306/elder_companion?charset=utf8mb4
+        run: python tools/qa3_drop_tables.py
 
       # ⚠️ 这里**故意不**放 qa3_r2_restart / qa3_migration / qa3_device_binding。
       # 理由不是「MySQL 不重要」，而是那三份脚本**跑不到 MySQL**：

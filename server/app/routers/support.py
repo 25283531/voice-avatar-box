@@ -38,7 +38,9 @@ admin_router = APIRouter(
     dependencies=[Depends(get_current_admin)],
 )
 
-# 与会员订单列表一致的默认条数上限
+# 列表接口的默认条数上限（工单量在这个量级下，靠它 + 前端翻页足够）。
+# ⚠️ 这里曾写「与会员订单列表一致」—— 会员制取消（e264200）后订单表已下线，
+# 那半句失去了参照物，改回描述本接口自己的口径。
 _LIST_LIMIT = Query(100, ge=1, le=500)
 
 

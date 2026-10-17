@@ -1,0 +1,273 @@
+"""回归门禁：会员制遗留的五张表**必须**在启动时被真正删掉。
+
+它守什么（一句话）
+------------------
+``schema_patch.drop_membership_tables()`` 一旦被掏空（或存在性检测失效、
+清单被改错），**本脚本必须变红** —— 而不是像 875b38c 当时那样：
+删表函数整个删掉，全仓 CI 依然全绿。
+
+为什么要单独写这一份（假绿的具体形态）
+--------------------------------------
+875b38c 落地时，没有任何一条断言碰过这五张表：
+
+* ``tools/qa3_migration.py`` 的老库 DDL 根本不建这五张表，它虽然连跑三次
+  ``run_all()``，删表分支**恒为空操作** —— 断言「第二次 run_all 全为 0」
+  在删表逻辑**完全不存在**时也照样成立；
+* MySQL job 连的是**全新** service DB，而当前 ORM 已经没有这五张表的映射，
+  ``create_all`` 不会建它们 —— 于是那条 job 真实执行的 DROP 是 **0 条**。
+
+也就是说：当时「删表成功」这件事**没有任何运行证据**。本脚本补的就是这个洞。
+做法是自己**先把五张旧表造出来**（按 e264200^ 的历史结构，含出向外键），
+再走真实入口，用「表还在不在」而不是「函数自称删了几张」作判据。
+
+⚠️ 判据必须是「复查表是否存在」，不能只看返回值
+------------------------------------------------
+只看返回值会退化成「函数自称删了」——把清单改成空的、或存在性检测恒返回
+"不存在"，都能让返回值看起来正常。所以每次删表都配一条
+``inspect(engine).get_table_names()`` 的复查，并且额外钉一条
+**保留表哨兵**（``chat_quota_config``）：证明删表没有扩大化。
+
+两种方言都跑（这是本脚本与其它 qa3_* 最大的不同）
+------------------------------------------------
+其余 qa3_* 脚本都无条件 ``env["ELDER_DB"] = sqlite:///...``，会**静默覆盖**
+CI 传入的 MySQL 连接串，因此只能挂在 SQLite job（见 server-ci.yml 的大段注释）。
+本脚本刻意**尊重外部 ``ELDER_DB``**：
+
+* 不设 / 设为 sqlite -> 用临时目录下的独立库文件，跑完删文件；
+* 设为 mysql+pymysql -> 用同一账号**新建一个专属库** ``elder_droptables_test``，
+  跑完 ``DROP DATABASE`` 删掉（不污染 CI 那个共享库）。
+
+于是 CI 的 mysql-smoke job 挂上它之后，**MySQL 上真的会执行 5 条 DROP**
+（此前是 0 条），补齐「MySQL 删表路径无人覆盖」这个洞。
+"""
+from __future__ import annotations
+
+import json
+import os
+import shutil
+import sys
+import tempfile
+from pathlib import Path
+
+from sqlalchemy import Column, DateTime, ForeignKey, Integer, String, Table
+from sqlalchemy import inspect, text
+
+ROOT = Path(__file__).resolve().parent.parent
+SERVER = ROOT / "server"
+sys.path.insert(0, str(SERVER))
+
+#: 五张要被删掉的遗留表（与 schema_patch.DROPPED_TABLES 一致）
+DROPPED = ("memberships", "membership_plans", "membership_orders",
+           "membership_amount_range", "payment_config")
+#: 保留表哨兵：**必须还在用**，用它证明删表没有扩大化
+RETAINED = "chat_quota_config"
+
+_results: list[tuple[str, bool, str]] = []
+
+
+def ok(name: str, cond: bool, detail: str = "") -> bool:
+    _results.append((name, bool(cond), detail))
+    print(f"  [{'PASS' if cond else 'FAIL'}] {name}" + (f"  -> {detail}" if detail else ""))
+    return bool(cond)
+
+
+def _mysql_admin_conn(url):
+    import pymysql
+    from sqlalchemy.engine import make_url
+    u = make_url(url)
+    return pymysql.connect(host=u.host or "127.0.0.1", user=u.username or "root",
+                           password=u.password or "", port=u.port or 3306,
+                           charset="utf8mb4", autocommit=True)
+
+
+def prepare_db() -> tuple[str, str | None]:
+    """决定本轮用哪个库。返回 ``(连接串, 需清理的临时目录)``。
+
+    ⚠️ MySQL 分支新建**专属库**而不是复用 CI 那个：本脚本会在库里留下
+    五张已删表的残留（若断言失败），复用会让后续 job 的 schema 不干净，
+    排查时更难判断「表是谁留下的」。
+    """
+    url = (os.environ.get("ELDER_DB") or "").strip()
+    tmpdir = None
+    if not url:
+        tmpdir = tempfile.mkdtemp(prefix="qa3_drop_tables_")
+        return "sqlite:///" + (Path(tmpdir) / "legacy.db").as_posix(), tmpdir
+    if url.startswith("mysql"):
+        from sqlalchemy.engine import make_url
+        conn = _mysql_admin_conn(url)
+        conn.cursor().execute(
+            "CREATE DATABASE IF NOT EXISTS elder_droptables_test "
+            "CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci")
+        conn.close()
+        return str(make_url(url).set(database="elder_droptables_test")), None
+    return url, None
+
+
+def cleanup(url: str, dialect: str, tmpdir: str | None) -> None:
+    if dialect == "mysql":
+        try:
+            conn = _mysql_admin_conn(url)
+            conn.cursor().execute("DROP DATABASE IF EXISTS elder_droptables_test")
+            conn.close()
+        except Exception as exc:  # noqa: BLE001  清理失败不该掩盖断言结果
+            print(f"  [warn] MySQL 测试库清理失败：{exc}")
+    if tmpdir:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+_LEGACY_DEFINED = False
+
+
+def build_legacy_tables(engine) -> None:
+    """按 e264200^ 的历史结构造出五张遗留表（含出向外键）+ 各插一行。
+
+    用 SQLAlchemy Core 而不是写死 DDL：SQLite 与 MySQL 两种方言都能建，
+    外键语法差异交给引擎，本脚本不必维护两份 DDL（也就不会像 qa3_migration
+    的 OLD_DDL 那样只覆盖一种方言）。
+
+    ⚠️ **定义只做一次**：``Table(...)`` 往 ``Base.metadata`` 里注册表名，
+    第二次再调会抛 ``InvalidRequestError: Table 'x' is already defined``。
+    两个场景都要"重新造出这五张表"，所以把「定义」与「建表 + 插数」分开 ——
+    后者可重复调用（场景 B 就是先被场景 A 删掉、再建回来）。
+    """
+    global _LEGACY_DEFINED
+    md = Base.metadata
+    if not _LEGACY_DEFINED:
+        Table("memberships", md,
+              Column("id", Integer, primary_key=True),
+              Column("user_id", Integer, ForeignKey("users.id")),
+              Column("expires_at", DateTime, nullable=True))
+        Table("membership_plans", md,
+              Column("id", Integer, primary_key=True),
+              Column("code", String(32)))
+        Table("membership_orders", md,
+              Column("id", Integer, primary_key=True),
+              Column("code", String(4)),
+              Column("user_id", Integer, ForeignKey("users.id")),
+              Column("admin_id", Integer, ForeignKey("users.id"), nullable=True),
+              Column("amount_cents", Integer))
+        Table("membership_amount_range", md,
+              Column("id", Integer, primary_key=True),
+              Column("min_cents", Integer))
+        Table("payment_config", md,
+              Column("id", Integer, primary_key=True),
+              Column("account", String(128)))
+        _LEGACY_DEFINED = True
+    md.create_all(bind=engine, tables=[md.tables[t] for t in DROPPED])
+    with engine.begin() as conn:
+        # 插一行：确保「有数据的表也会一起消失」。
+        # ⚠️ 先清行再插：场景 B 是在场景 A 之后重建同一批表，而**删表逻辑若被
+        # 变异掏空，表就还在、行也还在** —— 不清行会撞主键抛 IntegrityError，
+        # 把「断言失败」变成「脚本崩了」，反而掩盖真正该看的那几条断言。
+        for table in DROPPED:
+            conn.execute(text(f"DELETE FROM {table}"))
+        conn.execute(text("INSERT INTO memberships (id,user_id) VALUES (1,1)"))
+        conn.execute(text("INSERT INTO membership_plans (id,code) VALUES (1,'m1')"))
+        conn.execute(text("INSERT INTO membership_orders (id,code,user_id,amount_cents)"
+                          " VALUES (1,'A1B2',1,1234)"))
+        conn.execute(text("INSERT INTO membership_amount_range (id,min_cents) VALUES (1,1000)"))
+        conn.execute(text("INSERT INTO payment_config (id,account) VALUES (1,'acct')"))
+
+
+def scenario_run_all(engine) -> None:
+    """场景 A：走**真实启动入口** ``run_all()``（main.lifespan 调的就是它）。"""
+    print("\n── 场景 A：run_all()（真实启动入口）──")
+    build_legacy_tables(engine)
+    before = set(inspect(engine).get_table_names())
+    ok("A1 五张遗留表已按历史结构建出（含出向外键）",
+       set(DROPPED) <= before, str(sorted(set(DROPPED) - before)))
+
+    first = run_all()
+    after = set(inspect(engine).get_table_names())
+    remaining = sorted(set(DROPPED) & after)
+    ok("★ A2 五张遗留表在启动后**全部不再存在**", not remaining, str(remaining))
+    ok("★ A3 保留表哨兵仍在（删表没有扩大化）",
+       RETAINED in after, f"{RETAINED} 也被删了")
+    ok("A4 run_all 报告 membership_tables_dropped=5",
+       first.get("membership_tables_dropped") == 5, json.dumps(first, ensure_ascii=False))
+
+    second = run_all()
+    after2 = set(inspect(engine).get_table_names())
+    ok("★ A5 第二次 run_all 的删表计数为 0（幂等）",
+       second.get("membership_tables_dropped") == 0,
+       json.dumps(second, ensure_ascii=False))
+    ok("A6 幂等重跑后保留表哨兵依然在", RETAINED in after2)
+
+
+def scenario_direct(engine) -> None:
+    """场景 B：直接调 ``drop_membership_tables()``（把函数本身钉住）。"""
+    print("\n── 场景 B：drop_membership_tables()（函数本身）──")
+    build_legacy_tables(engine)
+    before = set(inspect(engine).get_table_names())
+    ok("B1 五张遗留表已重建（场景 A 删掉后能再建回来）",
+       set(DROPPED) <= before, str(sorted(set(DROPPED) - before)))
+
+    first = drop_membership_tables()
+    after = set(inspect(engine).get_table_names())
+    ok("★ B2 直接调用后五张表全部不再存在",
+       not (set(DROPPED) & after), str(sorted(set(DROPPED) & after)))
+    ok("★ B3 直接调用返回 5", first == 5, str(first))
+    ok("★ B4 保留表哨兵仍在", RETAINED in after, f"{RETAINED} 也被删了")
+
+    second = drop_membership_tables()
+    third = drop_membership_tables()
+    ok("★ B5 第二次 / 第三次调用返回 0（幂等）",
+       second == 0 and third == 0, f"2nd={second} 3rd={third}")
+
+
+# ================================================================ 环境准备
+# ⚠️ **顺序不能改**：必须在 ``import app.*`` 之前定好 ELDER_DB。
+# app.db 在**模块导入期**就 create_engine，之后再改环境变量没有任何作用
+# （其它 qa3_* 脚本为了绕开这点才改用子进程，本脚本不需要 —— 见模块头）。
+URL, TMPDIR = prepare_db()
+os.environ["ELDER_DB"] = URL
+os.environ["ELDER_JWT_SECRET"] = os.environ.get("ELDER_JWT_SECRET") or "qa3-drop"
+os.environ.setdefault("ELDER_DB_WAIT_SEC", "10")
+
+from app.db import Base, engine, init_db          # noqa: E402  必须晚于上面的 env
+from app.schema_patch import drop_membership_tables, run_all   # noqa: E402
+
+
+def main() -> int:
+    print("=" * 72)
+    print("回归门禁：会员制遗留五张表必须在启动时被真正删掉")
+    print("=" * 72)
+
+    url, tmpdir, dialect = URL, TMPDIR, engine.dialect.name
+    print(f"\n  方言：{dialect}")
+    print(f"  库：{url}")
+
+    try:
+        init_db()
+        fresh = set(inspect(engine).get_table_names())
+        ok("0 全新库里 ORM 不再建这五张表（它们只能来自老库）",
+           not (set(DROPPED) & fresh), str(sorted(set(DROPPED) & fresh)))
+        ok(f"0 保留表哨兵 {RETAINED} 已存在（哨兵承重的前提）",
+           RETAINED in fresh, str(sorted(fresh))[:200])
+        scenario_run_all(engine)
+        scenario_direct(engine)
+        # 哨兵承重：若 RETAINED 哪天从 ORM 里被移除，上面所有「哨兵仍在」
+        # 的断言会变成空转（查不到就是不在），这里把它钉在元数据上。
+        ok("9 保留表哨兵确实还是 ORM 里的活表（哨兵不空转）",
+           RETAINED in Base.metadata.tables, str(sorted(Base.metadata.tables))[:200])
+    except Exception as exc:  # noqa: BLE001  门禁自己崩了必须算失败，不能静默绿
+        ok(f"脚本运行期抛异常（{dialect}）", False, f"{type(exc).__name__}: {exc}")
+    finally:
+        try:
+            engine.dispose()
+        except Exception:  # noqa: BLE001
+            pass
+        cleanup(url, dialect, tmpdir)
+
+    passed = sum(1 for _n, o, _d in _results if o)
+    total = len(_results)
+    print("\n" + "=" * 72)
+    print(f"==== {passed}/{total} passed（{dialect}）====")
+    for name, _o, detail in _results:
+        if not _o:
+            print(f"  FAILED: {name}  -> {detail}")
+    return 1 if passed != total else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
