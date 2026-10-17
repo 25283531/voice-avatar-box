@@ -44,6 +44,18 @@ OPUS_APPLICATION_VOIP: Final[int] = 2048
 # 辅音先糊（"吃药"听成"去澡"）。
 OPUS_TARGET_BITRATE: Final[int] = 32000
 
+# ⚠️⚠️ **CTL 编号：SET 是偶数、GET 是奇数**（opus_defines.h 的原文注释
+# "In general, SETs should be even and GETs should be odd"）。这里曾经写的是
+# 4003，那是 ``OPUS_GET_BITRATE_REQUEST`` —— **GET 类 CTL 的第三个参数是
+# ``opus_int32 *`` 指针**，libopus 会执行 ``*((opus_int32*)argp) = 当前码率``。
+# 我们传进去的是整数 32000，于是 libopus 把它当成指针、向地址 0x7D00 写入，
+# **必然 SIGSEGV**（exit 139 / core dumped）。
+# 正确的 SET 是 4002，第三个参数按值传 int。
+# 为什么本机一直测不出来：Windows 没 libopus 时 ``_load_lib()`` 早退，
+# 这行代码根本走不到；只有 CI（装了 libopus0）才会真的建编码器 ——
+# 也就是说这条路径在修好之前**从未被任何机器执行过**。
+OPUS_SET_BITRATE_REQUEST: Final[int] = 4002
+
 # 候选库名。find_library("opus") 在 Alpine/musl 与 Windows 上都会失败，
 # 所以必须逐个试；Windows 上用户装的是 opus.dll，macOS 是 libopus.0.dylib。
 _CANDIDATES: Final[tuple[str, ...]] = (
@@ -61,6 +73,17 @@ _lib_lock = threading.Lock()
 _decoders: dict[tuple[int, int], ctypes.c_void_p] = {}
 _encoders: dict[tuple[int, int], ctypes.c_void_p] = {}
 _codec_lock = threading.Lock()
+
+# ⚠️ 真正调用 ``opus_decode`` / ``opus_encode`` 时必须持的锁（与建实例用的
+# ``_codec_lock`` 分开）。理由不是"保险"：
+#   * 上面两个缓存是**进程级共享**的，同一个 (采样率, 声道) 只有一份实例；
+#   * libopus 的编码器/解码器带内部状态，**不保证可重入**；
+#   * ``ctypes.CDLL``（区别于 PyDLL）在调用 C 函数期间**释放 GIL**，
+#     所以 uvicorn 的 WS 会话线程与主线程真能同时进入同一个实例。
+# 三者叠加 = 两个线程同时写同一个解码器状态 = 内存踩坏 = SIGSEGV。
+# 语音是 60ms 一帧、单次编解码在亚毫秒级，串行化的开销可以忽略，
+# 而踩坏内存的代价是整个进程（含所有会话）一起没。
+_ffi_lock = threading.RLock()
 
 
 class OpusUnavailableError(RuntimeError):
@@ -117,23 +140,43 @@ def _load_lib() -> ctypes.CDLL | None:
         # ---- 函数签名。restype 不声明时 ctypes 默认按 int 截断，
         # opus_decode 返回样本数（可达 5760）虽不会溢出，但
         # opus_encoder_create 返回指针（64 位）会被截成 32 位而崩溃。
-        lib.opus_decoder_create.restype = ctypes.c_void_p
-        lib.opus_decoder_create.argtypes = [
-            ctypes.c_int, ctypes.c_int, ctypes.POINTER(ctypes.c_int)]
-        lib.opus_decode.restype = ctypes.c_int
-        lib.opus_decode.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int,
-                                    ctypes.c_char_p, ctypes.c_int, ctypes.c_int]
-        lib.opus_encoder_create.restype = ctypes.c_void_p
-        lib.opus_encoder_create.argtypes = [
-            ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.POINTER(ctypes.c_int)]
-        lib.opus_encode.restype = ctypes.c_int
-        lib.opus_encode.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int,
-                                    ctypes.c_char_p, ctypes.c_int]
-        lib.opus_encoder_ctl.restype = ctypes.c_int
-        lib.opus_encoder_ctl.argtypes = [ctypes.c_void_p, ctypes.c_int,
-                                         ctypes.c_int]
-        lib.opus_decoder_destroy.argtypes = [ctypes.c_void_p]
-        lib.opus_encoder_destroy.argtypes = [ctypes.c_void_p]
+        #
+        # ⚠️ 绑定失败（符号不存在）必须当成"库不可用"而不是让
+        # AttributeError 往上冒：ctypes 在这里只会抛 Python 异常（不会段错误），
+        # 但调用方（session.py）只认 OpusUnavailableError，一个裸
+        # AttributeError 会绕过它的降级分支、把一次"缺库"变成 500。
+        # 现实触发场景：ELDER_LIBOPUS_PATH 指向了一个同名但不是 opus 的 .so
+        # （例如 libsndfile），CDLL 成功但符号对不上。
+        try:
+            lib.opus_decoder_create.restype = ctypes.c_void_p
+            lib.opus_decoder_create.argtypes = [
+                ctypes.c_int, ctypes.c_int, ctypes.POINTER(ctypes.c_int)]
+            lib.opus_decode.restype = ctypes.c_int
+            lib.opus_decode.argtypes = [
+                ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int,
+                ctypes.c_char_p, ctypes.c_int, ctypes.c_int]
+            lib.opus_encoder_create.restype = ctypes.c_void_p
+            lib.opus_encoder_create.argtypes = [
+                ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                ctypes.POINTER(ctypes.c_int)]
+            lib.opus_encode.restype = ctypes.c_int
+            lib.opus_encode.argtypes = [
+                ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int,
+                ctypes.c_char_p, ctypes.c_int]
+            # opus_encoder_ctl 是**变参**函数；这里只覆盖我们实际用的
+            # 「SET 类 CTL + 一个 int 值」这一种调用形态。绝不改成 GET 类
+            # 编号 —— GET 的第三参是指针，详见 OPUS_SET_BITRATE_REQUEST 注释。
+            lib.opus_encoder_ctl.restype = ctypes.c_int
+            lib.opus_encoder_ctl.argtypes = [ctypes.c_void_p, ctypes.c_int,
+                                             ctypes.c_int]
+            lib.opus_decoder_destroy.argtypes = [ctypes.c_void_p]
+            lib.opus_encoder_destroy.argtypes = [ctypes.c_void_p]
+        except AttributeError as exc:
+            log.warning(
+                "已加载 %s 但缺少必需的 opus 符号（%s），按库不可用处理。"
+                "若设了 ELDER_LIBOPUS_PATH，请确认它指向的是 libopus 而非"
+                "同名库（如 libsndfile）。", name, exc)
+            return None
         _lib = lib
         return lib
 
@@ -178,8 +221,15 @@ def _encoder(sample_rate: int, channels: int) -> ctypes.c_void_p:
         if err.value != 0 or not ptr:
             raise OpusUnavailableError(
                 f"创建 Opus 编码器（采样率 {sample_rate}，错误码 {err.value}）")
-        # OPUS_SET_BITRATE_REQUEST = 4003
-        lib.opus_encoder_ctl(ptr, 4003, OPUS_TARGET_BITRATE)
+        # OPUS_SET_BITRATE_REQUEST（4002，**不是** 4003 —— 4003 是 GET，
+        # 传 int 会被 libopus 当指针解引用 → SIGSEGV，详见常量处注释）。
+        if lib.opus_encoder_ctl(ptr, OPUS_SET_BITRATE_REQUEST,
+                                OPUS_TARGET_BITRATE) != 0:
+            # 设置失败不至于让整条链路不可用（编码器仍能用默认码率），
+            # 但必须留下痕迹 —— 静默忽略会让"码率没生效"变成查无实据的
+            # 音质问题。
+            log.warning("设置 Opus 目标码率 %d 失败，编码器将用默认码率",
+                        OPUS_TARGET_BITRATE)
         _encoders[key] = ptr
         return ptr
 
@@ -212,13 +262,14 @@ def decode_opus(data: bytes, sample_rate: int, channels: int = 1) -> bytes:
     frame = _frame_samples(sample_rate)
     out_len = frame * 2 * channels
     try:
-        dec = _decoder(sample_rate, channels)
-        lib = _load_lib()
-        assert lib is not None  # noqa: S101  _decoder 成功即必然非 None
-        buf = ctypes.create_string_buffer(out_len)
-        # 最后一个参数是 fec（前向纠错），传 0：固件不做 PLC 请求，
-        # 我们也不必在服务端补（丢了就静音，见上）。
-        n = lib.opus_decode(dec, data, len(data), buf, frame, 0)
+        with _ffi_lock:
+            dec = _decoder(sample_rate, channels)
+            lib = _load_lib()
+            assert lib is not None  # noqa: S101  _decoder 成功即必然非 None
+            buf = ctypes.create_string_buffer(out_len)
+            # 最后一个参数是 fec（前向纠错），传 0：固件不做 PLC 请求，
+            # 我们也不必在服务端补（丢了就静音，见上）。
+            n = lib.opus_decode(dec, data, len(data), buf, frame, 0)
         if n <= 0:
             log.warning("opus_decode 返回 %s（损坏/空包），按静音处理", n)
             return b"\x00" * out_len
@@ -246,14 +297,15 @@ def encode_opus(pcm: bytes, sample_rate: int, channels: int = 1) -> bytes:
     if len(pcm) % want:
         pcm = pcm + b"\x00" * (want - len(pcm) % want)
     try:
-        enc = _encoder(sample_rate, channels)
-        lib = _load_lib()
-        assert lib is not None  # noqa: S101  _encoder 成功即必然非 None
-        out = ctypes.create_string_buffer(1275 * 6)
-        # 只编码第一帧：调用方按帧循环调本函数（会话编排里就是逐帧发）。
-        # 多帧一次编会得到一个"多帧大包"，固件把它当一个包解，
-        # 得到的是第一帧的内容 + 后续被丢弃 —— 直接表现成播报只有一帧。
-        n = lib.opus_encode(enc, pcm[:want], frame, out, len(out))
+        with _ffi_lock:
+            enc = _encoder(sample_rate, channels)
+            lib = _load_lib()
+            assert lib is not None  # noqa: S101  _encoder 成功即必然非 None
+            out = ctypes.create_string_buffer(1275 * 6)
+            # 只编码第一帧：调用方按帧循环调本函数（会话编排里就是逐帧发）。
+            # 多帧一次编会得到一个"多帧大包"，固件把它当一个包解，
+            # 得到的是第一帧的内容 + 后续被丢弃 —— 直接表现成播报只有一帧。
+            n = lib.opus_encode(enc, pcm[:want], frame, out, len(out))
         if n <= 0:
             log.warning("opus_encode 返回 %s，本帧丢弃", n)
             return b""

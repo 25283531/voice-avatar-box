@@ -60,6 +60,7 @@ jobs:
       - name: 解析镜像标签
         id: meta
         run: |
+          IMG="ghcr.io/${{ github.repository }}"
           SHA="${GITHUB_SHA::7}"
           if [ "${{ github.event_name }}" = "push" ]; then
             # 自动发布：latest 常驻 + 短 SHA 便于出问题时回滚定位
@@ -72,15 +73,26 @@ jobs:
             TAGS="$TAG"
             [ "$TAG" = "$SHA" ] || TAGS="$TAG $SHA"
           fi
-          # tags 是多行输出（build-push-action 按行拆分），用 heredoc 写法，
-          # 并经循环逐行输出，确保值里不带任何缩进空白
+          # ⚠️⚠️ **标签必须带完整的 ghcr.io/<repo>: 前缀**，这不是风格问题。
+          # 这里曾经只输出裸名（latest / <短SHA>），于是 buildx 实际执行的是
+          #   docker buildx build --tag latest --tag <短SHA> --load
+          # 加载进本机 docker 的镜像名字就叫 `latest` 和 `<短SHA>`；
+          # 而下面的容器冒烟跑的是
+          #   docker run ... ghcr.io/25283531/voice-avatar-box:<短SHA>
+          # —— 名字对不上，docker 便以为本地没有、转头去 ghcr.io 拉，
+          # 于是报 `manifest unknown` / exit 125。
+          # 因为该 tag 从未推送成功过（推送步骤在冒烟之后，冒烟红就不推），
+          # 这个"拉 registry 上的自己"还会自我循环：拉不到 -> 冒烟红 -> 不推送
+          # -> 下次还是拉不到。改成前缀完整后，构建产物与冒烟/推送引用的是
+          # **同一个名字**，冒烟验的必然是本次刚构建的镜像，且推送能直接推它。
           {
             echo "tags<<EOF"
-            for t in $TAGS; do echo "$t"; done
+            for t in $TAGS; do echo "${IMG}:${t}"; done
             echo "EOF"
             echo "sha=${SHA}"
           } >> "$GITHUB_OUTPUT"
-          echo "将构建标签: $TAGS"
+          echo "将构建标签："
+          for t in $TAGS; do echo "  ${IMG}:${t}"; done
 
       - name: 准备 Buildx
         uses: docker/setup-buildx-action@v3
@@ -108,12 +120,25 @@ jobs:
       - name: 启动容器并验证 /api/health
         run: |
           set -e
+          IMG="${{ env.IMAGE }}:${{ steps.meta.outputs.sha }}"
+          # ⚠️ 必须先确认它**真的在本地**再 docker run。
+          # 直接 docker run 一个本地没有的名字时，docker 不会报错退出，
+          # 而是转头去 registry 拉，于是失败信息变成
+          # 「manifest unknown / exit 125」—— 一个和真因（构建产物没被加载
+          # 或名字对不上）毫无关系的报错，排障方向会被直接带偏。
+          # 这里显式断言 + 打出 docker images，让"标签没落地"当场自证。
+          if ! docker image inspect "$IMG" >/dev/null 2>&1; then
+            echo "::error::本次构建产物 $IMG 不在本机镜像库（冒烟必须验本次构建，不能拉 registry）"
+            echo "---- docker images ----"
+            docker images
+            exit 1
+          fi
           docker rm -f elder-smoke >/dev/null 2>&1 || true
           docker run -d --name elder-smoke \
             -p 8064:8080 \
             -e ELDER_DB=sqlite:////tmp/elder-smoke.db \
             -e ELDER_JWT_SECRET=ci-smoke-secret \
-            ${{ env.IMAGE }}:${{ steps.meta.outputs.sha }}
+            "$IMG"
           for i in $(seq 1 40); do
             if curl -fsS http://127.0.0.1:8064/api/health; then
               echo ""; echo "容器冒烟通过"
@@ -132,13 +157,17 @@ jobs:
         if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.publish)
         run: |
           set -e
-          IMG="${REGISTRY}/${GITHUB_REPOSITORY}"
-          SHA="${{ steps.meta.outputs.sha }}"
+          # tags 已经是 `ghcr.io/<repo>:<tag>` 全名（见"解析镜像标签"步骤），
+          # 而 buildx --load 就是按这些名字把它们装进本机 docker 的，
+          # 所以这里**直接推、不要再 docker tag**：
+          # 早先对裸标签做 `docker tag ${IMG}:${SHA} ${IMG}:${t}` 时，
+          # 源镜像 ${IMG}:${SHA} 在本机并不存在（只有裸名 <SHA>），
+          # 推送步骤同样会以 "tag ... doesn't exist" 失败 —— 只是它排在
+          # 冒烟之后，从没被走到过。
           while IFS= read -r t; do
             [ -n "$t" ] || continue
-            docker tag "${IMG}:${SHA}" "${IMG}:${t}"
-            docker push "${IMG}:${t}"
-            echo "已推送 ${IMG}:${t}"
+            docker push "$t"
+            echo "已推送 $t"
           done <<< "${{ steps.meta.outputs.tags }}"
           FIRST="$(head -n1 <<< "${{ steps.meta.outputs.tags }}")"
           {
@@ -146,9 +175,9 @@ jobs:
             echo '```'
             while IFS= read -r t; do
               [ -n "$t" ] || continue
-              echo "docker pull ${IMG}:${t}"
+              echo "docker pull $t"
             done <<< "${{ steps.meta.outputs.tags }}"
-            echo "docker run -d -p 8064:8080 --env-file .env ${IMG}:${FIRST}"
+            echo "docker run -d -p 8064:8080 --env-file .env $FIRST"
             echo '```'
             echo "- 来源提交：${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/commit/${GITHUB_SHA}"
             echo "- 触发事件：${GITHUB_EVENT_NAME}"

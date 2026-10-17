@@ -146,6 +146,16 @@ jobs:
   # 本机（Windows 开发环境）没装 libopus 时同理会红，这是有意为之 ——
   # 想在本机跑通就装一个 opus dll 并设 ELDER_LIBOPUS_PATH。
       - name: 语音链路冒烟（WS 协议 / Opus 编解码 / OTA）
+        env:
+          # ⚠️ 这一步要真跑 libopus（下面的断言会拿它编解码）。Python 一旦在
+          # C 库里段错误，默认只留一句 "Segmentation fault (core dumped)" +
+          # exit 139，**stdout 缓冲区也一起丢**（stdout 非 tty 时是块缓冲），
+          # 于是日志里既看不到崩在哪一行、也看不到崩之前跑完了哪些断言 ——
+          # 上一轮就是这么只能靠猜的。PYTHONFAULTHANDLER 让 faulthandler 在
+          # 致命信号到来时把**当前 Python 调用栈**打到 stderr，
+          # 于是"exit 139"会变成"exit 139 + 崩在 opus_codec.py 第几行"。
+          # 它只是加诊断，不放宽任何断言。
+          PYTHONFAULTHANDLER: '1'
         run: |
           python - <<'PY'
           import sys
@@ -209,6 +219,21 @@ jobs:
     name: MySQL 真实路径冒烟
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    # ⚠️ 这里**必须**重设种子口令，job 级的 env 不会跨 job 继承。
+    # 漏掉它的后果不是"少测点什么"，而是整条链路假绿式地崩：
+    #   MySQL 是 service container，每次 run 都是**空库** → 走"种子管理员"分支；
+    #   没设 ELDER_SEED_ADMIN_PASSWORD 时该分支按设计生成**随机口令**
+    #   （secrets.token_urlsafe(16)，见 server/app/security.py）；
+    #   而 tools/smoke_server.py 硬编码用 admin/admin123 登录
+    #   → 第一条断言就 401 → 后续拿不到 token 的用例连环 FAIL，
+    #   最后在生成激活码那步 IndexError 崩掉。
+    # 实测证据：run 39031736168 的 MySQL job 里，服务端日志打的是
+    #   「【安全】种子管理员已创建：用户名 admin，ELDER-INITIAL-***」
+    # 而 smoke 侧是「[FAIL] 登录默认管理员 -> 401」。
+    # ⚠️ 弱口令的合理性（一次性 runner、库跑完即销毁）与上面 smoke job
+    # 的注释完全一致，此处不再重复；生产/内网**不要**设它。
+    env:
+      ELDER_SEED_ADMIN_PASSWORD: admin123
     services:
       mysql:
         image: mysql:8.0
