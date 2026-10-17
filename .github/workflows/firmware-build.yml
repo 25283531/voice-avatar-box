@@ -167,8 +167,21 @@ jobs:
           set -e
           . "$IDF_PATH/export.sh"
           cd "$PROJECT_DIR"
-          # IDF 5.x 自带 merge-bin；失败不致命，仍可用 flash_args 分别烧写
-          idf.py merge-bin -o build/merged-flash.bin || echo "::warning::merge-bin 失败，用 flash_args 分别烧写"
+          # ⚠️⚠️ `-o` 后面**不能**带 build/ 前缀。
+          # idf.py merge-bin 内部会先 chdir 到 build 目录再调 esptool（日志里
+          # 明确打印 "Running merge_bin in directory .../firmware/xiaozhi/build"），
+          # 于是 `-o build/merged-flash.bin` 被解析成 build/build/merged-flash.bin，
+          # 父目录不存在 ⇒ esptool 抛 FileNotFoundError、退出码 1。
+          # 这个失败曾被 `|| echo warning` 吞掉，而后 summary 无条件写着
+          # 「烧录用这一个 elder-firmware-esp32s3-merged-flash.bin」——
+          # **用户按提示去下载，文件根本不存在**。绿灯 + 不存在的文件 = 最坏的一种假绿。
+          # 现在：失败即失败，不再吞。
+          idf.py merge-bin -o merged-flash.bin
+          test -s build/merged-flash.bin || {
+            echo "::error::merged-flash.bin 未生成，单文件烧录镜像不可用"
+            exit 1
+          }
+          echo "merged-flash.bin = $(stat -c%s build/merged-flash.bin) 字节"
 
       - name: 整理产物
         if: always()
@@ -182,8 +195,15 @@ jobs:
           cp -v build/generated_assets.bin             "$GITHUB_WORKSPACE/out/" 2>/dev/null || true
           # 单文件烧录镜像：改名成一眼能认出的名字（artifact 里散落一堆 bin 时，
           # 用户最容易搞错的就是"该烧哪个"）。flasher_args.json 不引用它，改名安全。
+          # ⚠️ 这一步是**硬校验**：merged 镜像是用户日常唯一要烧的文件，
+          # 它不在就说明上面的步骤出了问题，必须让 job 红掉而不是静默交付一堆散件。
+          if [ ! -s build/merged-flash.bin ]; then
+            echo "::error::build/merged-flash.bin 不存在 —— 不再产出只含散件的 artifact"
+            echo "::error::（曾经发生：job 绿、summary 让用户下一个从未生成的文件）"
+            exit 1
+          fi
           cp -v build/merged-flash.bin \
-               "$GITHUB_WORKSPACE/out/elder-firmware-esp32s3-merged-flash.bin" 2>/dev/null || true
+               "$GITHUB_WORKSPACE/out/elder-firmware-esp32s3-merged-flash.bin"
           cp -v build/flasher_args.json                "$GITHUB_WORKSPACE/out/" 2>/dev/null || true
           # 应用镜像文件名随工程名变化，统一抓取
           find build -maxdepth 1 -name "*.bin" ! -name "generated_assets.bin" \
