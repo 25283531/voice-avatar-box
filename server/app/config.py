@@ -288,12 +288,60 @@ VOICE_ASR_LANGUAGE = os.getenv("ELDER_VOICE_ASR_LANGUAGE", "zh")
 # 为什么需要它：① realtime 模式固件不做 VAD、等我们断句，而我们没有 AEC，
 #    只能靠能量判停；② auto 模式下设备若漏发 listen stop（丢包/重启），
 #    这一轮会永远挂在 listening 态，用户等不到回复。
-# 调太大 = 老人说完要干等；调太小 = 会被句子间的停顿误切。1500ms 是
-# 一句自然停顿的下界附近，实测 Sentence 之间极少有超过 1.2s 的停顿。
-VOICE_SILENCE_MS = int(os.getenv("ELDER_VOICE_SILENCE_MS", "1500"))
+# 调太大 = 老人说完要干等；调太小 = 会被句子间的停顿误切。
+# **2026-10-17 调档 1500 → 2000ms**：固件默认走 realtime 模式
+# （sdkconfig.defaults:82 CONFIG_USE_DEVICE_AEC=y ⇒ application.cc:279
+# 选 kListeningModeRealtime），服务端这个阈值是**唯一的断句判据**。
+# 老人语速慢、句中思考停顿长（自发口语中超过 1.5s 的停顿常见），
+# 1500ms 会把"话说一半"判成说完 —— 内容直接丢失且不可恢复；
+# 而调大的代价只是老人说完后多等半秒。**两类错误的代价不对称：
+# 宁可多等，不可截断。** 另有按停顿历史自适应的上限（见下）。
+VOICE_SILENCE_MS = int(os.getenv("ELDER_VOICE_SILENCE_MS", "2000"))
+# 自适应阈值上限（毫秒）。本轮对话里若出现过"停顿后又继续说"的长停顿，
+# 说明这位老人说话慢、停顿长，断句阈值按 VOICE_PAUSE_FACTOR 放大，
+# 但不超过这个上限 —— 否则一句不停地说下去会让阈值无限膨胀。
+VOICE_SILENCE_MAX_MS = int(os.getenv("ELDER_VOICE_SILENCE_MAX_MS", "6000"))
+# 停顿自适应系数：观察到的最长"句中停顿"（停顿后又继续说话的那次）P 毫秒，
+# 则本轮阈值 = max(VOICE_SILENCE_MS, min(VOICE_SILENCE_MAX_MS, P*系数+500))。
+# 1.5 的依据：VAD 端点判决要留出"停顿后还会接着说"的余量，取实测停顿的
+# 1.5 倍 + 500ms 固定余量；调成 1.0 等于没有自适应。
+VOICE_PAUSE_FACTOR = float(os.getenv("ELDER_VOICE_PAUSE_FACTOR", "1.5"))
+# 多长的"停顿后又继续"才记入自适应（毫秒）。低于它的是词间间隙，
+# 不是思考停顿，不拿来做依据。
+VOICE_PAUSE_MIN_MS = int(os.getenv("ELDER_VOICE_PAUSE_MIN_MS", "600"))
 # 触发兜底前至少要听到这么多语音，防止"一句都没说就静音触发"把环境噪声
 # 当成一整句送去 ASR（结果是识别出一串乱码，老人莫名其妙）。
 VOICE_MIN_SPEECH_MS = int(os.getenv("ELDER_VOICE_MIN_SPEECH_MS", "300"))
+# 单轮收听的安全上限（毫秒）：老人说着说着离开/卡住时，兜底 finalize，
+# 避免会话永远挂在 listening。60s 足够任何正常单句，又不会无限挂住。
+VOICE_MAX_LISTEN_MS = int(os.getenv("ELDER_VOICE_MAX_LISTEN_MS", "60000"))
+
+# ---- 语音能量门限（老人轻声 / 远场）----
+# 旧实现只有一个门限 _SILENCE_RMS=0.01（-40dBFS）：高于它算语音。
+# 两个失效模式：① 轻声老人/离设备远，整句 RMS 都在 0.01 以下 ⇒
+# 一句都不会被算作语音 ⇒ min_speech 门永远不过 ⇒ 整句被丢弃；
+# ② 门限一刀切到底噪以下又会让房间噪声被当成语音 ⇒ 静音永远攒不够 ⇒
+# 会话挂死。所以改成"迟滞 + 底噪跟随"两件套：
+#   * enter 门限：判定"开口了"用（高门限，别被底噪触发）；
+#   * keep  门限：已经开口之后，判定"还在说"用（低门限，句中换气/
+#     轻声音节不掉出语音态），但只保留 VOICE_SOFT_GRACE_MS 毫秒 ——
+#     不设期限的话，刚好落在两个门限之间的持续底噪会让会话永远挂住；
+#   * 底噪跟随：按帧估计房间底噪（快降慢升），门限 = max(绝对下限, 底噪×系数)。
+#     安静房间里轻声老人也能被检测到；嘈杂房间里门限自动抬高，
+#     代价是那种房间里的耳语分辨不出（诚实的降级，见报告）。
+# 绝对下限 0.005（-46dBFS）：高于实测底噪 0.002-0.004 的上限，
+# 低于旧门限 0.01 —— 把"轻声但可闻"的老人从"整句被丢"里救回来。
+VOICE_SPEECH_RMS = float(os.getenv("ELDER_VOICE_SPEECH_RMS", "0.005"))
+# keep 门限的绝对下限（-52dBFS）。句中轻声音节/远场衰减后的语音
+# 落在 enter 与 keep 之间时，靠它续住语音态。
+VOICE_SPEECH_RMS_KEEP = float(os.getenv("ELDER_VOICE_SPEECH_RMS_KEEP", "0.0025"))
+# 软语音（enter 与 keep 之间的能量）最长续多久（毫秒）。锚点是
+# **最后一次高能量帧**，软帧本身不会刷新它 —— 否则持续底噪会无限续期。
+VOICE_SOFT_GRACE_MS = int(os.getenv("ELDER_VOICE_SOFT_GRACE_MS", "2000"))
+
+# LLM 工具调用（提醒等）单轮最多几轮。防 LLM 反复调用同一工具形成死循环：
+# 每轮都是一次真实的 token 花费，不设上限等于把账单交给模型的坏心情。
+VOICE_TOOL_MAX_ROUNDS = int(os.getenv("ELDER_VOICE_TOOL_MAX_ROUNDS", "3"))
 
 # 会话内保留的历史轮数上限。语音链路每轮都要塞人格 + 记忆召回，窗口比
 # 纯文本更紧，且老人话题跳跃少、短会话即可；超过就丢最早的。

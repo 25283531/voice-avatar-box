@@ -316,6 +316,117 @@ def tts(db: Any, sentence: str, *, voice: str = "", speed: float = 1.0) -> bytes
     return raw
 
 
+def tts_stream(db: Any, sentence: str, *, voice: str = "",
+               speed: float = 1.0):
+    """一句话 -> **增量**吐出 24kHz/mono/S16LE 裸 PCM（阻塞生成器）。
+
+    与 :func:`tts` 的差异只有"读取方式"：本函数不等整个响应体到齐，
+    而是 ``resp.read(amt)`` 拿到多少吐多少，让上层（会话编排）边收边切
+    60ms 帧下发 —— 首句延迟从"整段合成时间"降到"第一个分片时间"。
+
+    **流式与否由厂商决定，我们不假装**：
+      * 厂商用 chunked transfer 分片发送（真流式 TTS）→ 每个分片到达就 yield；
+      * 厂商一次性发完整段（Content-Length，多数 OpenAI 兼容网关的默认行为）
+        → 生成器只 yield 一次（整段），行为与 :func:`tts` 等价，**不报错也不
+        假报流式**。上层按"第一帧早于整段合成完成"的实测值判断真实收益。
+
+    防御与非流式版逐字一致：RIFF 头剥 44 字节（可跨分片）、JSON 错误体
+    识别（读到就抛，不把错误文本当音频发出去）、奇数长度按采样对齐
+    （分片边界可能劈开一个采样，用 1 字节进位缓冲兜）。
+    """
+    from ..llm_gateway import resolve_row
+
+    row = resolve_row(db, "tts")
+    if row is None:
+        raise VoiceConfigMissingError("tts")
+    timeout = _row_timeout(row, TTS_TIMEOUT_SEC)
+    model = (getattr(row, "model", "") or "").strip() or "tts-1"
+
+    body: dict[str, Any] = {
+        "model": model,
+        "input": sentence,
+        "response_format": TTS_RESPONSE_FORMAT,
+    }
+    if voice:
+        body["voice"] = voice
+    if speed and speed != 1.0:
+        body["speed"] = speed
+
+    endpoint = _row_endpoint(row)
+    url = endpoint + "/audio/speech"
+    key = _row_key(row)
+    headers = {"Content-Type": "application/json"}
+    if key:
+        headers["Authorization"] = f"Bearer {key}"
+    payload = json.dumps(body, ensure_ascii=False).encode("utf-8")
+    req = urllib.request.Request(url, data=payload, headers=headers, method="POST")
+
+    try:
+        resp = _open(url, req, timeout)
+    except urllib.error.HTTPError as exc:
+        detail = ""
+        try:
+            detail = exc.read().decode("utf-8", "replace")
+        except Exception:  # noqa: BLE001
+            pass
+        raise _http_error(exc.code, detail, endpoint) from None
+    except urllib.error.URLError as exc:
+        raise _wrap_urlerror(exc, endpoint, timeout) from None
+    except (socket.timeout, TimeoutError):
+        raise VoiceUpstreamError(
+            f"调用超时（{timeout:g}s 未返回）：{endpoint}，可调大该配置的「超时秒数」") from None
+
+    try:
+        head = b""          # 尚未判别的头几个字节（RIFF / JSON / PCM）
+        carry = b""         # 奇数采样进位
+        seen_any = False
+        while True:
+            try:
+                chunk = resp.read(4096)
+            except (socket.timeout, TimeoutError):
+                raise VoiceUpstreamError(
+                    f"读取音频流超时：{endpoint}，可调大该配置的「超时秒数」") from None
+            if not chunk:
+                break
+            if not seen_any and not head:
+                head = chunk[:8]
+                # 防御：错误体伪装成音频（与非流式版同一条判据）
+                if head[:1] in (b"{", b"["):
+                    rest = chunk + resp.read()
+                    raise VoiceUpstreamError(
+                        f"TTS 返回体像 JSON 错误而非音频：{(chunk + rest)[:200]!r}：{endpoint}")
+            if not seen_any:
+                seen_any = True
+                if head[:4] == b"RIFF":
+                    # 剥 44 字节 WAV 头；头可能跨分片，先把前 44 字节攒齐
+                    need = _WAV_HEADER_LEN
+                    buf = chunk
+                    while len(buf) < need:
+                        more = resp.read(need - len(buf))
+                        if not more:
+                            break
+                        buf += more
+                    chunk = buf[need:]
+                    if not chunk:
+                        continue
+            if carry:
+                chunk = carry + chunk
+                carry = b""
+            if len(chunk) % 2:
+                carry = chunk[-1:]
+                chunk = chunk[:-1]
+            if chunk:
+                yield chunk
+        if carry:
+            # 末尾剩半个采样：补零对齐（S16LE 必须是整采样）
+            yield carry + b"\x00"
+    finally:
+        try:
+            resp.close()
+        except Exception:  # noqa: BLE001
+            pass
+
+
 def pick_voice(db: Any, device: Any) -> str:
     """音色回落链：**角色优先，形象兜底**（与 device_api.sync 口径一致）。
 
