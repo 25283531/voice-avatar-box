@@ -36,6 +36,7 @@
 #include "elder_reminder.h"
 #include "elder_activation.h"
 #include "elder_ui.h"
+#include "elder_cmd.h"     /* 离线命令词词表（启动自检时遍历，见 elder_bridge_start 第 9 步） */
 #include "elder_net.h"
 #include "elder_sync.h"
 #include "elder_cmd.h"
@@ -450,4 +451,25 @@ extern "C" void elder_bridge_start(void)
 
     ESP_LOGI(TAG, "elder 组件接入完成；离线提醒可用=%s",
              elder_time_synced() ? "已校时" : "未校时（依赖本地 RTC）");
+
+    // 9) 离线命令词自检：把词表真正跑一遍并打出来。
+    //
+    // 这么做有两个必要理由，缺一不可：
+    //  a) 可观测 —— 现场只要看这条日志就能确认「预置关键词」到底有没有烧进去，
+    //     不必去猜。医疗设备不允许「以为装好了其实没装」。
+    //  b) 保活 —— 离线识别层（MultiNet）尚未启用时，没有任何代码调用
+    //     elder_cmd_dispatch()，链接器的 --gc-sections 会把整个 elder_cmd.c
+    //     当作未被引用的目标文件**整块裁掉**，最终固件里根本不含词表。
+    //     这里主动调用一次，既留下证据，也防止被裁。
+    {
+        int n = elder_cmd_word_count();
+        ESP_LOGI(TAG, "离线命令词已预置 %d 条：", n);
+        for (int i = 0; i < n; i++) {
+            const elder_cmd_word_t *w = elder_cmd_word_at(i);
+            if (w) ESP_LOGI(TAG, "  [%d] \"%s\" -> %s", i, w->phrase, w->hint);
+        }
+        ESP_LOGW(TAG, "注意：离线**语音识别**当前未启用（esp-sr MultiNet 缺 model "
+                      "分区且未选 USE_CUSTOM_WAKE_WORD），断网时上述词表不会被自动喂词；"
+                      "服药确认请用按键（长按后 30 秒内短按）。详见 docs/决策记录.md D11");
+    }
 }

@@ -99,6 +99,18 @@ esp_err_t elder_cmd_dispatch(const char *phrase, elder_cmd_result_t *out);
  */
 time_t elder_cmd_now(void);
 
+/**
+ * @brief 离线命令词接线口（C 链接，供识别层直接喂识别结果）。
+ *
+ *        识别层（esp-sr MultiNet）每识别出一句就把原文喂进来，内部查词表并执行。
+ *        定义在 elder_bridge.cc —— 因为执行动作需要屏显/提示音这些
+ *        只有 bridge 才持有的 xiaozhi 运行时句柄。
+ *
+ * @note 现状：该接线口已就位，但 MultiNet 尚未启用（见 docs/决策记录.md D11），
+ *       所以**目前没有任何调用方**，离线时设备听不懂人话，服药确认请用按键。
+ */
+void elder_cmd_on_recognized(const char *phrase);
+
 #ifdef __cplusplus
 }
 #endif
