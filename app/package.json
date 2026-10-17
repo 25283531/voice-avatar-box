@@ -152,7 +152,7 @@
     "unplugin-auto-import": "^0.17.8",
     "vite": "5.2.8",
     "vite-plugin-restart": "^0.4.2",
-    "vue-tsc": "^2.2.10"
+    "vue-tsc": "^3.3.13"
   },
   "resolutions": {
     "bin-wrapper": "npm:bin-wrapper-china"
