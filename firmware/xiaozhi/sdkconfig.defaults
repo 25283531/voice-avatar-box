@@ -105,8 +105,31 @@ CONFIG_SR_MN_CN_MULTINET7_QUANT=y
 # >>> BEGIN elder-companion overlay (由 tools/merge_to_xiaozhi.py 注入，勿手改) >>>
 # 目标板卡：立创·实战派 ESP32-S3
 CONFIG_BOARD_TYPE_LICHUANG_DEV_S3=y
-# 表情/形象走 EAF 序列帧（esp_emote_gfx），只有开启它 EmoteDisplay 才会被实例化
-CONFIG_USE_EMOTE_MESSAGE_STYLE=y
+#
+# 显示风格：标准 LVGL 界面（SpiLcdDisplay），**不要**开 CONFIG_USE_EMOTE_MESSAGE_STYLE。
+#
+# 为什么放弃 emote（esp_emote_gfx + EAF 序列帧）形象：真机烧录后屏幕全黑，串口刷
+#   gfx_label: FreeType font detected but support is not enabled
+#   gfx_label: font context is NULL
+#   LichuangDevBoard: Touch display is not initialized
+# 根因链（已在本仓库源码上逐条核对）：
+#   1) EmoteDisplay 走的是 esp_emote_gfx 自绘引擎（gfx_emote_init），**根本不创建
+#      LVGL display**，也不调用 lv_init()。所以 lichuang_dev_board.cc:194 的
+#      lv_display_get_default() 必然返回 NULL —— 触摸屏那条报错是 emote 路径的
+#      固有产物，不是 LCD 初始化失败。
+#   2) 文字渲染走 gfx_draw_label.c:137 的 gfx_is_lvgl_font() 判断，判断失败就把
+#      font_ctx 置 NULL（:143-145），之后每次画字都报 "font context is NULL"。
+#   3) 实测本仓字体**不是** FreeType 字体，开 CONFIG_GFX_FONT_FREETYPE_SUPPORT 无效：
+#      · assets 里的 font_puhui_common_20_4.bin（1,240,332 B）头部就是 lv_font_t：
+#        line_height=25 / base_line=6 / dsc=36 / cmap_num=27 / bpp=4，
+#        与编译进固件的 font_puhui_basic_20_4.c（line_height=25, base_line=6,
+#        cmap_num=7）完全同构 ⇒ gfx_is_lvgl_font() 返回 **true**，
+#        压根不会进 #else 的 FreeType 分支；
+#      · FreeType 分支只服务 gfx_label_new_font() 载入的内存 TTF，xiaozhi 从未调用。
+#      开它只会白白把 FreeType 库编进固件（Flash 变大），症状不变。
+# 改回 emote 只需把下面这行换成 CONFIG_USE_EMOTE_MESSAGE_STYLE=y（但要先把上面
+# 第 1) 条的 lv_init/LVGL display 缺失和第 2) 条的字体判定一起修掉，否则依旧黑屏）。
+CONFIG_USE_DEFAULT_MESSAGE_STYLE=y
 # 与后端 TZ=Asia/Shanghai 对齐的提示音语言
 CONFIG_LANGUAGE_ZH_CN=y
 # 16MB Flash + Octal PSRAM（立创·实战派 N16R8）
@@ -114,9 +137,21 @@ CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
 CONFIG_SPIRAM=y
 CONFIG_SPIRAM_MODE_OCT=y
 CONFIG_SPIRAM_SPEED_80M=y
-# 分区表：v2/16m.csv（含 8MB assets 分区，存放 EAF 形象包）
+# 分区表：v2/16m.csv（含 8MB assets 分区，存放 EAF 形象包 + MultiNet 模型）
 CONFIG_PARTITION_TABLE_CUSTOM=y
 CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions/v2/16m.csv"
+# 离线语音命令词（esp-sr MultiNet）。切到 USE_CUSTOM_WAKE_WORD 是必须的：
+# build_default_assets.py 只在这个开关打开时才把 multinet 模型打进 assets，
+# 且 audio_service.cc SetModelsList() 见到 mn* 模型就改用 CustomWakeWord。
+# 唤醒词保持「你好小智」的拼音不变 —— 换了识别引擎不能换词，
+# 老人和子女的肌肉记忆是产品资产。Kconfig 要求中文写拼音、空格分隔。
+CONFIG_USE_CUSTOM_WAKE_WORD=y
+CONFIG_CUSTOM_WAKE_WORD="ni hao xiao zhi"
+CONFIG_CUSTOM_WAKE_WORD_DISPLAY="你好小智"
+CONFIG_CUSTOM_WAKE_WORD_THRESHOLD=20
+# mn7_cn：官方推荐（S3/P4），比 mn6_cn 小约 1MB。
+# 模型 2671229 字节 + fst 9648 字节 = 2680877 字节，进 assets 分区。
+CONFIG_SR_MN_CN_MULTINET7_QUANT=y
 # 业务后端地址（按实际部署修改，也可 idf.py menuconfig 调整）
 CONFIG_ELDER_SERVER_URL="http://192.168.1.100:8000"
 CONFIG_ELDER_SERVER_TOKEN=""

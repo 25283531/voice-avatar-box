@@ -13,10 +13,7 @@
 #define TAG "main"
 
 
-// >>> BEGIN elder-companion overlay (由 tools/merge_to_xiaozhi.py 注入，勿手改) >>>
-// 老人陪伴 & 提醒助手：等 xiaozhi 的 Board / Display / AudioService 就绪后拉起
-// 声明必须在**文件作用域**：extern "C" 写在函数体里是语法错误。
-// <<< END elder-companion overlay <<<
+
 
 
 // >>> BEGIN elder-companion overlay (由 tools/merge_to_xiaozhi.py 注入，勿手改) >>>
@@ -51,20 +48,5 @@ extern "C" void app_main(void)
     }, "elder_boot", 4096, NULL, 5, NULL, 1);
     // <<< END elder-companion overlay <<<
 
-    // >>> BEGIN elder-companion overlay (由 tools/merge_to_xiaozhi.py 注入，勿手改) >>>
-    xTaskCreatePinnedToCore([](void *arg) {
-        vTaskDelay(pdMS_TO_TICKS(2000));
-        elder_bridge_start();
-        vTaskDelete(NULL);
-    }, "elder_boot", 4096, NULL, 5, NULL, 1);
-    // <<< END elder-companion overlay <<<
 
-    // >>> BEGIN elder-companion overlay (由 tools/merge_to_xiaozhi.py 注入，勿手改) >>>
-    // 老人陪伴 & 提醒助手：等 xiaozhi 的 Board / Display / AudioService 就绪后拉起
-        xTaskCreatePinnedToCore([](void *arg) {
-        vTaskDelay(pdMS_TO_TICKS(2000));
-        elder_bridge_start();
-        vTaskDelete(NULL);
-    }, "elder_boot", 4096, NULL, 5, NULL, 1);
-    // <<< END elder-companion overlay <<<
 }
