@@ -114,6 +114,18 @@ QA 实测结论：``run_all()`` 第二次全 0 这条**幂等断言对「错误�
 将来若往这几张表**追加**字段，必须补一行登记 —— 否则全新部署正常、
 升级上来的库会在第一次 SELECT 时抛 ``no such column``（正是本文要防的事故）。
 本轮只给 agent_persona_profiles 补了 agent_key 一列，理由见上。
+
+删表（会员制取消后的收尾）
+------------------------
+产品决策**取消会员制**后，``memberships`` / ``membership_plans`` /
+``membership_orders`` / ``membership_amount_range`` / ``payment_config``
+这五张表的 **ORM 映射已经删除**（见 ``models.py`` 对应位置的说明），但**表本身
+还留在盘上**。它们从此变成孤儿表：``create_all`` 不认它们，代码也不再读写，
+留着只会让人误以为还有会员功能。
+
+所以本模块除了「补列」还多做一件事：启动时把这五张表**真正 DROP 掉**，
+登记在 :data:`DROPPED_TABLES`，由 :func:`drop_membership_tables` 执行。
+细节（两种方言、幂等、外键核查）写在那个函数里。
 """
 from __future__ import annotations
 
@@ -301,6 +313,35 @@ NEW_INDEXES: Final[list[tuple[str, str, tuple[str, ...]]]] = [
 # 且失败要能被单独容忍（老库若有顽固重复行，不该拖垮整个启动）。
 PERSONA_AGENTKEY_INDEX: Final = ("agent_persona_profiles", "uq_persona_user_agentkey",
                                ("user_id", "agent_key"))
+
+# ================================================================ 要删掉的表（会员制收尾）
+# 产品决策：取消会员制（见 commit「feat(产品决策)!: 取消会员制」）。ORM 映射已删，
+# 这里把**表本身**也删掉 —— 用户已确认「还在开发阶段，没有投入使用，数据可以动」。
+#
+# ⚠️ **外键已核查（删表前必须做这一步）**
+# ---------------------------------------
+# 这五张表只有**出向**外键，没有**入向**外键：
+#   * ``memberships.user_id``            -> users.id
+#   * ``membership_orders.user_id``      -> users.id
+#   * ``membership_orders.admin_id``     -> users.id
+#   * ``membership_plans`` / ``membership_amount_range`` / ``payment_config``：无外键
+# 换句话说：**没有任何表引用这五张表的 id**。所以删的是「子表」，
+# 不会破坏其它表的外键约束，删除顺序也无所谓（五张表彼此之间没有引用）。
+# 核查方式：``git show <删模型前>:server/app/models.py | grep ForeignKey``，
+# 全部 ForeignKey 目标只有 ai_providers / avatars / devices / reminders / users /
+# agent_memories，不含任何 membership / payment 表。
+#
+# ⚠️ 若将来有人往这里加表，**必须重做一遍上面的入向外键核查** ——
+# 一旦有别的表引用了它，MySQL 上 ``DROP TABLE`` 会因为外键约束直接失败
+# （SQLite 默认不强制外键，反而「删得掉」，于是两种库行为不一致，
+# 这种不一致在 CI 上表现为「SQLite 绿、MySQL 黄」）。
+DROPPED_TABLES: Final[tuple[str, ...]] = (
+    "memberships",
+    "membership_plans",
+    "membership_orders",
+    "membership_amount_range",
+    "payment_config",
+)
 
 
 def _dialect() -> str:
@@ -665,6 +706,84 @@ def dedupe_persona_globals() -> int:
     return removed
 
 
+def _quote_table(name: str) -> str:
+    """按当前方言引用表名：SQLite 用双引号，MySQL 用反引号。"""
+    return f'"{name}"' if _is_sqlite() else f"`{name}`"
+
+
+def drop_membership_tables() -> int:
+    """删掉会员制遗留的五张表，返回删掉的表数（**幂等**：第二次起返回 0）。
+
+    为什么放在这里而不是「写个一次性脚本清一遍」
+    ------------------------------------------
+    本项目没有 Alembic，**启动时只有一个改 schema 的入口**：``main.lifespan``
+    在 ``init_db()`` 之后调 :func:`run_all`。把删表登记进这个入口，才能保证
+    **每一台升级上来的机器**都在启动时自动清一遍。写成一次性脚本则必然有人
+    漏跑，而漏跑的后果是孤儿表永久留在生产库里 —— 没有任何报错提示。
+
+    ⚠️ 为什么必须由 ``run_all`` 统一调度，而不是各自 import
+    ----------------------------------------------------
+    启动路径上改 schema 的东西散落各处 = 无法保证顺序、无法一眼看全。
+    这里沿用 :data:`NEW_COLUMNS` 那套「清单 + 一个函数」的组织方式，
+    不新造一条平行的迁移路径。
+
+    两种方言怎么处理（SQLite / MySQL 的差异点在哪）
+    ----------------------------------------------
+    * **存在性判断**：**不用方言相关的 SQL**，统一走 SQLAlchemy 的
+      ``inspector.get_table_names()``。表不在就直接跳过、**一条 DDL 都不发**。
+      于是「全新部署」和「已清过的老库」都是零开销、零副作用。
+    * **表名引用**：SQLite 用双引号、MySQL 用反引号 —— 靠 :func:`_quote_table`
+      按方言拼。不硬写一种，是因为 MySQL 在 ``ANSI_QUOTES`` 模式下会把
+      双引号当标识符引号、把反引号当语法错误，而 CI 的 ``mysql-smoke`` job
+      会真跑这条 SQL，方言错一个字就是启动期崩溃。
+    * **DDL**：两边都用 ``DROP TABLE IF EXISTS <表名>``。``IF EXISTS``
+      两种库都支持（MySQL 一直支持；SQLite 3.3+ 支持）。
+
+    幂等怎么保证（三层）
+    --------------------
+    1. ``get_table_names()`` 里没有 -> 跳过，不发 DDL，返回 0；
+    2. 真要删时也带 ``IF EXISTS`` —— 因为「检查」与「执行」之间隔着一次
+       连接获取，**多实例同时启动**时存在竞态：另一个实例可能刚把表删了。
+       ``IF EXISTS`` 让竞态的结果变成「先跑的删掉、后跑的 0 行」，
+       而不是「后跑的启动失败」；
+    3. 删完之后表就不在 ``get_table_names()`` 里了 -> 第二次启动连 DDL 都不发。
+
+    于是 :func:`run_all` 第二次调用返回 ``membership_tables_dropped=0``，
+    ``tools/qa3_migration.py`` 的「第二次 run_all 全为 0」断言照常成立。
+
+    ⚠️ 失败处理：单表隔离，不拖垮启动
+    --------------------------------
+    MySQL 的 DDL 会**隐式提交**，没法像 SQLite 那样裹在事务里整体回滚。
+    所以这里**不做**「要么全删要么全不删」的假设，而是每张表单独 try/except：
+    某张删失败只打 warning 并继续，下次启动会再试一次（幂等）。
+    这条与 :func:`ensure_missing_columns`「补列失败不拖垮启动」是同一条原则 ——
+    **启动路径上任何一步的失败都不该让服务起不来**，否则一台机器的问题
+    会变成整个服务不可用。
+
+    ✅ 审计结论：**不登记进** :data:`PATCH_REGISTRY`（2026-10 补）。
+    判据（见模块顶部）：只登记「改变已有行业务含义」的迁移。删表删的是
+    **已经没有任何代码读写的孤儿表**，不存在「第二次改出不同结果」的问题 ——
+    第一次删完，第二次连表都找不着。
+    """
+    insp = inspect(engine)
+    existing = set(insp.get_table_names())
+    todo = [t for t in DROPPED_TABLES if t in existing]
+    if not todo:
+        return 0
+
+    dropped = 0
+    with engine.begin() as conn:
+        for table in todo:
+            try:
+                conn.execute(text(f"DROP TABLE IF EXISTS {_quote_table(table)}"))
+            except Exception as exc:  # noqa: BLE001  删表失败不该拖垮启动
+                log.warning("删除会员遗留表失败 %s: %s（下次启动会重试）", table, exc)
+                continue
+            dropped += 1
+            log.info("已删除会员遗留表: %s", table)
+    return dropped
+
+
 def ensure_missing_indexes() -> int:
     """幂等补建本轮新增的索引，返回新建的索引数。
 
@@ -734,12 +853,20 @@ def run_all() -> dict[str, int]:
       2. 回填 record_type —— 必须在建索引前完成，否则索引建在错误的分类上；
       3. 去重 + 回填 agent_key —— 必须在建唯一索引前完成，否则索引直接失败；
       4. 建索引 —— 最后一步，依赖前三步的列与数据。
+
+    删表（:func:`drop_membership_tables`）**与上面四步互不依赖**，放在最前面：
+    它动的是五张已经没有任何 ORM 映射的孤儿表，先清掉再补列，
+    读 ``inspector.get_table_names()`` 的结果也更干净
+    （否则老库里那五张表会混进「现存表」名单，虽然不影响正确性，
+    但排查时多五个噪音）。
     """
+    dropped = drop_membership_tables()
     added = ensure_missing_columns()
     backfilled = backfill_record_types()
     deduped = dedupe_persona_globals()
     indexed = ensure_missing_indexes()
     return {
+        "membership_tables_dropped": dropped,
         "columns_added": added,
         "record_types_backfilled": backfilled,
         "persona_globals_deduped": deduped,
