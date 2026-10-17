@@ -185,11 +185,16 @@ static void act_create(elder_cmd_result_t *out, elder_cmd_action_t act)
     uint8_t first = (act == ELDER_CMD_CREATE_ALL) ? 0 : (uint8_t)(act - ELDER_CMD_CREATE_MORNING);
     uint8_t last  = (act == ELDER_CMD_CREATE_ALL) ? (uint8_t)(g_times.n - 1) : first;
 
-    /* 时段列表缓冲：最多 4 个时段，「、HH:MM」每项 8 字节，留足余量。
- * 写成 64 是为了让「已创建 %s，%s 已存在：%s」这类组合文案的最坏情况
- * 也能被编译器静态证明不会溢出 feedback[160]。 */
-char created[64] = {0};
-    char existed[64] = {0};
+    /* 时段列表缓冲。最多 4 个时段，每项「、HH:MM」= 3+5 = 8 字节，
+ * 4 项 = 32 字节，32 足够。
+ *
+ * 取 32 而不是 64 是**为了让编译器能静态证明不越界**：feedback[160] 要装
+ * 「已创建 %.31s，%.15s 已存在：%.31s」，固定部分约 9+3+13=25 字节，
+ * 25 + 31*2 = 87 < 160。若列表给 64，同样的句式最坏是 25 + 63*2 = 151，
+ * 再加上中文字符与 NUL 的余量，GCC 会判定可能截断并报
+ * -Werror=format-truncation（ESP-IDF 把它当错误）。 */
+char created[32] = {0};
+    char existed[32] = {0};
     int  n_created = 0;
     bool any_exist = false;
 
@@ -229,19 +234,19 @@ char created[64] = {0};
     if (n_created == 0) {
         /* 全部已存在：不重复建，明确告知 */
         out->tone = ELDER_TONE_POPUP;
-        snprintf(out->feedback, sizeof(out->feedback), "已存在：每天 %.63s %.15s",
+        snprintf(out->feedback, sizeof(out->feedback), "已存在：每天 %.31s %.15s",
                  existed, label);
         return;
     }
     out->tone = ELDER_TONE_SUCCESS;
     if (any_exist) {
-        snprintf(out->feedback, sizeof(out->feedback), "已创建 %.63s，%.15s 已存在：%.63s",
+        snprintf(out->feedback, sizeof(out->feedback), "已创建 %.31s，%.15s 已存在：%.31s",
                  created, label, existed);
     } else if (n_created == 1 && act != ELDER_CMD_CREATE_ALL) {
-        snprintf(out->feedback, sizeof(out->feedback), "已创建：每天 %.63s %.15s",
+        snprintf(out->feedback, sizeof(out->feedback), "已创建：每天 %.31s %.15s",
                  created, label);
     } else {
-        snprintf(out->feedback, sizeof(out->feedback), "已创建 %d 个时段：%.63s %.15s",
+        snprintf(out->feedback, sizeof(out->feedback), "已创建 %d 个时段：%.31s %.15s",
                  n_created, created, label);
     }
 }
