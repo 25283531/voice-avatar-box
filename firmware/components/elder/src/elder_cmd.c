@@ -20,6 +20,8 @@
 #include <stdio.h>
 #include <time.h>
 
+#include "esp_log.h"   /* append_slot() 截断时需要 ESP_LOGE */
+
 /* 低于这个时刻认为系统时钟不可信（未校时/掉电归零），
  * 与 reminder.c 的守卫阈值保持一致 */
 #define ELDER_MIN_TRUSTED_EPOCH 1577836800L   /* 2020-01-01T00:00:00Z */
@@ -74,6 +76,39 @@ const elder_cmd_word_t *elder_cmd_word_at(int i)
 }
 
 /* ---------------------------------------------------------------- 内部工具 */
+
+/* 安全地把一段文字追加到定长缓冲尾部。
+ *
+ * 为什么不能直接写 `snprintf(buf, sizeof(buf), "%s%s", buf, add)`：
+ *   源与目标是**同一个对象**，属于未定义行为。GCC 会直接报
+ *   `-Werror=restrict`（'snprintf' argument N overlaps destination），
+ *   而且即便不报，截断时也可能把尾部写坏。ESP-IDF 把这两个警告当错误，
+ *   编译必挂。这里统一走「先算剩余空间、再一次性写完」，行为可预期。
+ *
+ * 返回 false 表示放不下（已按「宁可少显示也不越界」处理）。
+ */
+static bool append_text(char *buf, size_t cap, const char *add)
+{
+    if (!buf || !add || cap == 0) return false;
+    size_t used = strlen(buf);
+    if (used + 1 >= cap) return false;              /* 至少要留得下 NUL */
+    size_t room = cap - used;
+    size_t n = strlen(add);
+    if (n >= room) n = room - 1;                    /* 截断，不越界 */
+    memcpy(buf + used, add, n);
+    buf[used + n] = '\0';
+    return true;
+}
+
+/* 追加「、08:00」这种时段项；首次追加不加顿号 */
+static void append_slot(char *buf, size_t cap, uint8_t hh, uint8_t mm)
+{
+    char item[24];
+    snprintf(item, sizeof(item), "%s%02u:%02u", buf[0] ? "、" : "", hh, mm);
+    if (!append_text(buf, cap, item)) {
+        ESP_LOGE("elder.cmd", "时段列表已满，截断显示: %s", buf);
+    }
+}
 
 static bool time_trusted(void)
 {
@@ -150,7 +185,10 @@ static void act_create(elder_cmd_result_t *out, elder_cmd_action_t act)
     uint8_t first = (act == ELDER_CMD_CREATE_ALL) ? 0 : (uint8_t)(act - ELDER_CMD_CREATE_MORNING);
     uint8_t last  = (act == ELDER_CMD_CREATE_ALL) ? (uint8_t)(g_times.n - 1) : first;
 
-    char created[64] = {0};
+    /* 时段列表缓冲：最多 4 个时段，「、HH:MM」每项 8 字节，留足余量。
+ * 写成 64 是为了让「已创建 %s，%s 已存在：%s」这类组合文案的最坏情况
+ * 也能被编译器静态证明不会溢出 feedback[160]。 */
+char created[64] = {0};
     char existed[64] = {0};
     int  n_created = 0;
     bool any_exist = false;
@@ -159,9 +197,7 @@ static void act_create(elder_cmd_result_t *out, elder_cmd_action_t act)
         uint8_t hh = g_times.slots[s].hour, mm = g_times.slots[s].minute;
         if (same_schedule_exists(tbl, hh, mm, label)) {
             any_exist = true;
-            char one[16];
-            snprintf(one, sizeof(one), "%s%02d:%02d", existed[0] ? "、" : "", hh, mm);
-            snprintf(existed, sizeof(existed), "%s%s", existed, one);
+            append_slot(existed, sizeof(existed), hh, mm);
             continue;
         }
 
@@ -184,9 +220,7 @@ static void act_create(elder_cmd_result_t *out, elder_cmd_action_t act)
             return;
         }
         n_created++;
-        char one[16];
-        snprintf(one, sizeof(one), "%s%02d:%02d", created[0] ? "、" : "", hh, mm);
-        snprintf(created, sizeof(created), "%s%s", created, one);
+        append_slot(created, sizeof(created), hh, mm);
         /* add 之后表变了，重新取 */
         elder_reminder_list(&tbl);
     }
@@ -195,17 +229,19 @@ static void act_create(elder_cmd_result_t *out, elder_cmd_action_t act)
     if (n_created == 0) {
         /* 全部已存在：不重复建，明确告知 */
         out->tone = ELDER_TONE_POPUP;
-        snprintf(out->feedback, sizeof(out->feedback), "已存在：每天 %s %s", existed, label);
+        snprintf(out->feedback, sizeof(out->feedback), "已存在：每天 %.63s %.15s",
+                 existed, label);
         return;
     }
     out->tone = ELDER_TONE_SUCCESS;
     if (any_exist) {
-        snprintf(out->feedback, sizeof(out->feedback), "已创建 %s，%s 已存在：%s",
+        snprintf(out->feedback, sizeof(out->feedback), "已创建 %.63s，%.15s 已存在：%.63s",
                  created, label, existed);
     } else if (n_created == 1 && act != ELDER_CMD_CREATE_ALL) {
-        snprintf(out->feedback, sizeof(out->feedback), "已创建：每天 %s %s", created, label);
+        snprintf(out->feedback, sizeof(out->feedback), "已创建：每天 %.63s %.15s",
+                 created, label);
     } else {
-        snprintf(out->feedback, sizeof(out->feedback), "已创建 %d 个时段：%s %s",
+        snprintf(out->feedback, sizeof(out->feedback), "已创建 %d 个时段：%.63s %.15s",
                  n_created, created, label);
     }
 }
@@ -242,7 +278,7 @@ static void act_confirm(elder_cmd_result_t *out)
 
     out->ok = true;
     out->tone = ELDER_TONE_SUCCESS;
-    snprintf(out->feedback, sizeof(out->feedback), "已记录 %02d:%02d %s：已完成", hh, mm, label);
+    snprintf(out->feedback, sizeof(out->feedback), "已记录 %02u:%02u %.15s：已完成", hh, mm, label);
 }
 
 /* ---------------------------------------------------------------- 动作：查询 */
@@ -288,7 +324,7 @@ static void act_query_next(elder_cmd_result_t *out)
     }
     out->ok = true;
     out->tone = ELDER_TONE_POPUP;
-    snprintf(out->feedback, sizeof(out->feedback), "下一个提醒 %02d:%02d %s",
+    snprintf(out->feedback, sizeof(out->feedback), "下一个提醒 %02u:%02u %.15s",
              tbl->items[best].hour, tbl->items[best].minute, tbl->items[best].label);
 }
 
@@ -310,17 +346,20 @@ static void act_query_today(elder_cmd_result_t *out)
     struct tm tm_now;
     localtime_r(&now, &tm_now);
 
-    char list[80] = {0};
+    char list[96] = {0};
     int n = 0;
     for (uint8_t i = 0; i < tbl->count && i < ELDER_REMINDER_MAX; i++) {
         const elder_rmd_item_t *it = &tbl->items[i];
         if (!item_due_today(it, &tm_now)) continue;
         if (item_done_today(tbl, i)) continue;
-        char one[24];
-        snprintf(one, sizeof(one), "%s%02d:%02d %s", list[0] ? "、" : "",
+        /* 一项最坏 = 「、」(3) + "08"(2) + ":"(1) + "00"(2) + 空格(1) + 标题(31) = 40，
+         * 加 NUL 要41 字节，所以这里给 48 并给 %s 加精度上限，
+         * 让编译器能静态证明不截断（ESP-IDF 把该警告当错误）。 */
+        char one[48];
+        snprintf(one, sizeof(one), "%s%02u:%02u %.31s", list[0] ? "、" : "",
                  it->hour, it->minute, it->label);
-        if (strlen(list) + strlen(one) >= sizeof(list) - 1) break;
-        snprintf(list, sizeof(list), "%s%s", list, one);
+        /* 放不下就停：宁可少列几条，也不要把半个词截断给老人看 */
+        if (!append_text(list, sizeof(list), one)) break;
         n++;
     }
 
@@ -329,7 +368,8 @@ static void act_query_today(elder_cmd_result_t *out)
     if (n == 0) {
         snprintf(out->feedback, sizeof(out->feedback), "今天的提醒都完成了");
     } else {
-        snprintf(out->feedback, sizeof(out->feedback), "今天还有 %d 次：%s", n, list);
+        /* list 是 char[96]，最多 95 字节有效内容，故精度取 95 */
+        snprintf(out->feedback, sizeof(out->feedback), "今天还有 %d 次：%.95s", n, list);
     }
 }
 

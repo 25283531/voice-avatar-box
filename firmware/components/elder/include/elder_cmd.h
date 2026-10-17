@@ -56,7 +56,11 @@ typedef struct {
     bool               recognized;          /* 是否命中命令词表 */
     bool               ok;                  /* 动作是否成功执行 */
     elder_tone_t       tone;                /* 反馈提示音 */
-    char               feedback[96];        /* 屏显文案（UTF-8，NUL 结尾） */
+    /* 屏显文案（UTF-8，NUL 结尾）。
+     * 取 160 而非 96：「已创建 08:00、12:00，晚上的药 已存在：20:00」
+     * 这类文案在满表时会超过 96 字节。所有写入处都带 %.Ns 精度上限，
+     * 编译器可以静态证明不越界（ESP-IDF 把 format-truncation 当错误）。 */
+    char               feedback[160];
 } elder_cmd_result_t;
 
 /* 断网自建服药提醒的默认时段（由 bridge 启动时从 Kconfig 解析填入） */
