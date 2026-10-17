@@ -4,7 +4,7 @@
 #   容器内固定监听 8080（ELDER_PORT 可覆盖）
 #   对外只发布一个端口，默认 8064：  -p 8064:8080
 #   生产环境由 nginx 反代 https://voice.250886.xyz -> 127.0.0.1:8064
-FROM python:3.11-slim
+FROM python:3.14-slim
 
 # 默认用内置 SQLite，库文件放在 /data（docker-compose.yml 把命名卷挂到这里）。
 # 四个斜杠 = sqlite:// + 绝对路径，别漏写；切 MySQL 时用 ELDER_DB 覆盖即可。
