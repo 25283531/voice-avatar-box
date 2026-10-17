@@ -18,11 +18,10 @@
 
 namespace {
 
-/* elder 命令词的 command_id 段。
- * 唤醒词从 1 开始占 commands_.size() 个 id，elder 词紧跟其后。
- * 用偏移量而不是常量：commands_ 的长度来自 index.json，
- * 上游随时可能加第二个唤醒词，写死常量就会错位到别的短语上。 */
-constexpr int kElderAction = "elder";
+/* elder 命令词的 action 标记，用来把「执行离线命令」与「唤醒」区分开。
+ * 不是 command_id：id 由注册顺序决定，唤醒词占前 commands_.size() 个，
+ * elder 词紧跟其后（见Initialize）。这里只需要一个可比较的标签。 */
+constexpr const char* kElderAction = "elder";
 
 }  // namespace
 
