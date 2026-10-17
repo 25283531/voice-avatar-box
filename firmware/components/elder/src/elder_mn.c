@@ -63,7 +63,9 @@ static void elder_mn_task(void *arg)
     char slot[ELDER_MN_SLOT_BYTES];
 
     for (;;) {
-        if (xQueueReceive(s_q, slot, sizeof(slot), portMAX_DELAY) != pdTRUE) {
+        /* 3 参数：ESP-IDF 新版 FreeRTOS 的 xQueueReceive 去掉了 bufuxBytes 参数，
+         * 拷贝长度由 xQueueCreate 时定的 item size（ELDER_MN_SLOT_BYTES）决定。 */
+        if (xQueueReceive(s_q, slot, portMAX_DELAY) != pdTRUE) {
             continue;
         }
         /* NUL 兜底：万一队列里的数据被写坏，也不能让 dispatch 读越界 */
