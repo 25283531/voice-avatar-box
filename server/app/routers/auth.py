@@ -1,7 +1,7 @@
 """注册 / 登录 / 当前用户。"""
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -13,6 +13,11 @@ from ..config import (
 )
 from ..db import get_db
 from ..deps import get_current_user
+from ..ratelimit import (
+    clear_login_failures_for,
+    login_gate,
+    record_login_failure,
+)
 from ..schemas import (
     EmailChangeIn,
     PasswordChangeIn,
@@ -77,14 +82,50 @@ def register(payload: UserCreate, db: Session = Depends(get_db)):
     return user
 
 
+#: 失败文案。**必须**同时覆盖"用户不存在"与"密码错"两种情况，
+#: 且两种情况返回**完全相同**的响应 —— 否则这个接口就是一台用户名枚举机。
+#: （限速触发时返回 429，见下面 login() 里的说明。）
+LOGIN_FAILED_DETAIL = "用户名或密码错误"
+
+
 @router.post("/login", response_model=TokenOut)
-def login(payload: UserLogin, db: Session = Depends(get_db)):
+def login(payload: UserLogin, request: Request, db: Session = Depends(get_db)):
+    """登录。
+
+    ⚠️ 顺序是**先验口令、后过闸门**，这个顺序是有意的，别"优化"成先查配额：
+
+    1. 口令正确 -> 发证 + 清掉该账号的失败记录，**完全不看配额**。
+       ★ 这一条决定了**限速器永远不会把知道口令的人锁在外面**：
+       攻击者打满 20 次/小时，真正的管理员照样进得来 ——
+       否则"限速"就变成了一把把合法用户锁死的 DoS 武器。
+       （``tools/smoke_mail.py:458-461`` 先故意输错一次、紧接着用新口令登录，
+       反过来写会让它从 200 变 429。）
+    2. 口令不对 -> 先过闸门（IP 键 + 用户名键，任一触发即拦），
+       触发了就 429 + 还要等多久；没触发才记一笔失败并返回 401。
+       记与不记的差别很大：**被 429 拦下的那一笔不记账**，否则攻击者持续敲
+       就能把冷却期无限续期，5 秒冷却会退化成永久锁死。
+
+    ⚠️ 为什么触发限速用 **429** 而不是 401：401 会让"密码错"和"被限速"
+    在响应上无法区分，运维排障时看不出是被打了还是自己输错了；而 429 是否
+    "帮攻击者确认命中限速"其实无所谓 —— 他连发几次本来就能从"突然开始被拒"
+    推断出来，藏住状态码换不来任何安全性，只换来看不懂的日志。
+    """
     user = db.scalar(select(models.User).where(models.User.username == payload.username))
-    if not user or not verify_password(payload.password, user.password_hash):
-        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "用户名或密码错误")
-    token = issue_user_token(user.id, user.username, user.is_admin)
-    return TokenOut(access_token=token, user_id=user.id, username=user.username,
-                    is_admin=user.is_admin)
+    if user and verify_password(payload.password, user.password_hash):
+        clear_login_failures_for(payload.username)
+        token = issue_user_token(user.id, user.username, user.is_admin)
+        return TokenOut(access_token=token, user_id=user.id, username=user.username,
+                        is_admin=user.is_admin)
+
+    verdict = login_gate(request, payload.username)
+    if verdict is not None:
+        raise HTTPException(
+            status.HTTP_429_TOO_MANY_REQUESTS,
+            verdict.detail,
+            headers={"Retry-After": str(verdict.retry_after)},
+        )
+    record_login_failure(request, payload.username)
+    raise HTTPException(status.HTTP_401_UNAUTHORIZED, LOGIN_FAILED_DETAIL)
 
 
 @router.get("/me", response_model=UserOut)

@@ -46,6 +46,34 @@
     且**幂等**（第二次启动不再改）；
 13. 回归保护：普通用户、已改过口令的管理员在上述所有情形下**不受影响**。
 
+登录失败限速（本轮新增，场景 8~17，42 条断言）
+--------------------------------------------
+``POST /api/auth/login`` 曾经**没有任何失败次数限制**，可被无限撞库。主理人拍板的
+三条规则（**全部只针对登录失败**）：
+
+14. 密码错一次后必须等 **5 秒** 才能再试，期间尝试直接拒绝（429）；
+15. 每分钟最多 **6 次** 失败；
+16. 每小时最多 **20 次** 失败；
+17. **成功登录不计入**配额：连续成功 N 次仍能登，且成功后该账号的失败记录被清掉；
+18. ★ **口令正确的请求不过闸门** —— 冷却期内用正确口令照样 200。
+    这条决定了限速器**锁不死**合法用户（否则"限速"就是把管理员锁在门外的
+    DoS 武器）；它同时是 smoke_mail「先故意错一次、紧接着用新口令登录」的前提；
+19. 不泄露：**不存在的用户名** 与 **存在的用户名+错密码** 在未触发限速时返回
+    **逐字相同**的响应，触发限速时也同码同前缀、且文案里不含用户名；
+20. 默认值就是 5 / 6 / 20（既有静态读 config 的断言，也有不设该变量的行为断言）；
+21. ``X-Forwarded-For`` **默认不信任**（那是请求方能随便写的头）；
+    配了可信代理时**从右往左**取第一个不可信地址，跳过伪造段。
+
+⚠️ 两条防假绿的写法，改动前请先读
+--------------------------------
+* 三条规则**各自单独起一台服务**，把另外两个窗口设成 9999。否则"第 21 次被拦"
+  会被分钟窗口（第 7 次就拦）抢先命中 —— 断言即使把小时上限改成 9999 也照样绿。
+* 每个子场景用**不同的 ``X-Forwarded-For``** 隔离 IP 键：所有请求都从 127.0.0.1
+  发出，不限 IP 的话前一段的失败会把后一段全染成 429，断言变成"顺序敏感"。
+* 默认给 uvicorn 传 ``--no-proxy-headers``：uvicorn 自带一层 XFF 处理且默认信任
+  127.0.0.1，会**先于**我们的代码改写 ``request.client``。不关掉它，
+  「默认不信任 XFF」这条断言测到的是 uvicorn 而不是我们。
+
 ⚠️ 为什么随机分支必须**在进程内显式清空** ``ELDER_SEED_ADMIN_PASSWORD``
 ------------------------------------------------------------------
 CI 为了让 8 个硬依赖 admin/admin123 的冒烟脚本继续跑，会在 smoke job 里**全局**
@@ -111,6 +139,13 @@ SERVER_LOG = DB_PATH.with_name(DB_PATH.stem + "_server.log")
 
 results: list[tuple[str, bool, str]] = []
 
+#: 登录失败文案。**必须**同时覆盖"用户不存在"与"密码错"（防用户名枚举），
+#: 且与 server/app/routers/auth.py 的 LOGIN_FAILED_DETAIL 逐字对齐。
+LOGIN_FAILED_DETAIL = "用户名或密码错误"
+#: 触发限速时 detail 的**前缀**。整句含"还要等多久"会随时间变，所以只钉前缀
+#: （与 server/app/ratelimit.py 的 RATE_LIMIT_DETAIL_PREFIX 逐字对齐）。
+RATE_LIMIT_PREFIX = "登录失败次数过多"
+
 #: 要与后端 ``config.REGISTER_CLOSED_DETAIL`` 逐字对齐。
 #: 断言"逐字相等"而不是"包含某几个字" —— 前端会把这句话直接弹给用户，
 #: 后端改了措辞前端却不知道，是最难发现的一类失配。
@@ -127,6 +162,18 @@ SEED_PW = "Sm0ke-Seed-Pw!2026"
 ROTATE_PW = "N3w-Str0ng-Pw!2026"
 #: 普通用户 / 已改过口令的管理员用的口令（回归保护：它们不该被动到）
 NORMAL_PW = "test123456"
+
+#: 限速场景共用的 env。
+#: ⚠️ ``ELDER_TRUSTED_PROXY_IPS=127.0.0.1`` 是关键：冒烟跑在本机，TCP 对端
+#: 恒为 127.0.0.1，若不声明它可信，``X-Forwarded-For`` 就永远不生效，
+#: 各子场景无法用假 IP 互相隔离 —— 断言会互相污染变成"顺序敏感"。
+RL_ENV = {
+    "ELDER_ALLOW_PUBLIC_REGISTER": "1",
+    "ELDER_SEED_ADMIN_PASSWORD": LEGACY_PW,   # admin/admin123 可用
+    "ELDER_TRUSTED_PROXY_IPS": "127.0.0.1",
+}
+#: 把某个窗口"关掉"用的足够大的值（不是 0：0 在配置里也是"关"，两者都覆盖到）
+WINDOW_OFF = "9999"
 
 # 下面三个串与 server/app/main.py 的 SEED_PASSWORD_MARKER /
 # DEFAULT_PASSWORD_ALERT_MARKER / PASSWORD_ROTATED_MARKER **逐字对齐**。
@@ -170,6 +217,83 @@ def req(method: str, path: str, body: dict | None = None, token: str | None = No
             return e.code, json.loads(raw)
         except Exception:
             return e.code, raw
+
+
+def req_raw(method: str, path: str, body: dict | None = None, xff: str | None = None,
+            token: str | None = None):
+    """与 :func:`req` 相同，但**额外返回响应头**，且可带 ``X-Forwarded-For``。
+
+    为什么要单独一份而不是给 ``req`` 加参数：``req`` 有 60+ 处调用点，
+    改成三元组会把它们全改一遍；而只有限速断言需要 ``Retry-After`` 头与
+    伪造 XFF 的能力。
+
+    :param xff: 写入 ``X-Forwarded-For`` 头。⚠️ 只有在服务端
+        ``ELDER_TRUSTED_PROXY_IPS`` 里含 127.0.0.1 时它才会被采信 ——
+        这正是「默认不信任该头」那条断言要打的点。
+    """
+    data = json.dumps(body).encode() if body is not None else None
+    r = urllib.request.Request(BASE + path, data=data, method=method)
+    r.add_header("Content-Type", "application/json")
+    if token:
+        r.add_header("Authorization", "Bearer " + token)
+    if xff:
+        r.add_header("X-Forwarded-For", xff)
+    try:
+        with _LOCAL_OPENER.open(r, timeout=20) as resp:
+            raw = resp.read().decode("utf-8")
+            return resp.status, (json.loads(raw) if raw else None), _hdrs(resp.headers)
+    except urllib.error.HTTPError as e:
+        raw = e.read().decode("utf-8")
+        try:
+            parsed = json.loads(raw)
+        except Exception:  # noqa: BLE001
+            parsed = raw
+        return e.code, parsed, _hdrs(e.headers)
+
+
+def _hdrs(raw_headers) -> dict[str, str]:
+    """响应头统一转小写键。
+
+    ⚠️ 必须转：HTTP/1.1 下服务端发的是 ``retry-after``（小写），
+    而 ``dict(headers)`` 保留原始大小写 —— 直接 ``.get("Retry-After")``
+    会拿到 ``None``，于是"等 5 秒"那条断言会以「头没给」的形式**假红**。
+    """
+    return {k.lower(): v for k, v in raw_headers.items()}
+
+
+def login_x(ip: str, username: str, password: str):
+    """以``X-Forwarded-For: <ip>`` 的身份登录，返回 ``(code, body, headers)``。
+
+    ⚠️ 限速断言**必须**用它而不是 :func:`login`：所有子场景共用
+    ``127.0.0.1`` 这一个出口，若不限 IP，前一段的失败会把后一段全染成 429，
+    断言之间互相污染 —— 那会造出一批"顺序敏感"的脆断言。
+    """
+    return req_raw("POST", "/api/auth/login",
+                   {"username": username, "password": password}, xff=ip)
+
+
+def detail_of(body):
+    if isinstance(body, dict):
+        return body.get("detail")
+    return body
+
+
+def mask_digits(text) -> str:
+    """把数字抹成 ``#``。
+
+    429 文案里含「还要等多少秒」，同一秒内的两次请求拿到的数字都可能差 1，
+    所以比"两条响应是否泄露了用户名是否存在"时只能比抹掉数字后的形状。
+    """
+    return re.sub(r"\d+", "#", text or "")
+
+
+def retry_after_of(headers) -> int | None:
+    # 键名用小写：``_hdrs()`` 已统一转小写，而 HTTP/1.1 线上本来就是小写
+    raw = headers.get("retry-after")
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return None
 
 
 def _read_log_tail(max_bytes: int = 8192) -> str:
@@ -220,8 +344,13 @@ def wait_ready(timeout: float = 120.0) -> bool:
     return False
 
 
-def start_server(extra_env: dict[str, str | None], db_path: Path | None = None):
+def start_server(extra_env: dict[str, str | None], db_path: Path | None = None,
+                 uvicorn_args: list[str] | None = None):
     """起一个带指定 env 的服务进程。返回 ``proc``；失败返回 None。
+
+    :param uvicorn_args: 追加给 uvicorn 的命令行参数。**默认带
+        ``--no-proxy-headers``**，理由见下面 start 处 —— 限速断言要打的是
+        ``app/ratelimit.py`` 那一层，必须先把 uvicorn 自带的那一层关掉。
 
     :param db_path: 该场景**独占**的库文件，默认 :data:`DB_PATH`。
         场景 2b 必须另开一个库 —— 它会把 users 表抹空，
@@ -256,10 +385,22 @@ def start_server(extra_env: dict[str, str | None], db_path: Path | None = None):
     # 占位必须在 spawn 之前释放，否则自己挡住自己
     release_port(hold, PORT)
 
+    # ⚠️ 为什么默认给 uvicorn 传 ``--no-proxy-headers``
+    # ------------------------------------------------
+    # uvicorn **自带**一层 X-Forwarded-For 处理（ProxyHeadersMiddleware），
+    # 而且默认 ``--forwarded-allow-ips=127.0.0.1``：只要 TCP 对端是 127.0.0.1，
+    # 它就会**先把 request.client 改写成 XFF 里解析出来的地址**，
+    # 然后才轮到 app/ratelimit.py 的 client_ip() 看到它。
+    # 冒烟全部跑在本机（对端恒为 127.0.0.1），于是那一层永远先生效 ——
+    # 「默认不信任 XFF」这条断言会**既红不了也证明不了**（它测到的是 uvicorn，
+    # 不是我们的代码）。所以默认把它关掉，让被测对象确定是自己那一层；
+    # 场景 16 单独用 ``uvicorn_args=[]`` 把框架那一层的现状钉住。
+    if uvicorn_args is None:
+        uvicorn_args = ["--no-proxy-headers"]
     log_fp = SERVER_LOG.open("w", encoding="utf-8", errors="replace")
     proc = subprocess.Popen(
         [PY, "-m", "uvicorn", "app.main:app", "--host", "127.0.0.1",
-         "--port", str(PORT), "--log-level", "warning"],
+         "--port", str(PORT), "--log-level", "warning", *uvicorn_args],
         cwd=str(SERVER), env=env,
         stdout=log_fp, stderr=subprocess.STDOUT, text=True, encoding="utf-8",
         errors="replace",
@@ -684,6 +825,332 @@ def main() -> int:
               code == 200 and bool(tk.get("access_token")), f"code={code}")
         code, boss = login("boss2", NORMAL_PW)
         check("J04 回归：boss2 仍不受影响", code == 200, f"code={code}")
+    finally:
+        stop_server(proc)
+
+    # ================================================================ 场景 8
+    # ★★ 登录失败限速。三条规则各自**单独**起一台服务，把另外两个窗口设成
+    # 9999 隔离开 —— 否则"第 21 次被拦"会被分钟窗口（第 7 次就拦）抢先命中，
+    # 断言即使把小时上限改成 9999 也照样绿 —— 那是**假绿**。
+    group("场景 8：★ 规则 1 —— 密码错后必须等 5 秒（默认冷却，分钟/小时窗口关掉）")
+    proc = start_server({**RL_ENV,
+                         "ELDER_LOGIN_FAIL_PER_MINUTE": WINDOW_OFF,
+                         "ELDER_LOGIN_FAIL_PER_HOUR": WINDOW_OFF})
+    if proc is None:
+        return 1
+    try:
+        code, body, _ = login_x("10.8.1.1", "rl_cool", "wrong-password")
+        check("R01 首次输错 -> 401 且文案是「用户名或密码错误」（与今天一致，无回归）",
+              code == 401 and detail_of(body) == LOGIN_FAILED_DETAIL,
+              f"code={code} detail={detail_of(body)!r}")
+        code2, body2, head2 = login_x("10.8.1.1", "rl_cool", "wrong-password")
+        check("R02 ★ 立刻重试 -> 429（被 5 秒冷却拦住）", code2 == 429, f"code={code2}")
+        ra = retry_after_of(head2)
+        check("R03 ★ Retry-After 落在 1~6 秒 —— 证明命中的是**5 秒窗口**"
+              "（若分钟/小时窗口误命中会给出 ~60 / ~3600）",
+              ra is not None and 1 <= ra <= 6, f"Retry-After={ra}")
+        check("R04 提示是人话：以「登录失败次数过多」开头且带「秒」",
+              isinstance(detail_of(body2), str)
+              and detail_of(body2).startswith(RATE_LIMIT_PREFIX)
+              and "秒" in detail_of(body2),
+              repr(detail_of(body2)))
+        time.sleep(5.4)
+        code5, body5, _ = login_x("10.8.1.2", "rl_cool2", "wrong-password")
+        check("R05 ★ 等够 5 秒后可以重试 -> 401（不是 429，冷却真的放开了）",
+              code5 == 401, f"code={code5} detail={detail_of(body5)!r}")
+    finally:
+        stop_server(proc)
+
+    # ---------------------------------------------------------------- 规则 2
+    group("场景 9：★ 规则 2 —— 每分钟最多 6 次失败（冷却设 0 隔离出分钟窗口）")
+    proc = start_server({**RL_ENV,
+                         "ELDER_LOGIN_FAIL_COOLDOWN_SEC": "0",
+                         "ELDER_LOGIN_FAIL_PER_MINUTE": "6",
+                         "ELDER_LOGIN_FAIL_PER_HOUR": WINDOW_OFF})
+    if proc is None:
+        return 1
+    try:
+        codes = []
+        for i in range(6):
+            c, _, _ = login_x("10.9.0.1", "rl_min", "wrong-password")
+            codes.append(c)
+        check("R06 1 分钟内前 6 次失败都还是 401（未触发限额时与今天完全一致）",
+              codes == [401] * 6, f"codes={codes}")
+        c7, b7, h7 = login_x("10.9.0.1", "rl_min", "wrong-password")
+        check("R07 ★ 第 7 次 -> 429（每分钟 6 次封顶）", c7 == 429, f"code={c7}")
+        ra = retry_after_of(h7)
+        check("R08 ★ Retry-After 落在 45~65 秒 —— 证明是**分钟窗口**命中"
+              "（小时窗口是 9999，不可能在这里拦）",
+              ra is not None and 45 <= ra <= 65, f"Retry-After={ra}")
+        check("R09 文案说清了要等多久且用「分钟」（不是只给数字）",
+              isinstance(detail_of(b7), str) and "分钟" in detail_of(b7),
+              repr(detail_of(b7)))
+
+        # ---- 不泄露：不存在的用户名 vs 存在的用户名+错密码，响应必须完全相同
+        c_a, b_a, _ = login_x("10.9.9.1", "no_such_user_zz", "wrong-password")
+        c_b, b_b, _ = login_x("10.9.9.2", "admin", "definitely-wrong-password")
+        check("R10 ★★ 未触发限额时：不存在的用户名 与 存在的用户名+错密码"
+              " 返回**逐字相同**的响应（防用户名枚举）",
+              c_a == c_b == 401
+              and detail_of(b_a) == detail_of(b_b) == LOGIN_FAILED_DETAIL,
+              f"A=({c_a}, {detail_of(b_a)!r})  B=({c_b}, {detail_of(b_b)!r})")
+        check("R11 两种情况的响应体字段集合也相同（没有多给一个字段泄露线索）",
+              isinstance(b_a, dict) and isinstance(b_b, dict) and set(b_a) == set(b_b),
+              f"{sorted(b_a) if isinstance(b_a, dict) else b_a} vs "
+              f"{sorted(b_b) if isinstance(b_b, dict) else b_b}")
+    finally:
+        stop_server(proc)
+
+    # ---------------------------------------------------------------- 规则 3
+    group("场景 10：★ 规则 3 —— 每小时最多 20 次失败（冷却设 0、分钟设 9999 隔离）")
+    proc = start_server({**RL_ENV,
+                         "ELDER_LOGIN_FAIL_COOLDOWN_SEC": "0",
+                         "ELDER_LOGIN_FAIL_PER_MINUTE": WINDOW_OFF,
+                         "ELDER_LOGIN_FAIL_PER_HOUR": "20"})
+    if proc is None:
+        return 1
+    try:
+        codes = []
+        for _ in range(20):
+            c, _, _ = login_x("10.10.0.1", "rl_hour", "wrong-password")
+            codes.append(c)
+        check("R12 前 20 次失败都还是 401", codes == [401] * 20,
+              f"非 401 的次数={sum(1 for x in codes if x != 401)}")
+        c21, b21, h21 = login_x("10.10.0.1", "rl_hour", "wrong-password")
+        check("R13 ★ 第 21 次 -> 429（每小时 20 次封顶）", c21 == 429, f"code={c21}")
+        ra = retry_after_of(h21)
+        check("R14 ★ Retry-After > 600 —— 证明是**小时窗口**命中"
+              "（分钟窗口是 9999，不可能在这里拦）",
+              ra is not None and ra > 600, f"Retry-After={ra}")
+        check("R15 文案用「小时」（小时级等待说成多少秒没人看得懂）",
+              isinstance(detail_of(b21), str) and "小时" in detail_of(b21),
+              repr(detail_of(b21)))
+
+        # ---- 限速态下同样不许区分"用户名是否存在"
+        #      用小时窗口而不是分钟窗口：等待时长 ~3600 秒，两次请求之间
+        #      不会因为跨了「59 秒 / 1 分钟」的措辞边界而偶然不等。
+        c_c, b_c, _ = login_x("10.10.0.1", "still_no_such_user", "wrong-password")
+        c_d, b_d, _ = login_x("10.10.0.1", "admin", "definitely-wrong-password")
+        check("R16 ★★ 已触发限速时：不存在的用户名 与 存在的用户名+错密码"
+              " 状态码相同（都是 429）",
+              c_c == c_d == 429, f"C={c_c} D={c_d}")
+        check("R17 两者文案**抹掉数字后逐字相同**，且都不含任何一个用户名"
+              "（数字是「还要等多久」，会随时刻差 1 秒）",
+              mask_digits(detail_of(b_c)) == mask_digits(detail_of(b_d))
+              and not any(u in (detail_of(b_c) or "") or u in (detail_of(b_d) or "")
+                          for u in ("still_no_such_user", "admin")),
+              f"C={detail_of(b_c)!r}  D={detail_of(b_d)!r}")
+    finally:
+        stop_server(proc)
+
+    # ---------------------------------------------------------------- 成功登录
+    group("场景 11：★★ 成功登录不计入配额（冷却放宽到 30 秒，让「没被计数」无处可藏）")
+    proc = start_server({**RL_ENV,
+                         "ELDER_LOGIN_FAIL_COOLDOWN_SEC": "30",
+                         "ELDER_LOGIN_FAIL_PER_MINUTE": WINDOW_OFF,
+                         "ELDER_LOGIN_FAIL_PER_HOUR": WINDOW_OFF})
+    if proc is None:
+        return 1
+    try:
+        c0, _, _ = login_x("10.11.1.1", "admin", "wrong-password")
+        check("R18 前置：admin 先错一次 -> 401", c0 == 401, f"code={c0}")
+        oks = []
+        for _ in range(5):
+            c, t, _ = login_x("10.11.1.2", "admin", LEGACY_PW)
+            oks.append(c == 200 and bool((t or {}).get("access_token")))
+        check("R19 ★★ 连续成功登录 5 次**全部**成功（成功绝不计入配额）",
+              all(oks) and len(oks) == 5, f"oks={oks}")
+        c2, b2, _ = login_x("10.11.1.3", "admin", "wrong-password")
+        check("R20 ★★ 成功后紧接着错一次仍是 401 —— 证明那 5 次成功既没被计数、"
+              "也把 admin 自己的失败记录清掉了（否则这里会被 30 秒冷却拦成 429）",
+              c2 == 401, f"code={c2} detail={detail_of(b2)!r}")
+        # ⚠️ 下面这一笔**成功**不是为了再验一次登录，而是为了把 R20 记下的那笔
+        # 失败清掉 —— 冷却 30 秒下，admin 键只要有 1 笔失败就会拦住下一次失败，
+        # 不清掉的话 R20b 验的就不是"IP 键有没有被成功污染"而是"用户名键"。
+        c2c, _, _ = login_x("10.11.1.2", "admin", LEGACY_PW)
+        check("R20a 有失败记录时成功登录照样 200（清掉失败记录）",
+              c2c == 200, f"code={c2c}")
+        c2b, b2b, _ = login_x("10.11.1.2", "admin", "wrong-password")
+        check("R20b ★ 从**成功登录用的那个出口 IP** 再错一次也是 401"
+              "（证明成功没有在 IP 键上留痕）",
+              c2b == 401, f"code={c2b} detail={detail_of(b2b)!r}")
+        c3, t3, _ = login_x("10.11.1.1", "admin", LEGACY_PW)
+        check("R21 ★ 冷却期内用**正确**口令 -> 200（限速器绝不锁死知道口令的人；"
+              "smoke_mail「先故意错一次、紧接着用新口令登录」依赖这条）",
+              c3 == 200 and bool((t3 or {}).get("access_token")), f"code={c3}")
+        c4, b4, _ = login_x("10.11.1.1", "admin", "wrong-password")
+        check("R22 ★ 同一出口 IP 随后再错 -> 429（IP 侧的历史**没有**被成功登录洗掉）",
+              c4 == 429, f"code={c4} detail={detail_of(b4)!r}")
+    finally:
+        stop_server(proc)
+
+    # ---------------------------------------------------------------- 总开关
+    group("场景 12：ELDER_LOGIN_RATE_LIMIT=0 —— 限速可整体关闭（冒烟/内网部署的口子）")
+    proc = start_server({**RL_ENV, "ELDER_LOGIN_RATE_LIMIT": "0"})
+    if proc is None:
+        return 1
+    try:
+        codes = []
+        for _ in range(30):
+            c, _, _ = login_x("10.12.0.1", "rl_off", "wrong-password")
+            codes.append(c)
+        check("R23 ★ 关掉后连错 30 次全是 401（行为与今天**完全一致**，无回归）",
+              codes == [401] * 30, f"非 401 的次数={sum(1 for x in codes if x != 401)}")
+        c, t, _ = login_x("10.12.0.2", "admin", LEGACY_PW)
+        check("R24 关掉后正常登录不受影响", c == 200 and bool((t or {}).get("access_token")),
+              f"code={c}")
+        check("R25 关掉后**不会**返回 429（总开关真的生效）",
+              429 not in codes, f"出现 429 的次数={codes.count(429)}")
+    finally:
+        stop_server(proc)
+
+    # ---------------------------------------------------------------- 默认值
+    group("场景 13：★ 默认值就是主理人拍板的 5 秒 / 6 次 / 20 次（行为验证，不看代码）")
+    proc = start_server({**RL_ENV,
+                         "ELDER_LOGIN_FAIL_COOLDOWN_SEC": "0",
+                         "ELDER_LOGIN_FAIL_PER_HOUR": WINDOW_OFF})
+    if proc is None:
+        return 1
+    try:
+        codes = []
+        for _ in range(6):
+            c, _, _ = login_x("10.13.0.1", "rl_def_min", "wrong-password")
+            codes.append(c)
+        c7, _, h7 = login_x("10.13.0.1", "rl_def_min", "wrong-password")
+        ra = retry_after_of(h7)
+        check("R26 ★ 未设 ELDER_LOGIN_FAIL_PER_MINUTE 时，第 7 次被拦"
+              " -> 默认每分钟就是 6 次",
+              codes == [401] * 6 and c7 == 429, f"codes={codes} 第7次={c7}")
+        check("R27 且命中的是分钟窗口（Retry-After 45~65）",
+              ra is not None and 45 <= ra <= 65, f"Retry-After={ra}")
+    finally:
+        stop_server(proc)
+
+    proc = start_server({**RL_ENV,
+                         "ELDER_LOGIN_FAIL_COOLDOWN_SEC": "0",
+                         "ELDER_LOGIN_FAIL_PER_MINUTE": WINDOW_OFF})
+    if proc is None:
+        return 1
+    try:
+        codes = []
+        for _ in range(20):
+            c, _, _ = login_x("10.13.1.1", "rl_def_hour", "wrong-password")
+            codes.append(c)
+        c21, _, h21 = login_x("10.13.1.1", "rl_def_hour", "wrong-password")
+        ra = retry_after_of(h21)
+        check("R28 ★ 未设 ELDER_LOGIN_FAIL_PER_HOUR 时，第 21 次被拦"
+              " -> 默认每小时就是 20 次",
+              codes == [401] * 20 and c21 == 429,
+              f"非 401 的次数={sum(1 for x in codes if x != 401)} 第21次={c21}")
+        check("R29 且命中的是小时窗口（Retry-After > 600）",
+              ra is not None and ra > 600, f"Retry-After={ra}")
+    finally:
+        stop_server(proc)
+
+    # ---- 静态兜底：配置默认值本身（不启服务，秒级）
+    env_clean = dict(os.environ)
+    env_clean.pop("MSYSTEM", None)
+    for _k in ("ELDER_LOGIN_FAIL_COOLDOWN_SEC", "ELDER_LOGIN_FAIL_PER_MINUTE",
+               "ELDER_LOGIN_FAIL_PER_HOUR"):
+        env_clean.pop(_k, None)
+    dump = subprocess.run(
+        [PY, "-c", "import sys; sys.path.insert(0, '.'); import app.config as c; "
+                   "print(c.LOGIN_FAIL_COOLDOWN_SEC, c.LOGIN_FAIL_PER_MINUTE, "
+                   "c.LOGIN_FAIL_PER_HOUR, c.LOGIN_RATE_LIMIT_ENABLED)"],
+        cwd=str(SERVER), env=env_clean, capture_output=True, text=True)
+    check("R30 ★ 配置默认值逐字是「5 6 20 True」（默认值必须是主理人拍板的那组）",
+          dump.stdout.strip() == "5 6 20 True", f"stdout={dump.stdout.strip()!r}")
+
+    # ---------------------------------------------------------------- XFF
+    group("场景 14：★ X-Forwarded-For —— 默认不信任（盲目信任 = 限速器形同虚设）")
+    # ⚠️ 这一台**刻意不设** ELDER_TRUSTED_PROXY_IPS（默认值 = 谁都不信）
+    proc = start_server({"ELDER_ALLOW_PUBLIC_REGISTER": "1",
+                         "ELDER_SEED_ADMIN_PASSWORD": LEGACY_PW,
+                         "ELDER_TRUSTED_PROXY_IPS": None,
+                         "ELDER_LOGIN_FAIL_PER_MINUTE": WINDOW_OFF,
+                         "ELDER_LOGIN_FAIL_PER_HOUR": WINDOW_OFF})
+    if proc is None:
+        return 1
+    try:
+        c1, _, _ = login_x("8.8.8.8", "xff_a", "wrong-password")
+        c2, _, _ = login_x("9.9.9.9", "xff_b", "wrong-password")
+        check("R31 ★★ 未声明可信代理时，换个 X-Forwarded-For 头**换不了主体**"
+              " -> 第二笔仍被 5 秒冷却拦成 429（该头是请求方能随便写的，不能信）",
+              c1 == 401 and c2 == 429, f"第一笔={c1} 第二笔={c2}")
+        c3, _, _ = login_x("8.8.8.8", "xff_c", "wrong-password")
+        check("R32 再换一个用户名也一样被拦（拦的是 IP 主体，不是用户名）",
+              c3 == 429, f"code={c3}")
+    finally:
+        stop_server(proc)
+
+    group("场景 15：★ 声明了可信代理 -> 从右往左取真实客户端（跳过伪造段）")
+    proc = start_server({**RL_ENV,
+                         "ELDER_LOGIN_FAIL_PER_MINUTE": WINDOW_OFF,
+                         "ELDER_LOGIN_FAIL_PER_HOUR": WINDOW_OFF})
+    if proc is None:
+        return 1
+    try:
+        # 客户端真实 IP 是 5.5.5.5，8.8.8.8 是它自己伪造着塞进来的那段。
+        # 每跳可信代理把自己的上游**追加在右边**，所以从右往左扫跳过可信段后
+        # 遇到的第一个不可信地址才是真的。
+        c1, _, _ = login_x("8.8.8.8, 5.5.5.5", "xff_d", "wrong-password")
+        check("R33 前置：带伪造段的请求先失败一次 -> 401", c1 == 401, f"code={c1}")
+        c2, _, _ = login_x("5.5.5.5", "xff_e", "wrong-password")
+        check("R34 ★★ 只带真实 IP 的请求被拦 -> 429"
+              "（证明上一笔记的确实是 **5.5.5.5**，不是伪造的 8.8.8.8）",
+              c2 == 429, f"code={c2}")
+        c3, _, _ = login_x("8.8.8.8", "xff_f", "wrong-password")
+        check("R35 ★★ 只带伪造 IP 的请求**不**被拦 -> 401"
+              "（证明 R34 的 429 不是「所有请求都被拦」，取键确实取的是右数第一个不可信段）",
+              c3 == 401, f"code={c3}")
+    finally:
+        stop_server(proc)
+
+    group("场景 16：uvicorn 自带那一层（默认信任 127.0.0.1）—— 把现状钉住，别当配置")
+    # ⚠️ 这一台**刻意**不传 --no-proxy-headers，让 uvicorn 的
+    # ProxyHeadersMiddleware 保持默认（trusted_hosts=127.0.0.1），
+    # 且**不设** ELDER_TRUSTED_PROXY_IPS。它记录的是"框架默认行为"，
+    # 不是我们要的语义 —— 生产该怎么配写在 docs/DEPLOY.md §5.3。
+    proc = start_server({"ELDER_ALLOW_PUBLIC_REGISTER": "1",
+                         "ELDER_SEED_ADMIN_PASSWORD": LEGACY_PW,
+                         "ELDER_TRUSTED_PROXY_IPS": None,
+                         "ELDER_LOGIN_FAIL_PER_MINUTE": WINDOW_OFF,
+                         "ELDER_LOGIN_FAIL_PER_HOUR": WINDOW_OFF},
+                        uvicorn_args=[])
+    if proc is None:
+        return 1
+    try:
+        c1, _, _ = login_x("8.8.8.8", "uv_a", "wrong-password")
+        c2, _, _ = login_x("9.9.9.9", "uv_b", "wrong-password")
+        c3, _, _ = login_x("8.8.8.8", "uv_c", "wrong-password")
+        check("R36 记录现状：uvicorn 默认就信任本机对端的 XFF —— "
+              "不同 XFF 被当成不同主体（401/401/429），"
+              "所以「反代就在 127.0.0.1」的部署即使不配 ELDER_TRUSTED_PROXY_IPS 也照样限得住",
+              (c1, c2, c3) == (401, 401, 429), f"codes={(c1, c2, c3)}")
+    finally:
+        stop_server(proc)
+
+    group("场景 17：★ XFF 链里的可信段必须被跳过（只认右数第一个不可信地址）")
+    proc = start_server({"ELDER_ALLOW_PUBLIC_REGISTER": "1",
+                         "ELDER_SEED_ADMIN_PASSWORD": LEGACY_PW,
+                         "ELDER_TRUSTED_PROXY_IPS": "127.0.0.1,10.0.0.1",
+                         "ELDER_LOGIN_FAIL_PER_MINUTE": WINDOW_OFF,
+                         "ELDER_LOGIN_FAIL_PER_HOUR": WINDOW_OFF})
+    if proc is None:
+        return 1
+    try:
+        c1, _, _ = login_x("7.7.7.7", "tr_a", "wrong-password")
+        check("R37 前置：XFF=7.7.7.7 失败一次 -> 401", c1 == 401, f"code={c1}")
+        c2, _, _ = login_x("10.0.0.1, 7.7.7.7", "tr_b", "wrong-password")
+        check("R38 ★★ XFF=「10.0.0.1, 7.7.7.7」时被拦 -> 429"
+              "（可信的 10.0.0.1 被跳过，取到的仍是 7.7.7.7，与上一笔同一主体）",
+              c2 == 429, f"code={c2}")
+        c3, _, _ = login_x("5.5.5.5", "tr_c", "wrong-password")
+        check("R39 换个不可信地址 -> 401（证明 R38 的 429 不是「所有请求都被拦」）",
+              c3 == 401, f"code={c3}")
+        c4, _, _ = login_x("10.0.0.1", "tr_d", "wrong-password")
+        check("R40 整条链都是可信地址时回落到 TCP 对端，不炸且是另一个主体 -> 401",
+              c4 == 401, f"code={c4}")
     finally:
         stop_server(proc)
 

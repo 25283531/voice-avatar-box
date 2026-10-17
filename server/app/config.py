@@ -6,6 +6,24 @@ from datetime import timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+
+def _int_env(name: str, default: int) -> int:
+    """读一个整数型环境变量。
+
+    ⚠️ 解析不出整数时**回落到 default 而不是 0**，且负/零一律夹到 0：
+    限速类变量写错的后果必须是"更严格"或"保持默认"，绝不能是"限速器消失"。
+    （这段被调用方在「登录失败限速」一节里依赖，方向别改反。）
+    """
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        return default
+    return value if value > 0 else 0
+
+
 # ---------------------------------------------------------------- 基础
 APP_NAME = "老人陪伴提醒助手 · 业务后端"
 APP_VERSION = "0.1.0"
@@ -170,6 +188,62 @@ RESET_ADMIN_PASSWORD = os.getenv("ELDER_RESET_ADMIN_PASSWORD", "").strip()
 # 同一个口令两次 hash 出来的字符串**完全不同**，字符串比对会**恒 False**
 # -> 全员漏报 -> 体检形同虚设（这正是本类漏洞最难发现的失效形态）。
 DEFAULT_ADMIN_PASSWORDS: tuple[str, ...] = ("admin123",)
+
+# ---------------------------------------------------------------- 登录失败限速
+# 主理人 2026-10-17 拍板的三条规则（**全部只针对登录失败**）：
+#   1. 密码错一次之后，该主体必须等 5 秒才能再试，期间尝试直接拒绝；
+#   2. 每分钟最多 6 次失败；
+#   3. 每小时最多 20 次失败。
+#
+# 实现与取舍写在 server/app/ratelimit.py 的模块 docstring 里，运维口径写在
+# docs/DEPLOY.md §5.3。这里只解释**为什么必须是环境变量**：
+#
+#   1. 默认值（5 / 6 / 20）是给"面向公网的单人私有化部署"定的，**内网 / 办公
+#      网 / NAT 出口后面有很多人**的部署会被误伤 —— 那种场景要把 ELDER_LOGIN_FAIL_PER_HOUR
+#      调大，改代码等于逼人开分支；
+#   2. tools/ 下 8 个冒烟脚本会在几秒内连续登录同一台服务，其中 smoke_mail /
+#      smoke_home 还会**故意输错一次密码**。冒烟必须能把限额调大或整个关掉，
+#      否则限速器会把 CI 打红 —— 但**默认值仍必须是 5/6/20**，
+#      关掉只能靠显式设 ELDER_LOGIN_RATE_LIMIT=0。
+#
+# ⚠️ 取值规则（安全侧）：**解析不出整数时回落到默认值**，而默认值是**最严**的
+#   那一档。也就是说把变量写错（写成空串、写成 abc）得到的是"更严格"，
+#   不是"限速器消失" —— 这跟注册开关那类"写错就敞开"的变量正好相反，
+#   方向必须选对。
+LOGIN_RATE_LIMIT_ENABLED = (
+    os.getenv("ELDER_LOGIN_RATE_LIMIT", "1").strip().lower()
+    not in ("0", "false", "no", "off", "")
+)
+#: 失败后必须等待的秒数（规则 1）。``0`` = 不冷却。
+LOGIN_FAIL_COOLDOWN_SEC = _int_env("ELDER_LOGIN_FAIL_COOLDOWN_SEC", 5)
+#: 每个主体每分钟允许的失败次数（规则 2）。``0`` = 该窗口不生效。
+LOGIN_FAIL_PER_MINUTE = _int_env("ELDER_LOGIN_FAIL_PER_MINUTE", 6)
+#: 每个主体每小时允许的失败次数（规则 3）。``0`` = 该窗口不生效。
+LOGIN_FAIL_PER_HOUR = _int_env("ELDER_LOGIN_FAIL_PER_HOUR", 20)
+
+# 限速表最多记多少个"主体"（IP / 用户名）的失败记录。
+#
+# ⚠️ 为什么必须封顶：用户名键是**请求里带什么就建什么**，攻击者可以拿
+#     一万个不存在的用户名各错一次，把表撑爆（内存里的 dict 无上限增长 =
+#     一条不需要口令的 OOM 路径）。封顶后按 LRU 淘汰最久没动静的键，
+#     代价只是"某个很久没失败的主体重新计数"，不会锁死任何人。
+LOGIN_RATE_LIMIT_MAX_KEYS = _int_env("ELDER_LOGIN_RATE_LIMIT_MAX_KEYS", 10000)
+
+# ---------------------------------------------------------------- 客户端 IP 与反代
+# 生产是「Docker + 域名 + Nginx」，服务端看到的 TCP 对端是 **Nginx**，
+# 真实客户端 IP 只在 X-Forwarded-For 里。但盲目信任这个头等于限速器形同虚设
+# —— 攻击者随便换个头就是一个新主体。所以规则是：
+#
+#   * **默认（本变量为空）谁都不信**：只认 ``request.client.host``（TCP 对端）。
+#     直连部署 / 容器直接暴露端口就是这个形态，限速照常生效。
+#   * **只有显式列出**的上一级地址才被当成"可信代理"，此时才去解析 XFF，
+#     并且**从右往左**扫、跳过所有可信代理，取第一个不可信的地址 ——
+#     攻击者伪造的那几段是被**Nginx 追加在左边**的，从右往左扫正好跳过它们。
+#
+# 填法：逗号分隔的 IP 或 CIDR。Nginx 与应用同一台机器 -> ``127.0.0.1``；
+# Nginx 在另一个容器 -> 那个容器在 docker 网里的地址，或整段 ``172.18.0.0/16``。
+# 详见 docs/DEPLOY.md §5.3。
+TRUSTED_PROXY_IPS = os.getenv("ELDER_TRUSTED_PROXY_IPS", "").strip()
 
 # ---------------------------------------------------------------- 激活码
 # 与固件 elder_activation.c 保持完全一致：
