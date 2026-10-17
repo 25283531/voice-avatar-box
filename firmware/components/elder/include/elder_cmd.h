@@ -16,18 +16,29 @@ extern "C" {
 /*
  * 离线命令词分发器（断网可用的「新建 / 确认 / 查询」）。
  *
- * ⚠️ 离线语音识别的真实边界（别被这份文件的名字骗了）：
- *   本模块只做「意图 → 动作」的映射，**不含任何语音识别**。
- *   固件里唯一能离线听懂人话的是 esp-sr MultiNet（mn6_cn），而它需要
- *   CONFIG_USE_CUSTOM_WAKE_WORD + model 分区 + 词表注册，三者缺一不可。
- *   在 MultiNet 接通之前，断网时老人只能用**按键**确认（elder_input.c），
- *   语音命令词分发器处于「已就绪但无人喂词」的状态。见 docs/决策记录.md。
- *
  * 与 MultiNet 的分工：
  *   - 识别层（custom_wake_word.cc，main 组件）负责「听」——
- *     识别命中后调 elder_cmd_dispatch()；
+ *     esp-sr MultiNet 命中后经 elder_mn_post() 异步转交到这里；
  *   - 本模块负责「做」—— 纯 C、无 ESP 依赖（除 esp_err.h），
  *     因此可以在宿主机器上直接跑单元测试（tools/test_elder_host）。
+ *
+ * ⚠️ 模型放在哪（别再写成「需要 model 分区」，那是错的）：
+ *   模型由 main/assets.cc 从 **assets 分区**里的 srmodels.bin 加载
+ *   （读 index.json 的 srmodels 字段 → srmodel_load → SetModelsList），
+ *   8MB 的 assets 分区装得下 mn7_cn（2671229 字节）+ 字体 + emoji。
+ *   若反而新增 model 分区，esp-sr 的 CMakeLists 会**再打包烧一份**
+ *   srmodels.bin 到那里，纯浪费 —— 所以分区表不需要改。
+ *
+ * ⚠️ 与设备 AEC 的关系（读码结论，不是猜测）：
+ *   application.cc 里 CONFIG_USE_DEVICE_AEC 只决定 aec_mode_ 与
+ *   listening_mode_，AFE 的 AEC 配置在 afe_audio_processor.cc 里，
+ *   两者都不读唤醒词类型。真正的耦合只有一处：
+ *   Kconfig 的 WAKE_WORD_TYPE 是 **choice**，USE_AFE_WAKE_WORD 与
+ *   USE_CUSTOM_WAKE_WORD 互斥 —— 想让 MultiNet 离线命令词生效就必须
+ *   切到后者，代价是唤醒词从专用 WakeNet 换成 MultiNet（见 sdkconfig.defaults
+ *   里的说明）。且 CustomWakeWord::Feed 拿的是**未经 AEC 的原始单声道**
+ *   （audio_service.cc 里唤醒词与音频处理二选一，喂完就 continue），
+ *   所以设备自己放音时离线命令词可能被自己的声音误触发。
  *
  * 安全口径：
  *   - 确认类只确认「今天第一条未完成的服药」，没有删除/改期命令；
@@ -106,8 +117,10 @@ time_t elder_cmd_now(void);
  *        定义在 elder_bridge.cc —— 因为执行动作需要屏显/提示音这些
  *        只有 bridge 才持有的 xiaozhi 运行时句柄。
  *
- * @note 现状：该接线口已就位，但 MultiNet 尚未启用（见 docs/决策记录.md D11），
- *       所以**目前没有任何调用方**，离线时设备听不懂人话，服药确认请用按键。
+ * @note 调用链：CustomWakeWord::Feed（音频任务）
+ *          → elder_mn_post()（有界队列，非阻塞）
+ *          → elder_mn 任务 → 本函数（此时可以同步写 NVS 与刷屏）
+ *       识别层**不直接**调本函数，因为音频任务里不能阻塞。
  */
 void elder_cmd_on_recognized(const char *phrase);
 

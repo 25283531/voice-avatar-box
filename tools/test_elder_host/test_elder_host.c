@@ -287,6 +287,55 @@ static void test_offline_command_dispatch(void)
     }
     check("词表无重复短语", dup == 0, NULL);
 
+    /* --- 词表自检：每条都必须带拼音（MultiNet 的注册单元） ---
+     * MultiNet 中文模型识别的是拼音音节（mn7_cn/vocab 里的 405 个音节），
+     * 不是汉字。拼音留空 → esp_mn_commands_add() 直接 return
+     * ESP_ERR_INVALID_STATE 且不挂链表 → 那条命令**永远不会被识别**，
+     * 而固件不会因此报错，只会安静地少一条功能。
+     * 「以为装好了其实没装」在医疗设备上等于漏一次服药提醒。 */
+    int missing_pinyin = 0;
+    int bad_pinyin = 0;
+    char missing_list[192];
+    missing_list[0] = '\0';
+    for (int i = 0; i < n; i++) {
+        const elder_cmd_word_t *w = elder_cmd_word_at(i);
+        if (!w) continue;
+        if (w->pinyin == NULL || w->pinyin[0] == '\0') {
+            missing_pinyin++;
+            snprintf(missing_list + strlen(missing_list),
+                     sizeof(missing_list) - strlen(missing_list),
+                     "%s\"%s\"", missing_list[0] ? ", " : "", w->phrase);
+            continue;
+        }
+        /* 格式：小写字母与空格。混入汉字/数字/符号都会被模型判为无法解析。
+         * 声调也不能带（"ni3 hao3" 非法），FST 表 commands_cn.txt 就是基准。 */
+        for (const char *p = w->pinyin; *p; p++) {
+            if (!((*p >= 'a' && *p <= 'z') || *p == ' ')) { bad_pinyin++; break; }
+        }
+    }
+    check("词表每条都带拼音（否则 MultiNet 会静默不注册该命令）",
+          missing_pinyin == 0,
+          det("%d 条缺拼音：%s", missing_pinyin, missing_list));
+    check("词表拼音格式合法（只含小写字母与空格，不带声调）",
+          bad_pinyin == 0,
+          det("%d 条拼音含非法字符", bad_pinyin));
+
+    /* --- 拼音也不能重复 ---
+     * esp_mn_commands_add() 遇到已存在的短语只改 command_id 不报错，
+     * 两条不同汉字映射到同一串拼音时，后者会把前者的 id 顶掉，
+     * 于是老人说那句话执行的是**另一条**命令。 */
+    int dup_pinyin = 0;
+    for (int i = 0; i < n; i++) {
+        for (int j = i + 1; j < n; j++) {
+            const elder_cmd_word_t *a = elder_cmd_word_at(i);
+            const elder_cmd_word_t *b = elder_cmd_word_at(j);
+            if (a && b && a->pinyin && b->pinyin && strcmp(a->pinyin, b->pinyin) == 0) dup_pinyin++;
+        }
+    }
+    check("词表无重复拼音（重复会让 id 被顶掉，说 A 执行 B）",
+          dup_pinyin == 0,
+          det("%d 条拼音重复", dup_pinyin));
+
     /* --- 词表必须保守：不能有删除/改期类命令 ---
      * 误识别删除一条服药提醒不可逆，所以只允许 create/confirm/query。 */
     int destructive = 0;

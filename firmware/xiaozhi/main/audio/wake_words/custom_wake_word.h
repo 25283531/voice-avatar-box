@@ -48,6 +48,14 @@ private:
     int duration_ = 3000;
     float threshold_ = 0.2;
     std::deque<Command> commands_;
+
+    // command_id → commands_ 下标。
+    // 不用 id-1 直取的原因：esp_mn_commands_add() 遇到模型解析不了的短语会
+    // return ESP_ERR_INVALID_STATE 且不把短语挂进链表，但 command_id 是我们
+    // 自己递增传进去的。若有短语被拒，id 与 commands_ 下标就会错位，
+    // Feed() 里按 id-1 取命令会拿到**另一条短语** —— 对服药提醒来说
+    // 这是「说 A 执行 B」，比识别失败严重得多。
+    std::vector<std::pair<int, int>> registered_ids_;
  
     std::function<void(const std::string& wake_word)> wake_word_detected_callback_;
     AudioCodec* codec_ = nullptr;

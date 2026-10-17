@@ -37,6 +37,7 @@
 #include "elder_activation.h"
 #include "elder_ui.h"
 #include "elder_cmd.h"     /* 离线命令词词表（启动自检时遍历，见 elder_bridge_start 第 9 步） */
+#include "elder_mn.h"      /* MultiNet 识别结果 → 分发器的异步通道 */
 #include "elder_net.h"
 #include "elder_sync.h"
 #include "elder_cmd.h"
@@ -290,9 +291,10 @@ void OnDeviceStateChanged(DeviceState prev, DeviceState cur)
 
 // MultiNet（或任何离线识别层）命中命令词后调这个入口。
 //
-// ⚠️ 当前状态：MultiNet **未启用**（缺 model 分区 + 未选
-// CONFIG_USE_CUSTOM_WAKE_WORD），所以断网时这个函数还没有调用方。
-// 保留它是为了让识别层接通时只需加一行调用，而不用改分发逻辑。
+// ⚠️ 调用方**不是**音频任务：custom_wake_word.cc 的识别回调走
+// elder_mn_post()，由 elder_mn_task（独立任务）调到这里。
+// 所以这里可以同步做 NVS 写入与屏显，不必担心阻塞喂音频。
+// 若将来有别的识别层直接调本函数，请先经 elder_mn_post() 转交。
 void OnCommandRecognized(const char *phrase)
 {
     elder_cmd_result_t r;
@@ -452,24 +454,33 @@ extern "C" void elder_bridge_start(void)
     ESP_LOGI(TAG, "elder 组件接入完成；离线提醒可用=%s",
              elder_time_synced() ? "已校时" : "未校时（依赖本地 RTC）");
 
-    // 9) 离线命令词自检：把词表真正跑一遍并打出来。
+    // 9) 离线命令词：启动异步执行通道 + 把词表真正跑一遍并打出来。
+    //
+    // 9a) 先起执行通道。识别回调（音频任务）只往这里投递，
+    //     由独立任务执行 —— 理由见 elder_mn.c 的文件头注释。
+    if (elder_mn_init() != ESP_OK) {
+        ESP_LOGE(TAG, "离线命令词执行通道启动失败 —— 断网时只能用按键");
+    }
+
+    // 9b) 词表自检。
     //
     // 这么做有两个必要理由，缺一不可：
     //  a) 可观测 —— 现场只要看这条日志就能确认「预置关键词」到底有没有烧进去，
     //     不必去猜。医疗设备不允许「以为装好了其实没装」。
-    //  b) 保活 —— 离线识别层（MultiNet）尚未启用时，没有任何代码调用
-    //     elder_cmd_dispatch()，链接器的 --gc-sections 会把整个 elder_cmd.c
-    //     当作未被引用的目标文件**整块裁掉**，最终固件里根本不含词表。
-    //     这里主动调用一次，既留下证据，也防止被裁。
+    //  b) 保活 —— 链接器的 --gc-sections 会把未被引用的目标文件**整块裁掉**，
+    //     这里主动引用一次，防止词表被裁。
+    //
+    // 打印拼音是因为 MultiNet 注册用的是拼音那一份：现场老人说「吃过了」
+    // 设备没反应时，对着这条拼音排查比对着汉字有用。
     {
         int n = elder_cmd_word_count();
         ESP_LOGI(TAG, "离线命令词已预置 %d 条：", n);
         for (int i = 0; i < n; i++) {
             const elder_cmd_word_t *w = elder_cmd_word_at(i);
-            if (w) ESP_LOGI(TAG, "  [%d] \"%s\" -> %s", i, w->phrase, w->hint);
+            if (w) ESP_LOGI(TAG, "  [%d] \"%s\" (%s) -> %s", i, w->phrase, w->pinyin, w->hint);
         }
-        ESP_LOGW(TAG, "注意：离线**语音识别**当前未启用（esp-sr MultiNet 缺 model "
-                      "分区且未选 USE_CUSTOM_WAKE_WORD），断网时上述词表不会被自动喂词；"
-                      "服药确认请用按键（长按后 30 秒内短按）。详见 docs/决策记录.md D11");
+        ESP_LOGI(TAG, "以上短语已由 esp-sr MultiNet 接管离线识别"
+                     "（见 main/audio/wake_words/custom_wake_word.cc）；"
+                     "识别不可靠时仍可用按键兜底（长按后 30 秒内短按）");
     }
 }

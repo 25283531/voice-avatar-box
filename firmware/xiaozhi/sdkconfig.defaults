@@ -81,6 +81,27 @@ CONFIG_LV_BUILD_DEMOS=n
 CONFIG_BOARD_TYPE_LICHUANG_DEV_S3=y
 CONFIG_USE_DEVICE_AEC=y
 
+# --- 离线语音命令词（esp-sr MultiNet）---
+#
+# 为什么必须切到 USE_CUSTOM_WAKE_WORD（而不是只加模型）：
+#   audio_service.cc SetModelsList() 运行时按**模型内容**选唤醒词实现 ——
+#   看到 mn* 模型就用 CustomWakeWord，否则用 AfeWakeWord。而
+#   build_default_assets.py 也只在 USE_CUSTOM_WAKE_WORD 时才把 multinet
+#   模型打进 assets。只开模型不开这个开关，模型根本不会被打包。
+#
+# 为什么 CUSTOM_WAKE_WORD 要写成「你好小智」的拼音：
+#   切到 CustomWakeWord 后唤醒词由 MultiNet 识别，不再是专用 WakeNet。
+#   短语本身必须保持不变 —— 老人和子女的肌肉记忆是产品资产，
+#   不能因为换了识别引擎就换词。Kconfig 要求中文写拼音、空格分隔。
+CONFIG_USE_CUSTOM_WAKE_WORD=y
+CONFIG_CUSTOM_WAKE_WORD="ni hao xiao zhi"
+CONFIG_CUSTOM_WAKE_WORD_DISPLAY="你好小智"
+CONFIG_CUSTOM_WAKE_WORD_THRESHOLD=20
+# mn7_cn：官方推荐版本（S3/P4），比 mn6_cn 小约 1MB。
+# 模型字节数 = mn7_data 2659972 + mn7_index 4656 + vocab 6601 = 2671229，
+# 连同 fst 共 2680877 字节打进 assets 分区（8MB，当前余量充足）。
+CONFIG_SR_MN_CN_MULTINET7_QUANT=y
+
 # >>> BEGIN elder-companion overlay (由 tools/merge_to_xiaozhi.py 注入，勿手改) >>>
 # 目标板卡：立创·实战派 ESP32-S3
 CONFIG_BOARD_TYPE_LICHUANG_DEV_S3=y

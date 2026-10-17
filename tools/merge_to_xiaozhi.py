@@ -125,9 +125,21 @@ CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
 CONFIG_SPIRAM=y
 CONFIG_SPIRAM_MODE_OCT=y
 CONFIG_SPIRAM_SPEED_80M=y
-# 分区表：v2/16m.csv（含 8MB assets 分区，存放 EAF 形象包）
+# 分区表：v2/16m.csv（含 8MB assets 分区，存放 EAF 形象包 + MultiNet 模型）
 CONFIG_PARTITION_TABLE_CUSTOM=y
 CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions/v2/16m.csv"
+# 离线语音命令词（esp-sr MultiNet）。切到 USE_CUSTOM_WAKE_WORD 是必须的：
+# build_default_assets.py 只在这个开关打开时才把 multinet 模型打进 assets，
+# 且 audio_service.cc SetModelsList() 见到 mn* 模型就改用 CustomWakeWord。
+# 唤醒词保持「你好小智」的拼音不变 —— 换了识别引擎不能换词，
+# 老人和子女的肌肉记忆是产品资产。Kconfig 要求中文写拼音、空格分隔。
+CONFIG_USE_CUSTOM_WAKE_WORD=y
+CONFIG_CUSTOM_WAKE_WORD="ni hao xiao zhi"
+CONFIG_CUSTOM_WAKE_WORD_DISPLAY="你好小智"
+CONFIG_CUSTOM_WAKE_WORD_THRESHOLD=20
+# mn7_cn：官方推荐（S3/P4），比 mn6_cn 小约 1MB。
+# 模型 2671229 字节 + fst 9648 字节 = 2680877 字节，进 assets 分区。
+CONFIG_SR_MN_CN_MULTINET7_QUANT=y
 # 业务后端地址（按实际部署修改，也可 idf.py menuconfig 调整）
 CONFIG_ELDER_SERVER_URL="http://192.168.1.100:8000"
 CONFIG_ELDER_SERVER_TOKEN=""
