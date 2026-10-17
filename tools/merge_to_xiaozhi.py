@@ -84,10 +84,26 @@ target_link_libraries(${{COMPONENT_LIB}} PRIVATE idf::elder)
 # 追加到 main/main.cc 的内容：在 app.Start() 之后调用 elder_bridge_start()。
 # app.Start() 内部会创建主事件循环任务并立刻返回，因此这里延时 2s 再启动 elder，
 # 等 Board/Display 初始化完成，避免拿到空指针。
+#
+# ⚠️ 踩过的坑（C++ 语言规则，不是风格问题）：
+#   `extern "C"` **只能出现在命名空间作用域**，写在函数体里是语法错误：
+#       main.cc:35:12: error: expected unqualified-id before string constant
+#       main.cc:38:9: error: 'elder_bridge_start' was not declared in this scope
+#   连带出第二个错误：声明没生效，后面的调用自然找不到符号。
+#   所以这里用普通 C++ 声明（不套 extern "C"）—— elder_bridge.cc 那边自己
+#   是 `extern "C"` 定义，而 main.cc 里 lambda 捕获的调用会按 C++ 规则去找
+#   名字，两边对不上。所以正确做法是**在文件作用域加一个带 extern "C" 的
+#   前置声明**（见 MAIN_CC_DECL），函数体里只留调用。
+MAIN_CC_DECL = """
+// >>> BEGIN elder-companion overlay (由 tools/merge_to_xiaozhi.py 注入，勿手改) >>>
+// 老人陪伴 & 提醒助手：等 xiaozhi 的 Board / Display / AudioService 就绪后拉起
+// 声明必须在**文件作用域**：extern "C" 写在函数体里是语法错误。
+extern "C" void elder_bridge_start(void);
+// <<< END elder-companion overlay <<<
+"""
+
 MAIN_CC_CALL = """
     // >>> BEGIN elder-companion overlay (由 tools/merge_to_xiaozhi.py 注入，勿手改) >>>
-    // 老人陪伴 & 提醒助手：等 xiaozhi 的 Board / Display / AudioService 就绪后拉起
-    extern "C" void elder_bridge_start(void);
     xTaskCreatePinnedToCore([](void *arg) {
         vTaskDelay(pdMS_TO_TICKS(2000));
         elder_bridge_start();
@@ -242,20 +258,51 @@ def merge() -> int:
     else:
         print(f"[merge] 已是最新: {MAIN_CMAKE}")
 
-    # 3) main/main.cc 里插入 elder_bridge_start() 调用
+    # 3) main/main.cc：
+    #    - 文件作用域加 `extern "C" void elder_bridge_start(void);` 前置声明
+    #      （必须在这里 —— extern "C" 写在函数体里是语法错误，见 MAIN_CC_DECL）
+    #    - app.Start() 之后插入启动调用
+    #
+    # ⚠️ 不能沿用 "elder_bridge_start 是否出现过" 来判重：早期版本把
+    #    extern "C" 声明写在了函数体里（语法错误，编译必挂），那处文本里
+    #    同样含有 "elder_bridge_start" 字样，旧判重会误判成「已注入」而
+    #    永远修不好。改为按 overlay 标记整段剥离后重建（幂等且能纠错）。
     if MAIN_CC.is_file():
         text = MAIN_CC.read_text(encoding="utf-8")
-        if "elder_bridge_start" not in text:
-            marker = "    app.Start();\n"
-            if marker in text:
-                text = text.replace(marker, "    app.Start();\n" + MAIN_CC_CALL, 1)
-                MAIN_CC.write_text(text, encoding="utf-8")
-                print(f"[merge] 已注入启动调用: {MAIN_CC}")
-            else:
-                print(f"[merge] 警告：main.cc 中未找到 `app.Start();`，需手动接入",
-                      file=sys.stderr)
+        stripped, had_overlay = strip_overlay(
+            text,
+            "    // >>> BEGIN elder-companion overlay (由 tools/merge_to_xiaozhi.py 注入，勿手改) >>>",
+            "    // <<< END elder-companion overlay <<<",
+        )
+        # 也剥掉可能残留在文件作用域的裸声明（MAIN_CC_DECL 的形态）
+        stripped = stripped.replace(
+            'extern "C" void elder_bridge_start(void);\n', ""
+        )
+
+        marker = "    app.Start();\n"
+        if marker not in stripped:
+            print("[merge] 警告：main.cc 中未找到 `app.Start();`，需手动接入",
+                  file=sys.stderr)
         else:
-            print(f"[merge] 已是最新: {MAIN_CC}")
+            stripped = stripped.replace(
+                marker, marker + MAIN_CC_CALL, 1)
+            # 前置声明插在 app_main() 定义之前（文件作用域）
+            anchor = 'extern "C" void app_main(void)'
+            if anchor in stripped:
+                stripped = stripped.replace(
+                    anchor, MAIN_CC_DECL + "\n" + anchor, 1)
+            else:
+                print("[merge] 警告：main.cc 中未找到 app_main() 定义，"
+                      "elder_bridge_start 的声明需手动补到文件作用域",
+                      file=sys.stderr)
+
+            changed = stripped != text
+            if changed:
+                MAIN_CC.write_text(stripped, encoding="utf-8")
+                print(f"[merge] 已注入启动调用: {MAIN_CC}"
+                      + ("（含旧 overlay 纠错）" if had_overlay else ""))
+            else:
+                print(f"[merge] 已是最新: {MAIN_CC}")
 
     # 4) sdkconfig.defaults overlay
     if append_overlay(SDK_DEFAULTS, SDKCONFIG_OVERLAY):
