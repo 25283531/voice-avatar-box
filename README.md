@@ -1,10 +1,17 @@
 # voice-avatar-box · 老人陪伴 & 提醒助手
 
 面向老年人的语音陪伴与服药提醒助手，硬件基于 **立创·实战派 ESP32-S3**，
-后续移植 **ESP32-S3-BOX-3 / ESP-VoCat**。语音与 AI 链路复用开源
-[xiaozhi-esp32](https://github.com/xinnan-tech/xiaozhi-esp32) 与
-[xiaozhi-esp32-server](https://github.com/xinnan-tech/xiaozhi-esp32-server)，
-本项目只做「业务面」：设备绑定、提醒与回执、形象/提示词、AI 平台配置、交互统计、手机端与管理后台。
+后续移植 **ESP32-S3-BOX-3 / ESP-VoCat**。
+
+**语音链路是自研的**（`server/app/voice/`：WebSocket 服务端 + Opus 编解码 + 会话编排 + OTA），
+与业务 API 同进程同端口，运行时**不依赖任何第三方语音服务器**。
+固件侧借鉴开源 [xiaozhi-esp32](https://github.com/xinnan-tech/xiaozhi-esp32) 的
+**公开协议**（设备侧 WebSocket 帧格式、OTA 响应结构）与固件设计，
+从而在固件零改动的前提下自研服务端——**协议兼容 ≠ 调用它的服务器**：
+[xiaozhi-esp32-server](https://github.com/xinnan-tech/xiaozhi-esp32-server) 只作为协议与固件设计的参考，
+本项目不部署、不调用它（早期曾跑过它的容器，已删除）。设备出厂 OTA 地址默认指向本项目自己的域名。
+
+本项目自己做的「业务面」：设备绑定、提醒与回执、形象/提示词、AI 平台配置、交互统计、手机端与管理后台。
 
 ## 目录
 

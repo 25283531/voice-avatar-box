@@ -185,6 +185,31 @@
         </div>
         <div v-if="bindMsg" class="muted" style="font-size:12px;margin-top:8px;color:var(--ok)">{{bindMsg}}</div>
       </div>
+      <!-- 配网引导：固件本身自带浏览器配网（未配网时自建热点 + 强制门户，
+           屏幕上直接打出热点名与网址），所以这里只写操作说明、不发任何请求——
+           配网页面跑在设备自己的 192.168.4.1 上，与本服务不同源，从这里跳转也访问不到。
+           不新增 tab / 弹窗：tab 已经 9 个，且配网是一次性动作，不是日常操作。 -->
+      <div class="card">
+        <h2>给设备配网（连上家里 Wi-Fi）</h2>
+        <p class="muted" style="font-size:12px;margin:0 0 10px">
+          设备第一次使用、或者换了家里的 Wi-Fi 时需要配网。<b>不需要安装 APP</b>：
+          设备会自己开一个 Wi-Fi 热点，用手机或电脑的浏览器就能配完。
+        </p>
+        <ol style="margin:0;padding-left:20px;font-size:13px;line-height:1.9">
+          <li>给设备通电、进入配网模式，<b>屏幕上会显示一个热点名和一个网址</b>
+              （热点名形如 <code>Xiaozhi-A1B2</code>，网址一般是 <code>http://192.168.4.1</code>）。</li>
+          <li>打开手机或电脑的 Wi-Fi 设置，连上屏幕显示的那个热点（热点本身没有密码）。</li>
+          <li>打开浏览器，访问屏幕上显示的那个网址。</li>
+          <li>在打开的页面里选择家里的 Wi-Fi 名称，输入 Wi-Fi 密码并提交。</li>
+          <li>配网成功后<b>设备会自动重启</b>，重启后就连上家里的 Wi-Fi 了 ——
+              回到本页用激活码把它绑定到你的账号。</li>
+        </ol>
+        <p class="muted" style="font-size:12px;margin:10px 0 0">
+          配网页面打不开的话：多数手机连上这类热点后会<b>自动弹出配网提示</b>（强制门户），
+          点开即可；没有弹出就手动在浏览器地址栏输入 <code>192.168.4.1</code>。
+          还是不行，就确认一下手机/电脑连的确实是设备热点、而不是家里的 Wi-Fi，然后给设备断电重来一次。
+        </p>
+      </div>
       <div class="card">
         <h2>我的设备</h2>
         <table v-if="devices.length">
