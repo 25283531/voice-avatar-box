@@ -64,6 +64,45 @@
 21. ``X-Forwarded-For`` **默认不信任**（那是请求方能随便写的头）；
     配了可信代理时**从右往左**取第一个不可信地址，跳过伪造段。
 
+登录耗时对齐（本轮新增，场景 18~19）
+-----------------------------------
+上面第 19 条只钉住了**响应内容**，钉不住**响应时间** —— 而那恰好是剩下的漏洞：
+
+    ``login()`` 里 ``if user and verify_password(...)``，用户不存在时 ``and`` 短路，
+    口令哈希**根本不跑**，整个请求几毫秒就返回；用户存在但口令错时要跑满
+    PBKDF2 200000 轮（实测约 145ms）。两者差一个数量级，攻击者拿同一个口令
+    逐个试用户名、取几十次的中位数，就能把有效用户名筛出来。
+
+修法是给「查不到用户」这条分支补一次**等价**的 PBKDF2 计算
+（``security.burn_password_check_time()``，dummy 哈希在**模块加载时生成一次**）。
+新钉住的不变式：
+
+22. ★★ **实测**两条失败路径的**中位数耗时差**在容差内（断言里打出两个中位数数字）；
+23. ★★ 不存在用户名那条路径的中位数**不低于**存在路径的一定比例 ——
+    这条才是承重的：差值断言在"两边都被调快到接近 0"时会假绿，比例断言不会
+    （改造前实测 4.9ms / 144.9ms ≈ 3%，离任何合理下限都很远）；
+24. ★ dummy 路径**不发证**：随便一个用户名 + 任意口令仍是 401，
+    且响应体里**没有** ``access_token``；
+25. ★ 成功登录与「不存在用户名」**都只付一次** PBKDF2 的代价 ——
+    dummy 只补在「查不到用户」那条分支上，且两边都不是两次。
+    ⚠️ 这条比对的是**绝对锚点**（本机跑一次同轮数 PBKDF2 的耗时），而不是
+    「成功 vs 存在+错口令」的相对比值 —— 那个比值被一次真实变异逃过：
+    把 dummy **无条件**执行会让两条路径一起翻倍、比值不变而断言照样绿；
+26. ★★ ``burn_password_check_time()`` **永远返回 ``None``** —— 它内部那次
+    ``verify_password`` 其实返回 True（dummy 明文与 dummy 哈希是配对的），
+    一旦有人把它改成 ``return verify_password(...)`` 就是现成的认证绕过；
+27. ★ 限速没被这次改动破坏：连错 7 次，第 7 次仍是 429（每分钟 6 次封顶）。
+
+⚠️ 计时断言的三条防假绿写法
+--------------------------------
+* **采样取中位数**、不取均值也不取单次：单次会被 GC / 调度抖动带偏几十毫秒，
+  均值会被个别离群点拖走。样本数取**奇数**，让中位数落在真实采样上。
+* 计时那一台**必须整体关掉限速**（``ELDER_LOGIN_RATE_LIMIT=0``）：否则第 7 个样本
+  就开始返回 429，测到的将是"限速器的耗时"而不是"口令校验的耗时"。限速本身由
+  场景 19 另起一台服务单独验。
+* 容差取"绝对 + 相对"两条里更宽松的一条：PBKDF2 单次约 145ms，机器快慢差异很大，
+  写死一个绝对毫秒数会在快的 runner 上假绿、在慢的机器上假红。
+
 ⚠️ 两条防假绿的写法，改动前请先读
 --------------------------------
 * 三条规则**各自单独起一台服务**，把另外两个窗口设成 9999。否则"第 21 次被拦"
@@ -95,6 +134,7 @@ CI 为了让 8 个硬依赖 admin/admin123 的冒烟脚本继续跑，会在 smo
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -191,6 +231,25 @@ ROTATED_NEEDLE = PASSWORD_ROTATED_MARKER + " user="
 #: 随机口令告警必须出现的中文提示（主理人指定文案）
 SEED_RANDOM_HINT = "这是唯一的初始口令，请立即保存并登录后修改"
 
+# ---- 场景 18 的计时参数 ----
+#: 每条路径采样几次。**奇数**是有意的：中位数因此落在真实采样上，
+#: 而不是两个样本的均值（那样等于又多了一次"取平均"的噪声来源）。
+TIMING_SAMPLES = 11
+#: 中位数耗时差超过这个毫秒数即判失败（绝对口径）。
+TIMING_DIFF_LIMIT_MS = 60.0
+#: 「不存在的用户名」中位数至少要达到「存在的用户名」中位数的这个比例。
+#: ★ 这条是**承重**的：绝对差值断言在"两条路径都被调快到接近 0"时会假绿，
+#: 而比例断言不会 —— 改造前实测 4.9ms / 144.9ms ≈ 3%，离这个下限极远。
+TIMING_RATIO_FLOOR = 0.60
+#: 成功登录耗时相对「本机一次 PBKDF2」的锚点的上限倍数。
+#: ⚠️ 这个数是**绝对**锚点的容差（见 :func:`local_pbkdf2_ms` 的 docstring）：
+#: 端到端耗时里除哈希外还有 TCP 往返 + HTTP 解析 + SQL 查库，实测占比约 10~25%，
+#: 所以留到 1.6 足以吸收噪声，又远低于「跑了两遍」的 2.0 以上。
+TIMING_SUCCESS_MAX_ANCHOR = 1.6
+#: 同上，「不存在的用户名」这条路径相对锚点的**下界**。低于它说明 dummy 根本没跑
+#: （回到改造前的几毫秒）；上限复用 TIMING_SUCCESS_MAX_ANCHOR 排掉"跑了两遍"。
+TIMING_ANCHOR_FLOOR = 0.8
+
 
 def check(name: str, ok: bool, detail: str = "") -> None:
     results.append((name, ok, detail))
@@ -278,6 +337,72 @@ def detail_of(body):
     return body
 
 
+def timed_login_x(ip: str, username: str, password: str):
+    """与 :func:`login_x` 相同，但**额外返回端到端耗时（毫秒）**。
+
+    返回 ``(code, body, elapsed_ms)``。
+
+    计时范围是「客户端发起请求 -> 读完响应体」，包含 TCP 往返与 HTTP 解析 ——
+    这是**故意**的：断言要打的是攻击者从外面看到的那个差异，而那正是端到端耗时。
+    噪声来源（GC、调度、连接建立）由取中位数来吸收，不靠缩小计时范围来假装精确。
+    """
+    data = json.dumps({"username": username, "password": password}).encode()
+    r = urllib.request.Request(BASE + "/api/auth/login", data=data, method="POST")
+    r.add_header("Content-Type", "application/json")
+    r.add_header("X-Forwarded-For", ip)
+    t0 = time.perf_counter()
+    try:
+        with _LOCAL_OPENER.open(r, timeout=20) as resp:
+            raw = resp.read().decode("utf-8")
+            elapsed = (time.perf_counter() - t0) * 1000.0
+            return resp.status, (json.loads(raw) if raw else None), elapsed
+    except urllib.error.HTTPError as e:
+        raw = e.read().decode("utf-8")
+        elapsed = (time.perf_counter() - t0) * 1000.0
+        try:
+            return e.code, json.loads(raw), elapsed
+        except Exception:  # noqa: BLE001
+            return e.code, raw, elapsed
+
+
+def median_ms(samples: list[float]) -> float:
+    """样本耗时的中位数（毫秒）。
+
+    ⚠️ 刻意不用均值：均值会被单个离群样本拖走，而「偶发一次 400ms」在本地
+    调试机上再正常不过 —— 它不该决定断言红不红。中位数对离群值免疫。
+    """
+    ordered = sorted(samples)
+    n = len(ordered)
+    mid = n // 2
+    if n % 2:                      # 奇数：正中那一个就是中位数
+        return ordered[mid]
+    return (ordered[mid - 1] + ordered[mid]) / 2.0
+
+
+def local_pbkdf2_ms(rounds: int = 200_000, samples: int = 5) -> float:
+    """在**冒烟脚本自己的进程里**跑一次与 ``security._PBKDF2_ROUNDS`` 同样轮数的
+    PBKDF2，返回其中位数耗时（毫秒）。
+
+    这是一条**绝对锚点**，存在的理由是 S04 被一次真实变异逃过：
+
+    「成功登录没被拖成两倍」如果只拿成功路径去和「存在用户名 + 错口令」比，
+    那么"把 dummy 计算**无条件**执行"这个错实现会**同时**把两条路径都变成两次
+    PBKDF2 —— 比值仍然是 1.0，断言照样绿，而实际上每个登录请求都白白多付了
+    一次哈希（老人设备上每次登录多等 150ms，正是我们想避免的事）。
+    所以必须拿一个**与 login() 无关**的外部基准来比：一次 PBKDF2 到底多贵。
+
+    与服务端同机，因此 CPU/时钟一致；抽样取中位数以吸收调度抖动。
+    """
+    salt = b"timing-anchor-salt!"          # 16 字节，与 hash_password 的盐同长
+    pw = b"timing-anchor-password"
+    out: list[float] = []
+    for _ in range(samples):
+        t0 = time.perf_counter()
+        hashlib.pbkdf2_hmac("sha256", pw, salt, rounds)
+        out.append((time.perf_counter() - t0) * 1000.0)
+    return median_ms(out)
+
+
 def mask_digits(text) -> str:
     """把数字抹成 ``#``。
 
@@ -294,6 +419,52 @@ def retry_after_of(headers) -> int | None:
         return int(raw)
     except (TypeError, ValueError):
         return None
+
+
+def _human_wait(sec: int) -> str:
+    """server/app/ratelimit.py 的 ``_human_wait`` 的**测试侧副本**。
+
+    刻意复制一份而不是 import：ratelimit.py 的文案是**运维和老人用户直接看的
+    东西**，它必须与 ``tools/smoke_auth.py`` 里已有的 ``RATE_LIMIT_PREFIX`` 一样
+    各自独立（那边已有同样的理由，见常量注释）。在这里 import 会让"文案被改动"
+    这件事变成**同时**改掉断言 —— 断言与被测对象共用同一份代码，就再也测不出漂移。
+
+    规则必须与 server/app/ratelimit.py 的 ``_human_wait`` **逐字一致**：
+    ``<60 -> "N 秒"``；``round(N/60)`` 分钟后 ``<60 -> "N 分钟"``；否则小时+余分钟。
+    """
+    if sec < 60:
+        return f"{sec} 秒"
+    minutes = max(1, round(sec / 60))
+    if minutes < 60:
+        return f"{minutes} 分钟"
+    hours, rest = divmod(minutes, 60)
+    return f"{hours} 小时 {rest} 分钟" if rest else f"{hours} 小时"
+
+
+def _wait_detail_is_consistent(detail, retry_after: int | None) -> bool:
+    """429 的文案是否既"说清了要等多久"，又与 ``Retry-After`` **逐字一致**。
+
+    ⚠️ 为什么钉"一致"而不是钉"文案里出现「分钟」"：
+    分钟窗口命中时，剩下的秒数是**随请求时刻变化的** —— 第 7 次请求离第 1 次
+    失败隔了多久，剩下的就是 60 减多少。刚补上 dummy PBKDF2 之前，每个失败请求
+    只花几毫秒，第 7 次基本落在"还剩 60 秒"上，文案恰好是「1 分钟」；
+    补上之后每个失败请求要花约 150ms，第 7 次只剩约 59 秒，文案如实变成
+    「59 秒」。也就是说**钉死「分钟」等于钉死"每个请求都得足够快"** ——
+    那是速度性能断言，不是文案断言，两件事被绑在一起后，加任何一个防侧信道的
+    耗时都会把它打红。
+
+    这里改成断言它**真正想说的事**：
+      1. 文案带人能读的时长单位（秒 / 分钟 / 小时），而不是只给一个裸数字；
+      2. 文案里的时长与 ``Retry-After`` 头**逐字一致** ——
+         头说 59 秒、正文说 1 分钟，那才是真 bug（两个数打架，运维不知道信哪个）。
+    """
+    if not isinstance(detail, str) or retry_after is None:
+        return False
+    if not detail.startswith(RATE_LIMIT_PREFIX):
+        return False
+    if not any(unit in detail for unit in ("秒", "分钟", "小时")):
+        return False
+    return _human_wait(retry_after) in detail
 
 
 def _read_log_tail(max_bytes: int = 8192) -> str:
@@ -882,9 +1053,10 @@ def main() -> int:
         check("R08 ★ Retry-After 落在 45~65 秒 —— 证明是**分钟窗口**命中"
               "（小时窗口是 9999，不可能在这里拦）",
               ra is not None and 45 <= ra <= 65, f"Retry-After={ra}")
-        check("R09 文案说清了要等多久且用「分钟」（不是只给数字）",
-              isinstance(detail_of(b7), str) and "分钟" in detail_of(b7),
-              repr(detail_of(b7)))
+        check("R09 文案说清了要等多久：用的是**人能读的时长**（秒/分钟/小时），"
+              "且数字与 Retry-After 逐字一致（不是只给一个裸数字）",
+              _wait_detail_is_consistent(detail_of(b7), ra),
+              f"detail={detail_of(b7)!r} Retry-After={ra}")
 
         # ---- 不泄露：不存在的用户名 vs 存在的用户名+错密码，响应必须完全相同
         c_a, b_a, _ = login_x("10.9.9.1", "no_such_user_zz", "wrong-password")
@@ -1151,6 +1323,176 @@ def main() -> int:
         c4, _, _ = login_x("10.0.0.1", "tr_d", "wrong-password")
         check("R40 整条链都是可信地址时回落到 TCP 对端，不炸且是另一个主体 -> 401",
               c4 == 401, f"code={c4}")
+    finally:
+        stop_server(proc)
+
+    # ================================================================ 场景 18
+    group("场景 18：★★ 登录耗时对齐（用户名枚举的计时侧信道）")
+    # ⚠️ 这一台**整体关掉限速**：否则第 7 个采样就开始返回 429，
+    # 测到的是"限速器的耗时"而不是"口令校验的耗时"。限速本身由场景 19 单独验。
+    proc = start_server({**RL_ENV, "ELDER_LOGIN_RATE_LIMIT": "0"})
+    if proc is None:
+        return 1
+    try:
+        # ---- 采样：三条路径各采 TIMING_SAMPLES 次 ----
+        # 每个采样换一个新的 XFF，让 IP 键天然不共享（纵使限速没关也不会互相污染）。
+        missing_samples: list[float] = []
+        missing_codes: list[int] = []
+        for i in range(TIMING_SAMPLES):
+            c, _, ms = timed_login_x(f"10.20.{i}.1", f"no_such_user_t{i}",
+                                     "definitely-wrong-password")
+            missing_codes.append(c)
+            missing_samples.append(ms)
+        # 存在的用户名取种子建的 admin（库是空的 → admin 一定存在）。
+        present_samples: list[float] = []
+        present_codes: list[int] = []
+        for i in range(TIMING_SAMPLES):
+            c, _, ms = timed_login_x(f"10.21.{i}.1", "admin", "definitely-wrong-password")
+            present_codes.append(c)
+            present_samples.append(ms)
+        # 成功登录：用来证明"dummy 只补在查不到用户那条分支上"。
+        success_samples: list[float] = []
+        success_codes: list[int] = []
+        for i in range(TIMING_SAMPLES):
+            c, _, ms = timed_login_x(f"10.22.{i}.1", "admin", LEGACY_PW)
+            success_codes.append(c)
+            success_samples.append(ms)
+
+        med_missing = median_ms(missing_samples)
+        med_present = median_ms(present_samples)
+        med_success = median_ms(success_samples)
+        diff = abs(med_missing - med_present)
+        ratio = (med_missing / med_present) if med_present else 0.0
+        timing_detail = (f"不存在={med_missing:.1f}ms 存在={med_present:.1f}ms "
+                         f"差={diff:.1f}ms 比={ratio:.2f} "
+                         f"成功={med_success:.1f}ms (n={TIMING_SAMPLES})")
+
+        # 前置：三条路径的状态码必须符合预期，否则后面的耗时没有意义
+        #（比如服务端返回 500 或 422，耗时短是因为它压根没进登录逻辑）。
+        check("S01 前置：采样期间三条路径状态码全部符合预期"
+              "（不存在/存在+错口令都是 401，成功登录是 200）",
+              missing_codes == [401] * TIMING_SAMPLES
+              and present_codes == [401] * TIMING_SAMPLES
+              and success_codes == [200] * TIMING_SAMPLES,
+              f"missing={set(missing_codes)} present={set(present_codes)} "
+              f"success={set(success_codes)}")
+
+        check("S02 ★★ 实测：不存在用户名 与 存在用户名+错口令 的**中位数耗时差**"
+              f" < {TIMING_DIFF_LIMIT_MS:.0f}ms（改造前实测差约 140ms）",
+              diff < TIMING_DIFF_LIMIT_MS, timing_detail)
+
+        check("S03 ★★ 承重断言：不存在用户名的中位数 >= 存在用户名的 "
+              f"{TIMING_RATIO_FLOOR:.0%}"
+              "（S02 在「两边都被调快到接近 0」时会假绿，这条不会；"
+              "改造前实测约 3%）",
+              ratio >= TIMING_RATIO_FLOOR, timing_detail)
+
+        # ---- 绝对锚点：一次 PBKDF2 到底多贵 ----
+        # ⚠️ 必须用**绝对**锚点而不是「成功 vs 存在+错口令」的相对比值：
+        # 那次变异把 dummy **无条件**执行，两条路径一起变两次 PBKDF2、比值仍是 1.0，
+        # 相对断言完全逃过（实测 121/121 全绿），而每个登录请求其实都白白多付了
+        # 一次哈希。绝对锚点与 login() 的实现无关，逃不掉。
+        pbkdf_once = local_pbkdf2_ms()
+        anchor_detail = (timing_detail
+                         + f" | 本机一次PBKDF2={pbkdf_once:.1f}ms")
+        success_vs_anchor = med_success / pbkdf_once if pbkdf_once else 0.0
+        check("S04 ★★ 成功登录**只付一次** PBKDF2 的代价"
+              f"（中位数 <= 一次 PBKDF2 的 {TIMING_SUCCESS_MAX_ANCHOR}倍）"
+              "—— 用**绝对锚点**而非与另一条路径比，否则「dummy 无条件执行」"
+              "这个错实现会让两条路径一起翻倍、比值不变而断言照样绿",
+              0 < success_vs_anchor <= TIMING_SUCCESS_MAX_ANCHOR,
+              anchor_detail + f" 成功/锚点={success_vs_anchor:.2f}倍")
+
+        missing_vs_anchor = med_missing / pbkdf_once if pbkdf_once else 0.0
+        check("S11 ★★ 不存在的用户名也**只付一次**（不是零次、也不是两次）"
+              f"（比值落在 [{TIMING_ANCHOR_FLOOR}, {TIMING_SUCCESS_MAX_ANCHOR}]）"
+              "—— 下界排掉「dummy 根本没跑」，上界排掉「跑了两遍」",
+              TIMING_ANCHOR_FLOOR <= missing_vs_anchor <= TIMING_SUCCESS_MAX_ANCHOR,
+              anchor_detail + f" 不存在/锚点={missing_vs_anchor:.2f}倍")
+
+        # ---- dummy 路径不得发证 ----
+        c, b, _ = login_x("10.23.1.1", "totally_made_up_user", "any-password-at-all")
+        check("S05 ★★ dummy 路径**不发证**：随便的用户名 + 任意口令仍是 401",
+              c == 401, f"code={c} body={b!r}")
+        check("S06 ★★ 且响应体里**没有** access_token（dummy 不是一条捷径）",
+              isinstance(b, dict) and "access_token" not in b,
+              f"字段={sorted(b) if isinstance(b, dict) else b!r}")
+        check("S07 且 detail 仍是「用户名或密码错误」（没被 dummy 改写文案）",
+              detail_of(b) == LOGIN_FAILED_DETAIL, repr(detail_of(b)))
+
+        # ---- 静态兜底：burn_password_check_time 必须永远返回 None ----
+        # ⚠️ 为什么这条必须用静态读代码来钉：它内部那次 verify_password 实际返回
+        # True（dummy 明文与 dummy 哈希是配对的）。哪天有人"顺手"改成
+        # ``return verify_password(...)``，它就成了一个恒真的谓词 —— 任何一处
+        # ``if burn_password_check_time():`` 都是现成的认证绕过。而这个错误
+        # 在黑盒测试里**测不出来**（返回值根本没被用到），只能静态钉。
+        probe = subprocess.run(
+            [PY, "-c",
+             "import sys; sys.path.insert(0, '.');"
+             "import app.security as s;"
+             "r = s.burn_password_check_time();"
+             "print(repr(r))"],
+            cwd=str(SERVER), env=dict(os.environ, PYTHONIOENCODING="utf-8"),
+            capture_output=True, text=True)
+        check("S08 ★★ burn_password_check_time() **恒返回 None**"
+              "（改成 return verify_password(...) 就是恒真的认证绕过谓词）",
+              probe.stdout.strip() == "None",
+              f"stdout={probe.stdout.strip()!r} stderr={probe.stderr.strip()[-200:]!r}")
+
+        # ---- 静态兜底：dummy 必须在模块加载时生成一次，且轮数与真实一致 ----
+        # ⚠️ **不钉死 dummy 明文的长度**：``secrets.token_urlsafe(16)`` 的输出长度
+        # 由 base64 的填充规则决定（16 字节 -> 22 字符），钉死那个数字等于把
+        # 「16 字节」这个参数换成一个测试失败。这里钉的是**区间**：
+        # 与真实口令同量级（够长才有意义、太长也没必要），而不是某一个魔数。
+        probe2 = subprocess.run(
+            [PY, "-c",
+             "import sys; sys.path.insert(0, '.');"
+             "import app.security as s;"
+             "print(s._DUMMY_HASH.split('$')[0], s._DUMMY_HASH.split('$')[1],"
+             " len(s._DUMMY_PLAINTEXT),"
+             " s.verify_password(s._DUMMY_PLAINTEXT, s._DUMMY_HASH))"],
+            cwd=str(SERVER), env=dict(os.environ, PYTHONIOENCODING="utf-8"),
+            capture_output=True, text=True)
+        got = probe2.stdout.strip().split()
+        check("S09 ★★ dummy 用的是与真实口令**同一个算法与轮数**（pbkdf2_sha256/200000）"
+              "—— 轮数不同则耗时对不齐，本场景等于没测",
+              len(got) == 4 and got[0] == "pbkdf2_sha256" and got[1] == "200000"
+              and got[3] == "True",
+              f"stdout={probe2.stdout.strip()!r} stderr={probe2.stderr.strip()[-200:]!r}")
+        dummy_len = int(got[2]) if len(got) == 4 and got[2].isdigit() else -1
+        check("S10 ★ dummy 明文长度与真实口令**同量级**（8~64 字符：够随机、"
+              "又不会因为过长而让 PBKDF2 的耗时偏离真实口令）",
+              8 <= dummy_len <= 64, f"len={dummy_len}")
+    finally:
+        stop_server(proc)
+
+    # ================================================================ 场景 19
+    group("场景 19：★★ 加了 dummy 计算之后，限速行为没被破坏（连错 7 次 -> 第 7 次 429）")
+    # ⚠️ 冷却设 0、小时窗口关掉，把**分钟窗口**单独隔离出来 ——
+    # 否则「第 7 次被拦」可能是冷却窗口（5 秒）拦的，证明不了分钟上限还生效。
+    proc = start_server({**RL_ENV,
+                         "ELDER_LOGIN_FAIL_COOLDOWN_SEC": "0",
+                         "ELDER_LOGIN_FAIL_PER_HOUR": WINDOW_OFF})
+    if proc is None:
+        return 1
+    try:
+        codes = []
+        for _ in range(6):
+            c, _, _ = login_x("10.24.0.1", "rl_after_dummy", "wrong-password")
+            codes.append(c)
+        check("T01 加了 dummy 之后：1 分钟内前 6 次失败仍是 401（每分钟 6 次封顶）",
+              codes == [401] * 6, f"codes={codes}")
+        c7, b7, h7 = login_x("10.24.0.1", "rl_after_dummy", "wrong-password")
+        check("T02 ★★ 第 7 次 -> 429（限速没被 dummy 计算破坏）",
+              c7 == 429, f"code={c7}")
+        ra = retry_after_of(h7)
+        check("T03 ★ 且命中的是**分钟窗口**（Retry-After 45~65；"
+              "冷却是 0、小时是 9999，不可能在这里拦）",
+              ra is not None and 45 <= ra <= 65, f"Retry-After={ra}")
+        # 不存在的用户名同样被计入限速（否则攻击者改用不存在的用户名就绕过了）
+        c_ghost, _, _ = login_x("10.24.0.1", "no_such_user_after_dummy", "wrong-password")
+        check("T04 ★ dummy 路径也照样记账（改用不存在的用户名绕不过限速）",
+              c_ghost == 429, f"code={c_ghost}")
     finally:
         stop_server(proc)
 

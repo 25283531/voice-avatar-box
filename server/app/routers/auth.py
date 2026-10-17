@@ -26,7 +26,12 @@ from ..schemas import (
     UserLogin,
     UserOut,
 )
-from ..security import hash_password, issue_user_token, verify_password
+from ..security import (
+    burn_password_check_time,
+    hash_password,
+    issue_user_token,
+    verify_password,
+)
 
 router = APIRouter(prefix="/api/auth", tags=["auth"])
 
@@ -109,8 +114,26 @@ def login(payload: UserLogin, request: Request, db: Session = Depends(get_db)):
     在响应上无法区分，运维排障时看不出是被打了还是自己输错了；而 429 是否
     "帮攻击者确认命中限速"其实无所谓 —— 他连发几次本来就能从"突然开始被拒"
     推断出来，藏住状态码换不来任何安全性，只换来看不懂的日志。
+
+    ⚠️ 本函数里还有一处**不是**顺序、但同样不许"优化"的：查不到用户时那一次
+    ``burn_password_check_time()``。它是给「用户不存在」这条分支补等价的 PBKDF2
+    开销，用来堵住用户名枚举的**计时侧信道** —— 响应文案逐字相同还不够，
+    耗时也必须对齐。删掉它，这个接口就从"回显差异"变成"响应时间差异"的枚举机。
     """
     user = db.scalar(select(models.User).where(models.User.username == payload.username))
+    if user is None:
+        # ★ 用户不存在时也要付一次等价的 PBKDF2 代价（``burn_password_check_time``）。
+        #
+        #   没有这一行时，下面那个 ``and`` 会短路、口令校验根本不跑：这个请求几毫秒
+        #   就返回，而「用户存在 + 口令错」要跑满 200000 轮（约 145ms）。两者差一个
+        #   数量级，攻击者拿同一个口令逐个试用户名、取几十次的中位数就能筛出有效
+        #   用户名，拿到用户名后爆破成本降一个数量级。
+        #
+        #   为什么单独写成 ``user is None`` 的前置分支、而不是塞进下面那个 ``and``：
+        #   一是**只**给这条分支补，成功登录的耗时完全不受影响（塞进 ``and`` 的
+        #   右侧会在成功时也多跑一次，等于把登录变慢一倍）；二是下面那行的短路语义
+        #   一个字没动，"先验口令、后过闸门"的顺序也一个字没动（见上面 docstring）。
+        burn_password_check_time()
     if user and verify_password(payload.password, user.password_hash):
         clear_login_failures_for(payload.username)
         token = issue_user_token(user.id, user.username, user.is_admin)
