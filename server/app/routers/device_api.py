@@ -36,6 +36,8 @@ from ..schemas import (
     EventOut,
     EventReportIn,
     InteractionReportIn,
+    LocalReminderIn,
+    LocalReminderReportOut,
     ProviderSafeOut,
     ReminderOut,
 )
@@ -262,6 +264,63 @@ def report_event(payload: EventReportIn, db: Session = Depends(get_db),
     db.commit()
     db.refresh(ev)
     return ev
+
+
+@router.post("/reminders/local", response_model=LocalReminderReportOut)
+def report_local_reminders(
+    payload: list[LocalReminderIn],
+    db: Session = Depends(get_db),
+    dev: models.Device = Depends(get_current_device),
+):
+    """设备把断网期间本地自建的提醒补报上来，返回服务端分配的 id。
+
+    背景（医疗事故级）：老人在断网时用离线命令词/按键建的服药提醒，
+    只写在设备 NVS（server_id == 0），服务端完全不知道。如果不补报，
+    这些提醒在子女端永远不可见 —— 老人以为子女能看到服药记录，实际看不到。
+
+    幂等：按 (device_id, title, times_of_day) 查重。设备在「已入库但响应
+    丢失」时会重发同一批，靠这个避免建出重复提醒（重复提醒=老人被反复打扰，
+    同样不可接受）。这里刻意不用 client_key 落库，而是用业务字段比对，
+    这样即使设备端 client_key 生成逻辑变了也不会造出重复数据。
+    """
+    acks: list[dict[str, Any]] = []
+
+    for item in payload:
+        existing = db.scalar(
+            select(models.Reminder).where(
+                models.Reminder.device_id == dev.id,
+                models.Reminder.title == item.title,
+                models.Reminder.times_of_day == item.times_of_day,
+                models.Reminder.rtype == item.rtype,
+                models.Reminder.schedule_kind == item.schedule_kind,
+            )
+        )
+        if existing is not None:
+            acks.append({"client_key": item.client_key, "reminder_id": existing.id})
+            continue
+
+        row = models.Reminder(
+            device_id=dev.id,
+            creator_id=None,
+            title=item.title,
+            speak_text=item.speak_text or item.title,
+            rtype=item.rtype,
+            schedule_kind=item.schedule_kind,
+            times_of_day=list(item.times_of_day),
+            weekdays=list(item.weekdays),
+            require_confirm=True,
+            # 允许语音 + 按键：断网时老人只有这两条确认路径
+            confirm_methods=list(item.confirm_methods or ["voice", "button"]),
+            enabled=item.enabled,
+        )
+        db.add(row)
+        db.flush()   # 拿到自增 id 后回给设备
+        acks.append({"client_key": item.client_key, "reminder_id": row.id})
+
+    db.commit()
+    dev.last_seen_at = utcnow()
+    dev.online = True
+    return {"acks": acks}
 
 
 @router.post("/interactions", status_code=status.HTTP_201_CREATED)

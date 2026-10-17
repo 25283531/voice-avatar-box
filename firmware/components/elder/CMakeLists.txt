@@ -7,6 +7,7 @@ idf_component_register(
         "src/ui.c"
         "src/net.c"
         "src/sync.c"
+        "src/elder_cmd.c"
     INCLUDE_DIRS "include"
     REQUIRES
         driver

@@ -93,6 +93,22 @@ time_t elder_reminder_get_due_at(uint8_t id);
 esp_err_t elder_reminder_confirm(uint8_t id);
 
 /**
+ * @brief 同 elder_reminder_confirm，但显式带上确认方式。
+ * @param id            提醒索引
+ * @param confirm_method elder_confirm_method_t 的数值（1=语音 2=按键 3=APP）；
+ *                      离线语音确认必须传 1，否则回执会误报成按键确认。
+ *
+ * 为什么需要它：断网时「吃过了」是老人唯一能自助完成的确认动作，
+ * 而 elder_sync_on_reminder_state 只看到状态机回调，拿不到「是谁确认的」。
+ * 确认方式在这里暂存，由状态机回调带给 sync 层，保证离线补发的回执
+ * 仍然是 VOICE 而不是 BUTTON。
+ */
+esp_err_t elder_reminder_confirm_ex(uint8_t id, uint8_t confirm_method);
+
+/** 取上一次确认使用的确认方式（elder_confirm_method_t 数值） */
+uint8_t elder_reminder_last_confirm_method(void);
+
+/**
  * @brief 打开确认窗口（按键长按后由 input 事件驱动）
  */
 void elder_reminder_arm_confirm(uint8_t id);
@@ -111,6 +127,16 @@ int32_t elder_reminder_next_in_sec(void);
  * @brief 强制落盘（默认写 NVS 有去抖，避免频繁擦写）
  */
 esp_err_t elder_reminder_flush(void);
+
+/**
+ * @brief 跑一次提醒状态机（推进一天/触发/超时升级，并做 NVS 去抖落盘）。
+ *
+ * 固件里由 elder_reminder_init() 起的 1s 周期任务调用，一般不需要外部调。
+ * 单独暴露是为了让 tools/test_elder_host 能在宿主上按虚拟时钟驱动
+ * 「到点触发 → 30s 确认窗超时 → 15 分钟升级」这条断网关键路径，
+ * 不必烧板子、不必真的等 15 分钟。
+ */
+void elder_reminder_tick_once(void);
 
 #ifdef __cplusplus
 }

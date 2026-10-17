@@ -38,6 +38,7 @@
 #include "elder_ui.h"
 #include "elder_net.h"
 #include "elder_sync.h"
+#include "elder_cmd.h"
 
 #define TAG "elder.bridge"
 
@@ -127,11 +128,36 @@ void OnPlayTone(elder_tone_t tone, void *ctx)
 }
 
 // 联网 TTS：通过 MCP/协议让服务端合成并播报一段话。
-// 若协议未就绪（离线 / 未连接）则直接放弃，由上层降级为提示音。
+//
+// ⚠️ 离线时**不能**走这里 —— 服务端不可达，SendMcpMessage 会静默失败，
+// 老人听到的是「设备毫无反应」，看起来像设备坏了。离线必须明确告知
+// （用户原话）：「当前设备未连接网络，将使用设备自身能力进行处理」。
+static const char *const kOfflineNotice = "当前设备未连接网络，将使用设备自身能力进行处理";
+
+bool OnIsOnline(void *ctx)
+{
+    (void)ctx;
+    return Application::GetInstance().GetDeviceState() != kDeviceStateStarting
+           && Application::GetInstance().GetDeviceState() != kDeviceStateWifiConfiguring;
+}
+
 void OnSpeak(const char *text, void *ctx)
 {
     (void)ctx;
     auto &app = Application::GetInstance();
+
+    // 离线：明确告知 + 本地提示音（固件内置 ogg，不依赖网络），绝不尝试 TTS
+    if (!OnIsOnline(nullptr)) {
+        ESP_LOGW(TAG, "离线播报降级: %s", text ? text : "");
+        // 先播离线说明，再播原本要说的内容，两条都只走屏显+提示音
+        OnNotify(kOfflineNotice, nullptr, nullptr);
+        OnPlayTone(ELDER_TONE_POPUP, nullptr);
+        if (text && text[0]) {
+            OnNotify(text, nullptr, nullptr);
+        }
+        return;
+    }
+
     if (app.GetDeviceState() == kDeviceStateIdle) {
         // 空闲态才能安全插入一次播报，避免打断正在进行的对话
         std::string payload = "{\"type\":\"tts\",\"text\":\"";
@@ -139,13 +165,6 @@ void OnSpeak(const char *text, void *ctx)
         payload += "\"}";
         app.SendMcpMessage(payload);
     }
-}
-
-bool OnIsOnline(void *ctx)
-{
-    (void)ctx;
-    return Application::GetInstance().GetDeviceState() != kDeviceStateStarting
-           && Application::GetInstance().GetDeviceState() != kDeviceStateWifiConfiguring;
 }
 
 /* ---------------------------------------------------------------- 提醒 */
@@ -266,7 +285,38 @@ void OnDeviceStateChanged(DeviceState prev, DeviceState cur)
     }
 }
 
-/* ---------------------------------------------------------------- 激活码 */
+/* ---------------------------------------------------------------- 离线命令词 */
+
+// MultiNet（或任何离线识别层）命中命令词后调这个入口。
+//
+// ⚠️ 当前状态：MultiNet **未启用**（缺 model 分区 + 未选
+// CONFIG_USE_CUSTOM_WAKE_WORD），所以断网时这个函数还没有调用方。
+// 保留它是为了让识别层接通时只需加一行调用，而不用改分发逻辑。
+void OnCommandRecognized(const char *phrase)
+{
+    elder_cmd_result_t r;
+    esp_err_t err = elder_cmd_dispatch(phrase, &r);
+
+    if (err != ESP_OK || !r.recognized) {
+        // 认不出来就老实说认不出来，并提示走按键兜底（医疗场景宁可多按一下）
+        ESP_LOGW(TAG, "未识别的离线指令: %s", phrase ? phrase : "(null)");
+        elder_ui_set_state(ELDER_UI_OFFLINE, 0);
+        OnNotify("没听清，请长按按键两下再操作", nullptr, nullptr);
+        OnPlayTone(ELDER_TONE_EXCLAMATION, nullptr);
+        return;
+    }
+
+    ESP_LOGI(TAG, "离线指令: '%s' -> action=%d ok=%d: %s",
+             phrase, (int)r.action, (int)r.ok, r.feedback);
+
+    // 命令词一律走屏显 + 内置提示音，**不走 TTS**：
+    // 触发离线命令的前提就是没网，此时 TTS 必然失败。
+    OnNotify(r.feedback, nullptr, nullptr);
+    OnPlayTone(r.tone, nullptr);
+    if (r.ok) {
+        elder_ui_set_state(ELDER_UI_CONFIRMED, 4000);
+    }
+}
 
 // 后端尚未提供「设备自助换取 device_token」的接口（见交付报告的遗留问题），
 // 这里保留本地生成 + 屏显的完整流程，一旦后端补上 /api/device/hello
@@ -292,6 +342,15 @@ void ShowActivationCode()
 }
 
 }  // namespace
+
+/* ---------------------------------------------------------------- 离线命令词入口 */
+
+// 必须放在匿名 namespace **之外**：extern "C" 若声明在匿名 namespace 内，
+// 符号会退化成内部链接，识别层就链接不到这个入口了。
+extern "C" void elder_cmd_on_recognized(const char *phrase)
+{
+    OnCommandRecognized(phrase);
+}
 
 /* ---------------------------------------------------------------- 入口 */
 
@@ -321,6 +380,19 @@ extern "C" void elder_bridge_start(void)
     // 3) 提醒引擎（读 NVS，离线可用）
     if (elder_reminder_init(OnReminder, nullptr) != ESP_OK) {
         ESP_LOGE(TAG, "提醒引擎初始化失败");
+    }
+
+    // 3b) 断网自建服药提醒的默认时段。
+    // 「新建吃药提醒」说出口后落到哪几个时间点，全靠这张表 ——
+    // 老人不会报时间，只会用早/中/晚三个粗粒度时段。
+    // 数值可后续按实际用药方案调整。
+    {
+        elder_cmd_med_times_t mt = {};
+        mt.n = 3;
+        mt.slots[0] = { 8,  0 };
+        mt.slots[1] = { 12, 0 };
+        mt.slots[2] = { 20, 0 };
+        elder_cmd_set_med_times(&mt);
     }
 
     // 4) UI 钩子：把 elder 的抽象动作接到 xiaozhi

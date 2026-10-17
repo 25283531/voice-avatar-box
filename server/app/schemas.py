@@ -780,6 +780,58 @@ class EventReportIn(ORMBase):
     note: str = ""
 
 
+# ====================================================== 设备自建提醒上报
+class LocalReminderIn(ORMBase):
+    """设备断网期间本地新建的提醒（firmware 侧 server_id == 0）。
+
+    老人在没网时用离线命令词/按键建的服药提醒只存在设备 NVS 里，
+    服务端毫不知情。重新联网后设备把这条补报上来，服务端分配 id 回写，
+    之后就能像普通提醒一样被 APP 查看、被 /api/device/events 对账。
+
+    client_key 是设备侧的稳定标识（同一 slot 的「类型+时刻+标题」），
+    用来做幂等：设备在响应丢失时会重发，靠它避免建出重复提醒。
+    """
+
+    client_key: str = Field(max_length=64)
+    title: str = Field(max_length=128)
+    speak_text: str = ""
+    rtype: int = 0
+    schedule_kind: int = 1
+    times_of_day: list[str] = Field(default_factory=list)
+    weekdays: list[int] = Field(default_factory=list)
+    confirm_methods: list[str] = Field(default_factory=list)
+    enabled: bool = True
+
+    @field_validator("times_of_day")
+    @classmethod
+    def _check_local_times(cls, v: list[str]) -> list[str]:
+        for t in v:
+            if parse_hhmm(t) is None:
+                raise ValueError(f"时间格式非法: {t}，应为 HH:MM")
+        return v
+
+    @field_validator("weekdays")
+    @classmethod
+    def _check_local_weekdays(cls, v: list[int]) -> list[int]:
+        for d in v:
+            if not 1 <= d <= 7:
+                raise ValueError(f"weekdays 取值应为 1~7（1=周一）")
+        return v
+
+
+class LocalReminderAck(ORMBase):
+    """服务端分配结果。设备据此回写本地 server_id。"""
+
+    client_key: str
+    reminder_id: int
+
+
+class LocalReminderReportOut(ORMBase):
+    """一次上报的逐条对账结果（顺序与请求一致，便于设备按下标回写）。"""
+
+    acks: list[LocalReminderAck] = Field(default_factory=list)
+
+
 # ============================================================ 交互统计
 class InteractionReportIn(ORMBase):
     kind: int = 1

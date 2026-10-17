@@ -431,7 +431,13 @@ void elder_sync_on_reminder_state(const elder_rmd_item_t *item, elder_rmd_state_
         /* 只是打开了确认窗口，不上报 */
         break;
     case ELDER_RMD_DONE:
-        elder_sync_enqueue_event(sid, due, ELDER_EV_CONFIRMED, ELDER_CFM_BUTTON, "confirmed");
+        /* 确认方式由 elder_reminder_confirm_ex() 暂存：
+         * 按键路径传 BUTTON，断网语音确认（「吃过了」）传 VOICE。
+         * 这里若写死 BUTTON，离线补发的回执会把语音确认误报成按键，
+         * 子女端看到的依从率数据就不可信了。 */
+        elder_sync_enqueue_event(sid, due, ELDER_EV_CONFIRMED,
+                                 (elder_confirm_method_t)elder_reminder_last_confirm_method(),
+                                 "confirmed");
         elder_sync_report_interaction(ELDER_IT_REMINDER_CONFIRM, 0);
         break;
     case ELDER_RMD_ESCALATED:
@@ -458,6 +464,130 @@ esp_err_t elder_sync_report_interaction(elder_interaction_kind_t kind, int durat
     esp_err_t err = elder_net_post("/api/device/interactions", body, NULL, NULL, NULL);
     cJSON_free(body);
     return err;
+}
+
+/* ---------------------------------------------------------------- 本地自建提醒上报 */
+
+/* 稳定的幂等键：设备侧不落库，仅用于服务端查重与回写定位。
+ * 只取「类型 + 时刻 + 标题」—— 变了就当成新提醒，不会错合并。 */
+static void local_client_key(const elder_rmd_item_t *it, char *out, size_t len)
+{
+    snprintf(out, len, "%d-%02d%02d-%s", (int)it->type, it->hour, it->minute, it->label);
+}
+
+/*
+ * 把本地 server_id==0 的提醒上报服务端，回写服务端分配的 id。
+ *
+ * 为什么必须做：老人断网时亲手建的服药提醒只存在于设备 NVS。若不上报，
+ * 这些提醒在子女端永远不可见 —— 老人以为服药记录同步给子女了，实际没有，
+ * 出事时没人知道药到底吃没吃。
+ *
+ * 为什么放在 replace_all **之前**：replace_all 会用后端下发的表做全量合并。
+ * 本地自建条目虽然会被保住（见 reminder.c），但只要还没拿到 server_id，
+ * 它们对服务端而言就是「不存在的规则」，APP 侧看不到、事件也无法对账。
+ * 先上报拿到 id，再 replace_all，才能让本地条目与服务端规则真正对上。
+ *
+ * 失败处理：整个函数失败即放弃本次回写，下次心跳重试。此时 replace_all
+ * 仍会保住这些条目（server_id 仍为 0），所以不会丢数据，只是暂时不同步。
+ */
+static bool upload_local_reminders(void)
+{
+    const elder_rmd_table_t *tbl = NULL;
+    if (elder_reminder_list(&tbl) != ESP_OK || !tbl) return false;
+
+    int n_local = 0;
+    for (uint8_t i = 0; i < tbl->count && i < ELDER_REMINDER_MAX; i++) {
+        if (tbl->items[i].server_id == 0) n_local++;
+    }
+    if (n_local == 0) return true;
+
+    char body[1400];
+    int off = snprintf(body, sizeof(body), "[");
+    for (uint8_t i = 0; i < tbl->count && i < ELDER_REMINDER_MAX; i++) {
+        const elder_rmd_item_t *it = &tbl->items[i];
+        if (it->server_id != 0) continue;
+
+        char key[80];
+        local_client_key(it, key, sizeof(key));
+
+        char tod[8];
+        snprintf(tod, sizeof(tod), "%02d:%02d", it->hour, it->minute);
+
+        /* 固件 repeat_mask 是 bit0=周日..bit6=周六，后端是 1=周一..7=周日，
+         * 与 weekdays_to_mask() 的转换互逆：w%7 == bit。 */
+        char wd[16] = "";
+        int wlen = 0;
+        for (int b = 0; b < 7; b++) {
+            if (it->repeat_mask & (1u << b)) {
+                wlen += snprintf(wd + wlen, sizeof(wd) - (size_t)wlen,
+                                 "%s%d", wlen ? "," : "", b == 0 ? 7 : b);
+            }
+        }
+
+        off += snprintf(body + off, sizeof(body) - (size_t)off,
+                        "%s{\"client_key\":\"%s\",\"title\":\"%s\",\"rtype\":%d,"
+                        "\"schedule_kind\":%d,\"times_of_day\":[\"%s\"],"
+                        "\"weekdays\":[%s],\"confirm_methods\":[\"voice\",\"button\"],"
+                        "\"enabled\":true}",
+                        off > 1 ? "," : "", key, it->label, (int)it->rtype,
+                        (int)it->schedule_kind, tod, wd);
+        if (off < 0 || (size_t)off >= sizeof(body)) {
+            ESP_LOGW(TAG, "本地上报体超长（%u 条），本次放弃，下个心跳重试", n_local);
+            return false;
+        }
+    }
+    off += snprintf(body + off, sizeof(body) - (size_t)off, "]");
+
+    char *resp = heap_caps_malloc(ELDER_NET_RESP_MAX, MALLOC_CAP_8BIT);
+    if (!resp) return false;
+    size_t len = ELDER_NET_RESP_MAX;
+    esp_err_t err = elder_net_post("/api/device/reminders/local", body, resp, &len, NULL);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "本地上报失败（%s），下次心跳重试；提醒仍在本地响铃不受影响",
+                 esp_err_to_name(err));
+        heap_caps_free(resp);
+        return false;
+    }
+
+    cJSON *root = cJSON_ParseWithLength(resp, len);
+    heap_caps_free(resp);
+    if (!root) {
+        ESP_LOGW(TAG, "本地上报响应非 JSON（可能响应丢失，下次重试靠幂等去重）");
+        return false;
+    }
+
+    cJSON *acks = cJSON_GetObjectItem(root, "acks");
+    int applied = 0;
+    cJSON *a = NULL;
+    cJSON_ArrayForEach(a, acks) {
+        cJSON *jk = cJSON_GetObjectItem(a, "client_key");
+        cJSON *jid = cJSON_GetObjectItem(a, "reminder_id");
+        if (!cJSON_IsString(jk) || !cJSON_IsNumber(jid)) continue;
+
+        char key[80];
+        snprintf(key, sizeof(key), "%s", jk->valuestring);
+        /* 按 client_key 回写：先重新取表（期间可能被 replace_all 动过） */
+        if (elder_reminder_list(&tbl) != ESP_OK || !tbl) break;
+        for (uint8_t i = 0; i < tbl->count && i < ELDER_REMINDER_MAX; i++) {
+            elder_rmd_item_t *it = &tbl->items[i];
+            if (it->server_id != 0) continue;
+            char mine[80];
+            local_client_key(it, mine, sizeof(mine));
+            if (strcmp(mine, key) != 0) continue;
+            it->server_id = (uint32_t)jid->valueint;
+            applied++;
+            ESP_LOGI(TAG, "本地提醒已同步: '%s' %02d:%02d -> rid=%u",
+                     it->label, it->hour, it->minute, (unsigned)it->server_id);
+            break;
+        }
+    }
+    cJSON_Delete(root);
+
+    if (applied) {
+        elder_reminder_flush();
+        ESP_LOGI(TAG, "本地上报完成：%u 条取得服务端 id", (unsigned)applied);
+    }
+    return applied > 0;
 }
 
 /* ---------------------------------------------------------------- 拉取 */
@@ -494,7 +624,11 @@ static esp_err_t do_sync(void)
         elder_time_apply_server_time(st->valuestring);
     }
 
-    /* 2) 提醒规则 */
+    /* 2) 本地自建提醒补报（必须在 replace_all 之前：
+     *    这些条目 server_id 还是 0，不先拿到 id 就无法与后端规则对上） */
+    upload_local_reminders();
+
+    /* 3) 提醒规则 */
     elder_rmd_item_t items[ELDER_REMINDER_MAX];
     uint8_t count = 0;
     parse_reminders(cJSON_GetObjectItem(root, "reminders"), items, &count);
@@ -504,13 +638,13 @@ static esp_err_t do_sync(void)
         ESP_LOGI(TAG, "后端没有启用中的提醒规则，保留本地表兜底");
     }
 
-    /* 3) 心跳周期以服务端下发为准 */
+    /* 4) 心跳周期以服务端下发为准 */
     cJSON *iv = cJSON_GetObjectItem(root, "sync_interval_sec");
     if (cJSON_IsNumber(iv) && iv->valueint >= 60 && iv->valueint <= 3600) {
         g.interval_sec = (uint32_t)iv->valueint;
     }
 
-    /* 4) 形象 / 语音地址（记录到日志，接入层在 bridge 中处理） */
+    /* 5) 形象 / 语音地址（记录到日志，接入层在 bridge 中处理） */
     cJSON *avatar = cJSON_GetObjectItem(root, "avatar");
     if (cJSON_IsObject(avatar)) {
         cJSON *nm = cJSON_GetObjectItem(avatar, "name");

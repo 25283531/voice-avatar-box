@@ -113,6 +113,7 @@ DEFAULT_PORTS: dict[str, int] = {
     "smoke_usage": 8120,           # token 用量：网关提取 + 双端接口对账
     "smoke_auth": 8121,            # 注册/鉴权：公开开关 + 初始管理员引导（问题 A/B 的回归网）
     "smoke_deploy": 8122,          # 部署模式：tunnel/direct/auto 三模式地址推导 + 启动自检
+    "smoke_local_reminders": 8123, # 断网自建提醒上报：鉴权 + 幂等 + sync 可见性
 }
 
 

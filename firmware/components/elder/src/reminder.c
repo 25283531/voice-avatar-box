@@ -15,6 +15,13 @@ static const char *TAG = "elder.reminder";
 #define NVS_NS   "elder_rmd"
 #define NVS_KEY  "table"
 
+/* 低于这个时刻认为系统时钟不可信（未校时/掉电归零）。
+ * 时间不可信时**绝不触发提醒** —— 响错时间的服药提醒比不提醒更危险。 */
+#define ELDER_MIN_TRUSTED_EPOCH 1577836800L   /* 2020-01-01T00:00:00Z */
+
+/* 确认方式默认值（数值与 elder_sync.h 的 elder_confirm_method_t 一致） */
+#define ELDER_CFM_BUTTON_NUM 2
+
 static struct {
     elder_rmd_table_t table;
     elder_rmd_cb_t    cb;
@@ -24,6 +31,7 @@ static struct {
     bool              fired_today[ELDER_REMINDER_MAX];
     bool              dirty;
     int64_t           last_flush_us;
+    uint8_t           last_confirm_method;
     TaskHandle_t      task;
 } g;
 
@@ -131,6 +139,18 @@ static void set_state(int idx, elder_rmd_state_t st)
 static void tick(void)
 {
     time_t now = time(NULL);
+
+    /* 时间不可信（未校时/掉电归零）→ 暂停触发，等联网校时。
+     * 依据：用户明确要求「时间不准时，离线提醒就是错的，比不提醒更危险」。 */
+    if (now < (time_t)ELDER_MIN_TRUSTED_EPOCH) {
+        static int64_t last_warn_us = 0;
+        if (now_us() - last_warn_us > 60LL * 1000 * 1000) {
+            last_warn_us = now_us();
+            ESP_LOGE(TAG, "系统时钟不可信（未校时），暂停触发提醒；联网后自动校准");
+        }
+        return;
+    }
+
     struct tm tm_now;
     localtime_r(&now, &tm_now);
 
@@ -197,6 +217,11 @@ static void reminder_task(void *arg)
     }
 }
 
+void elder_reminder_tick_once(void)
+{
+    tick();
+}
+
 static int64_t now_us(void) { return esp_timer_get_time(); }
 
 /* ---------------- 对外接口 ---------------- */
@@ -253,40 +278,142 @@ esp_err_t elder_reminder_set_enabled(uint8_t id, bool enabled)
     return ESP_OK;
 }
 
+/* 两条 item 是否「同一条内容」（用于本地条目与后端条目的去重，
+ * 以及运行态继承时的本地条目匹配） */
+static bool same_content(const elder_rmd_item_t *a, const elder_rmd_item_t *b)
+{
+    return a->hour == b->hour && a->minute == b->minute &&
+           a->type == b->type && a->repeat_mask == b->repeat_mask &&
+           strncmp(a->label, b->label, ELDER_REMINDER_LABEL) == 0;
+}
+
 esp_err_t elder_reminder_replace_all(const elder_rmd_item_t *items, uint8_t count)
 {
     if (count > ELDER_REMINDER_MAX) return ESP_ERR_INVALID_SIZE;
 
-    /* 先按 server_id 保留「今日已确认/已触发」的运行态，避免同步打断老人当天的进度 */
-    uint16_t keep_done = 0;
-    for (uint8_t i = 0; i < g.table.count && i < ELDER_REMINDER_MAX; i++) {
-        if (g.state[i] == ELDER_RMD_DONE) keep_done |= (1u << i);
+    /* ---- 1. 快照旧表与运行态 ---- */
+    elder_rmd_item_t old[ELDER_REMINDER_MAX];
+    uint8_t old_n = g.table.count > ELDER_REMINDER_MAX ? ELDER_REMINDER_MAX : g.table.count;
+    memcpy(old, g.table.items, sizeof(elder_rmd_item_t) * old_n);
+    uint8_t old_state[ELDER_REMINDER_MAX];
+    bool    old_fired[ELDER_REMINDER_MAX];
+    int64_t old_deadline[ELDER_REMINDER_MAX];
+    memcpy(old_state, g.state, sizeof(old_state));
+    memcpy(old_fired, g.fired_today, sizeof(old_fired));
+    memcpy(old_deadline, g.confirm_deadline_us, sizeof(old_deadline));
+
+    /* ---- 2. 挑出「设备本地自建」（server_id==0）条目 —— 后端同步绝不能抹掉它们 ----
+     * 这是本函数存在的理由：断网时老人亲手建的服药提醒只存在于设备 NVS，
+     * 服务端毫不知情；一次 replace_all 全量覆盖就会让它们永久消失，
+     * 属于医疗事故级数据丢失。 */
+    elder_rmd_item_t keep[ELDER_REMINDER_MAX];
+    uint8_t keep_n = 0;
+    for (uint8_t i = 0; i < old_n; i++) {
+        if (old[i].server_id != 0) continue;
+        /* 与后端下发内容相同的本地条目视为同一条（上传后回写 server_id 失败
+         * 或响应丢失时的兜底），直接丢弃避免重复响铃 */
+        bool dup = false;
+        for (uint8_t j = 0; j < count; j++) {
+            if (same_content(&old[i], &items[j])) { dup = true; break; }
+        }
+        if (dup) {
+            ESP_LOGW(TAG, "本地条目与后端下发重复，按后端版本保留: %s %02d:%02d",
+                     old[i].label, old[i].hour, old[i].minute);
+            continue;
+        }
+        if (keep_n < ELDER_REMINDER_MAX) keep[keep_n++] = old[i];
     }
 
+    /* ---- 3. 组装新表：后端下发在前，本地保留在后 ----
+     * 容量溢出时优先保本地（服务端没有的数据丢了就找不回来），
+     * 后端放不下的丢弃并大声告警。 */
+    uint8_t srv_n = count;
+    if (srv_n + keep_n > ELDER_REMINDER_MAX) {
+        uint8_t room = (uint8_t)(ELDER_REMINDER_MAX - keep_n);
+        ESP_LOGE(TAG, "提醒表溢出：后端 %u 条 + 本地 %u 条 > %d，丢弃 %u 条后端下发",
+                 count, keep_n, ELDER_REMINDER_MAX, srv_n - room);
+        srv_n = room;
+    }
+
+    /* ---- 4. 安装 + 运行态继承（按 server_id / 内容匹配旧表）---- */
     memset(g.table.items, 0, sizeof(g.table.items));
-    for (uint8_t i = 0; i < count; i++) {
-        memcpy(&g.table.items[i], &items[i], sizeof(elder_rmd_item_t));
-        g.table.items[i].id = i;
-        g.table.items[i].label[ELDER_REMINDER_LABEL] = '\0';
-        /* 沿用旧表同 server_id 的状态（index 相同即视为同一条，服务端顺序稳定） */
-        if (keep_done & (1u << i)) {
-            g.state[i] = ELDER_RMD_DONE;
+    uint8_t n = 0;
+    for (uint8_t i = 0; i < srv_n; i++) {
+        g.table.items[n] = items[i];
+        g.table.items[n].id = n;
+        g.table.items[n].label[ELDER_REMINDER_LABEL] = '\0';
+        n++;
+    }
+    for (uint8_t i = 0; i < keep_n; i++) {
+        g.table.items[n] = keep[i];
+        g.table.items[n].id = n;
+        g.table.items[n].label[ELDER_REMINDER_LABEL] = '\0';
+        n++;
+    }
+
+    for (uint8_t i = 0; i < n; i++) {
+        const elder_rmd_item_t *it = &g.table.items[i];
+        int old_idx = -1;
+        if (it->server_id != 0) {
+            for (uint8_t j = 0; j < old_n; j++) {
+                if (old[j].server_id == it->server_id) { old_idx = (int)j; break; }
+            }
+        } else {
+            for (uint8_t j = 0; j < old_n; j++) {
+                if (old[j].server_id == 0 && same_content(&old[j], it)) {
+                    old_idx = (int)j;
+                    break;
+                }
+            }
+        }
+        if (old_idx >= 0) {
+            /* 沿用旧表同一条的运行态，避免同步打断老人当天的进度 */
+            g.state[i] = old_state[old_idx];
+            g.fired_today[i] = old_fired[old_idx];
+            g.confirm_deadline_us[i] = old_deadline[old_idx];
         } else {
             g.state[i] = ELDER_RMD_IDLE;
+            g.fired_today[i] = false;
+            g.confirm_deadline_us[i] = 0;
         }
+    }
+    for (uint8_t i = n; i < ELDER_REMINDER_MAX; i++) {
+        g.state[i] = ELDER_RMD_IDLE;
         g.fired_today[i] = false;
         g.confirm_deadline_us[i] = 0;
     }
-    for (int i = count; i < ELDER_REMINDER_MAX; i++) {
-        g.state[i] = ELDER_RMD_IDLE;
-        g.fired_today[i] = false;
+
+    /* ---- 5. 位图按新状态重算 ---- */
+    g.table.count = n;
+    g.table.done_today = 0;
+    g.table.pending_today = 0;
+    for (uint8_t i = 0; i < n; i++) {
+        if (g.state[i] == ELDER_RMD_DONE) {
+            g.table.done_today |= (1u << i);
+        } else if (g.state[i] == ELDER_RMD_PENDING || g.state[i] == ELDER_RMD_ESCALATED ||
+                   g.state[i] == ELDER_RMD_CONFIRM_WIN) {
+            g.table.pending_today |= (1u << i);
+        }
+    }
+    /* ---- 6. 自检：本地自建条目一条都不许丢 ----
+     * 这是本函数最容易写错、后果最重的一步。老人断网时亲手建的服药提醒
+     * 只存在于这台设备，一次全量覆盖就会让它们**永久消失**（没有任何副本），
+     * 老人从此再也收不到那条服药提醒 —— 医疗事故级数据丢失。
+     * 下面的断言把「不该发生」变成「当场发现」，宁可刷屏报错也不能静默丢。 */
+    for (uint8_t k = 0; k < keep_n; k++) {
+        bool survived = false;
+        for (uint8_t i = 0; i < n; i++) {
+            if (same_content(&g.table.items[i], &keep[k])) { survived = true; break; }
+        }
+        if (!survived) {
+            ESP_LOGE(TAG, "严重：本地自建提醒在合并中丢失 '%s' %02d:%02d —— "
+                          "服药提醒丢失属医疗事故级数据丢失，请立即上报",
+                     keep[k].label, keep[k].hour, keep[k].minute);
+        }
     }
 
-    g.table.count = count;
-    g.table.done_today = keep_done;
-    g.table.pending_today = 0;
     g.dirty = true;
-    ESP_LOGI(TAG, "提醒表已同步：%u 条（后端下发）", count);
+    ESP_LOGI(TAG, "提醒表已合并：后端 %u 条 + 本地 %u 条 = %u 条", srv_n, keep_n, n);
     return elder_reminder_flush();
 }
 
@@ -313,11 +440,24 @@ esp_err_t elder_reminder_list(const elder_rmd_table_t **out)
 
 esp_err_t elder_reminder_confirm(uint8_t id)
 {
+    return elder_reminder_confirm_ex(id, ELDER_CFM_BUTTON_NUM);
+}
+
+esp_err_t elder_reminder_confirm_ex(uint8_t id, uint8_t confirm_method)
+{
     if (id >= g.table.count) return ESP_ERR_NOT_FOUND;
+    /* 先记方式再改状态：set_state() 会同步回调 elder_sync_on_reminder_state，
+     * 那时 sync 层要能读到正确的确认方式。 */
+    g.last_confirm_method = confirm_method;
     g.confirm_deadline_us[id] = 0;
     set_state(id, ELDER_RMD_DONE);
     elder_reminder_flush();
     return ESP_OK;
+}
+
+uint8_t elder_reminder_last_confirm_method(void)
+{
+    return g.last_confirm_method;
 }
 
 void elder_reminder_arm_confirm(uint8_t id)
