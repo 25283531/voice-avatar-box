@@ -73,6 +73,13 @@ int stub_nvs_set_blob(nvs_handle_t h, const char *key, const void *buf, size_t l
 int stub_nvs_commit(nvs_handle_t h) { (void)h; return 0; }
 void stub_nvs_close(nvs_handle_t h) { (void)h; }
 
+void stub_nvs_corrupt(int ns_index, size_t offset, uint8_t xor_mask)
+{
+    if (ns_index < 0 || ns_index >= NVS_NS_MAX) return;
+    if (offset >= s_nvs_len[ns_index]) return;
+    s_nvs[ns_index][offset] ^= xor_mask;
+}
+
 /* ---------------- 受控时钟 ---------------- */
 
 /* 固定在一个「可信」的时刻：本地 2026-03-05（周四）07:00 +08:00。
@@ -109,17 +116,30 @@ int64_t stub_timer_us(void) { return (int64_t)stub_time_now() * 1000000LL; }
 
 static int s_tone_count;
 static int s_rgb_count;
+static int s_rgb_pending;
+static int s_rgb_escalate;
+static int s_rgb_done;
 
 int  stub_tone_count(void) { return s_tone_count; }
 int  stub_rgb_count(void) { return s_rgb_count; }
-void stub_fx_reset(void) { s_tone_count = 0; s_rgb_count = 0; }
+int  stub_rgb_pending_count(void) { return s_rgb_pending; }
+int  stub_rgb_escalate_count(void) { return s_rgb_escalate; }
+int  stub_rgb_done_count(void) { return s_rgb_done; }
+void stub_fx_reset(void)
+{
+    s_tone_count = 0;
+    s_rgb_count = 0;
+    s_rgb_pending = 0;
+    s_rgb_escalate = 0;
+    s_rgb_done = 0;
+}
 
 void elder_ui_play_tone(elder_tone_t tone) { (void)tone; s_tone_count++; }
 void elder_ui_announce(const char *t, elder_tone_t tone) { (void)t; (void)tone; s_tone_count++; }
 
-void elder_rgb_med_done(void) { s_rgb_count++; }
-void elder_rgb_med_pending(void) { s_rgb_count++; }
-void elder_rgb_med_escalate(void) { s_rgb_count++; }
+void elder_rgb_med_done(void) { s_rgb_count++; s_rgb_done++; }
+void elder_rgb_med_pending(void) { s_rgb_count++; s_rgb_pending++; }
+void elder_rgb_med_escalate(void) { s_rgb_count++; s_rgb_escalate++; }
 
 /* ---------------- FreeRTOS 任务（丢弃，不启动死循环） ---------------- */
 

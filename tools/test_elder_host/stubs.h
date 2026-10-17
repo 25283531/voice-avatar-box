@@ -20,6 +20,12 @@
 void stub_nvs_init(void);
 void stub_nvs_reset(void);
 
+/* 把已落盘 blob 里的某个字节翻转（异或 mask），长度不变。
+ * 唯一的用途是让 reminder.c 的 CRC 校验分支**可达**：正常流程写进去的
+ * 永远 CRC 自洽，不刻意写坏就读不到「NVS 校验」这条路径 —— 而它恰恰是
+ * 断网设备最该守住的一条（把坏数据当成有效提醒表 = 老人照着乱码时间吃药）。*/
+void stub_nvs_corrupt(int ns_index, size_t offset, uint8_t xor_mask);
+
 /* 受控时钟：所有 time() 与 esp_timer 都由它推导 */
 void stub_time_set(time_t epoch);
 void stub_time_advance(int64_t sec);
@@ -28,6 +34,11 @@ time_t stub_time_now(void);
 /* 副作用计数器 */
 int  stub_tone_count(void);
 int  stub_rgb_count(void);
+/* 三种灯分开计数。合并成一个总数时，「红灯升级」与「红灯待确认」
+ * 无法区分 —— 而「漏服 15 分钟后升级成红灯告警」正是必须钉死的医疗级行为。*/
+int  stub_rgb_pending_count(void);
+int  stub_rgb_escalate_count(void);
+int  stub_rgb_done_count(void);
 void stub_fx_reset(void);
 
 /* 任务创建被丢弃（不启动死循环） */
