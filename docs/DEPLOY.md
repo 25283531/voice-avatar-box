@@ -98,8 +98,10 @@ docker compose exec elder-server ls -l /data # 容器视角
 > 现在只有 8064 一个端口。若你手上是旧部署，升级后请同步调整防火墙与反代规则：
 > 放行 WebSocket 升级即可，不再需要 8000 / 8002 / 8003。
 >
-> **部署在反向代理 / Cloudflare Tunnel 后面时，还须设 `ELDER_VOICE_PUBLIC_BASE`**，
-> 否则设备会拿到 `ws://` 地址连不上 —— 完整解释与配置见 §4.1。
+> **部署在反向代理 / Cloudflare Tunnel 后面时，还须显式声明部署模式并配对外地址**
+> （`ELDER_DEPLOY_MODE=tunnel` + `ELDER_PUBLIC_BASE_URL=https://<域名>`），
+> 否则设备会拿到 `ws://` 地址连不上 —— 完整解释、三种拓扑的决策表与"我该选哪种"
+> 见 §4.2。旧变量 `ELDER_VOICE_PUBLIC_BASE` 仍然有效（向后兼容）。
 
 ### 1.7 设备配网（浏览器直连设备热点，不用装 APP）
 
@@ -464,7 +466,7 @@ server {
 - **语音链路不需要单独的域名或端口**：它和 `/api/` 同源。若出于某种原因把它拆出去部署，才需要为它单独配对外地址。
 - 8064 不需要对公网开放，只监听 `127.0.0.1` 更安全：把 compose 里的端口映射改成 `127.0.0.1:${ELDER_HTTP_PORT:-8064}:8080`。
   注意语音链路也随之走了反代，上面那段 WebSocket 配置就是必需的，不能偷懒直接暴露 8064。
-- **反代（无论 Nginx 还是 Cloudflare Tunnel）下都要配 `ELDER_VOICE_PUBLIC_BASE`**：当前镜像的 uvicorn 启动参数没有启用 `--proxy-headers`（见 `server/Dockerfile` 的 CMD），`X-Forwarded-Proto` 不会被采纳，`request.url.scheme` 恒为 `http`，设备会拿到 `ws://` 地址。不要以为"反代传了 X-Forwarded-Proto 就没事"——完整解释见 §4.1。
+- **反代（无论 Nginx 还是 Cloudflare Tunnel）下都要配对外地址**：当前镜像的 uvicorn 启动命令没有传 `--proxy-headers`，而 uvicorn 的 `X-Forwarded-Proto` 处理**只信任来自 127.0.0.1 的对端**（框架默认值）—— 生产里容器看到的 TCP 对端是 Docker 网桥网关（不是 127.0.0.1，查法见 §4.1.4），该头不被采纳，`request.url.scheme` 恒为 `http`，设备会拿到 `ws://` 地址。不要以为"反代传了 X-Forwarded-Proto 就没事"——完整解释见 §4.1.3，三种拓扑怎么配见 §4.2 的决策表。
 
 ---
 
@@ -524,31 +526,50 @@ curl -si -N --max-time 5 \
   https://voice.2508866.xyz/api/voice/v1/ws
 ```
 
-#### 4.1.3 ⚠️ ws:// vs wss://：隧道形态下**必须**设 `ELDER_VOICE_PUBLIC_BASE`
+#### 4.1.3 ⚠️ ws:// vs wss://：隧道形态下**必须**声明 `tunnel` 模式并配对外地址
 
 设备心跳 `POST /api/device/sync` 的响应里，语音 WS 地址是服务端**现场推导**的
-（`server/app/routers/device_api.py` 的 `_voice_endpoints()`）：默认按 `request.url.scheme`
-决定下发 `ws://` 还是 `wss://`，Host 取请求头里的 `host`。
+（`server/app/routers/device_api.py` 的 `_voice_endpoints()`）。推导逻辑由
+**部署模式** `ELDER_DEPLOY_MODE` 决定（启动期校验与摘要见 `server/app/config.py`
+的 `_deploy_startup_check`，三种模式的完整决策表见 §4.2）：
 
-坑在于：**当前镜像的 uvicorn 启动命令没有 `--proxy-headers`**（`server/Dockerfile` 的 CMD 只有
-`--host/--port`），`X-Forwarded-Proto` 不会被采纳 —— 即使 cloudflared 正确传了这个头，
-uvicorn 眼里自己永远是明文 HTTP。于是 `request.url.scheme` 恒为 `http`，设备拿到的是
-`ws://voice.2508866.xyz/api/voice/v1/ws`：明文 WS 打到 443。表现是**设备能配网、能心跳，
-一开口说话就断**，极易误判成固件问题。
+- `tunnel` / `direct` 且配了对外地址 -> 用配置的地址，与请求无关；
+- 否则按 `request.url.scheme` 决定下发 `ws://` 还是 `wss://`，Host 取请求头。
 
-解决办法（逃生舱，优先级最高；代码见 `server/app/config.py` 的 `VOICE_PUBLIC_BASE` 与
-`device_api.py` 的 `_voice_endpoints`）：
+坑在于：**uvicorn 对 `X-Forwarded-Proto` 的处理只信任来自 127.0.0.1 的对端**
+（框架默认值 `proxy_headers=True, forwarded_allow_ips=127.0.0.1`；镜像 CMD 没有
+传任何 proxy 参数，用的是这个默认值）。本形态里容器看到的 TCP 对端是
+**Docker 网桥网关**（cloudflared 在宿主机，查法见 §4.1.4），不在信任名单里
+—— 即使 cloudflared 正确传了 `X-Forwarded-Proto: https`，uvicorn 眼里自己
+永远是明文 HTTP。于是 `request.url.scheme` 恒为 `http`，设备拿到的是
+`ws://voice.2508866.xyz/api/voice/v1/ws`：明文 WS 打到 443。表现是**设备能配网、
+能心跳，一开口说话就断**，极易误判成固件问题。
+
+解决办法（二选一，**推荐前者**）：
 
 ```bash
-# server/.env（compose 自动读取并透传，见 server/docker-compose.yml 的 environment）
-ELDER_VOICE_PUBLIC_BASE=https://voice.2508866.xyz
+# ① 新变量（任何模式下都校验 scheme；WS 可单独配域名）
+ELDER_DEPLOY_MODE=tunnel
+ELDER_PUBLIC_BASE_URL=https://voice.2508866.xyz
+# ELDER_WS_PUBLIC_BASE_URL=wss://voice-ws.2508866.xyz   # 可选：WS 单独域名
+
+# ② 旧变量（向后兼容，语义与历史上逐字一致；tunnel 模式下同样满足"有显式地址"）
+# ELDER_VOICE_PUBLIC_BASE=https://voice.2508866.xyz
 ```
 
 注意：
 
-- 必须给 `https://`，服务端会自动换成 `wss://` 下发给设备；给 `ws://` 会被设备拒绝。
-- 末尾不要带 `/`（代码会 `rstrip("/")`，但别依赖这个）。
-- 改完 `docker compose up -d`（重建容器）生效；然后按 §4.1.2 的方法实测一次 WS。
+- `ELDER_PUBLIC_BASE_URL` 必须给 `https://`（服务端会自动换成 `wss://` 下发给设备）；
+  给 `ws://` / `ftp://` / 不带 scheme 会**启动直接失败**（报错点名是哪个变量）。
+- `ELDER_WS_PUBLIC_BASE_URL` 必须给 `ws(s)://`；只配它不配 HTTP 地址也会启动失败
+  （OTA 检查仍然需要 http(s) 地址）。
+- 末尾不要带 `/`（代码会剥掉，但别依赖这个）。
+- **`tunnel` 模式不配对外地址 = 容器启动失败**，这是刻意的：缺地址时服务端一切
+  "正常"（心跳成功、管理台能开），只有设备一开口就断，运行期没有任何信号。
+  用一次启动失败换掉一次线上静默故障。不设 `ELDER_DEPLOY_MODE` 则是 `auto`，
+  行为与今天完全一致，存量部署升级不受影响。
+- 改完 `docker compose up -d`（重建容器）生效；启动日志会打一行部署摘要
+  （模式 / HTTP 地址 / WS 地址 / 设备将拿到的 ws URL），然后按 §4.1.2 的方法实测一次 WS。
 
 #### 4.1.4 ⚠️ 登录限速与 X-Forwarded-For：别动 uvicorn 的 `--forwarded-allow-ips`
 
@@ -559,9 +580,11 @@ XFF，且**从右往左**跳过可信段、取第一个不可信地址（攻击�
 对应到本形态：
 
 - **绝不要**给 uvicorn 传 `--forwarded-allow-ips=*`。传 `*` 时 uvicorn 会把 XFF 最左段
-  （请求方随便写的那段）当作对端 IP，限速器直接形同虚设。本项目连 `--proxy-headers`
-  都没开，XFF 由应用层按可信名单自己解析，这是刻意的最安全默认；要改 Dockerfile CMD
-  属于 `server/**` 改动，需单独评审，不要在执行 docker run 时顺手加参数。
+  （请求方随便写的那段）当作对端 IP，限速器直接形同虚设。镜像 CMD 没有传任何 proxy
+  参数，用的是框架默认值（`proxy_headers=True` 但 `forwarded_allow_ips=127.0.0.1`）：
+  只有回环对端的 XFF 会被框架采纳，其余一律交给应用层按可信名单从右往左解析 ——
+  这是刻意的最安全默认；要改 Dockerfile CMD 属于 `server/**` 改动，需单独评审，
+  不要在执行 docker run 时顺手加参数。
 - cloudflared 跑在宿主机时，容器看到的 TCP 对端**不是 127.0.0.1**，而是 Docker 网桥网关
   （compose 网络 `server_elder-net` 的 Gateway，通常 `172.x.0.1`）。查法：
 
@@ -601,10 +624,69 @@ XFF，且**从右往左**跳过可信段、取第一个不可信地址（攻击�
     见 `firmware/xiaozhi/main/Kconfig.projbuild`），设备运行时还可被 NVS 覆盖
     （`settings("wifi")` 的 `ota_url`，见 `firmware/xiaozhi/main/ota.cc` 的 `GetCheckVersionUrl`）。
   - 语音 WS 地址：每次心跳由服务端按 §4.1.3 的逻辑重新下发。
-  - 所以换域名要**三处一起改**：固件默认值或 NVS、`ELDER_VOICE_PUBLIC_BASE`、
-    Cloudflare 隧道主机名。漏一处的典型症状是"能心跳不能说话"或"OTA 打到旧域名"。
+  - 所以换域名要**三处一起改**：固件默认值或 NVS、部署模式对应的对外地址变量
+    （`ELDER_PUBLIC_BASE_URL` / 旧变量 `ELDER_VOICE_PUBLIC_BASE`，
+    WS 单独域名再加 `ELDER_WS_PUBLIC_BASE_URL`）、Cloudflare 隧道主机名。
+    漏一处的典型症状是"能心跳不能说话"或"OTA 打到旧域名"。
 - cloudflared 在 iStoreOS 上的安装方式（opkg 包或官方二进制）与隧道创建
   （Cloudflare Zero Trust 后台）以各自官方文档为准，本文不复述可能过时的步骤。
+
+---
+
+### 4.2 三种拓扑决策表：我该选哪种（`ELDER_DEPLOY_MODE`）
+
+同一个镜像跑在三种拓扑下，**服务端给设备下发的 ws/OTA 地址来源不同**。
+`ELDER_DEPLOY_MODE` 把"当前是哪种拓扑"变成显式配置，启动时还会打一行摘要
+（模式 / HTTP 地址 / WS 地址 / 设备将拿到的 ws URL）—— 排障第一现场。
+
+| 拓扑 | `ELDER_DEPLOY_MODE` | 还要配什么 | 设备拿到的地址 | 主要坑 |
+| --- | --- | --- | --- | --- |
+| **Cloudflare Tunnel**（或任何 TLS 在前置终止的反代） | `tunnel` | `ELDER_PUBLIC_BASE_URL=https://<域名>`（**必需**，缺了启动失败）；`ELDER_WS_PUBLIC_BASE_URL=wss://<WS域名>`（可选） | 配置的地址，与请求无关；WS 域名分开配时两者各自生效 | uvicorn 不信任非回环对端的 `X-Forwarded-Proto`，自动推导会给出 `ws://`；长连接可能被 Cloudflare 空闲断开（§4.1.5） |
+| **公网直暴露**（有公网 IP，对外 `http://IP:8064`） | `direct`（或留空 = `auto`） | 不用配对外地址 | 按请求 Host 推导：`ws://IP:8064/...`、`http://IP:8064/...` | 明文 HTTP：流量、登录口令、设备 token 全部裸奔；谁扫到这个端口都能打你的 AI token（建议同时 `ELDER_ALLOW_PUBLIC_REGISTER=0`）。详见下方"直暴露的风险" |
+| **有头域的反代**（自管 Nginx/Caddy，TLS 在反代上终止） | `tunnel` + 对外地址（**推荐**）；反代确实把源站当明文 HTTP 用时 `direct` 即可 | 同第一行 | 配了就用配置的；没配按请求推导 | 与隧道同源的问题：TLS 在前置终止 ⇒ scheme 推导不可信。别指望反代传了 `X-Forwarded-Proto` 就没事（§4.1.3） |
+
+**取舍：为什么"实在解决不了就走公网直暴露"是下策**
+
+- 隧道（当前生产形态）不暴露任何入站端口，TLS 与证书由 Cloudflare 管，
+  家里没有公网 IP 也能上线 —— 这是它作为**首选**的理由。
+- 公网直暴露只需要一台有公网 IP 的服务器，配置最简单，但代价是明文：
+  ① 任何中间人都能看/改流量（含管理员登录口令与设备 token）；
+  ② 端口一扫就能定位到服务，注册接口匿名可达（不关注册的话），
+  陌生人可以注册账号消耗你的 AI token、把老人设备挤下线；
+  ③ `ws://` 在部分网络环境下会被中间设备劫持或阻断。
+  如果只是**临时验证**、或内网/VPN 内使用，直暴露是可接受的；
+  长期给老人用，请回到隧道，或至少给直暴露套一层 TLS 反代（那就变成第三行）。
+- 一条实用判据：**先试隧道**。按 §4.1 配好 cloudflared + 两行环境变量，
+  启动日志会明确告诉你设备将拿到什么地址；只有隧道因网络环境（如运营商干扰）
+  确实建不起来时，再退到公网服务器直暴露，并接受上面的风险。
+
+**新旧变量优先级（不静默改语义）**
+
+| 地址 | 来源（从左到右优先级递减） |
+| --- | --- |
+| HTTP/OTA 对外地址 | `ELDER_PUBLIC_BASE_URL` > `ELDER_VOICE_PUBLIC_BASE`（旧逃生舱，语义逐字未变） |
+| WS 对外地址 | `ELDER_WS_PUBLIC_BASE_URL` > 由 HTTP 地址换 scheme 推导（https→wss / http→ws） |
+
+- 两者都配时以新变量为准，并打 WARNING 提醒删掉旧变量（两处并存 = 下次换域名
+  必漏一处）。**旧变量没有废弃**：存量部署原样生效；迁移路径就是把
+  `ELDER_VOICE_PUBLIC_BASE=x` 改成 `ELDER_PUBLIC_BASE_URL=x`（值不变，
+  区别只是新变量在任何模式下都校验 scheme、且支持 WS 单独域名）。
+- `auto`（默认，不设该变量）= 历史上的行为：没配对外地址就按请求推导，
+  启动日志说明推断依据。**存量部署不设任何新变量，升级后行为逐字不变**
+  （回归证明见 `tools/smoke_deploy.py` 的 H 组：与 git 基线逐字比对）。
+
+**启动期校验（配错直接失败，不静默降级）**
+
+| 配置 | 结果 |
+| --- | --- |
+| `tunnel` 但没有任何对外地址 | **启动失败**，报错点名 `ELDER_DEPLOY_MODE=tunnel` 与 `ELDER_PUBLIC_BASE_URL` |
+| 配了 `ELDER_WS_PUBLIC_BASE_URL` 却没配 HTTP 地址 | **启动失败**（OTA 仍需要 http(s) 地址） |
+| `ELDER_DEPLOY_MODE` 写成 `cloudflare` 等 | **启动失败**，列出合法值 `auto / direct / tunnel` |
+| `ELDER_PUBLIC_BASE_URL` 不是 http(s) / `ELDER_WS_PUBLIC_BASE_URL` 不是 ws(s) | **启动失败**，点名是哪个变量、哪里不合法 |
+| `tunnel` 下旧变量给了 `wss://` | **启动失败**（auto/direct 下旧变量不校验，保持历史语义） |
+
+冒烟覆盖：`tools/smoke_deploy.py`（86 条断言：三模式推导逐条断言、启动失败
+必红、auto/direct 与 git 基线逐字一致、反向验证三处）。
 
 ---
 
@@ -624,7 +706,10 @@ XFF，且**从右往左**跳过可信段、取第一个不可信地址（攻击�
 | `ELDER_TZ` | `Asia/Shanghai` | 业务时区，改了会整体影响提醒时间计算 |
 | `MYSQL_ROOT_PASSWORD` | `123456` | 仅在使用自带 `elder-db` 容器时生效，**生产必须改** |
 | `ELDER_ORDER_TTL_HOURS` | `48` | 会员订单（人工核销）占用有效期，超时置 `expired` 并释放号段与金额 |
-| `ELDER_VOICE_PUBLIC_BASE` | 留空（自动推导） | 语音链路对外地址。自研链路与 API 同源同端口，服务端按请求 Host 推导；**反代（含 Cloudflare Tunnel）下必须显式填** `https://voice.2508866.xyz`（会自动换成 `wss://`），原因见 4.1.3。见 1.6 |
+| `ELDER_VOICE_PUBLIC_BASE` | 留空（自动推导） | 语音链路对外地址（**旧变量，向后兼容，语义逐字未变**）。自研链路与 API 同源同端口，未配时服务端按请求 Host 推导；反代（含 Cloudflare Tunnel）下**必须**有显式对外地址（新变量或本变量），否则设备拿到 `ws://`。与 `ELDER_PUBLIC_BASE_URL` 同时配置时以新变量为准并 WARNING。见 §4.2 |
+| `ELDER_DEPLOY_MODE` | `auto`（未设置） | **部署模式**：`auto` / `direct` / `tunnel`（大小写不敏感）。`tunnel` = Cloudflare Tunnel 等 TLS 前置形态，**必须**配对外地址否则启动失败；`direct` = 公网直暴露/反代后置，按请求推导；`auto` = 未声明，行为同 direct 但启动日志说明推断依据。写错取值启动失败。见 §4.2 |
+| `ELDER_PUBLIC_BASE_URL` | 留空 | **HTTP/OTA 对外地址**（新变量，http/https，启动期校验 scheme）。配了就在所有模式下优先使用；tunnel 模式下必需 |
+| `ELDER_WS_PUBLIC_BASE_URL` | 留空 | **WebSocket 单独域名**（可选，ws/wss，启动期校验）。Cloudflare Tunnel 可给同一源站配多个 hostname；不配则 WS 由 HTTP 地址换 scheme 推导。只配它不配 HTTP 地址会启动失败 |
 | `ELDER_SCHEDULE_AHEAD_HOURS` | `36` | 服务端预生成提醒实例的提前量 |
 | `ELDER_DB_ECHO` | `0` | 设为 `1` 打印所有 SQL，排查问题时开，平时关 |
 | `ELDER_ALLOW_PUBLIC_REGISTER` | `1`（开启） | **是否开放匿名自助注册**。设为 `0`/`false`/`no`/`off`/空串即关闭，关闭时 `POST /api/auth/register` 返回 `403` + 「当前未开放自助注册，请联系管理员开通账号」。详见 §5.1 |
@@ -1011,22 +1096,31 @@ docker inspect --format '{{.State.ExitCode}}' elder-server
 
 3. **`proxy_buffering off` 有没有配**：忘了开会有明显的语音延迟（音频被攒够一批才发）。
 
-4. **确认设备拿到的地址对不对**：调一次心跳看 `ws_url` 字段：
+4. **确认设备拿到的地址对不对**：看启动日志里的部署摘要（`docker compose logs elder-server | grep 【部署】`），
+   或调一次心跳看 `ws_url` 字段。
+
+   走 HTTPS 域名时必须是 `wss://voice.2508866.xyz/api/voice/v1/ws`。
+   如果显示的是内网 IP 或 `ws://`（非加密），按部署形态二选一：
 
    ```bash
-   docker compose logs elder-server | grep -i voice
+   # 隧道 / TLS 反代（推荐）：显式声明模式 + 对外地址，缺地址会启动失败
+   ELDER_DEPLOY_MODE=tunnel
+   ELDER_PUBLIC_BASE_URL=https://voice.2508866.xyz
+   # 旧变量仍然有效：ELDER_VOICE_PUBLIC_BASE=https://voice.2508866.xyz
    ```
-   走 HTTPS 域名时必须是 `wss://voice.2508866.xyz/api/voice/v1/ws`。
-   如果显示的是内网 IP 或 `ws://`（非加密），配 `ELDER_VOICE_PUBLIC_BASE=https://voice.2508866.xyz`
-   显式指定——注意在当前 uvicorn 启动参数下（无 `--proxy-headers`），scheme 推导恒为 http，
-   所以**只要走了 TLS 反代（Nginx / Cloudflare Tunnel 都一样）就必须配它**，详见 §4.1.3。
+
+   机制说明：uvicorn 对 `X-Forwarded-Proto` **只信任来自 127.0.0.1 的对端**
+   （框架默认值），生产里容器看到的对端是 Docker 网桥网关，该头不被采纳，
+   scheme 推导恒为 http —— 所以**只要走了 TLS 反代（Nginx / Cloudflare Tunnel
+   都一样）就必须配对外地址**，详见 §4.1.3，三种拓扑的完整决策表见 §4.2。
 
 5. 若完全没有到 `/api/voice/` 的日志，检查容器的 8064 端口映射是否已发布、
    以及有没有别的进程抢占了它。
 
 > 注：`ws` 与 `wss` **不能混用**。页面/设备在 HTTPS 下拒绝建立非加密的 WebSocket。
-> 服务端默认按请求 scheme 推导，但当前 uvicorn 启动参数下推导结果恒为 `http`，
-> 所以**走 TLS 反代时必须配 `ELDER_VOICE_PUBLIC_BASE`**（§4.1.3），不要指望自动推导。
+> 服务端默认按请求 scheme 推导，但生产对端不在 uvicorn 的 XFP 信任名单里、
+> 推导结果恒为 `http`，所以**走 TLS 反代时必须配对外地址**（§4.1.3 / §4.2），
+> 不要指望自动推导。
 
 ### 6.10 用户收不到密码重置邮件
 

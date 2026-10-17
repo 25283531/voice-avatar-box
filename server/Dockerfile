@@ -13,7 +13,33 @@ ENV PYTHONUNBUFFERED=1 \
     TZ=Asia/Shanghai \
     PIP_NO_CACHE_DIR=1 \
     ELDER_PORT=8080 \
-    ELDER_DB=sqlite:////data/elder.db
+    ELDER_DB=sqlite:////data/elder.db \
+    ELDER_DEPLOY_MODE=auto
+
+# ---------------------------------------------------------------- 部署模式
+# ELDER_DEPLOY_MODE 决定服务端给设备下发哪套对外地址，三种取值（决策表与
+# "我该选哪种"见 docs/DEPLOY.md §4.2；启动期校验与摘要见 app/config.py
+# 的 _deploy_startup_check）：
+#
+#   auto   —— 默认。未显式声明拓扑：按请求现场推导 ws/OTA 地址（历史行为），
+#             启动日志会说明推断依据。**只在公网 IP:端口直暴露下天然正确**：
+#             镜像没有给 uvicorn 传 --proxy-headers，而 uvicorn 只信任来自
+#             127.0.0.1 的 X-Forwarded-Proto；生产里对端是 Docker 网桥网关，
+#             scheme 恒为 http，TLS 反代/隧道后面会下发 ws://（能心跳不能说话）。
+#   direct —— 显式声明"直暴露/反代后置"：推导逻辑与 auto 完全相同，
+#             值是一份写进配置的意图声明 + 启动摘要里明确的模式名。
+#   tunnel —— Cloudflare Tunnel 等「TLS 在前置终止」的形态：**必须**配对外
+#             地址，否则容器启动直接失败（不静默降级）。配套变量：
+#               ELDER_PUBLIC_BASE_URL=https://voice.2508866.xyz   （HTTP/OTA，必需）
+#               ELDER_WS_PUBLIC_BASE_URL=wss://voice-ws.2508866.xyz （WS 单独域名，可选）
+#             旧变量 ELDER_VOICE_PUBLIC_BASE 仍然有效（向后兼容），新部署建议用
+#             ELDER_PUBLIC_BASE_URL（任何模式下都校验 scheme）。
+#
+# ⚠️ 上面 ENV 里的 auto 与 config.py 的默认值一致，显式声明只是为了让
+# `docker inspect` 能一眼看到当前模式；compose 的 environment 会覆盖它。
+# ⚠️ 刻意**不**给 CMD 的 uvicorn 加 --proxy-headers / --forwarded-allow-ips：
+# 传 * 会让登录限速形同虚设（XFF 最左段可伪造），应用层按
+# ELDER_TRUSTED_PROXY_IPS 名单从右往左解析，见 docs/DEPLOY.md §4.1.4。
 
 WORKDIR /app
 

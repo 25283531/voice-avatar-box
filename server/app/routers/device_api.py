@@ -16,10 +16,11 @@ from sqlalchemy.orm import Session
 
 from .. import models
 from ..config import (
+    PUBLIC_BASE_URL,
     SCHEDULE_AHEAD_HOURS,
     VOICE_OTA_PATH,
-    VOICE_PUBLIC_BASE,
     VOICE_WS_PATH,
+    WS_PUBLIC_BASE_URL,
 )
 from ..db import get_db
 from ..deps import get_current_device
@@ -54,13 +55,29 @@ def _voice_endpoints(request: Request) -> tuple[str, str]:
       被拒的情况（放在反代后面尤其重要）；
     - 单一镜像，没有第二个服务需要编排。
 
-    `VOICE_PUBLIC_BASE` 是逃生舱：极少数拓扑下反代没透传 Host，
-    或者需要从别的可达地址回来时，运维可以显式指定，优先级最高。
+    三种部署模式（``ELDER_DEPLOY_MODE``，启动期校验与摘要见
+    ``config._deploy_startup_check``）：
+
+    - ``direct`` / ``auto``（默认）：未配对外地址时**按请求现场推导** ——
+      scheme 取 ``request.url.scheme``，Host 取请求头。注意镜像没有给
+      uvicorn 传 ``--proxy-headers``，而 uvicorn 只信任来自 127.0.0.1 的
+      ``X-Forwarded-Proto``：生产里对端是 Docker 网桥网关，scheme 恒为
+      ``http``。所以这种推导**只在直暴露（公网 IP:端口）下天然正确**，
+      TLS 反代 / 隧道后面必须显式配对外地址。
+    - ``tunnel``：启动期强制要求显式对外地址（缺了直接启动失败，不静默
+      降级），本函数优先用它下发，与请求无关。
+
+    显式对外地址的来源与优先级（``config.PUBLIC_BASE_URL`` 已合并好）：
+    ``ELDER_PUBLIC_BASE_URL`` > ``ELDER_VOICE_PUBLIC_BASE``（旧逃生舱，
+    语义逐字未变）；WS 侧 ``ELDER_WS_PUBLIC_BASE_URL``（单独域名）优先，
+    未配则由 HTTP 地址换 scheme 推导。
     """
-    if VOICE_PUBLIC_BASE:
-        base = VOICE_PUBLIC_BASE
-        # 用户给的是 http(s) 地址，这里要换成同级的 ws(s)
-        ws_base = base.replace("https://", "wss://").replace("http://", "ws://")
+    if PUBLIC_BASE_URL:
+        base = PUBLIC_BASE_URL
+        # WS 地址：显式配了单独域名（wss://...）用它；否则由 HTTP 地址换
+        # scheme 推导 —— 与旧变量时代的口径逐字一致。
+        ws_base = WS_PUBLIC_BASE_URL or \
+            base.replace("https://", "wss://").replace("http://", "ws://")
         return f"{ws_base}{VOICE_WS_PATH}", f"{base}{VOICE_OTA_PATH}"
 
     scheme = "wss" if request.url.scheme == "https" else "ws"

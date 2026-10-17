@@ -1,9 +1,11 @@
 """运行时配置（全部可用环境变量覆盖）。"""
 from __future__ import annotations
 
+import logging
 import os
 from datetime import timedelta
 from pathlib import Path
+from urllib.parse import urlparse
 from zoneinfo import ZoneInfo
 
 
@@ -267,9 +269,226 @@ LETTERS = "ABCDEFGHJKLMNPQRSTUVWXYZ"
 VOICE_WS_PATH = os.getenv("ELDER_VOICE_WS_PATH", "/api/voice/v1/ws")
 VOICE_OTA_PATH = os.getenv("ELDER_VOICE_OTA_PATH", "/api/voice/ota")
 
-# 对外通告的地址：留空时由服务端按请求 Host 自动推导（ws/wss 与 http/https 同源）。
-# 生产部署在 HTTPS 域名后面时要显式配成 wss://<域名>，否则浏览器/设备会拒绝混合内容。
+# ---------------------------------------------------------------- 部署模式与对外地址
+# 三种拓扑（决策表与"我该选哪种"见 docs/DEPLOY.md §4.2）：
+#
+#   direct —— 公网 IP:端口直暴露，或前置反代能保证 scheme 正确的场景。
+#             **按原方案**：从 request.url.scheme + Host 推导 ws/wss 与 OTA 地址。
+#   tunnel —— Cloudflare Tunnel 等「TLS 在前置终止、源站只看到明文」的形态。
+#             **必须**有一个显式对外地址，否则**启动直接失败**（见下）。
+#   auto   —— 未显式设置 ELDER_DEPLOY_MODE 时的默认值：推导逻辑与 direct
+#             完全相同（= 历史行为），但启动日志会说明推断依据，便于排障。
+#
+# ⚠️ 为什么 tunnel 缺地址是**启动失败**而不是告警后继续跑
+# ----------------------------------------------------
+# 缺地址时服务端一切"正常"：心跳成功、管理台能开、日志一片干净，只有设备
+# 一开口就断（拿到 ws://域名 打 443）。这种故障在**运行期没有任何信号**，
+# 等发现时老人已经不会说话了。而它的修法只是加一行环境变量。
+# 用一次启动失败换掉一次线上静默故障，这就是"能早失败就早失败"的全部理由。
+#
+# 为什么这样不会伤到存量部署：tunnel 是**显式 opt-in** 的新变量，
+# 不设 ELDER_DEPLOY_MODE 就是 auto = 今天的行为，既有部署升级不受影响。
+# 反过来，如果用 WARNING 而不是失败：容器会继续跑（心跳确实通），
+# 告警混在启动日志里很可能没人注意 —— 那正是本特性要消灭的失效形态。
+#
+# ⚠️ auto/direct 下**故意不校验**旧变量 ELDER_VOICE_PUBLIC_BASE 的 scheme：
+# 那个变量历史上不校验，加了校验就改了存量部署的语义（本次要求逐字保持）。
+# 它在新变量 ELDER_PUBLIC_BASE_URL 上始终校验（新变量没有历史语义要保）。
+# ----------------------------------------------------------------
+
+#: 旧的逃生舱变量（``ELDER_VOICE_PUBLIC_BASE``）。**语义逐字未变**：仍然只做
+#: ``rstrip("/")``，仍然同时决定 HTTP/OTA 与 WS 地址（WS 由它换 scheme 推导）。
+#: 它是被下面 ``PUBLIC_BASE_URL`` 合并的输入之一，不再是 device_api 的直接读点。
 VOICE_PUBLIC_BASE = os.getenv("ELDER_VOICE_PUBLIC_BASE", "").rstrip("/")
+
+#: 部署模式（``ELDER_DEPLOY_MODE``）：``direct`` / ``tunnel`` / ``auto``。
+#: 大小写不敏感、忽略首尾空白；未设置 = ``auto``。
+DEPLOY_MODE = os.getenv("ELDER_DEPLOY_MODE", "").strip().lower() or "auto"
+
+#: HTTP/OTA 对外地址（``ELDER_PUBLIC_BASE_URL``）。必须是 http(s)://，启动期校验。
+_PUBLIC_BASE_URL = os.getenv("ELDER_PUBLIC_BASE_URL", "").strip().rstrip("/")
+
+#: WebSocket 单独域名（``ELDER_WS_PUBLIC_BASE_URL``，可选）。必须是 ws(s)://。
+#: Cloudflare Tunnel 可以给同一源站配多个 hostname，WS 走独立域名时用它；
+#: 不配则 WS 由 HTTP 地址换 scheme 推导（与旧变量时代的口径一致）。
+_WS_PUBLIC_BASE_URL = os.getenv("ELDER_WS_PUBLIC_BASE_URL", "").strip().rstrip("/")
+
+_DEPLOY_MODES = ("auto", "direct", "tunnel")
+_MODE_DESC = {
+    "auto": "auto（未显式设置 ELDER_DEPLOY_MODE，按请求现场推导）",
+    "direct": "direct（公网直暴露 / 反代后置，按请求现场推导）",
+    "tunnel": "tunnel（Cloudflare Tunnel 等 TLS 在前置终止的形态）",
+}
+
+_deploy_log = logging.getLogger("elder.deploy")
+
+
+def _ensure_deploy_log_handler() -> None:
+    """保证启动摘要必然可见。
+
+    ``main.py`` 的 ``logging.basicConfig`` 在 **import 完本模块之后**才执行
+    （import 顺序决定的），而启动自检发生在 import 期 —— 彼时 root 上还没有
+    handler，INFO 会被 ``logging.lastResort``（只打 WARNING+）吞掉。
+    这里在无 handler 时自建一个 StreamHandler，格式与 main.py 逐字一致；
+    随后 main.py 的 basicConfig 因 root 已有 handler 而成为 no-op，
+    日志格式与去向都不变。
+    """
+    root = logging.getLogger()
+    if root.handlers:
+        return
+    handler = logging.StreamHandler()
+    handler.setFormatter(logging.Formatter(
+        "%(asctime)s %(levelname)-7s %(name)s | %(message)s"))
+    root.addHandler(handler)
+    root.setLevel(logging.INFO)
+
+
+def _validate_base(value: str, var: str, allowed: tuple[str, ...]) -> None:
+    """校验一个对外地址变量；不合法**直接启动失败**（SystemExit）。
+
+    为什么用 SystemExit 而不是 raise Exception：它不会被调用链上常见的
+    ``except Exception`` 吞掉，且 Python 会把消息打到 stderr 后以非零码退出 ——
+    ``docker compose up`` 里一眼可见，不需要翻 traceback。
+    """
+    parsed = urlparse(value)
+    if parsed.scheme not in allowed or not parsed.netloc:
+        raise SystemExit(
+            f"【启动失败】{var} 取值非法：{value!r}\n"
+            f"    scheme 必须是 {' 或 '.join(allowed)} 且要带主机名，"
+            f"例如 https://voice.2508866.xyz。\n"
+            f"    这个地址是设备心跳时下发的，写错 = 设备拿到连不上的地址，"
+            f"所以在启动期直接失败，不静默降级。"
+        )
+
+
+def _resolve_public_bases() -> tuple[str, str, str]:
+    """合并新旧变量，返回 ``(HTTP/OTA 地址, 来源说明, WS 地址)``。
+
+    新旧变量优先级（**不静默改语义**）：
+      * HTTP/OTA 地址：``ELDER_PUBLIC_BASE_URL`` 优先；只有旧变量时用它
+        （行为与今天逐字一致）。两者都配时以新变量为准并 WARNING 提醒，
+        避免「改了一处漏一处」。
+      * WS 地址：``ELDER_WS_PUBLIC_BASE_URL`` 优先；未配则由 HTTP 地址换
+        scheme 推导（https→wss / http→ws，与旧变量时代逐字一致）。
+    """
+    http_base, http_source = "", ""
+    if _PUBLIC_BASE_URL:
+        _validate_base(_PUBLIC_BASE_URL, "ELDER_PUBLIC_BASE_URL", ("http", "https"))
+        http_base, http_source = _PUBLIC_BASE_URL, "ELDER_PUBLIC_BASE_URL"
+        if VOICE_PUBLIC_BASE:
+            _deploy_log.warning(
+                "【部署】ELDER_PUBLIC_BASE_URL 与旧变量 ELDER_VOICE_PUBLIC_BASE "
+                "同时配置：本次以新变量为准（%s），旧变量被忽略。建议删掉旧变量 —— "
+                "两处并存只会在下次换域名时变成「改了一处、漏了一处」的坑。",
+                _PUBLIC_BASE_URL)
+    elif VOICE_PUBLIC_BASE:
+        http_base = VOICE_PUBLIC_BASE
+        http_source = ("ELDER_VOICE_PUBLIC_BASE（旧变量；建议迁移到 "
+                       "ELDER_PUBLIC_BASE_URL，见 docs/DEPLOY.md §4.2）")
+
+    if _WS_PUBLIC_BASE_URL:
+        _validate_base(_WS_PUBLIC_BASE_URL, "ELDER_WS_PUBLIC_BASE_URL", ("ws", "wss"))
+        if not http_base:
+            # WS 单独域名是"锦上添花"的那一半：OTA 检查仍然需要一个 http(s)
+            # 地址。只配一半 = 配置自相矛盾，启动期挑明，不静默忽略。
+            raise SystemExit(
+                f"【启动失败】配了 ELDER_WS_PUBLIC_BASE_URL（{_WS_PUBLIC_BASE_URL}）"
+                f"却没有配置 HTTP/OTA 对外地址。\n"
+                f"    WS 单独域名用于「业务与语音分两个 hostname」的部署"
+                f"（Cloudflare Tunnel 可配多个 hostname），但 OTA 检查"
+                f"（/api/voice/ota）仍然需要一个 http(s) 地址。\n"
+                f"    请补上 ELDER_PUBLIC_BASE_URL=https://<域名>"
+                f"（或旧变量 ELDER_VOICE_PUBLIC_BASE）。"
+            )
+    return http_base, http_source, _WS_PUBLIC_BASE_URL
+
+
+#: 生效的 HTTP/OTA 对外地址（新变量或旧变量合并后的结果，留空 = 按请求推导）。
+PUBLIC_BASE_URL: str
+#: 上面的地址是哪个变量给的（"" / 变量名），启动摘要与排障时用它说明来源。
+PUBLIC_BASE_SOURCE: str
+#: 生效的 WS 对外地址（留空 = 由 HTTP 地址换 scheme 推导）。
+WS_PUBLIC_BASE_URL: str
+
+
+def _deploy_startup_check() -> None:
+    """启动自检：把部署拓扑里的配置矛盾在**启动期**暴露出来，并打摘要。
+
+    本函数在 config 被 import 时执行 —— 对 uvicorn 来说这就是启动的第一刻，
+    比任何 lifespan 钩子都早。
+    """
+    _ensure_deploy_log_handler()
+
+    if DEPLOY_MODE not in _DEPLOY_MODES:
+        raise SystemExit(
+            f"【启动失败】ELDER_DEPLOY_MODE 取值非法：{DEPLOY_MODE!r}。\n"
+            f"    合法取值：{' / '.join(_DEPLOY_MODES)}（大小写不敏感）。\n"
+            f"    这个变量的全部意义就是「显式声明拓扑」——写错时猜一个默认值，\n"
+            f"    等于把显式变回隐式，那正是本特性要消灭的故障形态。"
+        )
+
+    if DEPLOY_MODE == "tunnel":
+        if not PUBLIC_BASE_URL:
+            raise SystemExit(
+                "【启动失败】ELDER_DEPLOY_MODE=tunnel 但没有配置对外地址。\n"
+                "    tunnel 形态（Cloudflare Tunnel 等）的 TLS 在前置终止，源站\n"
+                "    看到的永远是明文 HTTP：不配对外地址，设备心跳会拿到\n"
+                "    ws://<域名>/... 去打 443 —— 能心跳、不能说话，且运行期零报错。\n"
+                "    修法只需一行（二选一）：\n"
+                "        ELDER_PUBLIC_BASE_URL=https://voice.2508866.xyz\n"
+                "        ELDER_VOICE_PUBLIC_BASE=https://voice.2508866.xyz   （旧变量）\n"
+                "    WS 想用单独域名，再加 ELDER_WS_PUBLIC_BASE_URL=wss://<WS域名>。"
+            )
+        if PUBLIC_BASE_SOURCE.startswith("ELDER_VOICE_PUBLIC_BASE"):
+            # 旧变量在 auto/direct 下故意不校验（保持历史语义），但 tunnel 模式
+            # 是显式声明的生产拓扑，这里必须严格：拿 wss:// 当 HTTP 地址用，
+            # OTA 会下发一个设备连不上的地址。
+            parsed = urlparse(PUBLIC_BASE_URL)
+            if parsed.scheme not in ("http", "https") or not parsed.netloc:
+                raise SystemExit(
+                    f"【启动失败】tunnel 模式下 ELDER_VOICE_PUBLIC_BASE 必须是 "
+                    f"http(s):// 地址，当前是 {PUBLIC_BASE_URL!r}。\n"
+                    f"    旧变量在 auto/direct 下不校验 scheme（那是历史宽松语义，\n"
+                    f"    本次刻意未改）；tunnel 显式声明了拓扑，这里必须严格。\n"
+                    f"    建议直接迁移到新变量 ELDER_PUBLIC_BASE_URL（任何模式下都校验）。"
+                )
+
+    _log_deploy_summary()
+
+
+def _log_deploy_summary() -> None:
+    """启动摘要 —— 排障第一现场，写成人能一眼看懂的话。"""
+    lines = [f"【部署】模式：{_MODE_DESC[DEPLOY_MODE]}"]
+    if PUBLIC_BASE_URL:
+        ws_show = WS_PUBLIC_BASE_URL or PUBLIC_BASE_URL.replace(
+            "https://", "wss://").replace("http://", "ws://")
+        ws_src = ("（来源 ELDER_WS_PUBLIC_BASE_URL）" if WS_PUBLIC_BASE_URL
+                  else "（由 HTTP 地址换 scheme 推导）")
+        lines.append(f"【部署】   HTTP/OTA 对外地址：{PUBLIC_BASE_URL}"
+                     f"（来源 {PUBLIC_BASE_SOURCE}）")
+        lines.append(f"【部署】   WS 对外地址：{ws_show} {ws_src}")
+        lines.append(f"【部署】   设备心跳将拿到：ws={ws_show}{VOICE_WS_PATH}"
+                     f"  ota={PUBLIC_BASE_URL}{VOICE_OTA_PATH}")
+    else:
+        lines.append("【部署】   HTTP/OTA 对外地址：未配置 → 按请求推导："
+                     f"http(s)://<请求Host>{VOICE_OTA_PATH}")
+        lines.append("【部署】   WS 对外地址：未配置 → 按请求推导："
+                     f"ws(s)://<请求Host>{VOICE_WS_PATH}")
+        lines.append("【部署】   设备拿到的 ws 地址由请求 scheme 决定。镜像未传 "
+                     "--proxy-headers，uvicorn 只信任来自 127.0.0.1 的 "
+                     "X-Forwarded-Proto；生产里对端是 Docker 网桥网关、不在信任名单"
+                     " ⇒ scheme 恒为 http ⇒ 下发 ws://")
+        if DEPLOY_MODE == "auto":
+            lines.append("【部署】   ⇒ 若部署在 Cloudflare Tunnel / Nginx(TLS) 后面，"
+                         "请显式设 ELDER_DEPLOY_MODE=tunnel + "
+                         "ELDER_PUBLIC_BASE_URL=https://<域名>（WS 单独域名再加 "
+                         "ELDER_WS_PUBLIC_BASE_URL），否则设备「能心跳不能说话」")
+    for line in lines:
+        _deploy_log.info(line)
+
+
+PUBLIC_BASE_URL, PUBLIC_BASE_SOURCE, WS_PUBLIC_BASE_URL = _resolve_public_bases()
+_deploy_startup_check()
 
 # ---------------------------------------------------------------- 语音链路（自研）
 # 下行音频的采样率：握手里**声明 24000**，固件用自己声明的这个速率解码

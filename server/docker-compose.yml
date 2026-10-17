@@ -47,6 +47,31 @@ services:
       #   ELDER_VOICE_PUBLIC_BASE: https://voice.2508866.xyz
       # 注意必须给 https（服务端会自动换成 wss），给 ws:// 会导致设备拒绝连接。
       ELDER_VOICE_PUBLIC_BASE: ${ELDER_VOICE_PUBLIC_BASE:-}
+      # ---------------------------------------------------------------- 部署模式
+      # ELDER_DEPLOY_MODE 三种取值（完整决策表见 docs/DEPLOY.md §4.2）：
+      #   auto   —— 默认，不声明拓扑，按请求现场推导（= 上面的历史行为）
+      #   direct —— 显式声明"公网直暴露 / 反代后置"，推导逻辑同 auto
+      #   tunnel —— Cloudflare Tunnel 等 TLS 前置形态，**必须配对外地址，
+      #              否则容器启动直接失败**（缺地址时设备"能心跳不能说话"）
+      # 三种模式各自怎么配（**取消注释即生效，默认行为不变**）：
+      #
+      #   # ① Cloudflare Tunnel（当前生产形态，iStoreOS + cloudflared）：
+      #   ELDER_DEPLOY_MODE: tunnel
+      #   ELDER_PUBLIC_BASE_URL: ${ELDER_PUBLIC_BASE_URL:-https://voice.2508866.xyz}
+      #   # 想给 WS 单独一个域名（Cloudflare Tunnel 支持多 hostname）再加一行：
+      #   # ELDER_WS_PUBLIC_BASE_URL: ${ELDER_WS_PUBLIC_BASE_URL:-wss://voice-ws.2508866.xyz}
+      #
+      #   # ② 公网服务器直暴露（有公网 IP，对外 http://IP:8064）：
+      #   ELDER_DEPLOY_MODE: direct
+      #   #   direct 不需要对外地址 —— 设备按请求 Host 推导 ws://IP:8064，
+      #   #   明文部署下这是对的。风险与取舍见 docs/DEPLOY.md §4.2。
+      #
+      #   # ③ 有头域的反代（Nginx/Caddy 正确透传 Host）：
+      #   #   反代终止 TLS 时 scheme 推导同样不可信（uvicorn 不信任非回环对端的
+      #   #   X-Forwarded-Proto），按 ① 配 tunnel + 对外地址最稳；
+      #   #   若反代确实把源站当明文 HTTP 用，direct 即可。
+      # 旧变量 ELDER_VOICE_PUBLIC_BASE（上面那行）仍然有效，与新变量
+      # ELDER_PUBLIC_BASE_URL 同时配置时以新变量为准并打 WARNING。
     volumes:
       - elder-data:/data
     # 对外只发布一个端口，默认 8064（8080 常与其它服务冲突）。
