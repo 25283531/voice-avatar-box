@@ -32,7 +32,7 @@
 | 容器内监听 | `8080` | `ELDER_PORT` 可覆盖 |
 | **对外发布** | **`8064`** | 镜像只发布这一个端口，`-p 8064:8080`。HTTP API、语音 WebSocket、OTA 全复用它 |
 | 语音 WebSocket | `ws(s)://<域名>/api/voice/v1/ws` | **自研链路**，与 API 同源同端口，不需要额外开端口 |
-| 生产域名 | `https://voice.2508866.xyz` | nginx 反代到 `127.0.0.1:8064`，手机端已固化此地址；反代需放行 WebSocket 升级头 |
+| 生产域名 | `https://voice.2508866.xyz` | 手机端已固化此地址；当前经 Cloudflare Tunnel（iStoreOS + cloudflared）转发到 `127.0.0.1:8064`，Nginx 形态见 DEPLOY.md §4，隧道形态见 §4.1（含 WebSocket 与 `ELDER_VOICE_PUBLIC_BASE` 必配项） |
 | 管理后台 | `https://voice.2508866.xyz/` | 默认账号 `admin` / `admin123`，登录后请立即改密 |
 | 接口文档 | `https://voice.2508866.xyz/docs` | FastAPI 自动生成 |
 
@@ -42,7 +42,7 @@
 | --- | --- | --- |
 | `pr-gate.yml` | push 到 `main` + **每个 PR**（刻意不加 paths 过滤） | 常驻门禁「守门人自检」：CODEOWNERS 覆盖 + workflows 可解析。push 时自动跑，结果可见但**不再拦截推送**（见下方流程变更） |
 | `server-ci.yml` | push/PR 改动 `server/`、`tools/`；可手动 | 安装依赖跑 `tools/smoke_server.py`（21 项业务闭环）+ Dockerfile 语法检查 |
-| `docker-build.yml` | push/PR 改动 `server/`；可手动 | 构建镜像 → 起容器校验 `/api/health`；手动触发勾选 `publish` 才推送 `ghcr.io/25283531/voice-avatar-box` |
+| `docker-build.yml` | push/PR 改动 `server/`；可手动 | 构建镜像 → 起容器校验 `/api/health`；**push 到 `main` 通过冒烟后自动推送 `ghcr.io/25283531/voice-avatar-box` 的 `latest` + 短 SHA tag**；PR 只构建不推送；手动触发勾选 `publish` 可覆盖 tag 发布 |
 | `app-build.yml` | push/PR 改动 `app/`；可手动 | 构建 H5 / 微信小程序并上传产物；校验后端地址已内联 |
 | `android-build.yml` | push/PR 改动 `app/`、`android/`；可手动 / 发 Release | **一次产出可安装的 Android APK**（H5 + WebView 壳，全程在 runner 内，不用 DCloud 账号） |
 
@@ -51,7 +51,7 @@
 
 手动产出最终产物：**Actions → 对应工作流 → Run workflow**。
 
-- `docker-build`：勾选 `publish`、填 `tag`（如 `v0.1.0`）→ 推送镜像，产物在 ghcr 包列表
+- `docker-build`：合入 `main` 即自动发布 `latest`（iStoreOS 上 `docker pull ghcr.io/25283531/voice-avatar-box:latest` 即用）；也可手动触发勾选 `publish`、填 `tag`（如 `v0.1.0`）发布指定版本，产物在 ghcr 包列表
 - `app-build`：选 `both` / `h5` / `mp-weixin` → 产物在 Actions 运行页的 Artifacts
 - `android-build`：选 `self`（仓库证书签名）/ `debug` → 产物为可直接安装的 APK
 

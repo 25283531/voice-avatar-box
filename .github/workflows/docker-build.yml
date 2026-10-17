@@ -1,9 +1,22 @@
 name: docker-build
 
-# 后端镜像构建。
+# 后端镜像构建与发布。
 #
-#   push / PR          -> 只构建并跑一遍容器冒烟（验证 Dockerfile 与启动链路），不推送
-#   workflow_dispatch  -> 勾选 publish 后推送到 ghcr.io（手动产出最终镜像）
+#   push 到 main/master（触及 server/**） -> 构建 + 容器冒烟 + 推送 ghcr.io
+#                                            标签：latest（主用）+ 短 SHA（回滚定位）
+#   pull_request                          -> 只构建 + 容器冒烟，**不推送**
+#   workflow_dispatch                     -> 勾选 publish 才推送（可覆盖 tag）
+#
+# 为什么 PR 不推送（后来人请不要"顺手"放开）：
+#   PR 里的代码可能没被 review 过、也可能永远合不进 main，但它触发的构建一旦推上
+#   ghcr.io 就是公共产物 —— 任何人 docker pull 就能跑一份未经审计的服务。
+#   且 pull_request 事件下 GITHUB_TOKEN 只有只读权限，permissions 里的
+#   packages: write 也不生效，硬放开只会拿到 403。发镜像只有两条路：
+#   合进 main（自动发 latest），或手动 workflow_dispatch 勾 publish。
+#
+# latest 的语义：main 上最新一个**通过容器冒烟**的构建。冒烟失败则推送步骤
+# 不执行，latest 不会被坏构建污染 —— iStoreOS 上 docker pull
+# ghcr.io/25283531/voice-avatar-box:latest 拿到的就是可直接用的版本。
 #
 # 端口：容器内 8080，对外发布 8064
 #   docker run -d -p 8064:8080 -e ELDER_DB=... ghcr.io/25283531/voice-avatar-box:latest
@@ -24,7 +37,7 @@ on:
         type: boolean
         default: false
       tag:
-        description: 镜像标签
+        description: 镜像标签（push 到 main 时忽略，固定为 latest + 短 SHA）
         type: string
         default: latest
 
@@ -47,17 +60,33 @@ jobs:
       - name: 解析镜像标签
         id: meta
         run: |
-          TAG="${{ inputs.tag }}"
-          if [ -z "$TAG" ]; then TAG="${GITHUB_SHA::7}"; fi
-          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
-          echo "sha=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
-          echo "镜像: ${REGISTRY}/${GITHUB_REPOSITORY}:${TAG}"
+          SHA="${GITHUB_SHA::7}"
+          if [ "${{ github.event_name }}" = "push" ]; then
+            # 自动发布：latest 常驻 + 短 SHA 便于出问题时回滚定位
+            TAGS="latest $SHA"
+          else
+            # PR：inputs.tag 为空，只打短 SHA（本地加载用，不推送）
+            # workflow_dispatch：用输入的 tag（默认 latest），非 SHA 时顺带补一个短 SHA
+            TAG="${{ inputs.tag }}"
+            [ -n "$TAG" ] || TAG="$SHA"
+            TAGS="$TAG"
+            [ "$TAG" = "$SHA" ] || TAGS="$TAG $SHA"
+          fi
+          # tags 是多行输出（build-push-action 按行拆分），用 heredoc 写法，
+          # 并经循环逐行输出，确保值里不带任何缩进空白
+          {
+            echo "tags<<EOF"
+            for t in $TAGS; do echo "$t"; done
+            echo "EOF"
+            echo "sha=${SHA}"
+          } >> "$GITHUB_OUTPUT"
+          echo "将构建标签: $TAGS"
 
       - name: 准备 Buildx
         uses: docker/setup-buildx-action@v3
 
       - name: 登录 ghcr.io
-        if: github.event_name == 'workflow_dispatch' && inputs.publish
+        if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.publish)
         uses: docker/login-action@v3
         with:
           registry: ${{ env.REGISTRY }}
@@ -72,7 +101,7 @@ jobs:
           platforms: linux/amd64
           load: true
           push: false
-          tags: ${{ env.IMAGE }}:${{ steps.meta.outputs.tag }}
+          tags: ${{ steps.meta.outputs.tags }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
@@ -84,7 +113,7 @@ jobs:
             -p 8064:8080 \
             -e ELDER_DB=sqlite:////tmp/elder-smoke.db \
             -e ELDER_JWT_SECRET=ci-smoke-secret \
-            ${{ env.IMAGE }}:${{ steps.meta.outputs.tag }}
+            ${{ env.IMAGE }}:${{ steps.meta.outputs.sha }}
           for i in $(seq 1 40); do
             if curl -fsS http://127.0.0.1:8064/api/health; then
               echo ""; echo "容器冒烟通过"
@@ -99,18 +128,28 @@ jobs:
           docker rm -f elder-smoke >/dev/null 2>&1 || true
           exit 1
 
-      - name: 推送镜像
-        if: github.event_name == 'workflow_dispatch' && inputs.publish
+      - name: 推送镜像到 ghcr.io
+        if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.publish)
         run: |
+          set -e
           IMG="${REGISTRY}/${GITHUB_REPOSITORY}"
-          docker tag "${IMG}:${{ steps.meta.outputs.tag }}" "${IMG}:${{ steps.meta.outputs.tag }}"
-          docker push "${IMG}:${{ steps.meta.outputs.tag }}"
-          if [ "${{ steps.meta.outputs.tag }}" != "${{ steps.meta.outputs.sha }}" ]; then
-            docker tag "${IMG}:${{ steps.meta.outputs.tag }}" "${IMG}:${{ steps.meta.outputs.sha }}"
-            docker push "${IMG}:${{ steps.meta.outputs.sha }}"
-          fi
-          echo "### 镜像已发布" >> "$GITHUB_STEP_SUMMARY"
-          echo "\`\`\`" >> "$GITHUB_STEP_SUMMARY"
-          echo "docker pull ${IMG}:${{ steps.meta.outputs.tag }}" >> "$GITHUB_STEP_SUMMARY"
-          echo "docker run -d -p 8064:8080 --env-file .env ${IMG}:${{ steps.meta.outputs.tag }}" >> "$GITHUB_STEP_SUMMARY"
-          echo "\`\`\`" >> "$GITHUB_STEP_SUMMARY"
+          SHA="${{ steps.meta.outputs.sha }}"
+          while IFS= read -r t; do
+            [ -n "$t" ] || continue
+            docker tag "${IMG}:${SHA}" "${IMG}:${t}"
+            docker push "${IMG}:${t}"
+            echo "已推送 ${IMG}:${t}"
+          done <<< "${{ steps.meta.outputs.tags }}"
+          FIRST="$(head -n1 <<< "${{ steps.meta.outputs.tags }}")"
+          {
+            echo "### 镜像已发布"
+            echo '```'
+            while IFS= read -r t; do
+              [ -n "$t" ] || continue
+              echo "docker pull ${IMG}:${t}"
+            done <<< "${{ steps.meta.outputs.tags }}"
+            echo "docker run -d -p 8064:8080 --env-file .env ${IMG}:${FIRST}"
+            echo '```'
+            echo "- 来源提交：${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/commit/${GITHUB_SHA}"
+            echo "- 触发事件：${GITHUB_EVENT_NAME}"
+          } >> "$GITHUB_STEP_SUMMARY"

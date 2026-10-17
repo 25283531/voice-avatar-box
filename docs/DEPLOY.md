@@ -97,6 +97,9 @@ docker compose exec elder-server ls -l /data # 容器视角
 > 那意味着角色、音色、记忆、大模型调用都在第三方进程里。**该 profile 已删除**，
 > 现在只有 8064 一个端口。若你手上是旧部署，升级后请同步调整防火墙与反代规则：
 > 放行 WebSocket 升级即可，不再需要 8000 / 8002 / 8003。
+>
+> **部署在反向代理 / Cloudflare Tunnel 后面时，还须设 `ELDER_VOICE_PUBLIC_BASE`**，
+> 否则设备会拿到 `ws://` 地址连不上 —— 完整解释与配置见 §4.1。
 
 ### 1.7 设备配网（浏览器直连设备热点，不用装 APP）
 
@@ -458,10 +461,150 @@ server {
   FastAPI 的 CORS 中间件在 `allow_origins=["*"]` 时不会带 `Allow-Credentials`，若前端要传凭证必须写明确来源。
 - 反向代理之后，容器内仍然认为自己是 HTTP，不需要在应用侧开 TLS。
 - **WebSocket 必须显式放行 Upgrade**：见上面 `location /api/voice/` 那段。这是本项目最容易踩的坑。
-- **语音链路不需要单独的域名或端口**：它和 `/api/` 同源。如果出于某种原因把它拆出去部署，
-  才需要配 `ELDER_VOICE_PUBLIC_BASE`。
+- **语音链路不需要单独的域名或端口**：它和 `/api/` 同源。若出于某种原因把它拆出去部署，才需要为它单独配对外地址。
 - 8064 不需要对公网开放，只监听 `127.0.0.1` 更安全：把 compose 里的端口映射改成 `127.0.0.1:${ELDER_HTTP_PORT:-8064}:8080`。
   注意语音链路也随之走了反代，上面那段 WebSocket 配置就是必需的，不能偷懒直接暴露 8064。
+- **反代（无论 Nginx 还是 Cloudflare Tunnel）下都要配 `ELDER_VOICE_PUBLIC_BASE`**：当前镜像的 uvicorn 启动参数没有启用 `--proxy-headers`（见 `server/Dockerfile` 的 CMD），`X-Forwarded-Proto` 不会被采纳，`request.url.scheme` 恒为 `http`，设备会拿到 `ws://` 地址。不要以为"反代传了 X-Forwarded-Proto 就没事"——完整解释见 §4.1。
+
+---
+
+### 4.1 Cloudflare Tunnel + iStoreOS 部署（当前生产形态）
+
+> 本节记录 2026-10 上线的实际形态：**iStoreOS（OpenWrt 软路由）+ Docker + cloudflared**，
+> 对外 `https://voice.2508866.xyz`，源站 `http://127.0.0.1:8064`（容器内 8080）。
+> 域名以仓库内配置为准（`firmware/xiaozhi/main/Kconfig.projbuild` 的 `CONFIG_OTA_URL`、
+> `server/app/config.py` 的注释、`server/docker-compose.yml` 的示例），不要凭记忆改。
+
+#### 4.1.1 链路形态
+
+```
+设备 ──wss://──> Cloudflare 边缘 ──(TLS 终止)──> cloudflared(iStoreOS 宿主机)
+       ──http://──> 127.0.0.1:8064 ──> 容器 8080（uvicorn）
+```
+
+- TLS 在 Cloudflare 边缘终止；cloudflared 到源站走**明文 HTTP** 即可，源站不需要证书、不启 TLS。
+- compose 端口建议只绑回环：`"127.0.0.1:${ELDER_HTTP_PORT:-8064}:8080"`。这样 8064 不对局域网开放，只有 cloudflared 能进来。
+- **一个端口承载全部**：业务 API + 管理后台 + 语音 WebSocket（`/api/voice/v1/ws`）+ OTA（`/api/voice/ota`），不要开第二个端口。
+
+#### 4.1.2 cloudflared 配置
+
+`config.yml`（iStoreOS 上的路径以你的安装方式为准，常见 `/etc/cloudflared/config.yml`）：
+
+```yaml
+tunnel: <隧道 UUID>
+credentials-file: /etc/cloudflared/<隧道 UUID>.json
+ingress:
+  - hostname: voice.2508866.xyz
+    service: http://127.0.0.1:8064
+  - service: http_status:404
+```
+
+两个必须写对的点：
+
+- **`service` 是 `http` 不是 `https`**。源站（uvicorn）监听明文，写 `https://` 会握手直接失败。
+  也不要画蛇添足加 `noTLSVerify: true` —— 那是给"https 源站 + 自签名证书"用的，这里根本没有 https 源站。
+- **不需要任何 WebSocket 专用开关**。cloudflared 默认转发 WebSocket 升级（101 Switching Protocols），
+  没有"开 WS"这类选项。对照物是 Nginx —— 那边才需要显式 `proxy_set_header Upgrade ...`（见 §4），cloudflared 侧无此坑。
+
+怎么确认 WS 真的过了隧道（抄走即用）：
+
+```bash
+# 1) HTTP 面：期望 {"ok":true,...}
+curl -s https://voice.2508866.xyz/api/health
+
+# 2) WS 升级面：不带设备 token，期望先看到 101，紧接着连接被服务端以 4401 关闭
+#    （4401 = token 缺失，见 server/app/voice/session.py 的 CLOSE_UNAUTHORIZED；
+#     服务端是"先 accept 再鉴权"，所以 101 一定会出现）。
+#    看到 101 就证明 Cloudflare → cloudflared → 源站的升级链路是通的；
+#    4401 是预期的，不代表配置有问题。
+curl -si -N --max-time 5 \
+  -H 'Connection: Upgrade' -H 'Upgrade: websocket' \
+  -H 'Sec-WebSocket-Version: 13' \
+  -H 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==' \
+  https://voice.2508866.xyz/api/voice/v1/ws
+```
+
+#### 4.1.3 ⚠️ ws:// vs wss://：隧道形态下**必须**设 `ELDER_VOICE_PUBLIC_BASE`
+
+设备心跳 `POST /api/device/sync` 的响应里，语音 WS 地址是服务端**现场推导**的
+（`server/app/routers/device_api.py` 的 `_voice_endpoints()`）：默认按 `request.url.scheme`
+决定下发 `ws://` 还是 `wss://`，Host 取请求头里的 `host`。
+
+坑在于：**当前镜像的 uvicorn 启动命令没有 `--proxy-headers`**（`server/Dockerfile` 的 CMD 只有
+`--host/--port`），`X-Forwarded-Proto` 不会被采纳 —— 即使 cloudflared 正确传了这个头，
+uvicorn 眼里自己永远是明文 HTTP。于是 `request.url.scheme` 恒为 `http`，设备拿到的是
+`ws://voice.2508866.xyz/api/voice/v1/ws`：明文 WS 打到 443。表现是**设备能配网、能心跳，
+一开口说话就断**，极易误判成固件问题。
+
+解决办法（逃生舱，优先级最高；代码见 `server/app/config.py` 的 `VOICE_PUBLIC_BASE` 与
+`device_api.py` 的 `_voice_endpoints`）：
+
+```bash
+# server/.env（compose 自动读取并透传，见 server/docker-compose.yml 的 environment）
+ELDER_VOICE_PUBLIC_BASE=https://voice.2508866.xyz
+```
+
+注意：
+
+- 必须给 `https://`，服务端会自动换成 `wss://` 下发给设备；给 `ws://` 会被设备拒绝。
+- 末尾不要带 `/`（代码会 `rstrip("/")`，但别依赖这个）。
+- 改完 `docker compose up -d`（重建容器）生效；然后按 §4.1.2 的方法实测一次 WS。
+
+#### 4.1.4 ⚠️ 登录限速与 X-Forwarded-For：别动 uvicorn 的 `--forwarded-allow-ips`
+
+登录限速取客户端 IP 的逻辑在**应用层**（`server/app/ratelimit.py` 的 `client_ip()`），
+默认**谁都不信**：只认 TCP 对端。只有 `ELDER_TRUSTED_PROXY_IPS` 显式列出的地址才解析
+XFF，且**从右往左**跳过可信段、取第一个不可信地址（攻击者伪造的段在左侧，正好被跳过）。
+
+对应到本形态：
+
+- **绝不要**给 uvicorn 传 `--forwarded-allow-ips=*`。传 `*` 时 uvicorn 会把 XFF 最左段
+  （请求方随便写的那段）当作对端 IP，限速器直接形同虚设。本项目连 `--proxy-headers`
+  都没开，XFF 由应用层按可信名单自己解析，这是刻意的最安全默认；要改 Dockerfile CMD
+  属于 `server/**` 改动，需单独评审，不要在执行 docker run 时顺手加参数。
+- cloudflared 跑在宿主机时，容器看到的 TCP 对端**不是 127.0.0.1**，而是 Docker 网桥网关
+  （compose 网络 `server_elder-net` 的 Gateway，通常 `172.x.0.1`）。查法：
+
+  ```bash
+  docker network inspect server_elder-net -f '{{range .IPAM.Config}}{{.Gateway}}{{end}}'
+  ```
+
+  想让限速按真实访客 IP 生效，就把该网关（或整段 CIDR）填进 `ELDER_TRUSTED_PROXY_IPS`
+  （例如 `172.18.0.0/16`）。cloudflared 会在 XFF 链上追加真实客户端（以 cloudflared
+  文档为准），应用层从右往左扫到的第一跳就是它；应用只解析 XFF，不读 `CF-Connecting-IP`。
+  不填则所有请求共享同一个"IP"——限速退化成全局阈值（多人共用会互相误伤），
+  但不会被伪造绕过。
+- 若 cloudflared 跑在另一个容器里，填那个容器在 docker 网里的地址或网段，同理。
+
+#### 4.1.5 Cloudflare 的 WebSocket 空闲超时（如实说明）
+
+长连接空闲被 Cloudflare 侧断开是已知行为：设备长时间静默后再开口，可能发现 WS 已断。
+**具体空闲阈值以 Cloudflare 官方文档为准**——本文刻意不写秒数，避免把不确定的数字
+写成事实。处置方向是**重连**而不是改配置：
+
+- 设备侧：断线后自动重连，建议指数退避（避免服务端重启时所有设备齐刷刷砸过来）。
+  服务端无会话状态，重连即新会话，对老人无感知。
+- 排查时先看 `docker compose logs -f elder-server` 里 WS 断开的时刻，与设备静默时长
+  互相印证，再怀疑固件或网络。
+
+#### 4.1.6 iStoreOS 特有注意点
+
+- **路径与磁盘**：把整个 `server/` 目录放到 iStoreOS 的持久化盘上（例如 `/opt/voice-avatar-box/server`
+  或你挂载的数据盘，**别放 `/tmp`**——重启会没），在该目录执行 `docker compose up -d`。
+  镜像加构建缓存约 1~2 GB；SQLite 数据在命名卷 `elder-data`，`docker compose down -v`
+  会连数据一起删（见 §1.4/§1.5）。
+- **时区**：镜像内 `TZ=Asia/Shanghai` 且装了 tzdata（`server/Dockerfile`），容器内
+  `ZoneInfo("Asia/Shanghai")` 恒为 +8，与宿主机时区无关 —— iStoreOS 默认 UTC 也不影响
+  提醒时间。固件侧时间由心跳下发的 `server_time` 校准。
+- **固件与服务的分工**（改域名时最容易漏）：
+  - OTA 检查地址：编译期 `CONFIG_OTA_URL`（默认 `https://voice.2508866.xyz/api/voice/ota`，
+    见 `firmware/xiaozhi/main/Kconfig.projbuild`），设备运行时还可被 NVS 覆盖
+    （`settings("wifi")` 的 `ota_url`，见 `firmware/xiaozhi/main/ota.cc` 的 `GetCheckVersionUrl`）。
+  - 语音 WS 地址：每次心跳由服务端按 §4.1.3 的逻辑重新下发。
+  - 所以换域名要**三处一起改**：固件默认值或 NVS、`ELDER_VOICE_PUBLIC_BASE`、
+    Cloudflare 隧道主机名。漏一处的典型症状是"能心跳不能说话"或"OTA 打到旧域名"。
+- cloudflared 在 iStoreOS 上的安装方式（opkg 包或官方二进制）与隧道创建
+  （Cloudflare Zero Trust 后台）以各自官方文档为准，本文不复述可能过时的步骤。
 
 ---
 
@@ -481,7 +624,7 @@ server {
 | `ELDER_TZ` | `Asia/Shanghai` | 业务时区，改了会整体影响提醒时间计算 |
 | `MYSQL_ROOT_PASSWORD` | `123456` | 仅在使用自带 `elder-db` 容器时生效，**生产必须改** |
 | `ELDER_ORDER_TTL_HOURS` | `48` | 会员订单（人工核销）占用有效期，超时置 `expired` 并释放号段与金额 |
-| `ELDER_VOICE_PUBLIC_BASE` | 留空（自动推导） | 语音链路对外地址。自研链路与 API 同源同端口，服务端按请求 Host 推导，**默认不用配**；仅在反代未透传 Host 时填 `https://voice.2508866.xyz`（会自动换成 `wss://`） |
+| `ELDER_VOICE_PUBLIC_BASE` | 留空（自动推导） | 语音链路对外地址。自研链路与 API 同源同端口，服务端按请求 Host 推导；**反代（含 Cloudflare Tunnel）下必须显式填** `https://voice.2508866.xyz`（会自动换成 `wss://`），原因见 4.1.3。见 1.6 |
 | `ELDER_SCHEDULE_AHEAD_HOURS` | `36` | 服务端预生成提醒实例的提前量 |
 | `ELDER_DB_ECHO` | `0` | 设为 `1` 打印所有 SQL，排查问题时开，平时关 |
 | `ELDER_ALLOW_PUBLIC_REGISTER` | `1`（开启） | **是否开放匿名自助注册**。设为 `0`/`false`/`no`/`off`/空串即关闭，关闭时 `POST /api/auth/register` 返回 `403` + 「当前未开放自助注册，请联系管理员开通账号」。详见 §5.1 |
@@ -495,7 +638,6 @@ server {
 | `ELDER_LOGIN_RATE_LIMIT_MAX_KEYS` | `10000` | 限速表最多记多少个主体，超出按 LRU 淘汰。挡住"拿一万个假用户名各错一次"把内存撑爆。详见 §5.3 |
 | `ELDER_TRUSTED_PROXY_IPS` | 空（谁都不信） | **可信反代地址**（逗号分隔，支持 CIDR）。留空 = 只认 TCP 对端、`X-Forwarded-For` 一律不信；填了且**对端在名单里**时才解析 XFF，并**从右往左**跳过可信段取第一个不可信地址。**切勿在 uvicorn 侧用 `--forwarded-allow-ips=*`**。详见 §5.3 |
 | `ELDER_MAIL_FAKE` | `0` | **测试专用**。设为 `1` 时邮件不真投递、写进进程内发件箱。**生产必须为 `0`**，留空等同 `0` |
-| `ELDER_VOICE_PUBLIC_BASE` | 留空（自动推导） | 语音链路对外地址，见 1.6 |
 
 > **SMTP 不在环境变量里** —— 存数据库，在管理后台配，见 1.7。
 
@@ -875,14 +1017,16 @@ docker inspect --format '{{.State.ExitCode}}' elder-server
    docker compose logs elder-server | grep -i voice
    ```
    走 HTTPS 域名时必须是 `wss://voice.2508866.xyz/api/voice/v1/ws`。
-   如果显示的是内网 IP 或 `ws://`（非加密），说明 Host 头没透传、也没有配
-   `ELDER_VOICE_PUBLIC_BASE`，此时需要在 compose 里显式设置它。
+   如果显示的是内网 IP 或 `ws://`（非加密），配 `ELDER_VOICE_PUBLIC_BASE=https://voice.2508866.xyz`
+   显式指定——注意在当前 uvicorn 启动参数下（无 `--proxy-headers`），scheme 推导恒为 http，
+   所以**只要走了 TLS 反代（Nginx / Cloudflare Tunnel 都一样）就必须配它**，详见 §4.1.3。
 
 5. 若完全没有到 `/api/voice/` 的日志，检查容器的 8064 端口映射是否已发布、
    以及有没有别的进程抢占了它。
 
-> 注：`ws` 与 `wss` **不能混用**。页面/设备在 HTTPS 下拒绝建立非加密的 WebSocket，
-> 服务端已经按请求 scheme 自动推导，一般不需要手配。
+> 注：`ws` 与 `wss` **不能混用**。页面/设备在 HTTPS 下拒绝建立非加密的 WebSocket。
+> 服务端默认按请求 scheme 推导，但当前 uvicorn 启动参数下推导结果恒为 `http`，
+> 所以**走 TLS 反代时必须配 `ELDER_VOICE_PUBLIC_BASE`**（§4.1.3），不要指望自动推导。
 
 ### 6.10 用户收不到密码重置邮件
 

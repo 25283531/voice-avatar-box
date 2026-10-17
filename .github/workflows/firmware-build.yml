@@ -9,6 +9,14 @@ name: firmware-build
 # 流程：checkout → merge_to_xiaozhi.py 注入 elder → idf.py set-target esp32s3 → build
 #       → merge-bin 出单文件烧录镜像 → 上传 artifact
 #
+# OTA 地址（重要，改前先读）：
+#   CONFIG_OTA_URL 的默认值在 firmware/xiaozhi/main/Kconfig.projbuild，
+#   已指向本项目自己的服务端 https://voice.2508866.xyz/api/voice/ota。
+#   本工作流的 server_url 输入**只**覆盖 CONFIG_ELDER_SERVER_URL，不动 OTA_URL；
+#   下方「校验 OTA 地址」步骤每次构建都会把生效值打进日志，把域名改错会当场看见。
+#   设备运行时还可被 NVS（settings("wifi") 的 ota_url，见 main/ota.cc
+#   的 GetCheckVersionUrl）覆盖，不必重新烧录。
+#
 # 触发：改动 firmware/ 或本文件时自动跑；也可手动（可覆盖板卡与后端地址）。
 
 on:
@@ -94,6 +102,11 @@ jobs:
           restore-keys: |
             idf-${{ inputs.idf_version || 'v5.5.1' }}-
 
+      # ⚠️ sdkconfig 与 build/ **刻意不进缓存**：runner 是干净环境，
+      #    sdkconfig 每次由 idf.py set-target 从 sdkconfig.defaults + Kconfig
+      #    重新生成。若把本地那份 build/（含指向第三方 OTA 的 sdkconfig）
+      #    缓存进来，坏配置会被静默烧进固件 —— 宁可每次多花几十秒重新生成。
+
       - name: set-target（生成 sdkconfig）
         shell: bash
         run: |
@@ -116,6 +129,26 @@ jobs:
           idf.py build 2>&1 | tee build/ci-build.log | tail -120
           echo "=== 产物 ==="
           ls -lh build/*.bin build/bootloader/*.bin build/partition_table/*.bin 2>/dev/null || true
+
+      - name: 校验 OTA 地址指向本项目服务端
+        shell: bash
+        run: |
+          set -e
+          cd "$PROJECT_DIR"
+          # CONFIG_OTA_URL 默认值在 main/Kconfig.projbuild（https://voice.2508866.xyz/api/voice/ota）。
+          # 本工作流只覆盖 CONFIG_ELDER_SERVER_URL，不动 OTA_URL —— 这里是把关：
+          # 万一将来有人改掉默认值或 sdkconfig.defaults 里覆盖了它，构建日志必须当场可见。
+          # sdkconfig 是 set-target 刚生成的新文件，不含本机历史构建的残留。
+          OTA="$(grep -E '^CONFIG_OTA_URL=' sdkconfig | head -1 | cut -d= -f2- || true)"
+          if [ -z "$OTA" ]; then
+            echo "CONFIG_OTA_URL 未显式设置 -> 用 Kconfig.projbuild 默认值（https://voice.2508866.xyz/api/voice/ota）"
+          else
+            echo "CONFIG_OTA_URL = $OTA"
+            case "$OTA" in
+              *voice.2508866.xyz*) echo "OTA 地址指向本项目服务端，OK" ;;
+              *) echo "::warning::CONFIG_OTA_URL 未指向 voice.2508866.xyz（当前 $OTA）—— 若非本意，检查 main/Kconfig.projbuild 与 sdkconfig.defaults" ;;
+            esac
+          fi
 
       # 失败时把真正的编译错误打出来（上面的 tail -120 可能被 LVGL 的 #warning 刷屏盖住）
       - name: 输出编译错误（失败时）
@@ -147,7 +180,10 @@ jobs:
           cp -v build/partition_table/partition-table.bin "$GITHUB_WORKSPACE/out/" 2>/dev/null || true
           cp -v build/ota_data_initial.bin             "$GITHUB_WORKSPACE/out/" 2>/dev/null || true
           cp -v build/generated_assets.bin             "$GITHUB_WORKSPACE/out/" 2>/dev/null || true
-          cp -v build/merged-flash.bin                 "$GITHUB_WORKSPACE/out/" 2>/dev/null || true
+          # 单文件烧录镜像：改名成一眼能认出的名字（artifact 里散落一堆 bin 时，
+          # 用户最容易搞错的就是"该烧哪个"）。flasher_args.json 不引用它，改名安全。
+          cp -v build/merged-flash.bin \
+               "$GITHUB_WORKSPACE/out/elder-firmware-esp32s3-merged-flash.bin" 2>/dev/null || true
           cp -v build/flasher_args.json                "$GITHUB_WORKSPACE/out/" 2>/dev/null || true
           # 应用镜像文件名随工程名变化，统一抓取
           find build -maxdepth 1 -name "*.bin" ! -name "generated_assets.bin" \
@@ -155,6 +191,29 @@ jobs:
           echo "=== 收集到的产物 ==="
           ls -lh "$GITHUB_WORKSPACE/out" || true
           test -n "$(ls -A "$GITHUB_WORKSPACE/out")" || { echo "::error::未收集到任何 bin"; exit 1; }
+
+      - name: 汇总产物信息（job summary）
+        if: always()
+        shell: bash
+        run: |
+          # 名字/大小/校验和打进 job summary：用户不用下载就能确认下对了文件，
+          # 也能跟本地 esptool 烧录前的 md5 对账。
+          cd "$GITHUB_WORKSPACE/out" 2>/dev/null || exit 0
+          {
+            echo "### ESP32-S3 固件产物（artifact: elder-firmware-esp32s3）"
+            echo
+            echo "| 文件 | 字节数 | SHA256 |"
+            echo "| --- | --- | --- |"
+            for f in *; do
+              [ -f "$f" ] || continue
+              printf '| `%s` | %s | `%s` |\n' \
+                "$f" "$(stat -c%s "$f" 2>/dev/null || echo '?')" \
+                "$(sha256sum "$f" 2>/dev/null | cut -c1-16 || echo '?')"
+            done
+            echo
+            echo "**烧录用这一个**：\`elder-firmware-esp32s3-merged-flash.bin\`（offset 0x0，esptool 单文件直烧）"
+            echo "其余文件是按 \`flasher_args.json\` 分地址烧写的备选；日常只下 merged 那个即可。"
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: 上传固件产物
         uses: actions/upload-artifact@v4
