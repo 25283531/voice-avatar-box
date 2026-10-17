@@ -1,13 +1,13 @@
-"""后台定时任务：排期补全 + 超时升级 + 会员订单/会员过期清理。
+"""后台定时任务：排期补全 + 超时升级 + 离线清扫。
 
 - 排期补全：为所有设备预生成未来 N 小时的提醒实例；
 - 超时升级：到点后超过 escalate_after_min 仍未确认 -> 标记 MISSED 并置 escalated，
   设备下次心跳会看到该状态，从而保持红灯常亮（需求 11）；
-- 订单过期：超过 48 小时仍为 pending / notified 的会员订单置 expired，
-  释放其占用的 4 位订单号与随机金额（见 app/membership.py 的占用规则）；
-- 会员过期：把已到期的会员记录标记为 expired，便于后台筛查。
 - 离线清扫：超过在线窗口（5 分钟，见 device_state.ONLINE_WINDOW）没有心跳的设备置 offline，
   否则 devices.online 只增不减，设备断电后仍会显示在线。
+
+⚠️ 这里曾有两步「会员订单过期」与「会员到期标记」，随会员制取消一并删除 ——
+它们服务的对象（membership_orders / memberships）已无 ORM 映射。
 """
 from __future__ import annotations
 
@@ -21,7 +21,6 @@ from sqlalchemy.orm import Session
 from .config import SCHEDULER_INTERVAL_SEC, SCHEDULE_AHEAD_HOURS, TZ
 from .db import SessionLocal
 from .device_state import mark_offline_devices
-from .membership import expire_memberships, expire_stale_orders
 from .models import Device, EventState, Reminder, ReminderEvent
 from .schedule import local_now, materialize_events
 
@@ -32,7 +31,7 @@ log = logging.getLogger("elder.scheduler")
 # 为什么单独开一个端点而不是塞进 /api/health：
 #   Dockerfile 的 HEALTHCHECK 每 30 秒打一次 /api/health，它一旦从 200 变成非 200，
 #   容器就会被判定 unhealthy —— 可此时进程还在、8064 上的业务 API 也照样能用，
-#   只是后台的排期补全 / 订单过期之类没跑成。为了后台任务把整个容器判死，连带代价太大。
+#   只是后台的排期补全 / 离线清扫之类没跑成。为了后台任务把整个容器判死，连带代价太大。
 #   所以「探活」和「后台任务是否健康」必须分开：/api/health 只表达进程活着，
 #   运维要看后台任务就查这个专门的端点（它不进任何探活链路）。
 _SCHEDULER_HEALTH: dict[str, object] = {
@@ -72,8 +71,8 @@ def _tick(session: Session) -> None:
         # due_at 是 schedule 按服务端时区 TZ 生成的，落库时带时区，
         # 但 SQLite 读回来会把时区抹掉变成 naive —— 直接和 now（aware）比较会抛
         # `TypeError: can't compare offset-naive and offset-aware datetimes`，
-        # 异常会顺着冒到 run_forever，把这一轮后面的所有步骤（含订单过期、
-        # 离线清扫）一起带走。这里按 TZ 把时区补回去再比较。
+        # 异常会顺着冒到 run_forever，把这一轮后面的所有步骤（含离线清扫）
+        # 一起带走。这里按 TZ 把时区补回去再比较。
         due = ev.due_at if ev.due_at.tzinfo else ev.due_at.replace(tzinfo=TZ)
         deadline = due + timedelta(minutes=max(1, rule.escalate_after_min))
         if now > deadline:
@@ -82,23 +81,7 @@ def _tick(session: Session) -> None:
             ev.note = ev.note or "超时未确认"
     session.commit()
 
-    # 3) 会员订单过期：释放订单号与金额占用
-    try:
-        n = expire_stale_orders(session)
-        if n:
-            log.info("expired %d stale membership orders", n)
-    except Exception as exc:  # noqa: BLE001
-        log.warning("expire orders failed: %s", exc)
-        session.rollback()
-
-    # 4) 会员到期标记
-    try:
-        expire_memberships(session)
-    except Exception as exc:  # noqa: BLE001
-        log.warning("expire memberships failed: %s", exc)
-        session.rollback()
-
-    # 5) 离线清扫：devices.online 只在设备上报时被置 True，
+    # 3) 离线清扫：devices.online 只在设备上报时被置 True，
     #    设备断电 / 换 Wi-Fi 之后不会再上报，不清扫就会「永远在线」。
     #    阈值与首页展示共用 device_state.ONLINE_WINDOW（5 分钟，一个心跳周期 + 余量）。
     try:

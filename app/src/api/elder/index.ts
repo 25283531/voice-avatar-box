@@ -184,108 +184,6 @@ export function statsOverview(devicePk: number, days = 7) {
   return elderGet<StatsOverview>('/api/stats/overview', { device_pk: devicePk, days })
 }
 
-// ============================================================ 会员
-export interface MembershipInfo {
-  is_vip: boolean
-  plan: string
-  expires_at: string | null
-  days_left: number
-  benefits: string[]
-}
-
-export interface MembershipPlan {
-  plan: string
-  name: string
-  price: number
-  months: number
-  benefits: string[]
-}
-
-export interface MembershipUsage {
-  devices: { used: number, limit: number }
-  agents: { used: number, limit: number }
-  reminders: { used: number, limit: number }
-}
-
-export function getMembership() {
-  return elderGet<MembershipInfo & { usage: MembershipUsage }>('/api/membership')
-}
-
-export function listMembershipPlans() {
-  return elderGet<MembershipPlan[]>('/api/membership/plans')
-}
-
-/** 开通 / 续费会员（months 为月数；后端暂为模拟订单，未接真实支付） */
-export function activateMembership(data: { plan: string, months: number }) {
-  return elderPost<MembershipInfo>('/api/membership/activate', data)
-}
-
-// ============================================================ 会员订单（人工核销）
-
-export interface MembershipOrder {
-  code: string
-  plan_code: string
-  plan_name: string
-  /** 金额，单位：分 */
-  amount_cents: number
-  /** 金额，单位：元（字符串，便于直接展示） */
-  amount_yuan: string
-  status: 'pending' | 'notified' | 'confirmed' | 'rejected' | 'cancelled' | 'expired'
-  created_at: string
-  expires_at: string
-}
-
-export interface PaymentInfo {
-  /** 收款方式名称，如"微信""支付宝""银行卡" */
-  channel: string
-  account: string
-  account_name: string
-  qrcode_url: string
-  note: string
-}
-
-/** 4 位订单号（[A-Z0-9]，不区分大小写） */
-export function genOrderCode(): string {
-  const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'
-  let out = ''
-  try {
-    // 优先用安全随机（H5 / 小程序 / 新版 App 均支持）
-    const buf = new Uint32Array(4)
-    const g: any = (globalThis as any).crypto || (globalThis as any).msCrypto
-    if (g && typeof g.getRandomValues === 'function') {
-      g.getRandomValues(buf)
-      for (let i = 0; i < 4; i++) out += chars[buf[i] % chars.length]
-      return out
-    }
-  }
-  catch { /* 降级到下一种方式 */ }
-  for (let i = 0; i < 4; i++) out += chars[Math.floor(Math.random() * chars.length)]
-  return out
-}
-
-export function getPaymentInfo() {
-  return elderGet<PaymentInfo>('/api/membership/payment-info')
-}
-
-/**
- * 创建会员订单。
- * 若 48 小时内该订单号已被占用，后端返回 409，调用方需重新生成 code 再提交。
- */
-export function createMembershipOrder(code: string, planCode: string) {
-  return elderPost<MembershipOrder>('/api/membership/orders', { code, plan_code: planCode })
-}
-
-export function notifyMembershipOrder(code: string) {
-  return elderPost<MembershipOrder>(`/api/membership/orders/${code.toUpperCase()}/notify`, {})
-}
-
-export function cancelMembershipOrder(code: string) {
-  return elderPost<MembershipOrder>(`/api/membership/orders/${code.toUpperCase()}/cancel`, {})
-}
-
-export function myMembershipOrders() {
-  return elderGet<MembershipOrder[]>('/api/membership/orders/mine')
-}
 
 // ============================================================ 账户（我的）
 export interface ElderAccount {
@@ -453,9 +351,11 @@ export function isResetFail(res: ElderRawResult<any>): res is ElderRawResult<Pas
 
 // ============================================================ 帮助与反馈（工单）
 
-/** 工单分类：与后端 TicketCategory 保持一致，未知值后端按"其它"处理 */
+/** 工单分类：与后端 TicketCategory 保持一致，未知值后端按"其它"处理。
+ *  ⚠️ `payment` 的 value 是**落库的短码**，改它会让老工单集体变「未知分类」，
+ *  所以只改 label。 */
 export const TICKET_CATEGORIES: { value: string, label: string }[] = [
-  { value: 'payment', label: '会员支付' },
+  { value: 'payment', label: '付款/费用' },
   { value: 'device', label: '设备故障' },
   { value: 'reminder', label: '提醒异常' },
   { value: 'account', label: '账号问题' },
@@ -521,7 +421,6 @@ export interface HomeSummary {
     confirmed_count: number
     total_count: number
   }
-  membership: MembershipInfo
 }
 
 export function homeSummary() {

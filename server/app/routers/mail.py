@@ -71,7 +71,7 @@ def _smtp_out(cfg: models.SmtpConfig) -> SmtpConfigOut:
 def _aware(dt: datetime | None) -> datetime | None:
     """SQLite 读回的时间是 naive（存的是 UTC），比较前补回 UTC 时区。
 
-    与 membership.aware() 同一个坑：naive 和 aware 直接相减会抛
+    与 chat_quota.aware() 同一个坑：naive 和 aware 直接相减会抛
     ``TypeError: can't subtract offset-naive and offset-aware datetimes``。
     """
     if dt is None:

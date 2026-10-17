@@ -531,146 +531,32 @@ class Interaction(Base):
     meta: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
 
 
-# ================================================================ 会员
-# 当前没有支付接口，走「用户线下转账 -> 订单号 + 随机金额 -> 管理员肉眼核对 -> 手动核销」链路。
-# 详见 docs/会员功能规划.md。
-class MembershipSource:
-    """会员来源。"""
-
-    ORDER = "order"    # 订单核销
-    ADMIN = "admin"    # 后台直接分配
-    GIFT = "gift"      # 赠送 / 补偿
-
-
-class MembershipStatus:
-    """会员记录状态。"""
-
-    ACTIVE = "active"
-    EXPIRED = "expired"
-
-
-class Membership(Base):
-    """用户会员记录。
-
-    一个用户只保留一行（uq_membership_user），续费时在原记录上延长 expires_at，
-    便于 GET /api/membership 一次查清状态；开通历史由 MembershipOrder 承担审计。
-    """
-
-    __tablename__ = "memberships"
-    __table_args__ = (
-        UniqueConstraint("user_id", name="uq_membership_user"),
-        Index("ix_membership_expires", "expires_at"),
-    )
-
-    id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
-    # 套餐 code（membership_plans.code），后台直接分配时填自定义标识
-    plan: Mapped[str] = mapped_column(String(32), default="")
-    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
-    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
-    source: Mapped[str] = mapped_column(String(16), default=MembershipSource.ORDER)
-    status: Mapped[str] = mapped_column(String(16), default=MembershipStatus.ACTIVE, index=True)
-    note: Mapped[str] = mapped_column(String(255), default="")
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
-    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
-
-
-class MembershipPlan(Base):
-    """会员套餐（定义开通天数与展示价，实际收款金额以订单的随机金额为准）。"""
-
-    __tablename__ = "membership_plans"
-
-    id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    code: Mapped[str] = mapped_column(String(32), unique=True, index=True)
-    name: Mapped[str] = mapped_column(String(64))
-    description: Mapped[str] = mapped_column(String(255), default="")
-    days: Mapped[int] = mapped_column(Integer, default=30)
-    # 展示价（整数分），仅用于页面展示与套餐对比，不参与实际收款对账
-    price_cents: Mapped[int] = mapped_column(Integer, default=0)
-    sort: Mapped[int] = mapped_column(Integer, default=0)
-    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
-
-
-class OrderStatus:
-    """订单状态机：pending -> notified -> confirmed / rejected，旁支 cancelled / expired。"""
-
-    PENDING = "pending"      # 已创建，等待用户付款
-    NOTIFIED = "notified"    # 用户声称已付款，等待管理员核对
-    CONFIRMED = "confirmed"  # 管理员确认到账，会员已开通
-    REJECTED = "rejected"    # 管理员未查到入账
-    CANCELLED = "cancelled"  # 用户主动放弃
-    EXPIRED = "expired"      # 超过 48 小时未支付
-
-
-class MembershipOrder(Base):
-    """会员订单。
-
-    code 为 4 位 `[A-Z0-9]`，落库与查询统一大写；
-    amount_cents 为整数分，在区间内随机且 48 小时内不重复，
-    管理员凭「订单号 + 金额」在收款账号里反查唯一订单。
-    """
-
-    __tablename__ = "membership_orders"
-    __table_args__ = (
-        Index("ix_order_code", "code"),
-        Index("ix_order_status_created", "status", "created_at"),
-        Index("ix_order_amount", "amount_cents"),
-    )
-
-    id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    code: Mapped[str] = mapped_column(String(4), index=True)
-    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
-    plan_code: Mapped[str] = mapped_column(String(32), default="")
-    # 实际应付金额（整数分，禁止浮点）
-    amount_cents: Mapped[int] = mapped_column(Integer, default=0)
-    status: Mapped[str] = mapped_column(String(16), default=OrderStatus.PENDING, index=True)
-
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
-    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
-    notified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
-    confirmed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
-    # 核销管理员与备注（审计）
-    admin_id: Mapped[int | None] = mapped_column(ForeignKey("users.id"), nullable=True)
-    admin_note: Mapped[str] = mapped_column(String(255), default="")
-
-
-class MembershipAmountRange(Base):
-    """金额区间配置（单行）：随机收款金额的取值区间，单位分。"""
-
-    __tablename__ = "membership_amount_range"
-
-    id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    min_cents: Mapped[int] = mapped_column(Integer, default=1000)
-    max_cents: Mapped[int] = mapped_column(Integer, default=9999)
-    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
-    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
-
-
-class PaymentConfig(Base):
-    """收款信息配置（单行）：收款账号 / 收款二维码，由管理端维护后下发给 APP。"""
-
-    __tablename__ = "payment_config"
-
-    id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    # 收款渠道名，如「微信」「支付宝」「银行卡」
-    channel: Mapped[str] = mapped_column(String(32), default="微信")
-    payee_name: Mapped[str] = mapped_column(String(64), default="")
-    account: Mapped[str] = mapped_column(String(128), default="")
-    qr_url: Mapped[str] = mapped_column(String(512), default="")
-    note: Mapped[str] = mapped_column(String(255), default="")
-    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
-
+# ================================================================ 陪聊计量
+# ⚠️ 这里曾有一整段会员模型（Membership / MembershipPlan / MembershipOrder /
+# MembershipAmountRange / PaymentConfig）。产品决策**取消会员制**后它们整体删除：
+# 任何一台我们授权的设备都能无限量对话，不再有订单、核销、会员期限与收款信息。
+#
+# **老库里那几张表会原样留在盘上、数据不删**（见上方 git 历史），理由：
+#   * 订单表是**历史收款流水**，删表等于毁掉财务凭证；
+#   * ORM 里不再有映射 -> ``create_all`` 不会给新库建这些表，
+#     也没有任何代码路径会读写它们，等于「停止使用」而非「删数据」；
+#   * SQLite 与 MySQL 都不需要写 DROP TABLE，避开两种方言的差异。
+# 详见 docs/会员功能规划.md（已标注为废弃）。
 
 class ChatQuotaConfig(Base):
-    """陪聊配额配置（单行）：非会员每日秒数、空闲切断秒数、会员是否不限。"""
+    """陪聊配置（单行）：未授权设备的每日秒数上限、空闲切断秒数。
+
+    ⚠️ 取消会员制时移除了 ``vip_unlimited`` 列 —— 它的唯一作用是
+    「会员是否不限量」，而现在**授权设备恒为无限量**，这个开关没有语义了。
+    老库里该列仍留在盘上（不 DROP，见上方说明），只是不再有 ORM 映射读它。
+    """
 
     __tablename__ = "chat_quota_config"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    # 仅对**未绑定设备**生效的兜底上限；已授权设备一律无限量
     free_daily_seconds: Mapped[int] = mapped_column(Integer, default=3600)
     idle_timeout_seconds: Mapped[int] = mapped_column(Integer, default=90)
-    vip_unlimited: Mapped[bool] = mapped_column(Boolean, default=True)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
 
 
@@ -837,16 +723,22 @@ class PasswordResetCode(Base):
 
 
 class TicketCategory:
-    """工单分类。落库存英文短码，展示时转中文（APP 只展示，不解析）。"""
+    """工单分类。落库存英文短码，展示时转中文（APP 只展示，不解析）。
 
-    PAYMENT = "payment"      # 会员支付
+    ⚠️ ``PAYMENT`` 的展示文案原为「会员支付」，取消会员制后改为「付款/费用」：
+    **短码 ``payment`` 一律不动** —— 老库里已存的工单按短码分类，
+    改码会让历史工单集体变成「未知分类」。这里只改给人看的那半边，
+    且「费用」仍覆盖设备购置款这类真实咨询。
+    """
+
+    PAYMENT = "payment"      # 付款 / 费用
     DEVICE = "device"        # 设备故障
     REMINDER = "reminder"    # 提醒异常
     ACCOUNT = "account"      # 账号问题
     OTHER = "other"          # 其它
 
     TEXTS = {
-        PAYMENT: "会员支付",
+        PAYMENT: "付款/费用",
         DEVICE: "设备故障",
         REMINDER: "提醒异常",
         ACCOUNT: "账号问题",

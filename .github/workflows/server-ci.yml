@@ -133,6 +133,13 @@ jobs:
       - name: 人格预设运营后台冒烟（红线不出库 + 审计同事务 + 重启不变式）
         run: python tools/smoke_admin_presets.py 8118
 
+      # 陪聊计量 + 「取消会员制」核心不变量（端口 8106，已在 smoke_ports.py 登记）。
+      # 它守着本次产品决策：把 free_daily_seconds 压到 0，已绑定设备仍 unlimited。
+      # ⚠️ 少了这一步，「有人把按用量拦人的逻辑加回来」不会被任何测试发现 ——
+      # 因为除了它，其余冒烟都不把上限压到 0。
+      - name: 陪聊计量冒烟（授权设备无限量 + 会员端点已下线）
+        run: python tools/smoke_quota.py 8106
+
       # token 用量：网关提取真实 usage + 双端接口（/api/usage 与 /api/admin/usage）
       # + 越权隔离。进程内起服务（usage 路由在 main.py 已接线，冒烟另走进程内
       # attach 覆盖同一份路由对象），端口 8120 已在 smoke_ports.py 登记。
@@ -382,7 +389,7 @@ jobs:
           PY
 
       # 端口同 SQLite job（8100/8101）—— 端口表全局唯一，不因换数据库就换端口。
-      # 早先这里写的是 8098/8096，恰好与 smoke_membership 的默认 8098、
+      # 早先这里写的是 8098/8096，恰好与 smoke_quota 的默认 8098、
       # smoke_models/smoke_mail 的默认 8096 撞车，等于留了两套互相冲突的端口表。
       - name: 跑业务闭环（mysql+pymysql）
         env:

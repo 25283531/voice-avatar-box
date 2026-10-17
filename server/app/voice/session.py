@@ -41,7 +41,7 @@ from starlette.websockets import WebSocket, WebSocketDisconnect
 from .. import config
 from ..db import SessionLocal
 from ..llm_gateway import ConfigMissingError, chat_stream
-from ..membership import local_date_str, quota_snapshot, record_chat_usage
+from ..chat_quota import local_date_str, quota_snapshot, record_chat_usage
 from ..memory import bridge as memory_bridge
 from ..models import InteractionKind
 from ..security import decode_token
@@ -50,9 +50,9 @@ from .. import usage as usage_svc
 from . import asr_tts, opus_codec
 from .prompts import (
     BASE_VOICE_PROMPT,
+    DEVICE_UNBOUND_MESSAGE,
     EMPTY_UTTERANCE_REPLY,
     LLM_NOT_CONFIGURED_MESSAGE,
-    QUOTA_EXHAUSTED_MESSAGE,
     TOOL_LOOP_FALLBACK,
 )
 from .tools import TOOL_DEFS, execute_tool
@@ -577,28 +577,33 @@ class VoiceSession:
         await self._send_json({"type": "stt", "text": utterance})
         t_asr = _now_ms() - t_asr
 
-        # ---- 配额校验：**在调 LLM 之前**。用尽就不调，省 token 也省时间。
+        # ---- 授权校验：**在调 LLM 之前**。
+        # 取消会员制后不再有「每日时长配额」这道闸门：只要这台设备是我们授权的
+        # （已绑定到某个用户），就无限量陪聊。判据与 /api/device/ota 下发
+        # WS 通道的条件一致（见 app/chat_quota.py 模块头部的说明）。
+        #
+        # ⚠️ 这里**不能把整段删掉**：`unlimited` 为 False 只在「设备未绑定」时成立，
+        # 而未绑定设备本不该出现在语音会话里（拿不到 device_token）。
+        # 留着它是为了纵深防御 —— 万一将来出现别的入口能拿到 device_token，
+        # 未授权设备就不该白烧 token。原有的降级播报与埋点也一并保留。
         def _quota() -> dict:
             with SessionLocal() as db:
-                return quota_snapshot(db, self.dev.owner_id,
-                                      device_ids=[self.dev.id])
+                return quota_snapshot(db, device_ids=[self.dev.id],
+                                      authorized=self.dev.owner_id is not None)
 
         try:
             quota = await run_in_threadpool(_quota)
         except Exception as exc:  # noqa: BLE001
-            log.warning("[%s] 配额查询失败，按不限制放行：%s: %s",
+            log.warning("[%s] 授权状态查询失败，按已授权放行：%s: %s",
                         self.session_id, type(exc).__name__, exc)
             quota = {"unlimited": True}
         if not quota.get("unlimited"):
-            used = int(quota.get("used_seconds") or 0)
-            limit = quota.get("limit_seconds")
-            if limit is not None and used >= int(limit):
-                log.info("[%s] 配额用尽（%d/%d），不调 LLM",
-                         self.session_id, used, int(limit))
-                await self._send_alert(QUOTA_EXHAUSTED_MESSAGE)
-                await self._record_turn(utterance, "", started, t_asr,
-                                        0, 0, 0, reply_ok=False)
-                return utterance
+            log.info("[%s] 设备未绑定用户，拒绝调用 LLM（未授权设备）",
+                     self.session_id)
+            await self._send_alert(DEVICE_UNBOUND_MESSAGE)
+            await self._record_turn(utterance, "", started, t_asr,
+                                    0, 0, 0, reply_ok=False)
+            return utterance
 
         # ---- 记忆 + 人格召回
         def _recall() -> str:
@@ -812,8 +817,8 @@ class VoiceSession:
         elapsed_ms = int((time.monotonic() - started) * 1000)
         total_tokens = sum(int(getattr(r, "total_tokens", 0) or 0)
                            for r in results)
-        # 提醒相关交互不计入陪聊配额（membership 既有口径），只累计到
-        # reminder_seconds 便于排查。
+        # 提醒相关交互与普通陪聊分开累计（chat_quota 既有口径），
+        # 只累计到 reminder_seconds 便于排查。
         is_reminder = any(str(t.get("name", "")).endswith("reminder")
                           for t in (tool_trace or []))
 

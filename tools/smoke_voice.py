@@ -12,7 +12,8 @@
    tts stop；有 libopus 时做**编解码 round-trip**（发出去的帧解回来非全静音）；
 5. **埋点**：model_usage（source=voice / usage=chat / total_tokens=155 /
    device_id）+ chat_usage + Interaction 三条都落库；
-6. **配额用尽**：假上游 chat 计数不变 + 收到 alert + WS 仍存活；
+6. **取消会员制**：已绑定设备把时长上限压到 0 仍**照常调 LLM 并播报**
+   （反向不变量，见 :func:`t_quota` —— 原来测的是「配额用尽不调 LLM」）;
 7. **打断**：播报中发 abort → 后续 sentence_start / 二进制帧不再来；
 8. **降级**：禁用 TTS → 仍收到 stt + tts start/stop + sentence_start，
    无二进制帧；禁用全部 LLM → 收到"未配置大模型" alert；
@@ -747,7 +748,7 @@ def _tomorrow() -> str:
 
 
 def _set_quota_limit(seconds: int) -> None:
-    """把免费日配额顶到上限，模拟"今天的时间用完了"。"""
+    """把每日时长上限压到 ``seconds``（用于验证**它不再拦已绑定设备**）。"""
     from app.db import SessionLocal
     from app.models import ChatQuotaConfig
 
@@ -1388,11 +1389,23 @@ async def t_empty_asr(ids: dict) -> None:
 
 
 async def t_quota(ids: dict) -> None:
-    print("── 6. 配额用尽：不调 LLM + alert + WS 存活 ──")
+    """第 6 条：**取消会员制后，已绑定设备不再被时长配额拦**。
+
+    ⚠️ 这条断言的**方向**在取消会员制时翻转了，原来测的是
+    「配额用尽 -> 不调 LLM + 收到 alert」。删功能不能把断言整条删掉 ——
+    那正是「为了让测试变绿而丢掉真正有价值的断言」。改为测**反向不变量**：
+
+        把 free_daily_seconds 压到 0（比任何真实用量都极端），
+        已绑定设备**仍然要调 LLM、仍然要拿到正常回复**。
+
+    这条守的是本次改动的核心：任何人把「按用户判会员/按用量拦人」的逻辑
+    加回来，这里会立刻红。
+    """
+    print("── 6. 取消会员制：已绑定设备不被时长配额拦 ──")
     import websockets
 
     await _settle()
-    _set_quota_limit(0)          # 免费日配额 0 秒 = 一开始就用尽
+    _set_quota_limit(0)          # 上限压到 0：闸门若还在必拦
     chat_before = UP.get("chat_calls")
     headers = {"Authorization": f"Bearer {ids['token']}",
                "Device-Id": MAC_BOUND, "Protocol-Version": "1"}
@@ -1409,7 +1422,8 @@ async def t_quota(ids: dict) -> None:
             await ws.send(json.dumps({"type": "listen", "state": "stop"}))
 
             alert = ""
-            deadline = time.time() + 30
+            spoke = False
+            deadline = time.time() + 40
             while time.time() < deadline:
                 try:
                     msg = await asyncio.wait_for(ws.recv(), timeout=8)
@@ -1420,13 +1434,21 @@ async def t_quota(ids: dict) -> None:
                 obj = json.loads(msg)
                 if obj.get("type") == "alert":
                     alert = obj.get("message", "")
-                    break
-            check("第 6 条 · 配额用尽收到 alert", bool(alert), f"alert={alert!r}")
-            check("第 6 条 · 配额用尽时**不调 LLM**（chat 计数不变）",
-                  UP.get("chat_calls") == chat_before,
+                    continue
+                if obj.get("type") == "tts":
+                    # 收到 tts 段（start/stop）说明真的走到播报了
+                    if obj.get("state") in ("start", "stop"):
+                        spoke = True
+                    if spoke and obj.get("state") == "stop":
+                        break
+            check("第 6 条 · 上限压到 0 时**仍调 LLM**（chat 计数 +1）",
+                  UP.get("chat_calls") == chat_before + 1,
                   f"{chat_before} -> {UP.get('chat_calls')}")
-            check("第 6 条 · alert 文案提到「聊天时间」",
-                  "聊天时间" in alert or "明天" in alert, f"alert={alert!r}")
+            check("第 6 条 · 上限压到 0 时仍拿到正常播报（未走降级）",
+                  spoke, f"tts={spoke}")
+            check("第 6 条 · 未收到「配额/时长用尽」类 alert",
+                  not ("聊天时间" in alert or "明天" in alert),
+                  f"alert={alert!r}")
     finally:
         _set_quota_limit(3600)   # 恢复，别影响后续断言
 

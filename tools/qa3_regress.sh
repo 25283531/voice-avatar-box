@@ -4,10 +4,10 @@ SB=/c/Users/Administrator/AppData/Local/Temp/qa3_sandbox
 PY=C:/Users/Administrator/.workbuddy/binaries/python/envs/elder/Scripts/python.exe
 cd "$SB" || exit 9
 
-declare -a NAMES=(eval_persona smoke_server smoke_home smoke_membership
+declare -a NAMES=(eval_persona smoke_server smoke_home smoke_quota
                  smoke_models smoke_memory smoke_roles qa3_edge
                  qa4_gate_challenge)
-declare -a FILES=(eval_persona.py smoke_server.py smoke_home.py smoke_membership.py
+declare -a FILES=(eval_persona.py smoke_server.py smoke_home.py smoke_quota.py
                   smoke_models.py smoke_memory.py smoke_roles.py qa3_edge.py
                   qa4_gate_challenge.py)
 

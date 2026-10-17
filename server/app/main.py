@@ -32,8 +32,8 @@ from .config import (
 )
 from .db import SessionLocal, init_db
 from .models import Avatar
-from .routers import (admin_presets, avatars, auth, device_api, devices, home, mail,
-                      membership, providers, reminders, roles, stats, support, usage)
+from .routers import (admin_presets, avatars, auth, chat_quota, device_api, devices,
+                      home, mail, providers, reminders, roles, stats, support, usage)
 from .schema_patch import run_all as run_schema_upgrade
 from .security import hash_password, verify_password
 # 记忆的 router 单独导入，**不从 .memory 包里取**：
@@ -279,7 +279,7 @@ def _admin_password_audit() -> None:
             log.warning(
                 "【安全】%s user=%s id=%s —— 该管理员的口令仍是已知默认口令「%s」。\n"
                 "    → 任何知道这个默认值的人都能以**平台管理员**身份登录：改 AI 配置"
-                "（含厂商 API Key 的读写口径）、核销会员订单、查看全部用户用量与记忆。\n"
+                "（含厂商 API Key 的读写口径）、查看全部用户用量与记忆。\n"
                 "    → 处置 A（登录后自己改）：带 token 调 "
                 "POST /api/auth/password  {\"old_password\":\"%s\","
                 "\"new_password\":\"<强口令>\"}\n"
@@ -421,12 +421,17 @@ def _seed_migration() -> None:
                 row.id, row.name, row.created_at)
 
 
-def _seed_membership() -> None:
-    """会员系统种子数据：金额区间、配额配置、默认套餐、服药关键词。"""
-    from . import membership as mbs
+def _seed_chat_quota() -> None:
+    """陪聊计量种子数据：配额配置（空闲切断秒数）与服药关键词表。
+
+    ⚠️ 这里曾叫 ``_seed_membership``，种子的是会员的金额区间与套餐 ——
+    会员制取消后那些表不再有 ORM 映射，``create_all`` 也不会给新库建，
+    所以只剩计量相关的两样要seed。
+    """
+    from . import chat_quota as cq
 
     with SessionLocal() as db:
-        mbs.seed_defaults(db)
+        cq.seed_defaults(db)
 
 
 @asynccontextmanager
@@ -451,7 +456,7 @@ async def lifespan(app: FastAPI):
     # 放到 _seed_migration() 之前则不成立任何依赖，两者互不相干，顺序随意。
     _admin_password_audit()
     _seed_migration()
-    _seed_membership()
+    _seed_chat_quota()
     from . import scheduler
 
     task = asyncio.create_task(scheduler.run_forever())
@@ -477,8 +482,9 @@ for r in (auth.router, devices.router, reminders.router, avatars.router,
           providers.router, roles.router, stats.router, device_api.router, home.router):
     app.include_router(r)
 
-# 会员系统：用户端 /api/membership、管理端 /api/admin/membership、设备端 /api/device/quota 等
-for r in (membership.router, membership.admin_router, membership.device_router):
+# 陪聊时长：设备端 /api/device/quota（当日统计 + 服药关键词）与 /api/device/chat-usage（上报）。
+# ⚠️ 用户端 /api/membership 与管理端 /api/admin/membership 已随会员制取消删除。
+for r in (chat_quota.router,):
     app.include_router(r)
 
 # token 用量：用户端 /api/usage（只看自己设备）、管理端 /api/admin/usage（全量+聚合）。
@@ -525,14 +531,14 @@ def health():
 
 @app.get("/api/health/scheduler")
 def health_scheduler():
-    """后台周期任务健康快照（排期补全 / 超时升级 / 订单与会员过期 / 离线清扫）。
+    """后台周期任务健康快照（排期补全 / 超时升级 / 离线清扫）。
 
     这个端点**不参与任何探活链路**，只给运维和监控看：
       - last_ok_at           最近一次完整跑完的时刻，从未成功过为 None
       - consecutive_failures 连续失败次数，成功一轮即归零
       - last_error           最近一次异常信息，成功时为 None
     """
-    # 惰性导入：scheduler 依赖 db / models / membership，模块级直接 import
+    # 惰性导入：scheduler 依赖 db / models，模块级直接 import
     # 会把初始化顺序钉死，放在函数里更稳。
     from .scheduler import scheduler_health
 

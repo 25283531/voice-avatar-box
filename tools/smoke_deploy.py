@@ -602,6 +602,17 @@ def main() -> int:
             shimmed = old_da_src.replace("from ..config import (",
                                          "from _old_config import (", 1)
             assert "from _old_config import (" in shimmed, "旧源码结构变了？"
+            # 旧 device_api 还会 ``from ..membership import quota_snapshot``，
+            # 而该模块已随取消会员制改名/删除 —— 基线代码本身不变，只把这一行
+            # 指到桩模块。_voice_endpoints 完全不碰 quota_snapshot，
+            # 所以桩只要能过 import 即可（下方 H 组断言会验证输出没被桩影响）。
+            exec_fresh_module(
+                "_old_membership",
+                "def quota_snapshot(*a, **k):  # 桩：H 组不调用它\n"
+                "    raise AssertionError('H 组不应调用 quota_snapshot')\n")
+            shimmed = shimmed.replace(
+                "from ..membership import quota_snapshot",
+                "from _old_membership import quota_snapshot", 1)
             old_da = exec_fresh_module("_old_device_api", shimmed,
                                        package="app.routers")
             return old_da._voice_endpoints(request)

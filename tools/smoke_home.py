@@ -6,7 +6,7 @@
 覆盖 APP 四个新增后端接口的字段契约（对照 app/src/api/elder/index.ts）：
     1. POST   /api/auth/password    修改密码（旧密码错 400 / 新密码太短 422 / 未登录 401）
     2. PATCH  /api/auth/email       更换邮箱（格式非法 422 / 与他人重复 409 / me 回读）
-    3. GET    /api/home/summary     首页聚合（设备状态 + 当天服药 + 会员，按服务端时区）
+    3. GET    /api/home/summary     首页聚合（设备状态 + 当天服药，按服务端时区）
     4. POST   /api/devices/{pk}/agent  绑定 agent 角色（他人设备 404 / 未登录 401）
 """
 from __future__ import annotations
@@ -222,16 +222,10 @@ def main() -> int:
               and s0.get("medicine_today", {}).get("pending_count") == 0
               and s0.get("medicine_today", {}).get("pending_times") == [],
               str(s0.get("medicine_today")))
-        check("非会员 is_vip 为 false", s0.get("membership", {}).get("is_vip") is False,
-              str(s0.get("membership")))
-        check("首页会员卡字段齐全",
-              set(["is_vip", "plan", "expires_at", "days_left", "benefits"])
-              <= set(s0.get("membership", {})),
-              ",".join(sorted(s0.get("membership", {}))))
-        check("benefits 是字符串数组",
-              isinstance(s0.get("membership", {}).get("benefits"), list)
-              and all(isinstance(x, str) for x in s0["membership"]["benefits"]),
-              str(s0.get("membership", {}).get("benefits")))
+        # ⚠️ 首页不再返回 membership 段（会员制已取消）。断言「没有」而不是
+        # 「为空」—— 后者对 {"membership": {}} 也成立，挡不住「删字段」漏改成空壳。
+        check("首页不再返回 membership 段（会员制已取消）",
+              "membership" not in s0, ",".join(sorted(s0.keys())))
 
         # ==================================================== 准备：u1 绑定设备
         code, dev = req("POST", "/api/devices", {"device_id": "homedev000001"}, u1)
@@ -441,46 +435,22 @@ def main() -> int:
         code, _ = req("PATCH", "/api/auth/email", {"email": "x@example.com"})
         check("未登录换邮箱 -> 401", code == 401, f"code={code}")
 
-        # ==================================================== 3.5 会员路径
-        # 用管理端直接分配会员，验证首页会员卡能正确反映「已开通 + 到期时间 + 剩余天数」
-        admin_token = tk.get("access_token", "")
-        u1_id = me.get("id", 0)
-        code, granted = req("POST", "/api/admin/membership/grant",
-                            {"user_id": u1_id, "days": 10, "note": "冒烟测试"}, admin_token)
-        check("管理端开通会员", code == 200 and granted.get("is_vip") is True, str(code))
+        # ==================================================== 3.5 会员端点已下线
+        # 会员制取消后 /api/membership* 与 /api/admin/membership* 全部 404。
+        # 老前端 / 老 APP 缓存仍可能打过来，这里钉住「必须是 404」而不是 500 ——
+        # 500 说明路由还在、只是内部炸了，属于另一种缺陷。
+        for _path in ("/api/membership", "/api/membership/plans",
+                      "/api/membership/orders/mine", "/api/membership/payment-info"):
+            code, _ = req("GET", _path, token=u1)
+            check(f"会员端点已下线 {_path}", code == 404, f"code={code}")
+        code, _ = req("POST", "/api/admin/membership/grant",
+                       {"user_id": me.get("id", 0), "days": 10}, tk.get("access_token", ""))
+        check("管理端授予会员接口已下线", code == 404, f"code={code}")
+        # 首页对**任何**用户都不再出现 membership 段（不是「非会员才没有」）
         code, s5 = req("GET", "/api/home/summary", token=u1)
-        mem5 = s5.get("membership", {})
-        check("首页会员卡显示已开通", mem5.get("is_vip") is True, str(mem5))
-        check("首页会员剩余天数 10", mem5.get("days_left") == 10, str(mem5.get("days_left")))
-        check("会员到期时间非空", bool(mem5.get("expires_at")), str(mem5.get("expires_at")))
-        check("会员权益含陪聊不限时长",
-              "陪聊不限时长" in (mem5.get("benefits") or []), str(mem5.get("benefits")))
-
-        # ==================================================== 3.6 benefits 必须是数组
-        # APP 首页写的是 (membership.benefits || []).join(' · ')，
-        # profile 页写的是 membership.benefits.join(' / ')，对字典调 join 会直接崩。
-        code, ms1 = req("GET", "/api/membership", token=u1)
-        ben1 = ms1.get("benefits") if isinstance(ms1, dict) else None
-        check("/api/membership 的 benefits 是字符串数组",
-              isinstance(ben1, list) and all(isinstance(x, str) for x in ben1), str(ben1))
-        check("APP 的 join 用法不会报错",
-              isinstance(ben1, list) and " · ".join(ben1) != "", "" if not ben1 else " · ".join(ben1))
-        check("会员 benefits 含陪聊不限时长", isinstance(ben1, list) and "陪聊不限时长" in ben1,
-              str(ben1))
-        detail = ms1.get("benefits_detail", {}) if isinstance(ms1, dict) else {}
-        check("明细没有丢，挪到 benefits_detail",
-              detail.get("chat_unlimited") is True
-              and detail.get("reminder_always_free") is True, str(detail))
-        check("首页与 /api/membership 的权益文案一致",
-              mem5.get("benefits") == ben1, f"{mem5.get('benefits')} vs {ben1}")
-
-        code, plans = req("GET", "/api/membership/plans", token=u1)
-        first_plan = plans[0] if isinstance(plans, list) and plans else {}
-        pben = first_plan.get("benefits")
-        check("套餐 benefits 也是字符串数组",
-              isinstance(pben, list) and all(isinstance(x, str) for x in pben), str(pben))
-        check("套餐页面的 join 用法不会报错",
-              isinstance(pben, list) and " / ".join(pben) != "", "" if not pben else " / ".join(pben))
+        check("有设备的用户首页也没有 membership 段",
+              code == 200 and "membership" not in s5,
+              ",".join(sorted(s5.keys())) if isinstance(s5, dict) else str(s5))
 
         # ==================================================== 1. 修改密码
         code, _ = req("POST", "/api/auth/password",

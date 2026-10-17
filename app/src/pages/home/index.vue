@@ -10,12 +10,11 @@ import { onShow } from '@dcloudio/uni-app'
 import { computed, ref } from 'vue'
 import {
   deviceEvents,
-  getMembership,
   homeSummary,
   listDevices,
   listReminders,
 } from '@/api/elder'
-import type { Device, MembershipInfo, Reminder, ReminderEvent } from '@/api/elder'
+import type { Device, Reminder, ReminderEvent } from '@/api/elder'
 import { getElderToken } from '@/http/elder'
 
 /** 今天零点（本地时区） */
@@ -33,7 +32,6 @@ function fmtTime(v?: string | null) {
 const devices = ref<Device[]>([])
 const reminders = ref<Reminder[]>([])
 const events = ref<ReminderEvent[]>([])
-const membership = ref<MembershipInfo | null>(null)
 const loading = ref(false)
 const logged = ref(true)
 
@@ -75,22 +73,10 @@ async function refresh() {
     devices.value = await listDevices()
 
     // 优先用后端聚合接口；拿不到就退回本地拼装（兼容旧版本后端）
-    let summaryOk = false
     try {
-      const s = await homeSummary()
-      if (s && Array.isArray(s.devices)) {
-        membership.value = s.membership || null
-        summaryOk = true
-      }
+      await homeSummary()
     }
-    catch { /* 旧后端没有该接口，走下面的兼容分支 */ }
-
-    if (!summaryOk) {
-      try {
-        membership.value = await getMembership()
-      }
-      catch { /* 会员模块未部署时不阻塞首页 */ }
-    }
+    catch { /* 旧后端没有该接口，不阻塞首页 */ }
 
     // 服药状态：取第一个设备的提醒与回执本地计算
     const first = devices.value[0]
@@ -142,27 +128,6 @@ onShow(() => { refresh() })
     </view>
 
     <template v-else>
-      <!-- 会员状态 -->
-      <view class="card vip" :class="{ on: membership?.is_vip }">
-        <view class="row between">
-          <text class="vip-name">{{ membership?.is_vip ? '会员已开通' : '未开通会员' }}</text>
-          <text v-if="membership?.is_vip && membership.expires_at" class="vip-exp">
-            {{ membership.expires_at.slice(0, 10) }} 到期
-          </text>
-        </view>
-        <view class="vip-sub">
-          <template v-if="membership?.is_vip">
-            剩余 {{ membership.days_left }} 天 · {{ (membership.benefits || []).join(' · ') || '尊享全部权益' }}
-          </template>
-          <template v-else>
-            开通会员可解锁更多设备与自定义角色
-          </template>
-        </view>
-        <button class="btn small" @click="goTab('/pages/profile/index')">
-          {{ membership?.is_vip ? '续费会员' : '开通会员' }}
-        </button>
-      </view>
-
       <!-- 设备状态 -->
       <view class="card">
         <view class="row between">
@@ -243,12 +208,6 @@ onShow(() => { refresh() })
 .between { justify-content: space-between; }
 .tip { font-size: 26rpx; color: #8a8f99; text-align: center; padding: 32rpx 0; }
 
-/* 会员卡 */
-.vip { background: linear-gradient(135deg, #fff7ed, #ffedd5); border: 1rpx solid #fed7aa; }
-.vip.on { background: linear-gradient(135deg, #fff7ed, #ffe8cc); }
-.vip-name { font-size: 32rpx; font-weight: 700; color: #9a3412; }
-.vip-exp { font-size: 24rpx; color: #c2410c; }
-.vip-sub { font-size: 24rpx; color: #a16207; margin: 12rpx 0 16rpx; }
 .btn { background: #e8590c; color: #fff; border-radius: 12rpx; font-size: 28rpx; padding: 18rpx 0; }
 .btn.small { padding: 12rpx 32rpx; font-size: 26rpx; margin-top: 0; }
 

@@ -1,6 +1,6 @@
 """设备 token 用量查询（双端）。
 
-* 用户端 ``/api/usage``：**只看本人设备**（``membership.user_device_ids``
+* 用户端 ``/api/usage``：**只看本人设备**（``chat_quota.user_device_ids``
   算出来的范围），汇总 + 最近流水；
 * 管理端 ``/api/admin/usage``：可按 device_id / user_id / usage / 时间过滤，
   都不传 = 全量（仅管理员允许全量）。
@@ -20,7 +20,7 @@
 --------
 ``since`` / ``until`` 收 ISO 日期（``2026-10-01``，按当天 00:00）或
 日期时间（``2026-10-01T12:00:00``）；pydantic 两种都解析，非法值 422。
-解析出的 naive 时间一律按 UTC 补齐（``membership.aware``）再进查询 ——
+解析出的 naive 时间一律按 UTC 补齐（``chat_quota.aware``）再进查询 ——
 库里 ``created_at`` 是 aware 的，naive 直比会静默错位。
 """
 from __future__ import annotations
@@ -33,7 +33,7 @@ from sqlalchemy.orm import Session
 from .. import usage as usage_svc
 from ..db import get_db
 from ..deps import get_current_admin, get_current_user
-from ..membership import aware, user_device_ids
+from ..chat_quota import aware, user_device_ids
 from ..models import User
 from ..schemas import UsageRowOut, UsageSummaryOut
 
@@ -41,7 +41,7 @@ from ..schemas import UsageRowOut, UsageSummaryOut
 router = APIRouter(prefix="/api/usage", tags=["usage"])
 
 # ============================================================ 管理端
-# 与 membership 同款的分路由写法：router 级依赖一次到位，端点函数里
+# 与 chat_quota 同款的分路由写法：router 级依赖一次到位，端点函数里
 # 不再各自判管理员（漏一处就是一个越权面）。
 admin_router = APIRouter(
     prefix="/api/admin/usage", tags=["admin-usage"],

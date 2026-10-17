@@ -121,7 +121,7 @@
     </template>
 
     <p class="muted" style="margin-top:12px;font-size:12px">
-      不装手机 APP 也能在浏览器里完成全部操作：绑定设备、开通会员、设置提醒、提交工单。
+      不装手机 APP 也能在浏览器里完成全部操作：绑定设备、设置提醒、提交工单。
       平台管理员请访问 <a href="/">管理后台</a>。
     </p>
   </div>
@@ -255,151 +255,6 @@
       </div>
     </section>
 
-    <!-- ---------------------- 会员情况 ---------------------- -->
-    <section v-if="tab==='membership'">
-      <div class="card" v-if="membership">
-        <h2>会员状态</h2>
-        <div class="row" style="margin-bottom:10px">
-          <span class="tag" :class="membership.is_vip?'ok':''">{{membership.is_vip?'会员生效中':'免费用户'}}</span>
-          <span class="muted" style="font-size:12px" v-if="membership.plan">套餐：{{membership.plan}}</span>
-          <span class="muted" style="font-size:12px" v-if="membership.expires_at">
-            到期：{{fmt(membership.expires_at)}}（剩 {{membership.days_left}} 天）</span>
-        </div>
-        <ul class="muted" style="margin:0;padding-left:20px;font-size:13px">
-          <li v-for="b in (membership.benefits||[])" :key="b">{{b}}</li>
-        </ul>
-        <div class="muted" style="font-size:12px;margin-top:8px" v-if="membership.quota">
-          今日陪聊：{{quotaText(membership.quota)}}
-        </div>
-      </div>
-
-      <div class="card">
-        <h2>套餐</h2>
-        <div class="grid g3">
-          <div class="kpi" v-for="p in plans" :key="p.id">
-            <div class="l">{{p.name}}</div>
-            <div class="n">¥{{p.price_yuan}}</div>
-            <div class="l">{{p.months}} 个月 / {{p.days}} 天</div>
-            <div class="muted" style="font-size:12px;margin-top:6px">{{(p.benefits||[]).join(' · ')}}</div>
-            <div class="row" style="margin-top:10px">
-              <button class="primary" :id="'buy-'+p.code" :disabled="busy" @click="placeOrder(p)">
-                {{membership && membership.is_vip ? '续费会员' : '开通会员'}}
-              </button>
-            </div>
-          </div>
-        </div>
-        <div v-if="!plans.length" class="empty">暂无可选套餐</div>
-        <p class="muted" style="font-size:12px;margin:10px 0 0">
-          在本页下单，转账后点「我已付款」通知管理员核对：下单会生成 4 位订单号和一个专属金额 →
-          按订单弹窗里的收款信息转账 → 管理员核对到账后自动开通。
-        </p>
-      </div>
-
-      <div class="card" v-if="payment && (payment.account || payment.payee_name || payment.qr_url)">
-        <h2>收款信息</h2>
-        <div class="muted" style="font-size:13px;line-height:2">
-          <div v-if="payment.channel">方式：{{payment.channel}}</div>
-          <div v-if="payment.payee_name">收款人：{{payment.payee_name}}</div>
-          <div v-if="payment.account">账号：<code>{{payment.account}}</code>
-            <button @click="copy(payment.account)">复制</button></div>
-          <div v-if="payment.note">备注：{{payment.note}}</div>
-        </div>
-        <div v-if="payment.qr_url" style="margin-top:10px">
-          <label>收款二维码</label>
-          <img :src="payment.qr_url" alt="收款二维码"
-               style="max-width:220px;max-height:220px;border:1px solid var(--line);border-radius:8px" />
-        </div>
-      </div>
-
-      <div class="card">
-        <h2>我的订单</h2>
-        <table v-if="orders.length">
-          <thead><tr><th>订单号</th><th>套餐</th><th class="num">金额</th><th>状态</th><th>创建时间</th><th>操作</th></tr></thead>
-          <tbody>
-            <tr v-for="o in orders" :key="o.id">
-              <td><code>{{o.code}}</code></td>
-              <td>{{o.plan_name||o.plan_code}}</td>
-              <td class="num">¥{{o.amount_yuan}}</td>
-              <td><span class="tag" :class="orderClass(o.status)">{{orderStatusName(o.status)}}</span>
-                <div class="muted" style="font-size:12px" v-if="o.status==='notified'">等待管理员核对到账</div>
-                <div class="muted" style="font-size:12px" v-if="o.status==='rejected' && o.admin_note">
-                  驳回原因：{{o.admin_note}}</div>
-              </td>
-              <td class="muted">{{fmt(o.created_at)}}</td>
-              <td class="row">
-                <button v-if="o.status==='pending'" class="primary" :disabled="busy" @click="notifyPaid(o)">我已付款</button>
-                <button v-if="o.status==='pending' || o.status==='notified'" class="danger"
-                        :disabled="busy" @click="cancelOrder(o)">放弃订单</button>
-                <span class="muted" style="font-size:12px"
-                      v-if="o.status!=='pending' && o.status!=='notified'">已结束</span>
-              </td>
-            </tr>
-          </tbody>
-        </table>
-        <div v-else class="empty">还没有订单</div>
-      </div>
-
-      <!-- 订单弹窗：付款指引 + 订单状态操作。支付是线下转账 + 管理员人工核销，
-           所以这里必须把订单号、专属金额、收款信息（含二维码）一次说清楚。 -->
-      <div v-if="orderBox" class="mask" @click.self="closeOrder">
-        <div class="modal" style="max-width:560px">
-          <button class="close" @click="closeOrder">&times;</button>
-          <h2>请按下方金额付款</h2>
-          <div v-if="orderBox.error" class="err">{{orderBox.error}}</div>
-
-          <div class="row" style="justify-content:space-between">
-            <div>
-              <label>订单号（转账时请备注）</label>
-              <div class="big-code" id="ordCode">{{orderBox.code}}</div>
-            </div>
-            <div style="text-align:right">
-              <label>应付金额</label>
-              <div style="font-size:26px;font-weight:700;color:var(--brand)" id="ordAmt">¥{{orderBox.amount_yuan}}</div>
-              <div class="muted" style="font-size:12px">请务必按此金额付款，便于管理员核对</div>
-            </div>
-          </div>
-
-          <div class="row" style="margin-bottom:10px">
-            <span class="tag" :class="orderClass(orderBox.status)">{{orderStatusName(orderBox.status)}}</span>
-            <span class="muted" style="font-size:12px">套餐：{{orderBox.plan_name||orderBox.plan_code}}</span>
-            <span class="muted" style="font-size:12px">有效期至 {{fmt(orderBox.expires_at)}}</span>
-          </div>
-
-          <div class="grid g2">
-            <div>
-              <label>收款信息</label>
-              <div class="muted" style="font-size:13px;line-height:1.9">
-                <div v-if="orderBox.payment && orderBox.payment.channel">方式：{{orderBox.payment.channel}}</div>
-                <div v-if="orderBox.payment && orderBox.payment.payee_name">收款人：{{orderBox.payment.payee_name}}</div>
-                <div v-if="orderBox.payment && orderBox.payment.account">账号：<code>{{orderBox.payment.account}}</code>
-                  <button id="ordCopyAcc" @click="copy(orderBox.payment.account)">复制</button></div>
-                <div v-if="orderBox.payment && orderBox.payment.note">备注：{{orderBox.payment.note}}</div>
-              </div>
-            </div>
-            <div v-if="orderBox.payment && orderBox.payment.qr_url">
-              <label>收款二维码</label>
-              <img :src="orderBox.payment.qr_url" alt="收款二维码"
-                   style="max-width:200px;max-height:200px;border:1px solid var(--line);border-radius:8px" />
-            </div>
-          </div>
-          <div v-if="!(orderBox.payment && (orderBox.payment.account || orderBox.payment.qr_url))"
-               class="muted" style="font-size:13px">
-            管理员尚未配置收款方式，请联系客服。
-          </div>
-
-          <div class="row" style="margin-top:14px;justify-content:flex-end">
-            <button id="ordCopyCode" @click="copy(orderBox.code)">复制订单号</button>
-            <button class="danger" v-if="orderBox.status==='pending' || orderBox.status==='notified'"
-                    id="ordCancel" :disabled="busy" @click="cancelOrder(orderBox, true)">放弃订单</button>
-            <button class="primary" v-if="orderBox.status==='pending'" id="ordNotify" :disabled="busy"
-                    @click="notifyPaid(orderBox, true)">我已付款，通知管理员</button>
-            <span class="muted" style="font-size:12px" v-if="orderBox.status==='notified'">
-              已通知管理员，核对到账后会自动开通，请稍候</span>
-            <span class="tag ok" v-if="orderBox.status==='confirmed'">已开通</span>
-          </div>
-        </div>
-      </div>
-    </section>
 
     <!-- ---------------------- 提醒 ---------------------- -->
     <section v-if="tab==='reminders'">
@@ -811,7 +666,7 @@
     <!-- ---------------------- 交互统计 + 今日概况 ---------------------- -->
     <!-- GET /api/stats/overview 必填 device_pk（设备主键，不是 device_id 标识串），
          所以必须先有设备才能拉；GET /api/home/summary 无参，一次给齐设备 /
-         服药 / 会员三块。字段名全部按 schemas.py 的 StatsOverview /
+         服药两块。字段名全部按 schemas.py 的 StatsOverview /
          HomeSummaryOut 实际定义渲染，不做二次映射。 -->
     <section v-if="tab==='stats'">
       <div class="card">
@@ -887,15 +742,6 @@
               ? '（' + home.medicine_today.pending_times.join(' ') + '）' : ''}}</div></div>
         </div>
 
-        <div class="row" style="margin-bottom:10px">
-          <span class="tag" :class="home.membership.is_vip?'ok':''">
-            {{home.membership.is_vip?'会员生效中':'免费用户'}}</span>
-          <span class="muted" style="font-size:12px" v-if="home.membership.plan">
-            套餐：{{home.membership.plan}}</span>
-          <span class="muted" style="font-size:12px" v-if="home.membership.is_vip">
-            剩 {{home.membership.days_left}} 天（{{fmt(home.membership.expires_at)}}）</span>
-        </div>
-
         <table v-if="(home.devices||[]).length">
           <thead><tr><th>设备</th><th>状态</th><th>IP</th><th>固件</th><th>角色</th><th>形象</th><th>最后上线</th></tr></thead>
           <tbody>
@@ -930,7 +776,7 @@
           <div><label>问题分类</label>
             <select id="tkCat" v-model="tkForm.category" style="width:100%">
               <option value="other">其它</option>
-              <option value="payment">会员支付</option>
+              <option value="payment">付款/费用</option>
               <option value="device">设备故障</option>
               <option value="reminder">提醒异常</option>
               <option value="account">账号问题</option>
@@ -1045,7 +891,7 @@ createApp({
       user: JSON.parse(localStorage.getItem('elder_user') || '{}'),
       tab: 'devices',
       tabs: [
-        {k:'devices',n:'我的设备'},{k:'membership',n:'会员情况'},{k:'reminders',n:'提醒'},
+        {k:'devices',n:'我的设备'},{k:'reminders',n:'提醒'},
         {k:'memory',n:'记忆管理'},{k:'avatars',n:'形象'},{k:'roles',n:'人格预设'},
         {k:'usage',n:'用量统计'},{k:'stats',n:'交互统计'},{k:'support',n:'帮助与工单'}
       ],
@@ -1058,10 +904,6 @@ createApp({
       devices: [], devForm: { device_id:'', name:'我的陪伴助手' },
       bindForm: { code:'', device_id:'', alias:'' }, bindMsg: '',
       codeBox: null, agentBind: {},
-      // 会员
-      membership: null, plans: [], payment: null, orders: [],
-      // 订单弹窗：{code, amount_yuan, plan_code, plan_name, status, expires_at, payment, error}
-      orderBox: null,
       // 提醒
       curDeviceId: null, reminders: [], events: [],
       rBox: null, rForm: null, timesText:'', weekText:'', monthText:'',
@@ -1198,7 +1040,7 @@ createApp({
     logout(){ this.token=''; localStorage.removeItem('elder_token'); },
     async loadAll(){
       this.err = '';
-      await Promise.all([this.loadDevices(), this.loadMembership(), this.loadAvatars(), this.loadRoles()]);
+      await Promise.all([this.loadDevices(), this.loadAvatars(), this.loadRoles()]);
       if (this.curDeviceId) await this.loadReminders();
     },
 
@@ -1273,119 +1115,6 @@ createApp({
     },
     copy(t){ navigator.clipboard && navigator.clipboard.writeText(t); },
 
-    // -------- 会员 --------
-    async loadMembership(){
-      try{
-        const [m, p, pay, o] = await Promise.all([
-          this.api('/api/membership'),
-          this.api('/api/membership/plans'),
-          this.api('/api/membership/payment-info'),
-          this.api('/api/membership/orders/mine?limit=50')
-        ]);
-        this.membership = m; this.plans = p || []; this.payment = pay; this.orders = o || [];
-      }catch(e){ this.err = '会员信息加载失败：' + e.message; }
-    },
-    quotaText(q){
-      if (!q) return '—';
-      if (q.unlimited) return '不限时长';
-      const used = Math.round((q.used_seconds||0)/60);
-      const limit = Math.round((q.limit_seconds||0)/60);
-      return '已用 ' + used + ' 分钟 / 上限 ' + limit + ' 分钟';
-    },
-    orderStatusName(s){
-      return {pending:'等待付款', notified:'待管理员核对', confirmed:'已开通',
-              rejected:'已被驳回', cancelled:'已放弃', expired:'已过期'}[s] || s;
-    },
-    orderClass(s){
-      return s==='confirmed' ? 'ok'
-           : (s==='rejected'||s==='expired'||s==='cancelled') ? 'bad'
-           : (s==='notified') ? 'warn' : '';
-    },
-
-    // ---- 会员下单（支付只有线下转账 + 管理员人工核销，无在线支付）----
-    // 4 位订单号本地生成：优先 crypto.getRandomValues，降级 Math.random。
-    genOrderCode(){
-      const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
-      let out = '';
-      try{
-        const g = window.crypto || window.msCrypto;
-        if (g && typeof g.getRandomValues === 'function'){
-          const buf = new Uint32Array(4);
-          g.getRandomValues(buf);
-          for (let i = 0; i < 4; i++) out += chars[buf[i] % chars.length];
-          return out;
-        }
-      }catch(e){ /* 降级到 Math.random */ }
-      for (let i = 0; i < 4; i++) out += chars[Math.floor(Math.random() * chars.length)];
-      return out;
-    },
-    // 下单。订单号 48 小时内已被占用时服务端返回 409，换一个号重试，最多 4 次。
-    async placeOrder(p){
-      if (this.busy) return;
-      this.busy = true; this.err = '';
-      try{
-        let lastMsg = '';
-        for (let i = 0; i < 4; i++){
-          try{
-            const o = await this.api('/api/membership/orders', {
-              method:'POST',
-              body: JSON.stringify({code: this.genOrderCode(), plan_code: p.code})
-            });
-            if (!o) return;
-            this.orderBox = {
-              code: o.code, amount_yuan: o.amount_yuan, amount_cents: o.amount_cents,
-              plan_code: o.plan_code, plan_name: o.plan_name, status: o.status,
-              expires_at: o.expires_at, tip: o.tip,
-              // 下单响应自带一份收款信息；为空时回落到页面已加载的 payment
-              payment: (o.payment_info && (o.payment_info.account || o.payment_info.qr_url))
-                       ? o.payment_info : this.payment,
-              error: ''
-            };
-            await this.loadMembership();
-            return;
-          }catch(e){
-            lastMsg = e.message || '下单失败';
-            if (lastMsg.indexOf('409') >= 0 || lastMsg.indexOf('已存在') >= 0) continue;
-            break;
-          }
-        }
-        this.err = '下单失败：' + lastMsg;
-      }finally{ this.busy = false; }
-    },
-    closeOrder(){ this.orderBox = null; },
-    // 「我已付款」：订单转 notified，等管理员核对到账。
-    // fromModal=true 表示从订单弹窗点的，顺手把弹窗里的状态也刷新掉。
-    async notifyPaid(o, fromModal){
-      if (!confirm('确认已按金额 ¥' + o.amount_yuan + ' 完成付款？\n'
-                 + '管理员核对到账后会自动开通会员。')) return;
-      if (fromModal) { if (this.orderBox) this.orderBox.error = ''; } else this.err = '';
-      this.busy = true;
-      try{
-        const r = await this.api('/api/membership/orders/' + encodeURIComponent(o.code) + '/notify',
-                                  {method:'POST', body:'{}'});
-        if (!r) return;
-        if (fromModal && this.orderBox) this.orderBox = Object.assign({}, this.orderBox, r, {error:''});
-        await this.loadMembership();
-      }catch(e){
-        const m = '通知失败：' + e.message;
-        if (fromModal && this.orderBox) this.orderBox.error = m; else this.err = m;
-      }finally{ this.busy = false; }
-    },
-    async cancelOrder(o, fromModal){
-      if (!confirm('放弃订单 ' + o.code + '？\n放弃后如仍要开通，需要重新下单。')) return;
-      if (fromModal) { if (this.orderBox) this.orderBox.error = ''; } else this.err = '';
-      this.busy = true;
-      try{
-        const r = await this.api('/api/membership/orders/' + encodeURIComponent(o.code) + '/cancel',
-                                  {method:'POST', body:'{}'});
-        if (!r) return;
-        if (fromModal) this.orderBox = null;
-        await this.loadMembership();
-      }catch(e){
-        const m = '放弃失败：' + e.message;
-        if (fromModal && this.orderBox) this.orderBox.error = m; else this.err = m;
-      }finally{ this.busy = false; }
-    },
 
     // -------- 提醒（与管理后台同一套表单与端点）--------
     async loadReminders(){
@@ -1747,7 +1476,7 @@ createApp({
   watch:{
     curDeviceId(){ this.loadReminders(); },
     tab(t){
-      // 各页按需加载：登录时只拉设备/会员/形象/角色四个概览页，
+      // 各页按需加载：登录时只拉设备/形象/角色三个概览页，
       // 重页（提醒/记忆/用量）进 tab 才拉，失败只红当前页的错误条，不白屏。
       if (t === 'reminders') this.loadReminders();
       if (t === 'memory') this.loadMemory();

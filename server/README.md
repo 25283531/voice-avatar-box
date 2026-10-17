@@ -63,7 +63,7 @@ python tools/smoke_home.py 8102 & \
 python tools/smoke_memory.py 8103 & \
 python tools/smoke_models.py 8104 & \
 python tools/smoke_mail.py 8105 & \
-python tools/smoke_membership.py 8106 & \
+python tools/smoke_quota.py 8106 & \
 wait
 ```
 

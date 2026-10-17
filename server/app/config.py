@@ -102,7 +102,8 @@ ALLOW_PUBLIC_REGISTER = (
 #   1. 本产品的主要部署形态是「给家里老人私有化部署一套」，那里就一个人注册，
 #      关掉等于每次部署都要先教一遍环境变量；
 #   2. 关掉默认值会让**全部既有部署**在下一次升级后悄悄失去自建账号的能力
-#       token 消耗另有闸门：非会员有每日时长配额（见 membership 的配额配置），
+#       token 消耗另有闸门：只有**未绑定设备**才受每日时长上限约束
+#       （见 chat_quota 的授权判定），已授权设备一律无限量，
 #       "能不能注册"不该被当成唯一的成本控制点。
 #   ⚠️ **但**：部署在公网、且不愿承担他人消耗 AI token 的场景，
 #   必须显式设 ``ELDER_ALLOW_PUBLIC_REGISTER=0``。届时路由返回 403 + 中文说明。
@@ -123,7 +124,7 @@ REGISTER_CLOSED_DETAIL = "当前未开放自助注册，请联系管理员开通
 #
 #   在公开部署下这条规则等价于**「先到先得的管理员」**：任意一个先点开注册页的
 #    **「先到先得的管理员」**：任意一个先点开注册页的陌生人就拿到了
-#    改 AI 配置 / 核销会员订单 / 看全部用量的权限。这不是竞态 bug 那么简单，
+#    改 AI 配置 / 看全部用量的权限。这不是竞态 bug 那么简单，
 #    是**规则本身就是错的** —— 管理员身份不能由"到达顺序"授予。
 #
 # 新规则：**只有用户名与本变量逐字相等的那个注册者**才是管理员。
@@ -147,7 +148,7 @@ BOOTSTRAP_ADMIN_USERNAME = os.getenv("ELDER_BOOTSTRAP_ADMIN_USERNAME", "").strip
 #
 #   本服务是公开部署的（生产域名 voice.2508866.xyz，APP 把 BASE_URL 写死成它），
 #   于是任何人用 admin/admin123 登录即成为**平台管理员** —— 能改 AI 配置
-#   （含厂商 API Key 的读写口径）、核销会员订单、查看全部用户用量与记忆。
+#   （含厂商 API Key 的读写口径）、查看全部用户用量与记忆。
 #
 # ⚠️⚠️ **改种子救不了存量库**：那条路径只在**空库**时执行，所以已经跑起来的
 #   数据库（含正在运行的生产库）里那个 admin 的口令**目前就是 admin123**。
@@ -572,15 +573,9 @@ VOICE_HISTORY_TURNS = int(os.getenv("ELDER_VOICE_HISTORY_TURNS", "4"))
 SCHEDULE_AHEAD_HOURS = int(os.getenv("ELDER_SCHEDULE_AHEAD_HOURS", "36"))
 SCHEDULER_INTERVAL_SEC = int(os.getenv("ELDER_SCHEDULER_INTERVAL", "60"))
 
-# ---------------------------------------------------------------- 会员（人工核销）
-# 订单号 / 收款金额的占用有效期（小时）：超时后订单置为 expired，号段与金额随之释放。
-MEMBERSHIP_ORDER_TTL_HOURS = int(os.getenv("ELDER_ORDER_TTL_HOURS", "48"))
-# 下单频率限制：同一用户在该窗口内最多创建这么多笔订单，避免刷号占满 4 位号段
-MEMBERSHIP_ORDER_RATE_WINDOW_SEC = int(os.getenv("ELDER_ORDER_RATE_WINDOW", "60"))
-MEMBERSHIP_ORDER_RATE_MAX = int(os.getenv("ELDER_ORDER_RATE_MAX", "3"))
-# 金额区间合法边界（整数分）：至少 1 元，最多 999.99 元
-AMOUNT_MIN_LIMIT_CENTS = 100
-AMOUNT_MAX_LIMIT_CENTS = 99999
-
 # ---------------------------------------------------------------- 其它
+# ⚠️ 这里曾有一整段会员核销配置（MEMBERSHIP_ORDER_TTL_HOURS /
+# MEMBERSHIP_ORDER_RATE_* / AMOUNT_*_LIMIT_CENTS），随会员制取消整体删除。
+# 陪聊时长上限本身没删，但它是 ``chat_quota_config`` 表里的**数据**而不是环境变量，
+# 见 app/chat_quota.py。
 CORS_ORIGINS = os.getenv("ELDER_CORS", "*").split(",")

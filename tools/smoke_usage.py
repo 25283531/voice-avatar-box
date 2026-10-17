@@ -216,7 +216,7 @@ def seed(upstream_port: int) -> dict:
     """进程内播种：两台设备 + 一条 llm_main 配置。账号走 HTTP 注册（见 main）。
 
     返回后续断言要用的 id。设备与模型配置**刻意不走 HTTP**：建设备要激活码
-    四步流程（那是 smoke_server/smoke_membership 的领地），本测试关心的是
+    四步流程（那是 smoke_server/smoke_quota 的领地），本测试关心的是
     用量口径，不是设备绑定链路。
     """
     from app.db import SessionLocal

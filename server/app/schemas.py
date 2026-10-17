@@ -673,27 +673,16 @@ class MedicineTodayOut(ORMBase):
     total_count: int = 0
 
 
-class HomeMembershipOut(ORMBase):
-    """首页会员卡片。
-
-    字段与 APP 的 MembershipInfo 对齐；注意 benefits 这里是字符串数组
-    （APP 直接 join 展示），而 GET /api/membership 的 benefits 是字典
-    （给管理端和调试看明细），两边刻意不同，见 routers/home.py 的注释。
-    """
-
-    is_vip: bool = False
-    plan: str = ""
-    expires_at: datetime | None = None
-    days_left: int = 0
-    benefits: list[str] = Field(default_factory=list)
-
-
 class HomeSummaryOut(ORMBase):
-    """GET /api/home/summary：一次拉齐首页要用的三块信息。"""
+    """GET /api/home/summary：一次拉齐首页要用的两块信息。
+
+    ⚠️ 取消会员制后移除了 ``membership`` 字段。删字段而不是留空对象：
+    留一个恒为「非会员、无限量」的空壳只���让每个客户端都要写一段
+    「反正没有会员了」的判断。调用方（APP / Web）已同步删除该 UI 区块。
+    """
 
     devices: list[HomeDeviceOut] = Field(default_factory=list)
     medicine_today: MedicineTodayOut = Field(default_factory=MedicineTodayOut)
-    membership: HomeMembershipOut = Field(default_factory=HomeMembershipOut)
 
 
 # ============================================================ 提醒
@@ -865,16 +854,21 @@ class StatsOverview(ORMBase):
     series: list[StatsPoint]
 
 
-# ============================================================ 设备陪聊配额
+# ============================================================ 设备陪聊统计
 # 放在设备同步之前定义，供 DeviceSyncOut 引用
 class DeviceQuotaOut(ORMBase):
-    """设备当日陪聊配额快照。"""
+    """设备当日陪聊统计快照。
+
+    ⚠️ 取消会员制后移除了 ``is_vip`` 字段（不再有会员这个概念），
+    且 ``unlimited`` 对授权设备恒为 ``True``、``limit_seconds`` 恒为 ``None``。
+    **两个字段都保留**：老固件按「先看 unlimited」的契约读它们，
+    直接删会让固件侧逻辑空掉。
+    """
     date: str
-    is_vip: bool = False
     used_seconds: int = 0
     # 不限时为 None；设备应优先判断 unlimited
     limit_seconds: int | None = None
-    unlimited: bool = False
+    unlimited: bool = True
     idle_timeout_seconds: int = 90
     reminder_keywords: list[str] = Field(default_factory=list)
 
@@ -899,152 +893,17 @@ class DeviceSyncOut(ORMBase):
     tts_voice: str = ""
 
 
-# ============================================================ 会员（人工核销）
-class MembershipOut(ORMBase):
-    """会员状态 + 当日陪聊配额。
-
-    benefits 直接给中文短句数组：APP 的 MembershipInfo.benefits 声明为 string[]，
-    页面上是 ``(membership.benefits || []).join(' · ')`` 直接拼字符串展示，
-    早先这里给的是字典，对字典调 join 会运行时报错。
-    原来字典里的明细并没有丢，挪到 benefits_detail 供管理端/排查使用。
-    """
-    is_vip: bool
-    plan: str = ""
-    started_at: datetime | None = None
-    expires_at: datetime | None = None
-    days_left: int = 0
-    source: str = ""
-    status: str = ""
-    # --- 权益（展示用，中文短句，APP 直接 join） ---
-    benefits: list[str] = Field(default_factory=list)
-    # --- 权益明细（结构化，给管理端与排查用） ---
-    benefits_detail: dict[str, Any] = Field(default_factory=dict)
-    # --- 当日陪聊额度 ---
-    quota: dict[str, Any] = Field(default_factory=dict)
-
-
-class MembershipPlanOut(ORMBase):
-    id: int
-    code: str
-    name: str
-    description: str = ""
-    days: int
-    # 月数（由 days 折算）。APP 的 MembershipPlan 里就有 months 字段，
-    # 套餐卡片直接渲染「{{ p.months }} 个月」，后端不给的话页面上会是个空白的「个月」。
-    # 套餐是按天存的（30/90/365），这里按 30 天一个月折算，至少显示 1 个月。
-    months: int = 0
-    price_cents: int
-    # 展示价（元，字符串，避免浮点误差）
-    price_yuan: str = ""
-    sort: int
-    enabled: bool
-    # APP 的 MembershipPlan.benefits 也是 string[]，页面上是 (p.benefits||[]).join(' / ')
-    benefits: list[str] = Field(default_factory=list)
-
-
-class OrderCreateIn(ORMBase):
-    """APP 下单：code 由 APP 用安全随机生成（4 位 A-Z/0-9），冲突时服务端返回 409。"""
-    code: str = Field(min_length=4, max_length=4)
-    plan_code: str
-
-
-class OrderOut(ORMBase):
-    id: int
-    code: str
-    user_id: int
-    plan_code: str
-    plan_name: str = ""
-    amount_cents: int
-    amount_yuan: str = ""
-    status: str
-    created_at: datetime
-    expires_at: datetime
-    notified_at: datetime | None = None
-    confirmed_at: datetime | None = None
-    admin_id: int | None = None
-    admin_note: str = ""
-    # 管理端列表用
-    username: str = ""
-    nickname: str = ""
-
-
-class OrderCreateOut(ORMBase):
-    """下单成功返回：订单号 + 应付金额 + 收款信息，供 APP 展示给用户转账。"""
-    id: int
-    code: str
-    plan_code: str
-    plan_name: str = ""
-    days: int = 0
-    amount_cents: int
-    amount_yuan: str
-    status: str
-    expires_at: datetime
-    expires_in_sec: int = 0
-    payment_info: dict[str, Any] = Field(default_factory=dict)
-    tip: str = ""
-
-
-class PaymentInfoOut(ORMBase):
-    """管理端配置的收款账号 / 二维码。"""
-    channel: str = ""
-    payee_name: str = ""
-    account: str = ""
-    qr_url: str = ""
-    note: str = ""
-
-
-class AmountRangeIn(ORMBase):
-    """金额区间（整数分）。"""
-    min_cents: int = 1000
-    max_cents: int = 9999
-    enabled: bool = True
-
-
-class QuotaConfigIn(ORMBase):
-    """陪聊配额。"""
-    free_daily_seconds: int = 3600
-    idle_timeout_seconds: int = 90
-    vip_unlimited: bool = True
-
-
-class MembershipConfigOut(ORMBase):
-    """管理端「会员配置」聚合视图。"""
-    amount_range: AmountRangeIn
-    quota: QuotaConfigIn
-    payment: PaymentInfoOut
-
-
-class MembershipConfigPatch(ORMBase):
-    """管理端局部更新：三块都可选，只传要改的。"""
-    amount_range: AmountRangeIn | None = None
-    quota: QuotaConfigIn | None = None
-    payment: PaymentInfoOut | None = None
-
-
-class GrantIn(ORMBase):
-    """后台直接给用户开通会员。"""
-    user_id: int
-    days: int = Field(default=30, ge=1, le=3650)
-    note: str = ""
-    plan: str = "admin"
-
-
-class RejectIn(ORMBase):
-    reason: str = ""
-
-
-class ConfirmResultOut(ORMBase):
-    order: OrderOut
-    membership: MembershipOut
-    # 幂等标志：False 表示本次为重复核销，未再次加时长
-    activated: bool
-
-
+# ============================================================ 陪聊时长上报
+# ⚠️ 这里曾有一整段会员 schema（MembershipOut / MembershipPlanOut / Order* /
+# PaymentInfoOut / AmountRangeIn / QuotaConfigIn / MembershipConfig* / GrantIn /
+# RejectIn / ConfirmResultOut），随会员制取消整体删除。
+# 保留下来的只有下面这两个 —— 它们是**计量**的出参，不是会员的。
 class ChatUsageIn(ORMBase):
     """设备上报一次会话时长。
 
-    is_reminder=True 表示服药/提醒类交互，不计入配额。
+    is_reminder=True 表示服药/提醒类交互，与普通陪聊分开累计。
     """
+
     date: str = ""
     seconds: int = Field(default=0, ge=0)
     is_reminder: bool = False
@@ -1055,8 +914,10 @@ class ChatUsageOut(ORMBase):
     used_seconds: int = 0
     session_count: int = 0
     reminder_seconds: int = 0
+    # 以下三个字段取消会员制后对授权设备恒为 unlimited=True / None，
+    # 但**必须保留**：老固件与老 APP 都按这个形状读。
     limit_seconds: int | None = None
-    unlimited: bool = False
+    unlimited: bool = True
     remaining_seconds: int | None = None
 
 
@@ -1219,7 +1080,7 @@ class TicketCreateIn(ORMBase):
     email: str = Field(min_length=3, max_length=128)
     title: str = Field(min_length=1, max_length=128)
     content: str = Field(min_length=1, max_length=4000)
-    # 会员支付 / 设备故障 / 提醒异常 / 账号问题 / 其它，未知值按其它处理
+    # 付款费用 / 设备故障 / 提醒异常 / 账号问题 / 其它，未知值按其它处理
     category: str = "other"
     device_id: str = ""
 

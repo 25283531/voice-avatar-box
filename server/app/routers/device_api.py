@@ -25,7 +25,7 @@ from ..config import (
 from ..db import get_db
 from ..deps import get_current_device
 from ..llm_gateway import resolve_row
-from ..membership import quota_snapshot
+from ..chat_quota import quota_snapshot
 from ..model_catalog import DEVICE_KINDS, KIND_LLM
 from ..models import EventState, Interaction, ReminderEvent, utcnow
 from ..schedule import local_now, materialize_events, next_occurrence
@@ -201,8 +201,10 @@ def sync(request: Request, fw_version: str = "", db: Session = Depends(get_db),
         role = None
 
     db.refresh(dev)
-    # 规划文档 7.3：心跳时顺带下发当日陪聊配额（已用/上限/空闲切断/服药关键词）
-    quota = DeviceQuotaOut(**quota_snapshot(db, dev.owner_id, device_ids=[dev.id]))
+    # 规划文档 7.3：心跳时顺带下发当日陪聊统计（已用秒数 / 空闲切断 / 服药关键词）。
+    # ⚠️ 取消会员制后这里**没有上限**了 —— 已绑定设备恒为 unlimited。
+    quota = DeviceQuotaOut(**quota_snapshot(db, device_ids=[dev.id],
+                                            authorized=dev.owner_id is not None))
     ws_url, ota_url = _voice_endpoints(request)
     # 音色回落：**角色优先，形象兜底**（架构 §4.2）。
     # 角色有自己选定的音色时用它；没选（或角色缺失/已删）才用形象的默认音色。

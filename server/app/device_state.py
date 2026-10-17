@@ -22,7 +22,7 @@ from datetime import datetime, timedelta
 from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
 
-from .membership import aware
+from .chat_quota import aware
 from .models import Device, utcnow
 
 # 在线判定窗口：心跳周期 300s + 一倍余量，注释见模块头部

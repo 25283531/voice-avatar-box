@@ -8,142 +8,17 @@
 import { onShow } from '@dcloudio/uni-app'
 import { ref } from 'vue'
 import {
-  cancelMembershipOrder,
   changeEmail,
   changePassword,
   createAgentRole,
   deriveAgentRole,
-  listPresetRoles,
-  createMembershipOrder,
-  genOrderCode,
   getMe,
-  getMembership,
-  getPaymentInfo,
-  listMembershipPlans,
-  myMembershipOrders,
-  notifyMembershipOrder,
+  listPresetRoles,
 } from '@/api/elder'
-import type { MembershipInfo, MembershipOrder, MembershipPlan, PaymentInfo } from '@/api/elder'
 import { clearElderToken, getElderToken } from '@/http/elder'
 
 const account = ref<any>({})
-const membership = ref<MembershipInfo | null>(null)
-const plans = ref<MembershipPlan[]>([])
 const logged = ref(true)
-
-/* ---------------- 会员（人工核销下单） ---------------- */
-const showPlans = ref(false)
-const showOrder = ref(false)
-const order = ref<MembershipOrder | null>(null)
-const payment = ref<PaymentInfo | null>(null)
-const orders = ref<MembershipOrder[]>([])
-const submitting = ref(false)
-
-async function loadMembership() {
-  try {
-    membership.value = await getMembership()
-  }
-  catch { /* 会员模块未部署 */ }
-  try {
-    plans.value = await listMembershipPlans()
-  }
-  catch { /* 忽略 */ }
-  try {
-    payment.value = await getPaymentInfo()
-  }
-  catch { /* 管理员还没配置收款方式 */ }
-  try {
-    orders.value = await myMembershipOrders()
-  }
-  catch { /* 忽略 */ }
-}
-
-/**
- * 下单：订单号由 APP 本地生成（4 位），若 48 小时内已被占用（409）则重新生成再试。
- */
-async function onActivate(p: MembershipPlan) {
-  if (submitting.value) return
-  submitting.value = true
-  try {
-    let lastErr: any = null
-    for (let i = 0; i < 4; i++) {
-      try {
-        const o = await createMembershipOrder(genOrderCode(), p.plan)
-        order.value = o
-        showPlans.value = false
-        showOrder.value = true
-        await loadMembership()
-        return
-      }
-      catch (e: any) {
-        // 订单号撞号 → 换一个再来
-        if (String(e?.message || '').includes('409') || String(e?.message || '').includes('已存在')) {
-          lastErr = e
-          continue
-        }
-        lastErr = e
-        break
-      }
-    }
-    uni.showToast({ title: lastErr?.message ? String(lastErr.message).slice(0, 30) : '下单失败，请重试', icon: 'none' })
-  }
-  finally {
-    submitting.value = false
-  }
-}
-
-/** 我已付款 → 通知管理员核对 */
-async function onNotifyPaid() {
-  if (!order.value) return
-  uni.showModal({
-    title: '通知管理员',
-    content: `确认已按金额 ￥${order.value.amount_yuan} 完成付款？管理员核对到账后会自动开通会员。`,
-    success: async (res) => {
-      if (!res.confirm) return
-      try {
-        order.value = await notifyMembershipOrder(order.value!.code)
-        uni.showToast({ title: '已通知管理员，请耐心等待', icon: 'success' })
-        await loadMembership()
-      }
-      catch { /* 已提示 */ }
-    },
-  })
-}
-
-async function onCancelOrder() {
-  if (!order.value) return
-  uni.showModal({
-    title: '放弃订单',
-    content: '放弃后需要重新下单，确定吗？',
-    success: async (res) => {
-      if (!res.confirm) return
-      try {
-        await cancelMembershipOrder(order.value!.code)
-        showOrder.value = false
-        order.value = null
-        uni.showToast({ title: '已放弃订单', icon: 'none' })
-        await loadMembership()
-      }
-      catch { /* 已提示 */ }
-    },
-  })
-}
-
-function statusText(s: string) {
-  return ({
-    pending: '等待付款',
-    notified: '待管理员核对',
-    confirmed: '已开通',
-    rejected: '已被驳回',
-    cancelled: '已放弃',
-    expired: '已过期',
-  } as Record<string, string>)[s] || s
-}
-
-async function copyCode() {
-  if (!order.value) return
-  uni.setClipboardData({ data: order.value.code, success: () => uni.showToast({ title: '订单号已复制', icon: 'none' }) })
-}
 
 /* ---------------- 修改密码 ---------------- */
 const showPwd = ref(false)
@@ -282,7 +157,6 @@ async function refresh() {
     account.value = await getMe()
   }
   catch { /* 已提示 */ }
-  await loadMembership()
 }
 
 onShow(() => { refresh() })
@@ -296,7 +170,7 @@ onShow(() => { refresh() })
         未登录
       </view>
       <view class="empty-sub">
-        登录后可管理设备、提醒与会员
+        登录后可管理设备与提醒
       </view>
       <button class="btn" @click="goLogin">
         去登录
@@ -312,35 +186,6 @@ onShow(() => { refresh() })
         <view class="account-info">
           <text class="account-name">{{ account.nickname || account.username || '—' }}</text>
           <text class="account-sub">账号 {{ account.username || '—' }}{{ account.email ? ` · ${account.email}` : '' }}</text>
-        </view>
-      </view>
-
-      <!-- 会员 -->
-      <view class="card">
-        <view class="row between">
-          <text class="group-title">会员</text>
-          <text class="vip-tag" :class="{ on: membership?.is_vip }">
-            {{ membership?.is_vip ? `剩余 ${membership.days_left} 天` : '未开通' }}
-          </text>
-        </view>
-        <view v-if="membership?.is_vip" class="sub">
-          {{ membership.expires_at ? `${membership.expires_at.slice(0, 10)} 到期` : '' }}{{ membership.benefits?.length ? ` · ${membership.benefits.join(' / ')}` : '' }}
-        </view>
-        <view class="row ops">
-          <button class="btn small" @click="showPlans = true">
-            {{ membership?.is_vip ? '续费会员' : '开通会员' }}
-          </button>
-        </view>
-
-        <!-- 进行中的订单 -->
-        <view v-for="o in orders.filter(x => x.status === 'pending' || x.status === 'notified')" :key="o.code" class="order-item" @click="order = o; showOrder = true">
-          <view class="row between">
-            <text class="order-item-code">{{ o.code }}</text>
-            <text class="order-item-status">{{ statusText(o.status) }}</text>
-          </view>
-          <view class="order-item-sub">
-            ￥{{ o.amount_yuan }} · {{ o.plan_name || o.plan_code }}
-          </view>
         </view>
       </view>
 
@@ -389,92 +234,6 @@ onShow(() => { refresh() })
         退出登录
       </button>
     </template>
-
-    <!-- 会员套餐 -->
-    <view v-if="showPlans" class="mask" @click="showPlans = false">
-      <view class="modal" @click.stop>
-        <view class="title">
-          {{ membership?.is_vip ? '续费会员' : '开通会员' }}
-        </view>
-        <view v-for="p in plans" :key="p.plan" class="plan" @click="onActivate(p)">
-          <view class="row between">
-            <text class="plan-name">{{ p.name }}</text>
-            <text class="plan-price">￥{{ p.price }}</text>
-          </view>
-          <view class="plan-sub">{{ p.months }} 个月 · {{ (p.benefits || []).join(' / ') }}</view>
-        </view>
-        <view v-if="!plans.length" class="tip">
-          暂无可选套餐
-        </view>
-        <view class="tip left">
-          下单后会生成一个 4 位订单号和专属金额，请按该金额付款，付款后点「我已付款」通知管理员。
-        </view>
-        <button class="btn ghost" @click="showPlans = false">
-          关闭
-        </button>
-      </view>
-    </view>
-
-    <!-- 订单详情 / 付款指引 -->
-    <view v-if="showOrder && order" class="mask" @click="showOrder = false">
-      <view class="modal" @click.stop>
-        <view class="title">
-          请按下方金额付款
-        </view>
-
-        <view class="order-code" @click="copyCode">
-          <text class="order-code-label">订单号</text>
-          <text class="order-code-value">{{ order.code }}</text>
-          <text class="order-code-tip">点击复制</text>
-        </view>
-
-        <view class="order-amount">
-          <text class="order-amount-num">￥{{ order.amount_yuan }}</text>
-          <text class="order-amount-tip">请务必按此金额付款，便于管理员核对</text>
-        </view>
-
-        <view v-if="payment" class="pay-info">
-          <view class="pay-row">
-            <text class="pay-label">收款方式</text>
-            <text class="pay-value">{{ payment.channel }}</text>
-          </view>
-          <view class="pay-row">
-            <text class="pay-label">收款账号</text>
-            <text class="pay-value" @click="uni.setClipboardData({ data: payment.account })">{{ payment.account }}</text>
-          </view>
-          <view v-if="payment.account_name" class="pay-row">
-            <text class="pay-label">收款人</text>
-            <text class="pay-value">{{ payment.account_name }}</text>
-          </view>
-          <view v-if="payment.qrcode_url" class="pay-qr">
-            <image :src="payment.qrcode_url" mode="widthFix" />
-          </view>
-          <view v-if="payment.note" class="pay-note">
-            {{ payment.note }}
-          </view>
-        </view>
-        <view v-else class="tip">
-          管理员尚未配置收款方式，请联系客服
-        </view>
-
-        <view class="order-status">
-          状态：{{ statusText(order.status) }} · 有效期至 {{ order.expires_at.replace('T', ' ').slice(0, 16) }}
-        </view>
-
-        <button v-if="order.status === 'pending'" class="btn" :disabled="submitting" @click="onNotifyPaid">
-          我已付款，通知管理员
-        </button>
-        <view v-else-if="order.status === 'notified'" class="waiting">
-          已通知管理员，核对到账后会自动开通，请稍候…
-        </view>
-        <button v-if="order.status === 'pending' || order.status === 'notified'" class="btn ghost" @click="onCancelOrder">
-          放弃订单
-        </button>
-        <button class="btn ghost" @click="showOrder = false">
-          关闭
-        </button>
-      </view>
-    </view>
 
     <!-- 修改密码 -->
     <view v-if="showPwd" class="mask" @click="showPwd = false">
@@ -554,10 +313,6 @@ onShow(() => { refresh() })
 .account-name { font-size: 34rpx; font-weight: 700; display: block; }
 .account-sub { font-size: 24rpx; color: #8a8f99; display: block; margin-top: 8rpx; }
 
-/* 会员 */
-.vip-tag { font-size: 24rpx; color: #8a8f99; background: #f1f3f6; border-radius: 20rpx; padding: 6rpx 18rpx; }
-.vip-tag.on { color: #9a3412; background: #ffedd5; font-weight: 600; }
-
 /* 菜单 */
 .menu { padding: 0 28rpx; }
 .menu-item { display: flex; flex-direction: row; align-items: center; padding: 28rpx 0; border-bottom: 1rpx solid #f1f3f6; }
@@ -585,30 +340,5 @@ onShow(() => { refresh() })
 .title { font-size: 32rpx; font-weight: 600; margin-bottom: 16rpx; }
 .input { border: 1rpx solid #e3e8ef; border-radius: 10rpx; padding: 18rpx; margin-bottom: 16rpx; font-size: 28rpx; background: #fff; width: auto; }
 .textarea { width: auto; height: 160rpx; line-height: 1.5; }
-.plan { border: 1rpx solid #e3e8ef; border-radius: 12rpx; padding: 20rpx; margin-bottom: 12rpx; }
-.plan-name { font-size: 28rpx; font-weight: 600; }
-.plan-price { font-size: 30rpx; font-weight: 700; color: #e8590c; }
-.plan-sub { font-size: 24rpx; color: #8a8f99; margin-top: 6rpx; }
 .tip.left { text-align: left; padding: 16rpx 0 0; }
-
-/* 订单 */
-.order-code { background: #fff7ed; border: 2rpx dashed #e8590c; border-radius: 12rpx; padding: 24rpx; text-align: center; margin-bottom: 20rpx; }
-.order-code-label { display: block; font-size: 24rpx; color: #a16207; }
-.order-code-value { display: block; font-size: 60rpx; font-weight: 800; letter-spacing: 8rpx; color: #9a3412; margin: 8rpx 0; }
-.order-code-tip { display: block; font-size: 22rpx; color: #a16207; }
-.order-amount { text-align: center; margin-bottom: 24rpx; }
-.order-amount-num { display: block; font-size: 56rpx; font-weight: 800; color: #e8590c; }
-.order-amount-tip { display: block; font-size: 24rpx; color: #8a8f99; margin-top: 8rpx; }
-.pay-info { border: 1rpx solid #e3e8ef; border-radius: 12rpx; padding: 20rpx; margin-bottom: 20rpx; }
-.pay-row { display: flex; flex-direction: row; justify-content: space-between; padding: 10rpx 0; }
-.pay-label { font-size: 26rpx; color: #8a8f99; }
-.pay-value { font-size: 26rpx; color: #1f2937; font-weight: 600; }
-.pay-qr { margin: 16rpx 0; }
-.pay-note { font-size: 24rpx; color: #8a8f99; line-height: 1.6; }
-.order-status { font-size: 24rpx; color: #8a8f99; text-align: center; margin-bottom: 16rpx; }
-.waiting { font-size: 26rpx; color: #16a34a; text-align: center; padding: 20rpx 0; }
-.order-item { border-top: 1rpx solid #f1f3f6; padding: 20rpx 0 0; margin-top: 16rpx; }
-.order-item-code { font-size: 34rpx; font-weight: 800; letter-spacing: 4rpx; color: #9a3412; }
-.order-item-status { font-size: 24rpx; color: #e8590c; }
-.order-item-sub { font-size: 24rpx; color: #8a8f99; margin-top: 6rpx; }
 </style>

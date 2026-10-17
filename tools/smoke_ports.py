@@ -88,7 +88,7 @@ DEFAULT_PORTS: dict[str, int] = {
     "smoke_memory": 8103,     # 记忆抽取 / 检索 / 去重
     "smoke_models": 8104,     # 模型接入点 + 本地假厂商
     "smoke_mail": 8105,       # 邮件 / SMTP / 工单
-    "smoke_membership": 8106, # 会员订单
+    "smoke_quota": 8106,      # 陪聊计量 + 「授权设备无限量」不变量（原 smoke_membership）
     # ---- QA 独立验证脚本（QA 轮次产出）----
     # 也登记进来而不是各写一份：QA 曾手动给 smoke_roles 指定 8155，
     # 而 qa3_evidence.py 的默认值恰好也是 8155 —— 撞车症状是
