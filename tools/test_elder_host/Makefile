@@ -12,6 +12,10 @@
 #   T2  replace_all 不抹掉本地自建    —— 一次心跳同步不该让老人的服药提醒消失
 #   T3  断网新建 + 断网确认 + 确认方式 —— 命令词分发器全链路
 #   T4  时钟不可信时不触发            —— 响错时间比不提醒更危险
+#   T5  本地日边界不错判              —— 08:00 不该被当成「新的一天」
+#   T6  跨天真的重置                  —— 第二天提醒仍要响（否则从此再不响）
+# T5/T6 是一对：T5 守「同一天内别乱重置」，T6 守「跨天必须重置」。
+# 只写 T5 会漏掉「重置逻辑恒不生效 → 提醒从第二天起永远不响」这个更坏的形态。
 #
 # 怎么跑
 # ------
@@ -19,28 +23,37 @@
 #   make clean
 #
 # 依赖：任意 C99 编译器 + make（CI 的 ubuntu-latest 自带 gcc）。
-# ⚠️ 本机（C 盘满、无 IDF、无 gcc、WSL 被策略禁用）跑不了，
-#    **请以 CI 结果为准**，不要只看这个文件就认为测试已通过。
+# 本工作流 server-ci.yml 的 elder-host-test job 每天在 Ubuntu 上真跑它，
+# **以那个 job 的日志为准**（本地无 C 编译器时尤其要看 CI）。
 
 CC      ?= cc
 ELDER    = ../../firmware/components/elder
 STUBS    = stubs
 
-# -I stubs/include：提供 esp_err.h / esp_log.h / nvs.h / esp_timer.h / freertos/*
-#   这些 ESP-IDF 头文件的宿主替身。
+# -I $(STUBS)/include：提供 esp_err.h / esp_log.h / nvs.h / esp_timer.h /
+#   freertos/* 这些 ESP-IDF 头文件的宿主替身。
+#   注意 stubs.c / stubs.h 本身就在本目录（桩的**实现**），
+#   只有「ESP-IDF 头的替身」才放在 stubs/include/ 下。
 # 时间劫持在 stubs.c 里直接定义 time() 完成（不用 -Dtime=，那会连
 # <time.h> 自己的声明一起改名，反而编不过）。
-CFLAGS  ?= -std=c99 -Wall -Wextra -Wno-unused-parameter -O1 -g \
+#
+# -D_POSIX_C_SOURCE=200809L 不是可选项：reminder.c / elder_cmd.c 用
+# localtime_r()，测试用 setenv()+tzset() 固定时区，这三个都是 **POSIX**
+# 而非 C99 标准函数。纯 -std=c99 下它们不会被声明，
+# gcc 会报 implicit-function-declaration（C99 起不再是合法隐式声明），
+# 于是整个测试**编译不过** —— 这是本 Makefile 首次真正被编译时暴露的问题。
+CFLAGS  ?= -std=c99 -D_POSIX_C_SOURCE=200809L \
+           -Wall -Wextra -Wno-unused-parameter -O1 -g \
            -I$(STUBS)/include -I$(ELDER)/include
 
-SRCS     = test_elder_host.c $(STUBS)/stubs.c \
+SRCS     = test_elder_host.c stubs.c \
            $(ELDER)/src/elder_cmd.c $(ELDER)/src/reminder.c
 BUILD    = build
 
 .PHONY: all run clean
 all: run
 
-$(BUILD)/test: $(SRCS) $(STUBS)/stubs.h
+$(BUILD)/test: $(SRCS) stubs.h
 	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) -o $@ $(SRCS)
 

@@ -9,11 +9,16 @@ on:
     paths:
       - 'server/**'
       - 'tools/**'
+      # ↓ firmware/components/elder/ 是 elder-host-test job 的被测代码：
+      # reminder.c / elder_cmd.c 一改就必须重跑宿主测试，否则「改了固件不跑
+      # 对应门禁」就等于那个 job 形同虚设。之前漏了这条，改固件不会触发它。
+      - 'firmware/components/elder/**'
       - '.github/workflows/server-ci.yml'
   pull_request:
     paths:
       - 'server/**'
       - 'tools/**'
+      - 'firmware/components/elder/**'
       - '.github/workflows/server-ci.yml'
   workflow_dispatch:
 
@@ -209,6 +214,99 @@ jobs:
 
       - name: 设备绑定归属（重启不被绑上平台预设）
         run: python tools/qa3_device_binding.py
+
+  # elder 组件的宿主单元测试：断网提醒链路的「离线可用」证据。
+  #
+  # 为什么必须是独立 job（而不是塞进 smoke）：
+  #   smoke job 要装 Python 依赖、起服务、占端口、连数据库；
+  #   而本测试只需要一个 C 编译器。它验的东西与后端**完全无关**
+  #   （验的是 reminder.c / elder_cmd.c 这两个纯 C 文件），
+  #   混进 smoke 只会让「后端挂了」和「固件提醒逻辑坏了」两种红灯混在一起，
+  #   排查时先要猜是哪个。独立 job 的红灯只有一个含义：断网提醒链路出问题。
+  #
+  # 为什么它必须每天真跑：这份测试在接入本 job 之前**从来没有被执行过一次**
+  #   （仓库里没有任何 workflow 引用过它）。一份没跑过的测试不构成任何证据 ——
+  #   「文件躺在磁盘上」和「门禁是绿的」是两回事，而前者常被当成后者。
+  #   接入后它第一次真编译就暴露了 3 个编译级问题 + 1 个真实逻辑缺陷
+  #   （见 commit：day_ordinal 用 UTC 日号，导致每天 08:00 误判跨天、
+  #    把已确认的服药记录清空并让提醒二次响铃）。
+  elder-host-test:
+    name: elder 断网链路宿主测试
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      # ubuntu-latest 自带 gcc/make，这里显式确认一次：
+      # 「编译器缺失」必须当场红成一条清楚的错误，而不是让 make 报一句
+      # 难懂的 command not found —— 后者容易被误读成「代码有问题」。
+      - name: 确认 C 工具链
+        run: |
+          gcc --version | head -1
+          make --version | head -1
+
+      - name: 编译并运行宿主测试
+        run: make -C tools/test_elder_host CC=gcc
+
+      # 挡住「测试没真正跑 / 全被跳过」的假绿。
+      # 上游 run 步骤非零退出已经会让 job 变红，所以这一步只处理
+      # 「退出码是 0 但内容不对」的情形：
+      #   - 一条断言都没跑（0 通过 0 失败）—— 例如被改成空 main；
+      #   - 六组用例里有一组整段没输出 —— 例如新增用例忘了注册，
+      #     main() 里漏调，测试静默少跑一组还照样全绿。
+      # 这两种形态用「只看退出码」的门禁一律抓不到，而它们恰恰是
+      # 「测试文件存在」被误当成「测试有效」的主要途径。
+      - name: 断言六组用例都真的执行了
+        run: |
+          set -euo pipefail
+          LOG=$(mktemp)
+          make -C tools/test_elder_host CC=gcc > "$LOG" 2>&1 || {
+            cat "$LOG"; exit 1
+          }
+          cat "$LOG"
+
+          # ① 六组用例的标题必须逐组出现
+          for t in \
+            "提醒时间存储在设备本地" \
+            "不抹掉设备本地自建的提醒" \
+            "断网新建服药提醒" \
+            "系统时钟不可信" \
+            "本地日边界" \
+            "跨天重置生效"
+          do
+            grep -qF "$t" "$LOG" || {
+              echo "::error::用例组未执行：$t —— 新增用例可能忘了在 main() 里注册"
+              exit 1
+            }
+          done
+
+          # ② 汇总行必须存在，且通过数不为 0、失败数为 0
+          SUMMARY=$(grep -E '^=== [0-9]+ 通过 / [0-9]+ 失败 ===$' "$LOG" || true)
+          if [ -z "$SUMMARY" ]; then
+            echo "::error::没找到「=== N 通过 / M 失败 ===」汇总行，测试未真正运行"
+            exit 1
+          fi
+          echo "断言汇总：$SUMMARY"
+          PASSED=$(echo "$SUMMARY" | sed -E 's/^=== ([0-9]+) .*/\1/')
+          FAILED=$(echo "$SUMMARY" | sed -E 's#.*/ ([0-9]+) 失败 ===$#\1#')
+          if [ "$PASSED" -eq 0 ]; then
+            echo "::error::通过数为 0 —— 断言一条都没跑，拒绝假绿"
+            exit 1
+          fi
+          if [ "$FAILED" -ne 0 ]; then
+            echo "::error::失败数为 $FAILED —— 断网提醒链路有断言不成立"
+            exit 1
+          fi
+
+          # ③ 打到 job summary：不用点进日志就能看到这次验了什么
+          {
+            echo "### elder 断网链路宿主测试"
+            echo
+            echo '```'
+            cat "$LOG"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
 
   # 用真实 MySQL 再跑一遍同一套业务闭环。
   # 必要性：SQLite 覆盖不到 pymysql 的连接/握手路径，而线上部署踩的坑正是

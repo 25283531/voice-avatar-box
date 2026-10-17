@@ -9,6 +9,9 @@
  */
 #include "stubs.h"
 
+#include "nvs.h"        /* nvs_handle_t —— 与 reminder.c 用的是同一份替身 */
+#include "elder_ui.h"   /* elder_tone_t —— elder_ui_* 桩的形参类型 */
+
 #include <stdio.h>
 #include <string.h>
 

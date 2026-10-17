@@ -5,6 +5,14 @@
 #include <stdint.h>
 #include <time.h>
 
+/* 本头文件自己的原型就用到了 ESP-IDF 的类型（esp_err_t / BaseType_t /
+ * TickType_t），所以必须把它们的宿主替身一起带上。
+ * 漏掉这一步的后果很隐蔽：test_elder_host.c 的**第一个** #include 就是本文件，
+ * 此时 esp_err.h 与 freertos 下的两个头都还没被包含，于是 BaseType_t 之类
+ * 全部未定义，编译直接失败 —— 而这个 Makefile 从未在 CI 上跑过，所以没人发现过。 */
+#include "esp_err.h"
+#include "freertos/task.h"   /* 连带提供 freertos/FreeRTOS.h 里的 BaseType_t */
+
 #define NVS_NS_MAX  2
 #define NVS_BLOB_MAX 4096
 

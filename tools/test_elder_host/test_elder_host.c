@@ -115,7 +115,7 @@ static void test_replace_all_keeps_local(void)
 
     /* 老人断网时亲手建了两条（server_id == 0） */
     elder_rmd_item_t local1 = mk_med(8, 0, "早上的药", 0);
-    elder_remd_item_t local2 = mk_med(20, 0, "晚上的药", 0);
+    elder_rmd_item_t local2 = mk_med(20, 0, "晚上的药", 0);
     elder_reminder_add(&local1);
     elder_reminder_add(&local2);
 
@@ -290,6 +290,113 @@ static void test_untrusted_clock_guard(void)
           t && t->done_today == 0, "未确认不应记为已完成");
 }
 
+/* =================================================================== */
+/* T5：本地日边界 —— 08:00 不是「新的一天」                            */
+/* =================================================================== */
+/* reminder.c 里提醒的「几点」「星期几」全部取自 localtime_r()（本地时区
+ * CST-8），但 tick() 判断「是否跨天」用的 day_ordinal() 却是
+ * time/86400 —— 那是 **UTC 日**。CST-8 下 UTC 日界落在本地 08:00，
+ * 于是每天早上 8 点都会被当成新的一天：done_today / pending_today 被清空、
+ * fired_today 与状态机归零，随后因为 now_min >= due 而**再次触发**。
+ *
+ * 后果是医疗事故级的，且两个方向都错：
+ *   1. 老人 07:00 已服药并确认，记录在 08:00 被抹掉
+ *      → 子女端看到「漏服」，触发不该有的告警与催促；
+ *   2. 同一条提醒在 08:00 二次响铃，要老人再吃一次
+ *      → 已服药者被要求重复服药（降压药/降糖药重复服用有实际危险）。
+ *
+ * 本组断言必须跑在真实时刻上（06:00 -> 07:00 -> 08:00 本地），
+ * 不能靠推进受控时钟糊弄过去：只有让本地时间真的跨过 08:00，
+ * UTC 日界才会翻转，缺陷才会暴露。 */
+static void test_local_day_boundary(void)
+{
+    printf("\n[T5] 本地日边界：08:00 不得被当成「新的一天」清掉服药记录\n");
+    stub_nvs_init();
+    stub_time_set(1772661600L);   /* 2026-03-05 06:00 +08:00，可信时钟 */
+    elder_reminder_init(NULL, NULL);
+
+    elder_rmd_item_t m = mk_med(7, 0, "早上的药", 0);
+    elder_reminder_add(&m);
+
+    /* 06:00：未到点，不该触发 */
+    elder_reminder_tick_once();
+    const elder_rmd_table_t *t = tbl();
+    check("未到点不触发", t && t->pending_today == 0, NULL);
+
+    /* 07:00：到点触发 */
+    stub_time_advance(3600);
+    elder_reminder_tick_once();
+    t = tbl();
+    check("07:00 到点触发", t && (t->pending_today & 1u) != 0, NULL);
+
+    /* 老人确认服药完成 */
+    check("确认 07:00 那条", elder_reminder_confirm(0) == ESP_OK, NULL);
+    t = tbl();
+    check("07:00 已记为完成", t && (t->done_today & 1u) != 0, NULL);
+
+    /* 08:00：本地仍是同一天（UTC 恰好跨了日界，正是缺陷触发窗口） */
+    stub_time_advance(3600);
+    elder_reminder_tick_once();
+    t = tbl();
+    check("08:00 不清掉当天已完成的服药记录",
+          t && (t->done_today & 1u) != 0,
+          "记录被清空 -> 子女端会看到假「漏服」并误告警");
+    check("已确认的提醒不在 08:00 二次响铃",
+          t && (t->pending_today & 1u) == 0,
+          "老人已服药却被要求再吃一次 -> 重复服药有实际危险");
+}
+
+/* =================================================================== */
+/* T6：跨天必须真的重置 —— T5 的必要反向                              */
+/* =================================================================== */
+/* T5 守的是「同一天内不许误重置」，本组守的是它的反面：「跨天必须重置」。
+ * 两者缺一不可，只写 T5 会留下一半的漏洞：
+ * T5 只在**同一天**内推进时钟，所以若 day_ordinal() 恒定返回同一个值
+ * （或恒为 0，被 `last_day_ordinal != 0` 的守卫吃掉），
+ * 跨天重置就永远不会发生 —— 而 T5 全程观察不到，因为那天里没跨天。
+ *
+ * 那个缺陷的后果同样是医疗事故级：服药提醒每天都要响，
+ * 一旦跨天不再重置，fired_today 永远为真，
+ * 老人第二天开始**再也收不到任何服药提醒**，且没有任何报错。
+ * 「测试全绿但提醒再也不响」是最坏的失效形态，所以必须钉死。 */
+static void test_next_day_fires_again(void)
+{
+    printf("\n[T6] 跨天重置生效：第二天的服药提醒仍会照常响\n");
+    stub_nvs_init();
+
+    /* 2026-03-05 06:00 +08:00（周四） */
+    stub_time_set(1772661600L);
+    elder_reminder_init(NULL, NULL);
+
+    elder_rmd_item_t m = mk_med(7, 0, "早上的药", 0);
+    elder_reminder_add(&m);
+
+    /* ---- 第一天：07:00 响 + 确认完成 ---- */
+    stub_time_advance(3600);              /* 第一天 07:00 */
+    elder_reminder_tick_once();
+    const elder_rmd_table_t *t = tbl();
+    check("第一天 07:00 触发", t && (t->pending_today & 1u) != 0, NULL);
+    elder_reminder_confirm(0);
+    t = tbl();
+    check("第一天已确认完成", t && (t->done_today & 1u) != 0, NULL);
+
+    /* ---- 跨到第二天 06:00：昨天的完成状态必须清掉 ---- */
+    stub_time_set(1772661600L + 86400);   /* 2026-03-06 06:00 +08:00 */
+    elder_reminder_tick_once();
+    t = tbl();
+    check("跨天后昨日完成状态被清空",
+          t && (t->done_today & 1u) == 0,
+          "跨天不重置 -> 第二天提醒被当成已完成，从此再也不响");
+
+    /* ---- 关键：第二天 07:00 必须再次响铃 ---- */
+    stub_time_advance(3600);              /* 第二天 07:00 */
+    elder_reminder_tick_once();
+    t = tbl();
+    check("第二天 07:00 再次触发",
+          t && (t->pending_today & 1u) != 0,
+          "每天都要吃的药，第二天没响 = 静默漏服药，且无任何报错");
+}
+
 int main(void)
 {
     /* 时区必须与固件一致（elder_bridge.cc 同样固定 CST-8）：
@@ -303,6 +410,8 @@ int main(void)
     test_replace_all_keeps_local();
     test_offline_command_dispatch();
     test_untrusted_clock_guard();
+    test_local_day_boundary();
+    test_next_day_fires_again();
 
     printf("\n=== %d 通过 / %d 失败 ===\n", g_pass, g_fail);
     return g_fail ? 1 : 0;

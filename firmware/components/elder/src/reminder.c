@@ -51,7 +51,26 @@ static uint32_t crc32_simple(const void *data, size_t len)
     return ~crc;
 }
 
-static int day_ordinal(time_t t) { return (int)(t / 86400); }
+/* 本地日序号 —— **必须与提醒调度本身用同一个时区**。
+ *
+ * 曾经的写法是 `(int)(t / 86400)`，那是 **UTC 日**。而同一文件里判断
+ * 「几点该响」「今天星期几」全部走 localtime_r()（本地 CST-8）。
+ * 两者时区不一致的代价是实打实的：CST-8 下 UTC 日界落在**本地 08:00**，
+ * 于是每天早上 8 点 tick() 都会误判为「跨天」→
+ *   done_today/pending_today 被清空（子女端看到假「漏服」并误告警）
+ *   + fired_today 与状态机归零 → 同一条已确认的提醒**二次响铃**
+ *     并立刻升级成 ESCALATED（老人已服药却被要求再吃一次）。
+ * 服药类重复服用有实际危险，所以这里按本地 tm 折算日序号。
+ *
+ * tm_year*366 + tm_yday 单调递增即可；闰年多出来的那个槽位不影响单调性，
+ * 而本函数只用于「和上次比是否变了」，不需要真实日历日号。
+ * 改成以本地时间为准后，老设备 NVS 里存的是旧的 UTC 日号，
+ * 升级后第一次 tick 会多触发一次跨天重置 —— 一次性、且方向是
+ * 「重新响一次」，远小于原本「每天 08:00 都响一次」。 */
+static int day_ordinal(const struct tm *tm)
+{
+    return tm->tm_year * 366 + tm->tm_yday;
+}
 
 static int weekday_mask_from_tm(const struct tm *tm)
 {
@@ -154,8 +173,10 @@ static void tick(void)
     struct tm tm_now;
     localtime_r(&now, &tm_now);
 
-    /* 跨天重置 */
-    int ord = day_ordinal(now);
+    /* 跨天重置。日序号取自上面已算好的 tm_now（本地时区），
+     * 不可退回用 time()/86400 —— 那是 UTC 日，会让 CST-8 下每天 08:00
+     * 误判跨天，把已确认的服药记录清空并让提醒二次响铃。详见 day_ordinal()。 */
+    int ord = day_ordinal(&tm_now);
     if (g.table.last_day_ordinal != 0 && ord != g.table.last_day_ordinal) {
         ESP_LOGI(TAG, "new day: reset daily state");
         g.table.done_today = 0;
