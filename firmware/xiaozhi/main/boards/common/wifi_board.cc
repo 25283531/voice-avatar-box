@@ -38,7 +38,24 @@ void WifiBoard::EnterWifiConfigMode() {
 
     auto& wifi_ap = WifiConfigurationAp::GetInstance();
     wifi_ap.SetLanguage(Lang::CODE);
-    wifi_ap.SetSsidPrefix("Xiaozhi");
+    // 配网热点名前缀。成品叫「小暖」，热点要跟产品名对得上 —— 老人拿手机
+    // 搜 WiFi 时看到的是 XiaoNuan-XXXX，而不是上游项目的小智。
+    //
+    // ⚠️ **全仓只改这一处**。main/ 下其余的 "Xiaozhi" 全是**上游标识**，
+    // 改了会出事，逐类说明（grep "Xiaozhi" 可复现）：
+    //   * CONFIG_XIAOZHI_*（Kconfig 符号，如 CAMERA/JPEG/ROTATE_*）
+    //     —— 上游 Kconfig 定义的配置项，改名等于改坏构建；
+    //   * XIAOZHI_STATE_EVENTS / XIAOZHI_STATE_CHANGED_EVENT
+    //     —— ESP 事件基与事件 ID（device_state_event.h），协议标识；
+    //   * xiaozhi-fonts / 78/xiaozhi-fonts —— 组件名与依赖坐标；
+    //   * "Xiaozhi Assistant" —— menuconfig 菜单名（上游文档里大量引用）；
+    //   * wn9_nihaoxiaozhi_tts / ni hao xiao zhi —— 唤醒词模型与唤醒词本身
+    //     （后者是老人的肌肉记忆，产品资产，绝不能动）；
+    //   * XiaozhiStatus（atk-dnesp32s3-box0，另一块板的状态枚举变量名）。
+    //
+    // 长度核对：GetSsid() 用 char ssid[32] 拼 "%s-%02X%02X"，
+    // 即 前缀(8) + '-' + 4 位 MAC = 13 字符，加结尾 NUL 共 14，远小于 32。
+    wifi_ap.SetSsidPrefix("XiaoNuan");
     wifi_ap.Start();
 
     // Wait 1.5 seconds to display board information
@@ -191,7 +208,7 @@ std::string WifiBoard::GetDeviceStatusJson() {
      *     },
      *     "network": {
      *         "type": "wifi",
-     *         "ssid": "Xiaozhi",
+     *         "ssid": "XiaoNuan-XXXX",
      *         "rssi": -60
      *     },
      *     "chip": {
