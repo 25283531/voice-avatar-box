@@ -10,6 +10,9 @@
 
 #include <esp_log.h>
 #include <esp_lcd_panel_vendor.h>
+// FreeRTOS.h：InitializeCamera() 里的 i2c_master_probe() 第三个参数是 **tick**，
+// 要用 pdMS_TO_TICKS() 换算。显式包含，别去赌哪个间接头文件先把它带进来。
+#include <freertos/FreeRTOS.h>
 #include <driver/i2c_master.h>
 #include <driver/spi_common.h>
 #include <wifi_station.h>
@@ -71,7 +74,11 @@ private:
     Button boot_button_;
     Display* display_;
     Pca9557* pca9557_;
-    Esp32Camera* camera_;
+    /* ⚠️ 必须 nullptr 初始化：InitializeCamera() 在「没探到摄像头」时会提前返回，
+     * 那时 camera_ 不会被赋值。留着未初始化会让 GetCamera() 返回野指针，
+     * 而 mcp_server.cc 正是靠 `if (camera)` 决定注不注册 take_photo ——
+     * 野指针会让那个守卫直接失效。 */
+    Esp32Camera* camera_ = nullptr;
 
     void InitializeI2c() {
         // Initialize I2C peripheral
@@ -163,14 +170,44 @@ private:
 #endif
     }
 
+    /* 触摸屏：FT5x06，挂在音频 codec 那条共享 I2C 上（地址 0x38，见
+     * ESP_LCD_TOUCH_IO_I2C_FT5x06_CONFIG()）。
+     *
+     * ★ **驱动配置已核对完整，不需要补任何 CONFIG_LV_TOUCH_***：
+     *   * 驱动本体：main/idf_component.yml 里有 espressif/esp_lcd_touch_ft5x06，
+     *     编译期无条件编进来，没有「开某个 Kconfig 才有驱动」这种开关；
+     *   * esp_lvgl_port 的触摸支持也是自动的 —— esp_lvgl_port_touch.h 里
+     *     `#if __has_include("esp_lcd_touch.h")` 会定义
+     *     ESP_LVGL_PORT_TOUCH_COMPONENT，本工程有 esp_lcd_touch 依赖，必然命中。
+     *
+     * ★ **坐标映射已核对正确，不要"顺手改"**：
+     *   屏是 320x240 物理、swap_xy=true ⇒ LVGL 建出来是 320x240 再转 90°
+     *   （逻辑 240x320）。而 LVGL 9 的 indev_pointer_proc()（lv_indev.c:695）
+     *   会**自己**按 disp->rotation 把触摸坐标旋一遍，所以它要求驱动上报的是
+     *   **屏的原生帧**（320x240）。
+     *   本函数给的是 x_max=DISPLAY_HEIGHT(240) / y_max=DISPLAY_WIDTH(320)，
+     *   再经 esp_lcd_touch.c:84-106 的软件调整（mirror_x 取反 + swap_x交换）
+     *   ⇒ 最终上报 (x∈[0,320), y∈[0,240))，正是屏的原生帧。✔
+     *
+     * ★ **与"屏幕无显示"的依赖关系（重要，别让两个改动打架）**：
+     *   下面要用 lv_display_get_default()，它只在**LVGL 的 display 被创建之后**
+     *   才非 NULL。之前一直返回 NULL 的根因是显示走了 EmoteDisplay
+     *   （esp_emote_gfx 自绘引擎，既不 lv_init() 也不建 LVGL display），
+     *   **不是触摸屏驱动的问题**。改回 SpiLcdDisplay 之后它自然有值。
+     *    ⇒ 所以：显示修好 ⇒ 这条自动好；显示没修好 ⇒ 这里改到天上去也没用。
+     *      本函数只负责**不在这种状态下刷 ERROR、不 assert**，见下面。 */
     void InitializeTouch()
     {
-        esp_lcd_touch_handle_t tp;
+        /* ⚠️ 必须初始化成 nullptr：下面三个 API 只要有一个失败，
+         * out_touch **不会被赋值**。原代码写的是未初始化的 `tp` 再 `assert(tp)`，
+         * 于是「触摸屏没接 / I2C 通信失败」时读到的是栈上的随机值 ——
+         * 运气好 assert 崩掉重启，运气不好 assert 通过、拿着野指针往下走。 */
+        esp_lcd_touch_handle_t tp = nullptr;
         esp_lcd_touch_config_t tp_cfg = {
             .x_max = DISPLAY_HEIGHT,
             .y_max = DISPLAY_WIDTH,
             .rst_gpio_num = GPIO_NUM_NC, // Shared with LCD reset
-            .int_gpio_num = GPIO_NUM_NC, 
+            .int_gpio_num = GPIO_NUM_NC, // NC => 轮询模式，见 lvgl_port_add_touch
             .levels = {
                 .reset = 0,
                 .interrupt = 0,
@@ -185,26 +222,116 @@ private:
         esp_lcd_panel_io_i2c_config_t tp_io_config = ESP_LCD_TOUCH_IO_I2C_FT5x06_CONFIG();
         tp_io_config.scl_speed_hz = 400000;
 
-        esp_lcd_new_panel_io_i2c(i2c_bus_, &tp_io_config, &tp_io_handle);
-        esp_lcd_touch_new_i2c_ft5x06(tp_io_handle, &tp_cfg, &tp);
-        assert(tp);
+        /* 三步各自判返回值，任何一步失败都**优雅降级**：
+         * 触摸屏不是核心功能（语音 / 提醒 / 联网都不依赖它），
+         * 一块屏没接or 触摸芯片坏了就把整块板初始化打断（原代码的 assert 就是
+         * 这个效果）属于把「少一个便利功能」放大成「设备变砖」。 */
+        esp_err_t err = esp_lcd_new_panel_io_i2c(i2c_bus_, &tp_io_config, &tp_io_handle);
+        if (err != ESP_OK || tp_io_handle == NULL) {
+            ESP_LOGW(TAG, "触摸屏 IO 未建起来（err=0x%x）→ 跳过触摸；"
+                          "不影响语音 / 提醒 / 联网，只是不能点屏", err);
+            return;
+        }
+
+        err = esp_lcd_touch_new_i2c_ft5x06(tp_io_handle, &tp_cfg, &tp);
+        if (err != ESP_OK || tp == nullptr) {
+            ESP_LOGW(TAG, "FT5x06 未初始化（err=0x%x，I2C 地址 0x%02X）→ 跳过触摸；"
+                          "常见原因是屏排线没接好", err, ESP_LCD_TOUCH_IO_I2C_FT5x06_ADDRESS);
+            return;
+        }
+
+        lv_display_t *disp = lv_display_get_default();
+        if (disp == nullptr) {
+            /* ⚠️ 这条**不是**触摸屏的错。它说的是「LVGL display 还没建出来」，
+             * 根因在显示路径（见 InitializeSt7789Display 与上面那段依赖说明）。
+             * 所以这里打 WARNING 而不是 ERROR —— ERROR 会让人去查触摸屏，
+             * 而真正该看的是屏幕。 */
+            ESP_LOGW(TAG, "LVGL display 尚未就绪 → 触摸屏暂不注册"
+                          "（待显示路径修好后自动生效，不是触摸屏驱动的问题）");
+            return;
+        }
 
         /* Add touch input (for selected screen) */
         const lvgl_port_touch_cfg_t touch_cfg = {
-            .disp = lv_display_get_default(), 
+            .disp = disp,
             .handle = tp,
         };
-
-        if(touch_cfg.disp) {
-            lvgl_port_add_touch(&touch_cfg);
-        } else {
-            ESP_LOGE(TAG, "Touch display is not initialized");
+        if (lvgl_port_add_touch(&touch_cfg) == nullptr) {
+            ESP_LOGW(TAG, "lvgl_port_add_touch 返回 NULL → 触摸输入未注册");
         }
     }
 
+    /* 摄像头：GC0308（DVP，8bit），挂在音频 codec 那条共享 I2C 上。
+     *
+     * ============================================================
+     * ★ 结论：默认**不**初始化 —— 先探硬件，探到了才起来
+     * ============================================================
+     * 用户要的是「驱动正常添加，即便现在不用，也为后期做准备」。
+     * 这句话拆成两件事，缺一不可，而它们的做法**相反**：
+     *
+     *   ① **驱动必须编进固件**（否则后期接上也永远起不来）
+     *      → 靠 CONFIG_CAMERA_GC0308=y，已加进 sdkconfig overlay。
+     *   ② **但现在别让它占资源 / 刷错误**
+     *      → 靠本函数开头的 I2C 探测，探不到就直接返回。
+     *
+     * 为什么"无条件初始化 + 失败就算了"不够，非要探：
+     *   * **白占 11 个独占 IO**。DVP 一旦起来就吃掉 3,4,5,6,7,8,9,15,16,17,18
+     *     （见 config.h 的 CAMERA_PIN_*）。这些脚现在虽然没跟别的外设冲突，
+     *     但**被占了就不可能再给别的东西用** —— 开发板上 IO 是最稀缺的资源。
+     *   * **现在没有任何消费者**。firmware/components/elder/ 对摄像头零引用；
+     *     全仓唯一的消费者是 mcp_server.cc 的 self.camera.take_photo，
+     *     而它只在 board.GetCamera() 非 NULL 时才注册。也就是说摄像头对象
+     *     起来之后**没有任何代码会去用它**。
+     *   * **每次开机刷一条 ERROR**。原来无条件初始化在没接摄像头时必打
+     *     `E (364) Esp32Camera: open /dev/video2 failed`，用户明确说了
+     *     「没接硬件时不要刷错误」。
+     *
+     * 探到才起来，正好同时满足 ① 和 ②：
+     *   现在没接 → 一条 WARNING，不占 IO，不刷错；
+     *   以后接上排线 → 重启后自动启用，**不需要改一行代码**。
+     * 这才是"为后期做准备"该有的样子 —— 不是"现在硬扛着跑"，
+     * 而是"硬件一到位就自动可用"。
+     *
+     * ------------------------------------------------------------
+     * 附：为什么原来一定失败（真机 `open /dev/video2 failed` 的根因链，
+     * 逐行在 esp_video 源码里核对过，不是推测）：
+     *   1) esp_video_init() 遍历 __esp_cam_sensor_detect_fn_array，
+     *      这个数组由各传感器驱动用 ESP_CAM_SENSOR_DETECT_FN 宏注册，
+     *      **只有 Kconfig 打开的那个传感器才会注册进来**；
+     *   2) 本工程 CI 走 `idf.py set-target` + `idf.py build`，
+     *      **根本不读 main/boards/lichuang-dev/config.json** ——
+     *      那是上游 scripts/release.py 做多板发布时才用的。
+     *      于是 config.json 里那三行 CONFIG_CAMERA_GC0308=y 一直是**死配置**；
+     *   3) 数组为空 ⇒ esp_video_init 的循环体一次都不执行 ⇒ **不创建
+     *      /dev/video2 节点**，但函数本身**返回 ESP_OK**（它没遇到任何错误，
+     *      只是没找到传感器）；
+     *   4) 回到 Esp32Camera 构造函数：video_device_name 取到
+     *      ESP_VIDEO_DVP_DEVICE_NAME（= "/dev/video2"，因为 config.dvp 非 NULL
+     *      且 CONFIG_ESP_VIDEO_ENABLE_DVP_VIDEO_DEVICE=y），
+     *      然后 open() 失败 ⇒ 就是我们看到的那条 ERROR。
+     *   ⇒ 所以修复的正着是**第 2 步**：把 GC0308 真正编进来。
+     * ------------------------------------------------------------ */
     void InitializeCamera() {
         // Open camera power
         pca9557_->SetOutputState(2, 0);
+
+        /* ⚠️ 探测必须放在**开电源之后**：没上电的 GC0308 不会 ACK 自己的地址，
+         * 那样会把「摄像头接得好好的」误判成「没接」，于是永远起不来 ——
+         * 这个错误方向比不探还糟（不探至少还能刷条错误提示）。
+         *
+         * 探的是 SCCB 地址 0x21（config.h 的 CAMERA_SCCB_ADDR）。
+         * 用 i2c_master_probe 做 0 字节写、看有没有 ACK，与 SCCB 建链时
+         * 的行为一致：连地址都不 ACK 的器件，后面 esp_video 的 detect
+         * 必然失败。本仓其余板（atom/echoear/kevin-c3）也是这个用法。 */
+        esp_err_t probe_err = i2c_master_probe(i2c_bus_, CAMERA_SCCB_ADDR, pdMS_TO_TICKS(100));
+        if (probe_err != ESP_OK) {
+            ESP_LOGW(TAG, "未检测到摄像头（GC0308 @ 0x%02X，err=0x%x）→ 跳过初始化。"
+                          "现在没接摄像头时这是**正常的**；接上排线后重启即可自动启用，"
+                          "不需要改固件。DVP 的 11 个 IO 也不会被占用。",
+                     CAMERA_SCCB_ADDR, probe_err);
+            camera_ = nullptr;   // GetCamera() 返回 nullptr ⇒ MCP 不注册 take_photo
+            return;
+        }
 
         static esp_cam_ctlr_dvp_pin_config_t dvp_pin_config = {
             .data_width = CAM_CTLR_DATA_WIDTH_8,

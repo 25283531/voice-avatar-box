@@ -130,6 +130,40 @@ CONFIG_BOARD_TYPE_LICHUANG_DEV_S3=y
 # 改回 emote 只需把下面这行换成 CONFIG_USE_EMOTE_MESSAGE_STYLE=y（但要先把上面
 # 第 1) 条的 lv_init/LVGL display 缺失和第 2) 条的字体判定一起修掉，否则依旧黑屏）。
 CONFIG_USE_DEFAULT_MESSAGE_STYLE=y
+#
+# --- 摄像头驱动：GC0308（DVP 8bit）---
+#
+# ⚠️⚠️ **为什么这一行必须写在这里，而不是留在 board 的 config.json 里**
+# ------------------------------------------------------------------
+# main/boards/lichuang-dev/config.json 里其实**早就**写着：
+#     CONFIG_CAMERA_GC0308=y
+#     CONFIG_CAMERA_GC0308_AUTO_DETECT_DVP_INTERFACE_SENSOR=y
+#     CONFIG_CAMERA_GC0308_DVP_YUV422_640X480_16FPS=y
+# 但那三条是**死配置**：config.json 是上游 scripts/release.py 做「多板一次性
+# 发布」时读的，而 CI 走的是 `idf.py set-target` + `idf.py build`，**根本不看
+# config.json**。于是在 CI 产出的固件里 GC0308 驱动压根没编进来。
+#
+# 后果（真机日志 `E (364) Esp32Camera: open /dev/video2 failed` 的完整根因链，
+# 逐行在 esp_video 源码里核对过）：
+#   1) esp_video_init() 遍历 __esp_cam_sensor_detect_fn_array，这个数组由各
+#      传感器驱动用 ESP_CAM_SENSOR_DETECT_FN 宏注册 ——
+#      **只有 Kconfig 打开的那个传感器才会注册进来**；
+#   2) GC0308 没开 ⇒ 数组为空 ⇒ 循环体一次都不执行 ⇒ **不创建 /dev/video2
+#      节点**，但 esp_video_init() 本身**照样返回 ESP_OK**（它没遇到错误，
+#      只是没找到传感器）；
+#   3) 于是 Esp32Camera 拿到 ESP_VIDEO_DVP_DEVICE_NAME（就是 "/dev/video2"）
+#      去 open() —— 必失败。
+# ⇒ 修复的正着是**把驱动真正编进来**，也就是这一行。
+#
+# 另两条**不用写**：AUTO_DETECT_DVP_INTERFACE_SENSOR 在 CAMERA_GC0308 打开后
+# 默认就是 y，DVP_YUV422_640X480_16FPS 也是 CAMERA_GC0308_DVP_DEFAULT_FMT
+# 的默认项（见 esp_cam_sensor/sensors/gc0308/Kconfig.gc0308）。
+#
+# ⚠️ 关于「开了驱动但没接摄像头」：不会刷错误。InitializeCamera() 会先用
+#    i2c_master_probe() 探 SCCB 地址 0x21，探不到就打一条 WARNING 跳过，
+#    既不占 DVP 的 11 个 IO，也不刷 ERROR。接上排线重启即可自动启用。
+#    （详见 main/boards/lichuang-dev/lichuang_dev_board.cc 的注释。）
+CONFIG_CAMERA_GC0308=y
 # 与后端 TZ=Asia/Shanghai 对齐的提示音语言
 CONFIG_LANGUAGE_ZH_CN=y
 # 16MB Flash + Octal PSRAM（立创·实战派 N16R8）
