@@ -5,7 +5,7 @@ pydantic>=2.7,<3.0
 PyMySQL>=1.1,<2.0
 cryptography>=42.0
 PyJWT>=2.8,<3.0
-tzdata>=2024.1
+tzdata>=2026.5
 # 语音链路冒烟测试的 WS 客户端。**只被 tools/smoke_voice.py 使用**，
 # 服务端自身走 uvicorn 自带的 WS 实现，不依赖它。
 # 版本锁 <14：13.x 与 14.x 的同步 API（connect/asyncio.run）行为有差异，
