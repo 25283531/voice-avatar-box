@@ -15,6 +15,9 @@
   H. 三家 TTS 厂商预置（Edge/火山/阿里百炼）与**服务端自动分发**：预置字段
      完整性、按厂商分组的音色、火山签名四级派生（按官方文档推导过程独立
      复算）、base64 错误体识破、Edge 分块无损、真实语音测试端点
+  P. 非 TTS 厂商预置（硅基流动等 5 家）：**装配**断言（后端下发 + 前端消费
+     缺一即红）、endpoint 精确到 /v1、免费模型名、既有字段不被挤掉
+     —— 这一组的存在理由见文件内 P 组开头的长注释（一次真实的「半成品提交」）
 
 **为什么 H 组必须存在（本轮实测踩出的 bug）**
 --------------------------------------------
@@ -471,6 +474,60 @@ def main() -> int:
         check("H21 失败时带可读原因（而非 500 堆栈）",
               code == 200 and (tv.get("ok") is True or bool(tv.get("message"))),
               str(tv)[:160])
+
+        # ==================== P. 非 TTS 厂商预置（LLM/向量/重排）
+        # 为什么必须有这一组（2026-10-18 仓库核验发现的「半成品提交」）
+        # ----------------------------------------------------------
+        # 这批预置（app/provider_presets.py）曾以「只提交前端」的形态进过
+        # main：index.html 消费 providerPresets，而 providers.py 的接线与
+        # 预置表本身留在工作区没提交。页面**不报错**（Array.isArray 兜底成
+        # 空数组），表现为「下拉里只有自部署三项，硅基流动不出现」——
+        # 而当时没有任何一条断言覆盖它，提交信息却写着「冒烟通过」。
+        # P1/P9 两条钉的就是这个**装配**（后端发 + 前端消费，缺一即红）。
+        print("\n── P. 非 TTS 厂商预置（provider_presets）──")
+        presets = (cat2 or {}).get("provider_presets")
+        check("P1 catalog 下发 provider_presets 且是非空数组（装配：后端真的发了）",
+              isinstance(presets, list) and len(presets) > 0,
+              f"type={type(presets).__name__} "
+              f"len={len(presets) if isinstance(presets, list) else '-'}")
+        pmap = {p.get("value"): p for p in (presets or [])}
+        check("P2 五家齐全（硅基流动/DeepSeek/智谱/阿里百炼/OpenAI）",
+              set(pmap) >= {"siliconflow", "deepseek", "zhipu", "aliyun", "openai"},
+              f"{sorted(pmap)}")
+        req_fields = {"value", "label", "api_style", "endpoint", "needs_key",
+                      "key_hint", "models", "free_tier", "notes"}
+        incomplete = [p.get("value") for p in (presets or [])
+                      if not req_fields.issubset(p.keys())]
+        check("P3 每条预置字段齐全（下拉/自动填表/费用说明全靠这些字段渲染）",
+              not incomplete, f"缺字段: {incomplete}")
+        sf = pmap.get("siliconflow") or {}
+        check("P4 硅基流动 endpoint 精确到 /v1 一级（少一级会被网关返 HTML 首页）",
+              sf.get("endpoint") == "https://api.siliconflow.cn/v1",
+              sf.get("endpoint", ""))
+        sf_models = sf.get("models") or {}
+        check("P5 硅基流动含 embedding+rerank 两个免费模型（记忆检索零成本的两条腿）",
+              sf_models.get("embedding") == "BAAI/bge-m3"
+              and sf_models.get("rerank") == "BAAI/bge-reranker-v2-m3",
+              json.dumps(sf_models, ensure_ascii=False))
+        check("P6 硅基流动 key_hint 明确劝退「把整条接口地址粘进 endpoint」"
+              "（2026-10-18 大模型调用失败事故的直接对策）",
+              sf.get("needs_key") is True and "接口地址" in (sf.get("key_hint") or ""), "")
+        # 旧字段不得被新表挤掉：presets_payload 是往同一个 payload 里 update，
+        # 不是替换。若有人把它写成 payload = presets_payload()，这里立刻红。
+        check("P7 预置表没有挤掉既有字段（kinds/api_styles/vendors/voices 仍在）",
+              all(k in (cat2 or {}) for k in ("kinds", "api_styles", "vendors", "voices")),
+              str(sorted((cat2 or {}).keys())))
+        from app.provider_presets import preset_entry  # noqa: E402
+        check("P8 preset_entry：已知值返回条目；未知值/空串/None 返回 None"
+              "（前端据此走通用手填路径）",
+              (preset_entry("siliconflow") or {}).get("endpoint") == "https://api.siliconflow.cn/v1"
+              and preset_entry("nope") is None and preset_entry("") is None
+              and preset_entry(None) is None, "")
+        # 消费侧装配：后端发了但前端不消费，同样表现为「下拉只有自部署三项」。
+        check("P9 前端消费 providerPresets 且有 Array.isArray 兜底"
+              "（字段缺失时退回自部署三项而不是模板抛错）",
+              "providerPresets" in html and "Array.isArray(r.provider_presets)" in html,
+              "index.html 里找不到 providerPresets 的装载处")
 
     finally:
         try:

@@ -29,6 +29,7 @@ from .. import models
 from ..db import get_db
 from ..deps import get_current_admin, get_current_user, require_config
 from ..llm_gateway import GatewayError, chat, embed, rerank, resolve_plan
+from .. import provider_presets
 from ..model_catalog import (
     API_STYLES,
     EXPORT_KINDS,
@@ -188,6 +189,7 @@ def provider_catalog(user: models.User = Depends(get_current_user)):
     }
     payload.update(voice_catalog.catalog_payload())
     payload.update(voice_catalog.vendors_payload())
+    payload.update(provider_presets.presets_payload())
     # 让前端知道 Edge 这条路在本部署里**现在到底能不能走**。
     # 缺依赖时返回 false 而不是静默：否则管理员配好 Edge、页面一切正常，
     # 直到老人没声音才发现少装了两个包。

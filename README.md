@@ -383,6 +383,38 @@ bug），都不匹配则回落 `openai_compatible`。`tts_stream()` 内部做了
 （`asr_tts.TTS_RESPONSE_FORMAT="pcm"`、`TTS_SAMPLE_RATE=24000`），固件按服务端
 声明的采样率逐帧 Opus 编码。
 
+### 非 TTS 厂商预置：硅基流动的向量化与重排是免费的
+
+记忆检索要两种模型：**向量化**（`kind=embedding`）与**重排**（`kind=rerank`）。
+这不是可选项 —— 没有向量模型时记忆检索整体退化为「按关键词硬匹配」。
+
+`server/app/provider_presets.py` 是这张预置表的**唯一真源**，通过
+`GET /api/providers/catalog` 的 `provider_presets` 下发给前端。当前 5 条：
+硅基流动 / DeepSeek / 智谱 / 阿里云百炼 / OpenAI 官方。
+
+**首推硅基流动 SiliconFlow**（`api_style=openai_compatible`，
+endpoint `https://api.siliconflow.cn/v1`），因为它是唯一一家把记忆检索要用的两个
+模型都做成永久免费的：
+
+| 能力（kind） | 模型 | 费用 |
+| --- | --- | --- |
+| `embedding` | `BAAI/bge-m3` | 永久免费 |
+| `rerank` | `BAAI/bge-reranker-v2-m3` | 永久免费 |
+| `llm_main` | `Qwen/Qwen2.5-7B-Instruct` | 永久免费（9B 及以下） |
+| `llm_light` | `Qwen/Qwen2.5-1.5B-Instruct` | 永久免费 |
+
+**要配成两行，不是一行两个模型**：能力选 `embedding` 填 bge-m3 保存，再新增一行
+能力选 `rerank` 填 bge-reranker-v2-m3。两行可以同厂商同 key。
+
+⚠️ 重排端点是 `/v1/rerank`（**不是** OpenAI 那套 `/rerankings`），
+`server/app/llm_gateway.py::rerank()` 已按此实现，**不需要改调用层**；
+`_extract_scores()` 同时认 `relevance_score` / `score`，两家格式都能解。
+换 9B 以上的模型就开始计费。
+
+⚠️ 这张表**只管 OpenAI 兼容这一族**。TTS 厂商在 `server/app/voice/catalog.py`
+的 `VENDOR_CATALOG`（字段集不同：要音色、要 AK:SK 两段密钥、有私有协议）。
+**两张表不要合并** —— 合并后必然出现一半条目没有 `voices` 的空壳。
+
 ### 服务就绪度面板：「零配置即可服务」不成立
 
 管理后台 AI 接入页顶部有「服务就绪度」卡片（`GET /api/providers/readiness`），
