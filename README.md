@@ -40,10 +40,10 @@
 | 容器内监听 | `8080` | `ELDER_PORT` 可覆盖 |
 | **对外发布** | **`8064`** | 镜像只发布这一个端口，`-p 8064:8080`。HTTP API、语音 WebSocket、OTA 全复用它 |
 | 语音 WebSocket | `ws(s)://<域名>/api/voice/v1/ws` | **自研链路**，与 API 同源同端口，不需要额外开端口 |
-| 生产域名 | `https://voice.2508866.xyz` | 手机端已固化此地址；当前经 Cloudflare Tunnel（iStoreOS + cloudflared）转发到 `127.0.0.1:8064`，Nginx 形态见 DEPLOY.md §4，隧道形态见 §4.1（含 WebSocket 与 `ELDER_VOICE_PUBLIC_BASE` 必配项） |
-| 管理后台 | `https://voice.2508866.xyz/` | 源码在 `server/app/static/index.html`，按 `is_admin` 过滤入口。账号 `admin` 的口令**不再有硬编码默认值**（`admin/admin123` 已从代码移除，commit `bb5ca98`）：首次启动必须经 `ELDER_SEED_ADMIN_PASSWORD` 显式提供，否则随机化并打进启动日志 `ELDER-INITIAL-PASSWORD=<pwd>` |
-| 用户端 | `https://voice.2508866.xyz/user` | 源码在 `server/app/static/user.html`，**浏览器直接用，不需要装 APP**；绑定设备等操作全在 web 完成 |
-| 接口文档 | `https://voice.2508866.xyz/docs` | FastAPI 自动生成 |
+| 生产域名 | `https://voice.250886.xyz` | 手机端已固化此地址；当前经 Cloudflare Tunnel（iStoreOS + cloudflared）转发到 `127.0.0.1:8064`，Nginx 形态见 DEPLOY.md §4，隧道形态见 §4.1（含 WebSocket 与 `ELDER_VOICE_PUBLIC_BASE` 必配项） |
+| 管理后台 | `https://voice.250886.xyz/` | 源码在 `server/app/static/index.html`，按 `is_admin` 过滤入口。账号 `admin` 的口令**不再有硬编码默认值**（`admin/admin123` 已从代码移除，commit `bb5ca98`）：首次启动必须经 `ELDER_SEED_ADMIN_PASSWORD` 显式提供，否则随机化并打进启动日志 `ELDER-INITIAL-PASSWORD=<pwd>` |
+| 用户端 | `https://voice.250886.xyz/user` | 源码在 `server/app/static/user.html`，**浏览器直接用，不需要装 APP**；绑定设备等操作全在 web 完成 |
+| 接口文档 | `https://voice.250886.xyz/docs` | FastAPI 自动生成 |
 
 ## GitHub Actions 工作流
 
@@ -123,7 +123,7 @@
 ### 手机 APP 栏目
 
 APP 是给家属用的，不接入小智任何服务，业务后端地址在代码级写死
-（`app/src/http/elder.ts`，域名 `https://voice.2508866.xyz`），**不提供任何网络设置入口**。
+（`app/src/http/elder.ts`，域名 `https://voice.250886.xyz`），**不提供任何网络设置入口**。
 
 ⚠️ **APP 不是唯一入口**：绑定设备等操作在浏览器打开 `/user` 同样能做完，
 固件配网也不需要 APP（见下文「双界面与配网」）。
@@ -258,7 +258,7 @@ docker compose up -d            # 对外 http://<host>:8064
 | 变量 | 示例值 | 生产怎么办 |
 | --- | --- | --- |
 | `ELDER_JWT_SECRET` | `please-change-this-secret-in-production` | **必须**换成随机长字符串，否则任何人可伪造 token |
-| `ELDER_CORS` | `*` | 收窄到 `https://voice.2508866.xyz` |
+| `ELDER_CORS` | `*` | 收窄到 `https://voice.250886.xyz` |
 | `MYSQL_ROOT_PASSWORD` | `123456` | 仅 MySQL 变体用得到，改强口令 |
 | `ELDER_MAIL_FAKE` | `0` | ⚠️ **必须留 `0`**。这是唯一一个「留着默认值就可能出事」的：设为 `1` 时 `send_mail()` 不碰网络，邮件全写进进程内发件箱——用户点「找回密码」永远收不到邮件。上表其余几项不改只是「不安全」，这一项不改是**功能直接坏掉** |
 | `ELDER_TZ` | `Asia/Shanghai` | **建议别动**。服药提醒是时间强相关业务，服务端/设备端/展示层必须同一时区；改了整体影响提醒的时间计算 |
@@ -285,9 +285,9 @@ iStoreOS（OpenWrt 软路由）+ Docker 对外 `8064`（容器内 `8080`）+ Clo
 
 ```bash
 ELDER_DEPLOY_MODE=tunnel
-ELDER_PUBLIC_BASE_URL=https://voice.2508866.xyz
+ELDER_PUBLIC_BASE_URL=https://voice.250886.xyz
 # WS 想用单独域名再加：
-# ELDER_WS_PUBLIC_BASE_URL=wss://voice-ws.2508866.xyz
+# ELDER_WS_PUBLIC_BASE_URL=wss://voice-ws.250886.xyz
 ```
 
 旧变量 `ELDER_VOICE_PUBLIC_BASE` 仍向后兼容（语义逐字未变），新变量在任何模式下
@@ -309,7 +309,7 @@ nginx 反代片段：
 ```nginx
 server {
     listen 443 ssl;
-    server_name voice.2508866.xyz;
+    server_name voice.250886.xyz;
     # ssl_certificate / ssl_certificate_key ...
 
     location / {
@@ -481,7 +481,7 @@ pnpm build:h5          # 产物 app/dist/build/h5
 pnpm build:mp-weixin   # 产物 app/dist/build/mp-weixin，用微信开发者工具上传
 ```
 
-- 后端地址**代码级写死** `https://voice.2508866.xyz`（`app/src/http/elder.ts` 的 `BASE_URL` 常量）
+- 后端地址**代码级写死** `https://voice.250886.xyz`（`app/src/http/elder.ts` 的 `BASE_URL` 常量）
 - 页面入口：`src/pages/elder/`（绑定设备、提醒列表与编辑、统计、形象选择）
 
 ### Android APK（CI 一次出包，不依赖 DCloud）
@@ -554,7 +554,7 @@ rm -rf firmware/xiaozhi/build
 ```
 
 正确的默认值在 `firmware/xiaozhi/main/Kconfig.projbuild`：
-`CONFIG_OTA_URL` 默认 `https://voice.2508866.xyz/api/voice/ota`。
+`CONFIG_OTA_URL` 默认 `https://voice.250886.xyz/api/voice/ota`。
 
 CI 不受影响：`firmware-build.yml` 走 `idf.py set-target` 重新生成 `sdkconfig`，
 并且**每次构建都打印生效的 `CONFIG_OTA_URL`**，偏离本项目域名时告警。

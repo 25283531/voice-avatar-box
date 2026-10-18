@@ -30,8 +30,8 @@ ENV PYTHONUNBUFFERED=1 \
 #             值是一份写进配置的意图声明 + 启动摘要里明确的模式名。
 #   tunnel —— Cloudflare Tunnel 等「TLS 在前置终止」的形态：**必须**配对外
 #             地址，否则容器启动直接失败（不静默降级）。配套变量：
-#               ELDER_PUBLIC_BASE_URL=https://voice.2508866.xyz   （HTTP/OTA，必需）
-#               ELDER_WS_PUBLIC_BASE_URL=wss://voice-ws.2508866.xyz （WS 单独域名，可选）
+#               ELDER_PUBLIC_BASE_URL=https://voice.250886.xyz   （HTTP/OTA，必需）
+#               ELDER_WS_PUBLIC_BASE_URL=wss://voice-ws.250886.xyz （WS 单独域名，可选）
 #             旧变量 ELDER_VOICE_PUBLIC_BASE 仍然有效（向后兼容），新部署建议用
 #             ELDER_PUBLIC_BASE_URL（任何模式下都校验 scheme）。
 #

@@ -255,13 +255,13 @@ def group_a() -> None:
 # ================================================================ B. 两层一致性
 def _fake_request(client: tuple[str, int], xff: str = ""):
     from starlette.requests import Request
-    headers = [(b"host", b"voice.2508866.xyz")]
+    headers = [(b"host", b"voice.250886.xyz")]
     if xff:
         headers.append((b"x-forwarded-for", xff.encode()))
     scope = {
         "type": "http", "method": "GET", "path": "/api/auth/login",
         "raw_path": b"/api/auth/login", "headers": headers,
-        "scheme": "http", "server": ("voice.2508866.xyz", 443),
+        "scheme": "http", "server": ("voice.250886.xyz", 443),
         "client": client, "query_string": b"", "http_version": "1.1",
         "root_path": "",
     }

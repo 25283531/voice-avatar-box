@@ -146,7 +146,7 @@ BOOTSTRAP_ADMIN_USERNAME = os.getenv("ELDER_BOOTSTRAP_ADMIN_USERNAME", "").strip
 #
 #       password_hash=hash_password("admin123")
 #
-#   本服务是公开部署的（生产域名 voice.2508866.xyz，APP 把 BASE_URL 写死成它），
+#   本服务是公开部署的（生产域名 voice.250886.xyz，APP 把 BASE_URL 写死成它），
 #   于是任何人用 admin/admin123 登录即成为**平台管理员** —— 能改 AI 配置
 #   （含厂商 API Key 的读写口径）、查看全部用户用量与记忆。
 #
@@ -369,7 +369,7 @@ def _validate_base(value: str, var: str, allowed: tuple[str, ...]) -> None:
         raise SystemExit(
             f"【启动失败】{var} 取值非法：{value!r}\n"
             f"    scheme 必须是 {' 或 '.join(allowed)} 且要带主机名，"
-            f"例如 https://voice.2508866.xyz。\n"
+            f"例如 https://voice.250886.xyz。\n"
             f"    这个地址是设备心跳时下发的，写错 = 设备拿到连不上的地址，"
             f"所以在启动期直接失败，不静默降级。"
         )
@@ -450,8 +450,8 @@ def _deploy_startup_check() -> None:
                 "    设备心跳会拿到 ws://<域名>/... 去打 443 —— 能心跳、不能说话，\n"
                 "    且运行期零报错。\n"
                 "    修法只需一行（二选一）：\n"
-                "        ELDER_PUBLIC_BASE_URL=https://voice.2508866.xyz\n"
-                "        ELDER_VOICE_PUBLIC_BASE=https://voice.2508866.xyz   （旧变量）\n"
+                "        ELDER_PUBLIC_BASE_URL=https://voice.250886.xyz\n"
+                "        ELDER_VOICE_PUBLIC_BASE=https://voice.250886.xyz   （旧变量）\n"
                 "    WS 想用单独域名，再加 ELDER_WS_PUBLIC_BASE_URL=wss://<WS域名>。\n"
                 "    （若你的后端容器确实直接收到 https:// 请求，用 auto 即可。）"
             )

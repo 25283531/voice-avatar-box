@@ -16,7 +16,7 @@ const USER_KEY = 'elder_user'
  * 业务后端地址（服务端接口 + 业务接口统一走这个域名）。
  * 生产域名由 nginx 反代到 Docker 容器的 8064 端口。
  */
-const BASE_URL = 'https://voice.2508866.xyz'
+const BASE_URL = 'https://voice.250886.xyz'
 
 /** 返回写死的业务后端地址（只读，不允许运行时修改） */
 export function getElderBaseUrl(): string {

@@ -338,28 +338,28 @@ def main() -> int:
                     f"ws://127.0.0.1:{PORT}{WS_PATH}",
                     f"http://127.0.0.1:{PORT}{OTA_PATH}")
         expect_call("A2 auto 无显式地址（合成 https 请求）", {},
-                    fake_request("https", "voice.2508866.xyz"),
-                    f"wss://voice.2508866.xyz{WS_PATH}",
-                    f"https://voice.2508866.xyz{OTA_PATH}")
+                    fake_request("https", "voice.250886.xyz"),
+                    f"wss://voice.250886.xyz{WS_PATH}",
+                    f"https://voice.250886.xyz{OTA_PATH}")
         expect_http("A3 auto + 旧变量 https", {
-            "ELDER_VOICE_PUBLIC_BASE": "https://voice.2508866.xyz"},
-            f"wss://voice.2508866.xyz{WS_PATH}",
-            f"https://voice.2508866.xyz{OTA_PATH}")
+            "ELDER_VOICE_PUBLIC_BASE": "https://voice.250886.xyz"},
+            f"wss://voice.250886.xyz{WS_PATH}",
+            f"https://voice.250886.xyz{OTA_PATH}")
         # 旧变量历史上**不校验 scheme**：wss:// 会被原样当 base 用（OTA 段因此
         # 是坏的）。这是今天的真实行为，本轮刻意未改 —— 钉死它，防止有人
         # "顺手"给旧变量加校验，那是静默改存量语义。
         expect_http("A4 auto + 旧变量 wss（历史不校验，逐字保持）", {
-            "ELDER_VOICE_PUBLIC_BASE": "wss://voice.2508866.xyz"},
-            f"wss://voice.2508866.xyz{WS_PATH}",
-            f"wss://voice.2508866.xyz{OTA_PATH}")
+            "ELDER_VOICE_PUBLIC_BASE": "wss://voice.250886.xyz"},
+            f"wss://voice.250886.xyz{WS_PATH}",
+            f"wss://voice.250886.xyz{OTA_PATH}")
         expect_http("A5 auto + 旧变量 http+端口（直暴露形态）", {
             "ELDER_VOICE_PUBLIC_BASE": "http://12.34.56.78:8064"},
             f"ws://12.34.56.78:8064{WS_PATH}",
             f"http://12.34.56.78:8064{OTA_PATH}")
         expect_http("A6 auto + 新变量 ELDER_PUBLIC_BASE_URL（逃生舱不变）", {
-            "ELDER_PUBLIC_BASE_URL": "https://voice.2508866.xyz"},
-            f"wss://voice.2508866.xyz{WS_PATH}",
-            f"https://voice.2508866.xyz{OTA_PATH}")
+            "ELDER_PUBLIC_BASE_URL": "https://voice.250886.xyz"},
+            f"wss://voice.250886.xyz{WS_PATH}",
+            f"https://voice.250886.xyz{OTA_PATH}")
 
         # ---------------------------------------------------------- B. direct 回归
         group("B. direct 模式：与今天逐字一致（direct = auto 的显式声明版）")
@@ -368,38 +368,38 @@ def main() -> int:
                     f"http://127.0.0.1:{PORT}{OTA_PATH}")
         expect_http("B2 direct + 旧变量 https", {
             "ELDER_DEPLOY_MODE": "direct",
-            "ELDER_VOICE_PUBLIC_BASE": "https://voice.2508866.xyz"},
-            f"wss://voice.2508866.xyz{WS_PATH}",
-            f"https://voice.2508866.xyz{OTA_PATH}")
+            "ELDER_VOICE_PUBLIC_BASE": "https://voice.250886.xyz"},
+            f"wss://voice.250886.xyz{WS_PATH}",
+            f"https://voice.250886.xyz{OTA_PATH}")
         expect_http("B3 direct + 旧变量 wss（历史不校验，逐字保持）", {
             "ELDER_DEPLOY_MODE": "direct",
-            "ELDER_VOICE_PUBLIC_BASE": "wss://voice.2508866.xyz"},
-            f"wss://voice.2508866.xyz{WS_PATH}",
-            f"wss://voice.2508866.xyz{OTA_PATH}")
+            "ELDER_VOICE_PUBLIC_BASE": "wss://voice.250886.xyz"},
+            f"wss://voice.250886.xyz{WS_PATH}",
+            f"wss://voice.250886.xyz{OTA_PATH}")
         expect_http("B4 direct + 新变量", {
             "ELDER_DEPLOY_MODE": "direct",
-            "ELDER_PUBLIC_BASE_URL": "https://voice.2508866.xyz"},
-            f"wss://voice.2508866.xyz{WS_PATH}",
-            f"https://voice.2508866.xyz{OTA_PATH}")
+            "ELDER_PUBLIC_BASE_URL": "https://voice.250886.xyz"},
+            f"wss://voice.250886.xyz{WS_PATH}",
+            f"https://voice.250886.xyz{OTA_PATH}")
 
         # ---------------------------------------------------------- C. tunnel
         group("C. tunnel 模式：显式对外地址（支持 HTTP/WS 两个域名）")
         expect_http("C1 tunnel + 新 HTTP 变量", {
             "ELDER_DEPLOY_MODE": "tunnel",
-            "ELDER_PUBLIC_BASE_URL": "https://voice.2508866.xyz"},
-            f"wss://voice.2508866.xyz{WS_PATH}",
-            f"https://voice.2508866.xyz{OTA_PATH}")
+            "ELDER_PUBLIC_BASE_URL": "https://voice.250886.xyz"},
+            f"wss://voice.250886.xyz{WS_PATH}",
+            f"https://voice.250886.xyz{OTA_PATH}")
         expect_http("C2 tunnel + HTTP/WS 双域名（Cloudflare 多 hostname）", {
             "ELDER_DEPLOY_MODE": "tunnel",
-            "ELDER_PUBLIC_BASE_URL": "https://voice.2508866.xyz",
-            "ELDER_WS_PUBLIC_BASE_URL": "wss://voice-ws.2508866.xyz"},
-            f"wss://voice-ws.2508866.xyz{WS_PATH}",
-            f"https://voice.2508866.xyz{OTA_PATH}")
+            "ELDER_PUBLIC_BASE_URL": "https://voice.250886.xyz",
+            "ELDER_WS_PUBLIC_BASE_URL": "wss://voice-ws.250886.xyz"},
+            f"wss://voice-ws.250886.xyz{WS_PATH}",
+            f"https://voice.250886.xyz{OTA_PATH}")
         expect_http("C3 tunnel + 旧变量（向后兼容，满足显式地址要求）", {
             "ELDER_DEPLOY_MODE": "tunnel",
-            "ELDER_VOICE_PUBLIC_BASE": "https://voice.2508866.xyz"},
-            f"wss://voice.2508866.xyz{WS_PATH}",
-            f"https://voice.2508866.xyz{OTA_PATH}")
+            "ELDER_VOICE_PUBLIC_BASE": "https://voice.250886.xyz"},
+            f"wss://voice.250886.xyz{WS_PATH}",
+            f"https://voice.250886.xyz{OTA_PATH}")
         expect_http("C4 tunnel + 明文 http 地址 -> 下发 ws://", {
             "ELDER_DEPLOY_MODE": "tunnel",
             "ELDER_PUBLIC_BASE_URL": "http://12.34.56.78:8064"},
@@ -407,14 +407,14 @@ def main() -> int:
             f"http://12.34.56.78:8064{OTA_PATH}")
         expect_http("C5 tunnel + 新变量带尾斜杠（归一化）", {
             "ELDER_DEPLOY_MODE": "tunnel",
-            "ELDER_PUBLIC_BASE_URL": "https://voice.2508866.xyz/"},
-            f"wss://voice.2508866.xyz{WS_PATH}",
-            f"https://voice.2508866.xyz{OTA_PATH}")
+            "ELDER_PUBLIC_BASE_URL": "https://voice.250886.xyz/"},
+            f"wss://voice.250886.xyz{WS_PATH}",
+            f"https://voice.250886.xyz{OTA_PATH}")
         expect_http("C6 tunnel 模式名大小写不敏感（TUNNEL）", {
             "ELDER_DEPLOY_MODE": "TUNNEL",
-            "ELDER_PUBLIC_BASE_URL": "https://voice.2508866.xyz"},
-            f"wss://voice.2508866.xyz{WS_PATH}",
-            f"https://voice.2508866.xyz{OTA_PATH}")
+            "ELDER_PUBLIC_BASE_URL": "https://voice.250886.xyz"},
+            f"wss://voice.250886.xyz{WS_PATH}",
+            f"https://voice.250886.xyz{OTA_PATH}")
 
         # ---------------------------------------------------------- D. 启动失败
         group("D. 启动期校验：配置矛盾必须启动失败（不能静默降级）")
@@ -422,31 +422,31 @@ def main() -> int:
             "ELDER_DEPLOY_MODE": "tunnel"},
             ("【启动失败】", "ELDER_DEPLOY_MODE=tunnel", "ELDER_PUBLIC_BASE_URL"))
         expect_boot_fail("D2 只配 WS 域名不配 HTTP 地址（auto 模式同样拦）", {
-            "ELDER_WS_PUBLIC_BASE_URL": "wss://voice-ws.2508866.xyz"},
+            "ELDER_WS_PUBLIC_BASE_URL": "wss://voice-ws.250886.xyz"},
             ("【启动失败】", "ELDER_WS_PUBLIC_BASE_URL", "ELDER_PUBLIC_BASE_URL"))
         expect_boot_fail("D3 模式名写错", {
             "ELDER_DEPLOY_MODE": "cloudflare"},
             ("【启动失败】", "ELDER_DEPLOY_MODE", "auto / direct / tunnel"))
         expect_boot_fail("D4 ELDER_PUBLIC_BASE_URL scheme 错（ftp）", {
-            "ELDER_PUBLIC_BASE_URL": "ftp://voice.2508866.xyz"},
-            ("【启动失败】", "ELDER_PUBLIC_BASE_URL", "ftp://voice.2508866.xyz"))
+            "ELDER_PUBLIC_BASE_URL": "ftp://voice.250886.xyz"},
+            ("【启动失败】", "ELDER_PUBLIC_BASE_URL", "ftp://voice.250886.xyz"))
         expect_boot_fail("D5 ELDER_PUBLIC_BASE_URL 缺 scheme", {
-            "ELDER_PUBLIC_BASE_URL": "voice.2508866.xyz"},
+            "ELDER_PUBLIC_BASE_URL": "voice.250886.xyz"},
             ("【启动失败】", "ELDER_PUBLIC_BASE_URL"))
         expect_boot_fail("D6 ELDER_WS_PUBLIC_BASE_URL scheme 错（https）", {
-            "ELDER_PUBLIC_BASE_URL": "https://voice.2508866.xyz",
-            "ELDER_WS_PUBLIC_BASE_URL": "https://voice-ws.2508866.xyz"},
+            "ELDER_PUBLIC_BASE_URL": "https://voice.250886.xyz",
+            "ELDER_WS_PUBLIC_BASE_URL": "https://voice-ws.250886.xyz"},
             ("【启动失败】", "ELDER_WS_PUBLIC_BASE_URL", "ws"))
         expect_boot_fail("D7 tunnel 下旧变量 scheme 错（wss 当 HTTP 用）", {
             "ELDER_DEPLOY_MODE": "tunnel",
-            "ELDER_VOICE_PUBLIC_BASE": "wss://voice.2508866.xyz"},
+            "ELDER_VOICE_PUBLIC_BASE": "wss://voice.250886.xyz"},
             ("【启动失败】", "ELDER_VOICE_PUBLIC_BASE", "http(s)"))
         # 失败之后必须还能正常启动：证明上面的 SystemExit 没把进程状态弄脏
         expect_http("D8 连续失败后恢复正常配置仍能启动", {
             "ELDER_DEPLOY_MODE": "tunnel",
-            "ELDER_PUBLIC_BASE_URL": "https://voice.2508866.xyz"},
-            f"wss://voice.2508866.xyz{WS_PATH}",
-            f"https://voice.2508866.xyz{OTA_PATH}")
+            "ELDER_PUBLIC_BASE_URL": "https://voice.250886.xyz"},
+            f"wss://voice.250886.xyz{WS_PATH}",
+            f"https://voice.250886.xyz{OTA_PATH}")
 
         # ---------------------------------------------------------- E. 框架层
         group("E. uvicorn 框架默认层现状钉住（回环对端 + XFP）")
@@ -479,8 +479,8 @@ def main() -> int:
         port_ok = _free_port()
         proc = run_uvicorn_child({
             "ELDER_DEPLOY_MODE": "tunnel",
-            "ELDER_PUBLIC_BASE_URL": "https://voice.2508866.xyz",
-            "ELDER_WS_PUBLIC_BASE_URL": "wss://voice-ws.2508866.xyz"},
+            "ELDER_PUBLIC_BASE_URL": "https://voice.250886.xyz",
+            "ELDER_WS_PUBLIC_BASE_URL": "wss://voice-ws.250886.xyz"},
             port_ok, "ok")
         healthy = False
         deadline = time.time() + 90
@@ -505,7 +505,7 @@ def main() -> int:
                 proc.kill()
                 out, _ = proc.communicate()
             check("F2 启动日志含部署摘要（设备心跳将拿到…）",
-                  "设备心跳将拿到" in out and "wss://voice-ws.2508866.xyz" in out,
+                  "设备心跳将拿到" in out and "wss://voice-ws.250886.xyz" in out,
                   next((ln for ln in out.splitlines() if "设备心跳" in ln), "(未找到)"))
         else:
             proc.kill()
@@ -551,18 +551,18 @@ def main() -> int:
         else:
             reload_config_and_router({
                 "ELDER_DEPLOY_MODE": "tunnel",
-                "ELDER_PUBLIC_BASE_URL": "https://voice.2508866.xyz"})
+                "ELDER_PUBLIC_BASE_URL": "https://voice.250886.xyz"})
             mut = exec_fresh_module(
                 "_mut_device_api_g2", da_src.replace(g2_old, g2_new, 1),
                 package="app.routers")
-            req = fake_request("https", "voice.2508866.xyz")
+            req = fake_request("https", "voice.250886.xyz")
             mut_ws, _ = mut._voice_endpoints(req)
             real_ws, _ = device_api_mod._voice_endpoints(req)
             check("G2 变异版推导结果确实是错的（ws:// 而非 wss://）",
-                  mut_ws == f"ws://voice.2508866.xyz{WS_PATH}",
+                  mut_ws == f"ws://voice.250886.xyz{WS_PATH}",
                   f"变异结果 {mut_ws}")
             check("G2 真实代码给出正确的 wss://",
-                  real_ws == f"wss://voice.2508866.xyz{WS_PATH}",
+                  real_ws == f"wss://voice.250886.xyz{WS_PATH}",
                   f"实际 {real_ws}")
             check("G2 若按 C1 的期望断言，变异版必然转红", mut_ws != real_ws)
 
@@ -576,14 +576,14 @@ def main() -> int:
             mut = exec_fresh_module(
                 "_mut_device_api_g3", da_src.replace(g3_old, g3_new, 1),
                 package="app.routers")
-            req = fake_request("https", "voice.2508866.xyz")
+            req = fake_request("https", "voice.250886.xyz")
             mut_ws, mut_ota = mut._voice_endpoints(req)
             real_ws, real_ota = device_api_mod._voice_endpoints(req)
             check("G3 变异版 https 请求推出 ws://（确实是错的）",
-                  mut_ws == f"ws://voice.2508866.xyz{WS_PATH}",
+                  mut_ws == f"ws://voice.250886.xyz{WS_PATH}",
                   f"变异结果 {mut_ws}")
             check("G3 真实代码 https 请求推出 wss://",
-                  real_ws == f"wss://voice.2508866.xyz{WS_PATH}",
+                  real_ws == f"wss://voice.250886.xyz{WS_PATH}",
                   f"实际 {real_ws}")
             check("G3 若按 A2 的期望断言，变异版必然转红", mut_ws != real_ws)
 
@@ -619,25 +619,25 @@ def main() -> int:
 
         h_combos = [
             ("H1 auto 无地址 + http 请求", {}, "http", "127.0.0.1:8122"),
-            ("H2 auto 无地址 + https 请求", {}, "https", "voice.2508866.xyz"),
+            ("H2 auto 无地址 + https 请求", {}, "https", "voice.250886.xyz"),
             ("H3 auto 旧变量 https", {
-                "ELDER_VOICE_PUBLIC_BASE": "https://voice.2508866.xyz"},
-             "http", "voice.2508866.xyz"),
+                "ELDER_VOICE_PUBLIC_BASE": "https://voice.250886.xyz"},
+             "http", "voice.250886.xyz"),
             ("H4 auto 旧变量 wss（历史不校验）", {
-                "ELDER_VOICE_PUBLIC_BASE": "wss://voice.2508866.xyz"},
-             "http", "voice.2508866.xyz"),
+                "ELDER_VOICE_PUBLIC_BASE": "wss://voice.250886.xyz"},
+             "http", "voice.250886.xyz"),
             ("H5 auto 旧变量 http+端口", {
                 "ELDER_VOICE_PUBLIC_BASE": "http://12.34.56.78:8064"},
-             "https", "voice.2508866.xyz"),
+             "https", "voice.250886.xyz"),
             ("H6 auto 旧变量带尾斜杠", {
-                "ELDER_VOICE_PUBLIC_BASE": "https://voice.2508866.xyz/"},
-             "http", "voice.2508866.xyz"),
+                "ELDER_VOICE_PUBLIC_BASE": "https://voice.250886.xyz/"},
+             "http", "voice.250886.xyz"),
             ("H7 direct 无地址 + https 请求", {
-                "ELDER_DEPLOY_MODE": "direct"}, "https", "voice.2508866.xyz"),
+                "ELDER_DEPLOY_MODE": "direct"}, "https", "voice.250886.xyz"),
             ("H8 direct 旧变量 https", {
                 "ELDER_DEPLOY_MODE": "direct",
-                "ELDER_VOICE_PUBLIC_BASE": "https://voice.2508866.xyz"},
-             "http", "voice.2508866.xyz"),
+                "ELDER_VOICE_PUBLIC_BASE": "https://voice.250886.xyz"},
+             "http", "voice.250886.xyz"),
         ]
         for name, env, scheme, host in h_combos:
             request = fake_request(scheme, host)

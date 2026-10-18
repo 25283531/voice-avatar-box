@@ -2,7 +2,7 @@ menu "Xiaozhi Assistant"
 
 config OTA_URL
     string "Default OTA URL"
-    default "https://voice.2508866.xyz/api/voice/ota"
+    default "https://voice.250886.xyz/api/voice/ota"
     help
         The application will access this URL to check for new firmwares and server address.
 

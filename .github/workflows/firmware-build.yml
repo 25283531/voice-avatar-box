@@ -11,9 +11,10 @@ name: firmware-build
 #
 # OTA 地址（重要，改前先读）：
 #   CONFIG_OTA_URL 的默认值在 firmware/xiaozhi/main/Kconfig.projbuild，
-#   已指向本项目自己的服务端 https://voice.2508866.xyz/api/voice/ota。
+#   已指向本项目自己的服务端 https://voice.250886.xyz/api/voice/ota。
 #   本工作流的 server_url 输入**只**覆盖 CONFIG_ELDER_SERVER_URL，不动 OTA_URL；
-#   下方「校验 OTA 地址」步骤每次构建都会把生效值打进日志，把域名改错会当场看见。
+#   下方「校验 OTA 地址」步骤每次构建都会把生效值打进日志，域名写错**直接让构建失败**
+#   （2026-10-18 起从 warning 升级为 exit 1：错误域名曾靠"只警告"静默流出出厂固件）。
 #   设备运行时还可被 NVS（settings("wifi") 的 ota_url，见 main/ota.cc
 #   的 GetCheckVersionUrl）覆盖，不必重新烧录。
 #
@@ -34,7 +35,7 @@ on:
       server_url:
         description: '设备要连的业务后端地址（留空则用 sdkconfig.defaults 里的值）'
         type: string
-        default: https://voice.2508866.xyz
+        default: https://voice.250886.xyz
       board:
         description: '目标板卡 Kconfig 符号（默认立创·实战派）'
         type: string
@@ -135,20 +136,39 @@ jobs:
         run: |
           set -e
           cd "$PROJECT_DIR"
-          # CONFIG_OTA_URL 默认值在 main/Kconfig.projbuild（https://voice.2508866.xyz/api/voice/ota）。
+          # CONFIG_OTA_URL 默认值在 main/Kconfig.projbuild（https://voice.250886.xyz/api/voice/ota）。
           # 本工作流只覆盖 CONFIG_ELDER_SERVER_URL，不动 OTA_URL —— 这里是把关：
           # 万一将来有人改掉默认值或 sdkconfig.defaults 里覆盖了它，构建日志必须当场可见。
           # sdkconfig 是 set-target 刚生成的新文件，不含本机历史构建的残留。
-          OTA="$(grep -E '^CONFIG_OTA_URL=' sdkconfig | head -1 | cut -d= -f2- || true)"
+          #
+          # ⚠️⚠️ 2026-10-18 事故：本步骤曾**只打 ::warning:** —— 一次构建里
+          #   CONFIG_OTA_URL = https://voice.25088866.xyz/api/voice/ota
+          #   （正确域名 voice.250886.xyz 多了一个 8），warning 打完 job 照绿、
+          #   用户照下固件，设备全连去一个不存在的域名，静默失声。
+          #   **warning 在绿色流水线里等于不存在**，故升级为失败即红：
+          #   只放行 ①本项目域名 ②明文 http（仅可能是内网联调），其余一律 exit 1。
+          OTA="$(grep -E '^CONFIG_OTA_URL=' sdkconfig | head -1 | cut -d= -f2- | tr -d '"' || true)"
           if [ -z "$OTA" ]; then
-            echo "CONFIG_OTA_URL 未显式设置 -> 用 Kconfig.projbuild 默认值（https://voice.2508866.xyz/api/voice/ota）"
+            # sdkconfig 没落显式行 ⇒ 生效值是 Kconfig.projbuild 的 default。
+            # 把默认值也抓来一起校验，堵住"只改 Kconfig 默认值"的漏网形态。
+            OTA="$(grep -A3 '^config OTA_URL' main/Kconfig.projbuild \
+                    | grep -m1 'default' | sed 's/.*default "//; s/".*//' || true)"
+            echo "CONFIG_OTA_URL 未在 sdkconfig 显式设置 -> Kconfig.projbuild 默认值：${OTA:-<解析失败>}"
           else
             echo "CONFIG_OTA_URL = $OTA"
-            case "$OTA" in
-              *voice.2508866.xyz*) echo "OTA 地址指向本项目服务端，OK" ;;
-              *) echo "::warning::CONFIG_OTA_URL 未指向 voice.2508866.xyz（当前 $OTA）—— 若非本意，检查 main/Kconfig.projbuild 与 sdkconfig.defaults" ;;
-            esac
           fi
+          case "$OTA" in
+            https://voice.250886.xyz/*)
+              echo "OTA 地址指向本项目服务端，OK" ;;
+            http://*)
+              # 明文 http 只可能是内网/本机联调（公网 OTA 必须 https）。放行但大声标注。
+              echo "::warning::OTA 地址是明文 http（$OTA）—— 仅限内网联调，别让它流出到出厂固件" ;;
+            *)
+              echo "::error::CONFIG_OTA_URL 既不是本项目域名（https://voice.250886.xyz/...）也不是内网 http 地址（当前：${OTA:-<空>}）"
+              echo "::error::2026-10-18 事故形态：错误域名静默烧进固件而 job 照绿。构建中止。"
+              echo "::error::确需指向别处：先改 main/Kconfig.projbuild 或 sdkconfig.defaults，并同步更新本校验与 docs/DEPLOY.md。"
+              exit 1 ;;
+          esac
 
       # 失败时把真正的编译错误打出来（上面的 tail -120 可能被 LVGL 的 #warning 刷屏盖住）
       - name: 输出编译错误（失败时）

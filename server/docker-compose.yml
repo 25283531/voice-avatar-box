@@ -48,7 +48,7 @@ services:
       # ---------------------------------------------------------------- 语音链路
       # 自研语音链路与本服务同源同端口，设备地址由服务端自动推导，**默认不用配**。
       # 只有当部署在反代后面、且 Host 头没被正确透传时才需要显式指定，例如：
-      #   ELDER_VOICE_PUBLIC_BASE: https://voice.2508866.xyz
+      #   ELDER_VOICE_PUBLIC_BASE: https://voice.250886.xyz
       # 注意必须给 https（服务端会自动换成 wss），给 ws:// 会导致设备拒绝连接。
       ELDER_VOICE_PUBLIC_BASE: ${ELDER_VOICE_PUBLIC_BASE:-}
       # ---------------------------------------------------------------- 部署模式
@@ -61,9 +61,9 @@ services:
       #
       #   # ① Cloudflare Tunnel（当前生产形态，iStoreOS + cloudflared）：
       #   ELDER_DEPLOY_MODE: tunnel
-      #   ELDER_PUBLIC_BASE_URL: ${ELDER_PUBLIC_BASE_URL:-https://voice.2508866.xyz}
+      #   ELDER_PUBLIC_BASE_URL: ${ELDER_PUBLIC_BASE_URL:-https://voice.250886.xyz}
       #   # 想给 WS 单独一个域名（Cloudflare Tunnel 支持多 hostname）再加一行：
-      #   # ELDER_WS_PUBLIC_BASE_URL: ${ELDER_WS_PUBLIC_BASE_URL:-wss://voice-ws.2508866.xyz}
+      #   # ELDER_WS_PUBLIC_BASE_URL: ${ELDER_WS_PUBLIC_BASE_URL:-wss://voice-ws.250886.xyz}
       #
       #   # ② 公网服务器直暴露（有公网 IP，对外 http://IP:8064）：
       #   ELDER_DEPLOY_MODE: direct

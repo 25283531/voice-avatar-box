@@ -102,13 +102,52 @@ export interface StatsOverview {
 }
 
 // ============================================================ 认证
-export function elderLogin(username: string, password: string) {
-  return elderPost<{ access_token: string, user_id: number, username: string, is_admin: boolean }>(
-    '/api/auth/login', { username, password })
+// ⚠️ 登录/注册是**请求前就没有 token** 的接口，必须走 auth:false。
+//    历史事故（2026-10-18，用户实测"点登录/点注册都提示未登录"）：
+//    这两个函数曾用 elderPost（默认 auth=true），而 elderRequest 在**发请求之前**
+//    就检查 token —— 没有 token 直接 reject('未登录')，一个 HTTP 包都发不出去。
+//    同文件的找回密码接口（auth:false）本就是正确范式。
+//
+//    也不能借道 elderRequest 的错误通道：它把 401 一律解释成"登录态失效"，
+//    而登录失败的 401 detail 是「用户名或密码错误」（服务端刻意让"用户不存在"
+//    与"密码错"返回完全相同的响应以防用户名枚举，见 auth.py 的
+//    LOGIN_FAILED_DETAIL），两种 401 的文案不能混。故用 elderRequestRaw 自取 detail。
+//
+//    网络层失败（域名不存在/DNS 失败/断网）时 uni.request 的 errMsg 形如
+//    "request:fail"，不加工直接怼给用户看不懂，统一包成"网络异常"。
+
+/** 从原始响应取服务端 detail（仅字符串可用；对象型 detail 对这两个接口不会出现） */
+function authDetail(raw: ElderRawResult, fallback: string): string {
+  const detail = (raw.data as any)?.detail
+  return typeof detail === 'string' && detail ? detail : fallback
 }
 
-export function elderRegister(data: { username: string, password: string, nickname?: string, phone?: string, email?: string }) {
-  return elderPost<ElderUser>('/api/auth/register', data)
+export async function elderLogin(username: string, password: string) {
+  let raw: ElderRawResult<{ access_token: string, user_id: number, username: string, is_admin: boolean }>
+  try {
+    raw = await elderRequestRaw('/api/auth/login', {
+      method: 'POST', data: { username, password }, auth: false, toast: false,
+    })
+  }
+  catch {
+    throw new Error('网络异常，请检查网络连接')
+  }
+  if (raw.statusCode >= 200 && raw.statusCode < 300) return raw.data
+  throw new Error(authDetail(raw, '登录失败'))
+}
+
+export async function elderRegister(data: { username: string, password: string, nickname?: string, phone?: string, email?: string }) {
+  let raw: ElderRawResult<ElderUser>
+  try {
+    raw = await elderRequestRaw('/api/auth/register', {
+      method: 'POST', data, auth: false, toast: false,
+    })
+  }
+  catch {
+    throw new Error('网络异常，请检查网络连接')
+  }
+  if (raw.statusCode >= 200 && raw.statusCode < 300) return raw.data
+  throw new Error(authDetail(raw, '注册失败'))
 }
 
 // ============================================================ 设备

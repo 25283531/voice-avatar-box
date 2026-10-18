@@ -10,7 +10,7 @@
 端口与域名是硬性约定，不要改：
 
 - 容器内固定监听 **8080**，对外只发布 **8064**（`ELDER_HTTP_PORT` 可改宿主机侧端口）
-- 生产域名 `https://voice.2508866.xyz`（手机 APP 在 `app/src/http/elder.ts` 里代码级写死，无设置入口）
+- 生产域名 `https://voice.250886.xyz`（手机 APP 在 `app/src/http/elder.ts` 里代码级写死，无设置入口）
 
 ---
 
@@ -148,7 +148,7 @@ docker compose exec elder-server ls -l /data # 容器视角
 "配网成功但连不上云"通常是这两件事，和配网本身无关：
 
 1. **固件 OTA 地址指向了别处**。设备连上 Wi-Fi 后会去 `CONFIG_OTA_URL` 换 WebSocket 地址与 token，
-   出厂默认已指向本项目的 `https://voice.2508866.xyz/api/voice/ota`。
+   出厂默认已指向本项目的 `https://voice.250886.xyz/api/voice/ota`。
    若刷的是早期固件，默认值可能仍指向第三方域名——OTA 请求（含 MAC / UUID / 板子信息）
    会发给第三方，而响应里的 WebSocket 地址与 token 也由第三方下发，等于把整条语音链路的控制权交出去。
    处置：改 `CONFIG_OTA_URL` 后重新编译，或写 NVS 里 `settings("wifi")` 的 `ota_url` 覆盖
@@ -471,16 +471,16 @@ docker compose -f docker-compose.yml -f docker-compose.mysql.yml run --rm \
 
 ## 4. 反向代理 / HTTPS
 
-手机 APP 里的后端地址是**代码级写死**的 `https://voice.2508866.xyz`（`app/src/http/elder.ts` 的 `BASE_URL`），没有网络设置入口。所以对外域名只能是这个，Nginx 负责把 443 转到容器发布的 8064。
+手机 APP 里的后端地址是**代码级写死**的 `https://voice.250886.xyz`（`app/src/http/elder.ts` 的 `BASE_URL`），没有网络设置入口。所以对外域名只能是这个，Nginx 负责把 443 转到容器发布的 8064。
 
 ```nginx
 server {
     listen 443 ssl;
     http2 on;
-    server_name voice.2508866.xyz;
+    server_name voice.250886.xyz;
 
-    ssl_certificate     /etc/letsencrypt/live/voice.2508866.xyz/fullchain.pem;
-    ssl_certificate_key /etc/letsencrypt/live/voice.2508866.xyz/privkey.pem;
+    ssl_certificate     /etc/letsencrypt/live/voice.250886.xyz/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/voice.250886.xyz/privkey.pem;
     ssl_protocols       TLSv1.2 TLSv1.3;
 
     client_max_body_size 20m;
@@ -521,14 +521,14 @@ server {
 # HTTP 全量跳 HTTPS
 server {
     listen 80;
-    server_name voice.2508866.xyz;
+    server_name voice.250886.xyz;
     return 301 https://$host$request_uri;
 }
 ```
 
 注意点：
 
-- **`ELDER_CORS` 要跟着改**：`*` 在开发时方便，上线后建议写成 `https://voice.2508866.xyz`（多个来源用逗号分隔）。
+- **`ELDER_CORS` 要跟着改**：`*` 在开发时方便，上线后建议写成 `https://voice.250886.xyz`（多个来源用逗号分隔）。
   FastAPI 的 CORS 中间件在 `allow_origins=["*"]` 时不会带 `Allow-Credentials`，若前端要传凭证必须写明确来源。
 - 反向代理之后，容器内仍然认为自己是 HTTP，不需要在应用侧开 TLS。
 - **WebSocket 必须显式放行 Upgrade**：见上面 `location /api/voice/` 那段。这是本项目最容易踩的坑。
@@ -542,7 +542,7 @@ server {
 ### 4.1 Cloudflare Tunnel + iStoreOS 部署（当前生产形态）
 
 > 本节记录 2026-10 上线的实际形态：**iStoreOS（OpenWrt 软路由）+ Docker + cloudflared**，
-> 对外 `https://voice.2508866.xyz`，源站 `http://127.0.0.1:8064`（容器内 8080）。
+> 对外 `https://voice.250886.xyz`，源站 `http://127.0.0.1:8064`（容器内 8080）。
 > 域名以仓库内配置为准（`firmware/xiaozhi/main/Kconfig.projbuild` 的 `CONFIG_OTA_URL`、
 > `server/app/config.py` 的注释、`server/docker-compose.yml` 的示例），不要凭记忆改。
 
@@ -565,7 +565,7 @@ server {
 tunnel: <隧道 UUID>
 credentials-file: /etc/cloudflared/<隧道 UUID>.json
 ingress:
-  - hostname: voice.2508866.xyz
+  - hostname: voice.250886.xyz
     service: http://127.0.0.1:8064
   - service: http_status:404
 ```
@@ -581,7 +581,7 @@ ingress:
 
 ```bash
 # 1) HTTP 面：期望 {"ok":true,...}
-curl -s https://voice.2508866.xyz/api/health
+curl -s https://voice.250886.xyz/api/health
 
 # 2) WS 升级面：不带设备 token，期望先看到 101，紧接着连接被服务端以 4401 关闭
 #    （4401 = token 缺失，见 server/app/voice/session.py 的 CLOSE_UNAUTHORIZED；
@@ -592,7 +592,7 @@ curl -si -N --max-time 5 \
   -H 'Connection: Upgrade' -H 'Upgrade: websocket' \
   -H 'Sec-WebSocket-Version: 13' \
   -H 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==' \
-  https://voice.2508866.xyz/api/voice/v1/ws
+  https://voice.250886.xyz/api/voice/v1/ws
 ```
 
 #### 4.1.3 ⚠️ ws:// vs wss://：隧道形态下**必须**声明 `tunnel` 模式并配对外地址
@@ -612,7 +612,7 @@ curl -si -N --max-time 5 \
 **Docker 网桥网关**（cloudflared 在宿主机，查法见 §4.1.4），不在信任名单里
 —— 即使 cloudflared 正确传了 `X-Forwarded-Proto: https`，uvicorn 眼里自己
 永远是明文 HTTP。于是 `request.url.scheme` 恒为 `http`，设备拿到的是
-`ws://voice.2508866.xyz/api/voice/v1/ws`：明文 WS 打到 443。表现是**设备能配网、
+`ws://voice.250886.xyz/api/voice/v1/ws`：明文 WS 打到 443。表现是**设备能配网、
 能心跳，一开口说话就断**，极易误判成固件问题。
 
 解决办法（二选一，**推荐前者**）：
@@ -620,11 +620,11 @@ curl -si -N --max-time 5 \
 ```bash
 # ① 新变量（任何模式下都校验 scheme；WS 可单独配域名）
 ELDER_DEPLOY_MODE=tunnel
-ELDER_PUBLIC_BASE_URL=https://voice.2508866.xyz
-# ELDER_WS_PUBLIC_BASE_URL=wss://voice-ws.2508866.xyz   # 可选：WS 单独域名
+ELDER_PUBLIC_BASE_URL=https://voice.250886.xyz
+# ELDER_WS_PUBLIC_BASE_URL=wss://voice-ws.250886.xyz   # 可选：WS 单独域名
 
 # ② 旧变量（向后兼容，语义与历史上逐字一致；tunnel 模式下同样满足"有显式地址"）
-# ELDER_VOICE_PUBLIC_BASE=https://voice.2508866.xyz
+# ELDER_VOICE_PUBLIC_BASE=https://voice.250886.xyz
 ```
 
 注意：
@@ -695,7 +695,7 @@ XFF，且**从右往左**跳过可信段、取第一个不可信地址（攻击�
   `ZoneInfo("Asia/Shanghai")` 恒为 +8，与宿主机时区无关 —— iStoreOS 默认 UTC 也不影响
   提醒时间。固件侧时间由心跳下发的 `server_time` 校准。
 - **固件与服务的分工**（改域名时最容易漏）：
-  - OTA 检查地址：编译期 `CONFIG_OTA_URL`（默认 `https://voice.2508866.xyz/api/voice/ota`，
+  - OTA 检查地址：编译期 `CONFIG_OTA_URL`（默认 `https://voice.250886.xyz/api/voice/ota`，
     见 `firmware/xiaozhi/main/Kconfig.projbuild`），设备运行时还可被 NVS 覆盖
     （`settings("wifi")` 的 `ota_url`，见 `firmware/xiaozhi/main/ota.cc` 的 `GetCheckVersionUrl`）。
   - 语音 WS 地址：每次心跳由服务端按 §4.1.3 的逻辑重新下发。
@@ -789,7 +789,7 @@ XFF，且**从右往左**跳过可信段、取第一个不可信地址（攻击�
 
 **这张表解释的那个真实坑**：「我配了旧变量、`direct` 模式跑得好好的，
 怎么一换成隧道就连不上」—— 因为旧变量在 `direct` 下**根本不检查 scheme**，
-你填 `wss://voice.2508866.xyz` 它照收不误、照跑不误；直到你把
+你填 `wss://voice.250886.xyz` 它照收不误、照跑不误；直到你把
 `ELDER_DEPLOY_MODE` 改成 `tunnel`，才会在启动时被拦下来。
 **这不是 bug，是刻意的**（不校验是为了不打断存量部署），但必须知道。
 
@@ -881,7 +881,7 @@ WS 地址由它自动换 scheme 推导成 `wss://voice.example.com/api/voice/v1/
 | `ELDER_HTTP_PORT` | `8064` | 宿主机对外端口（容器内固定 8080） |
 | `ELDER_PORT` | `8080` | 容器内监听端口，一般不改 |
 | `ELDER_JWT_SECRET` | `please-change-this-secret-in-production` | JWT 签名密钥，**生产必须换成随机长字符串** |
-| `ELDER_CORS` | `*` | 允许的跨域来源，逗号分隔；上线建议填 `https://voice.2508866.xyz` |
+| `ELDER_CORS` | `*` | 允许的跨域来源，逗号分隔；上线建议填 `https://voice.250886.xyz` |
 | `ELDER_DB_WAIT_SEC` | `180` | 启动阶段等待数据库可用的秒数（仅 MySQL 生效，SQLite 是本地文件无需等待） |
 | `ELDER_TZ` | `Asia/Shanghai` | 业务时区，改了会整体影响提醒时间计算 |
 | `MYSQL_ROOT_PASSWORD` | `123456` | 仅在使用自带 `elder-db` 容器时生效，**生产必须改** |
@@ -1077,7 +1077,7 @@ ELDER_BOOTSTRAP_ADMIN_USERNAME=zhangjiashu_admin
 * **已经跑起来的库**（含正在运行的生产库）：那个 `admin` 的口令**至今仍是 `admin123`**，
   升级代码**不会**自动改掉它 —— 因为根本不会再走 `_seed()`。
 
-本服务是公开部署的（`voice.2508866.xyz`，APP 把 `BASE_URL` 写死成它），
+本服务是公开部署的（`voice.250886.xyz`，APP 把 `BASE_URL` 写死成它），
 所以存量的 `admin/admin123` 等于"任何人都能当平台管理员"：改 AI 配置（含厂商
 API Key 的读写口径）、查看全部用户用量与记忆、给设备核销付费开通。
 
@@ -1108,12 +1108,12 @@ hash 带随机盐，同一个口令两次 hash 出来的字符串不同，字符
 
 ```bash
 # 1) 拿 token
-TOKEN=$(curl -s -X POST https://voice.2508866.xyz/api/auth/login \
+TOKEN=$(curl -s -X POST https://voice.250886.xyz/api/auth/login \
   -H 'Content-Type: application/json' \
   -d '{"username":"admin","password":"admin123"}' | python -c 'import sys,json;print(json.load(sys.stdin)["access_token"])')
 
 # 2) 改密码（新口令自己换掉）
-curl -X POST https://voice.2508866.xyz/api/auth/password \
+curl -X POST https://voice.250886.xyz/api/auth/password \
   -H "Authorization: Bearer $TOKEN" \
   -H 'Content-Type: application/json' \
   -d '{"old_password":"admin123","new_password":"换成你的强口令"}'
@@ -1406,7 +1406,7 @@ docker inspect --format '{{.State.ExitCode}}' elder-server
    ```bash
    curl -i -N -H "Connection: Upgrade" -H "Upgrade: websocket" \
         -H "Sec-WebSocket-Version: 13" -H "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==" \
-        https://voice.2508866.xyz/api/voice/v1/ws
+        https://voice.250886.xyz/api/voice/v1/ws
    # 正确：HTTP/1.1 101 Switching Protocols
    # 错误：HTTP/1.1 200 或 400 —— 说明 Upgrade 头被反代吃掉了
    ```
@@ -1419,14 +1419,14 @@ docker inspect --format '{{.State.ExitCode}}' elder-server
 4. **确认设备拿到的地址对不对**：看启动日志里的部署摘要（`docker compose logs elder-server | grep 【部署】`），
    或调一次心跳看 `ws_url` 字段。
 
-   走 HTTPS 域名时必须是 `wss://voice.2508866.xyz/api/voice/v1/ws`。
+   走 HTTPS 域名时必须是 `wss://voice.250886.xyz/api/voice/v1/ws`。
    如果显示的是内网 IP 或 `ws://`（非加密），按部署形态二选一：
 
    ```bash
    # 隧道 / TLS 反代（推荐）：显式声明模式 + 对外地址，缺地址会启动失败
    ELDER_DEPLOY_MODE=tunnel
-   ELDER_PUBLIC_BASE_URL=https://voice.2508866.xyz
-   # 旧变量仍然有效：ELDER_VOICE_PUBLIC_BASE=https://voice.2508866.xyz
+   ELDER_PUBLIC_BASE_URL=https://voice.250886.xyz
+   # 旧变量仍然有效：ELDER_VOICE_PUBLIC_BASE=https://voice.250886.xyz
    ```
 
    机制说明：uvicorn 对 `X-Forwarded-Proto` **只信任来自 127.0.0.1 的对端**
@@ -1561,9 +1561,9 @@ export ELDER_LIBOPUS_PATH=C:/lib/opus.dll
 
 **现象**：页面本身能打开（HTTPS 正常），但一调用某些接口就失败：
 
-- 浏览器 Console：`Mixed Content: The page at 'https://voice.2508866.xyz/' was loaded
+- 浏览器 Console：`Mixed Content: The page at 'https://voice.250886.xyz/' was loaded
   over HTTPS, but requested an insecure XMLHttpRequest endpoint
-  'http://voice.2508866.xyz/api/admin/presets/'. This request has been blocked;
+  'http://voice.250886.xyz/api/admin/presets/'. This request has been blocked;
   the content must be served over HTTPS.`
 - 前端只显示一个没有细节的 `Failed to fetch`（fetch 被浏览器拦下，
   连 socket 都没建，所以服务端日志里**一行都没有**）。
@@ -1586,8 +1586,8 @@ export ELDER_LIBOPUS_PATH=C:/lib/opus.dll
 
 ```bash
 curl -sI http://<宿主机>:8064/api/admin/presets | grep -i '^location'
-# 错：location: http://voice.2508866.xyz/api/admin/presets/
-# 对：location: https://voice.2508866.xyz/api/admin/presets/
+# 错：location: http://voice.250886.xyz/api/admin/presets/
+# 对：location: https://voice.250886.xyz/api/admin/presets/
 ```
 
 **处置**（按推荐顺序）：
