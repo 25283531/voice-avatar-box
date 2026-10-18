@@ -86,6 +86,21 @@
   .fold>summary:before{content:"▸ ";color:var(--muted)}
   .fold[open]>summary:before{content:"▾ "}
   .fold .inner{padding:8px 12px}
+  /* ---- 填写说明区 ---- */
+  /* 每块一个浅底卡片而不是靠标题分隔：这些说明要读很久，
+     连续十几行 13px 正文贴在一起会让人找不到自己在读哪一条。 */
+  .guideblk{border:1px solid var(--line);border-radius:8px;padding:10px 12px;
+        margin-bottom:10px;background:#fcfdfe}
+  .guideblk h2{font-size:14px;margin:0 0 8px}
+  .guideblk p{margin:5px 0;font-size:13px;line-height:1.75}
+  /* 字段所在页面的角标：说明写在人格预设页，但片段/灯效其实在形象页填，
+     不标出来管理员会在这页找半天。 */
+  .guideblk .where{font-size:12px;font-weight:400;color:var(--muted);margin-left:8px}
+  .guideblk .ex{background:#0f172a;color:#7dd3fc;padding:10px 12px;border-radius:8px;
+        font:12px/1.65 ui-monospace,Consolas,monospace;overflow:auto;margin:6px 0;
+        white-space:pre-wrap}
+  .guideblk .warn{background:#fdf3e3;color:#8a5a00;padding:7px 10px;border-radius:6px;
+        font-size:13px;line-height:1.7}
   .audit{border:1px solid var(--line);border-radius:8px;padding:8px 10px;margin-bottom:8px}
   .audit pre{white-space:pre-wrap;word-break:break-all;background:#f8fafc;padding:6px 8px;
         border-radius:6px;font-size:12px;margin:4px 0 0}
@@ -108,7 +123,8 @@
     <input id="lp" v-model="loginForm.password" type="password" style="width:100%;margin-bottom:14px" @keyup.enter="doLogin" />
     <button id="lb" class="primary" style="width:100%" :disabled="busy" @click="doLogin">登 录</button>
     <p class="muted" style="margin-top:12px;font-size:12px">
-      首次部署默认账号 <code>admin</code> / <code>admin123</code>，登录后请立即修改。
+      首次部署的管理员口令由启动日志给出（形如 <code>ELDER-INITIAL-PASSWORD=…</code>），
+      重启不再显示；也可在部署前用 <code>ELDER_SEED_ADMIN_PASSWORD</code> 指定。登录后请立即修改。
     </p>
   </div>
 
@@ -125,6 +141,7 @@
       </div>
       <div class="row">
         <span class="muted" style="font-size:12px">{{user.username}}</span>
+        <button @click="openPassword">修改密码</button>
         <button @click="logout">退出</button>
       </div>
     </header>
@@ -140,93 +157,127 @@
       <div class="grid g4" style="margin-bottom:14px">
         <div class="kpi"><div class="n">{{devices.length}}</div><div class="l">设备总数</div></div>
         <div class="kpi"><div class="n">{{devices.filter(d=>d.online).length}}</div><div class="l">在线设备</div></div>
-        <div class="kpi"><div class="n">{{reminders.length}}</div><div class="l">提醒规则</div></div>
+        <div class="kpi"><div class="n">{{reminders.length}}</div><div class="l">全平台提醒规则</div></div>
         <div class="kpi"><div class="n">{{avatars.length}}</div><div class="l">形象数量</div></div>
       </div>
+      <!-- 快速上手：这份清单只讲**管理员自己**能做的事。
+           为什么不写「怎么加设备」：设备登记与激活码绑定都在用户级 /user 页
+           （家属用自己的账号操作，见 user.html:155-187）。这里曾写着
+           「在设备页登记设备、点生成激活码」，而那两个入口已经不存在 ——
+           管理员照着做只会白跑一趟，而且与设备页空态那段
+           「这不是故障，设备由家属在 APP 绑定」自相矛盾。 -->
       <div class="card">
         <h2>快速上手</h2>
-        <ol class="muted" style="margin:0;padding-left:20px">
-          <li>在「设备」页登记设备，点「生成激活码」，屏幕上会显示形如 <code>A-3829-4471-0056</code> 的 13 位码</li>
-          <li>手机端输入该码完成绑定；激活码 10 分钟内有效，末位是 Luhn 校验位，输错当场提示</li>
-          <li>在「提醒」页添加服药 / 日程规则，支持按周、按月、隔天与一天多次</li>
-          <li>在「形象」页配置 EAF 序列帧资源包与提示词，在设备页应用到具体设备</li>
-          <li>在「AI 接入」页配置 ASR / LLM / TTS 平台，可导出为小智配置</li>
+        <p class="muted" style="font-size:12px;margin:0 0 8px">
+          这个后台是<b>平台管理员</b>用的，只负责「配置平台」和「查看运行情况」。
+          <b>设备登记、绑定、添加提醒都由家属在 <code>/user</code> 页自己完成</b>，
+          管理员在这里看不到也代不了操作。
+        </p>
+        <ol class="muted" style="margin:0;padding-left:20px;line-height:1.9">
+          <li><b>先看设备接进来了没有。</b>「设备」页是只读的：谁接了、什么时候接的、
+              系统版本、token 花了多少，一行就够。家属绑定完成后设备会自动出现在这里，
+              不用管理员登记。</li>
+          <li><b>提醒规则不用你建。</b>「提醒」页能看所有用户设的规则和它们的回执
+              （响没响、确认没确认），也能在提醒误报时临时暂停某一条。
+              新增和修改请让家属在 <code>/user</code> 操作，他们能在手机上看到自己刚改了什么。</li>
+          <li><b>平台级配置在这里做：</b>「AI 接入」页配 ASR / LLM / TTS，
+              「形象」页配屏幕动画与灯效资源包，「人格预设」页调全平台说话风格。
+              这三项都是<b>所有用户共用</b>的，改动会影响全部设备。</li>
+          <li><b>角色绑定也在 <code>/user</code>：</b>哪台设备用哪个人格，
+              由家属在自己的页面选，管理员端不提供这个操作。</li>
         </ol>
       </div>
     </section>
 
-    <!-- ---------------------- 设备 ---------------------- -->
+    <!-- ---------------------- 设备（只读） ---------------------- -->
+    <!-- 管理员端只做「看」：谁接了、什么时候接的、系统版本、花了多少 token。
+         新增设备在用户级 /user 页面（那边能拿到设备的 eFuse MAC 与激活码），
+         管理员在这里既拿不到 MAC 也代不了用户绑定，给一个入口只会让人空跑一趟。 -->
     <section v-if="tab==='devices'">
       <div class="card">
-        <h2>登记设备</h2>
-        <div class="row">
-          <div><label>设备标识（eFuse MAC）</label><input v-model="devForm.device_id" placeholder="aabbccddeeff" /></div>
-          <div><label>名称</label><input v-model="devForm.name" placeholder="客厅陪伴助手" /></div>
-          <button class="primary" @click="createDevice">添加</button>
+        <div class="row" style="justify-content:space-between">
+          <h2>已接入设备</h2>
+          <div class="row">
+            <input v-model="devFilter" placeholder="按名称 / 设备标识搜索" />
+            <button @click="loadDevices" :disabled="devBusy">{{devBusy?'刷新中…':'刷新'}}</button>
+          </div>
         </div>
-      </div>
-      <div class="card">
-        <h2>设备列表</h2>
-        <table v-if="devices.length">
-          <thead><tr><th>名称</th><th>标识</th><th>状态</th><th>形象</th><th>最近在线</th><th>操作</th></tr></thead>
+        <table v-if="shownDevices.length">
+          <thead><tr>
+            <th>名称</th><th>设备标识</th><th>类型</th><th>拥有者</th>
+            <th>接入时间</th><th>系统版本</th><th>状态</th>
+            <th class="num">token 用量</th><th>操作</th>
+          </tr></thead>
           <tbody>
-            <tr v-for="d in devices" :key="d.id">
+            <tr v-for="d in shownDevices" :key="d.id">
               <td>{{d.name}}</td>
               <td><code>{{d.device_id}}</code></td>
+              <td class="muted">{{devType(d)}}</td>
+              <td>{{ownerName(d)}}</td>
+              <td class="muted">{{fmt(d.created_at)}}</td>
+              <td class="muted">{{d.fw_version||'未上报'}}</td>
               <td><span class="tag" :class="d.online?'ok':''">{{d.online?'在线':'离线'}}</span></td>
-              <td>
-                <select :value="d.avatar_id||''" @change="applyAvatar(d,$event)">
-                  <option value="">未设置</option>
-                  <option v-for="a in avatars" :key="a.id" :value="a.id">{{a.name}}</option>
-                </select>
+              <td class="num">
+                <span v-if="devTokens(d.id)">{{devTokens(d.id).toLocaleString()}}</span>
+                <span v-else-if="devUsageBusy" class="muted">…</span>
+                <span v-else class="muted" title="这台设备还没有产生过任何模型调用">0</span>
               </td>
-              <td class="muted">{{fmt(d.last_seen_at)}}</td>
               <td class="row">
-                <button @click="genCode(d)">激活码</button>
-                <button @click="openReminders(d)">提醒</button>
-                <button @click="openStats(d)">统计</button>
-                <button class="danger" @click="removeDevice(d)">删除</button>
+                <button @click="openReminders(d)">看提醒</button>
+                <button @click="openStats(d)">看统计</button>
               </td>
             </tr>
           </tbody>
         </table>
-        <div v-else class="empty">还没有设备，先在上方登记一台</div>
-      </div>
-
-      <div v-if="codeBox" class="mask" @click.self="codeBox=null">
-        <div class="modal">
-          <button class="close" @click="codeBox=null">&times;</button>
-          <h2>设备激活码</h2>
-          <p class="muted">让设备屏幕显示该码，或用手机端输入。<b>10 分钟内有效</b>，过期请在设备上重新获取。</p>
-          <div class="big-code">{{codeBox.display}}</div>
-          <p class="muted" style="font-size:12px">
-            原始码：<code>{{codeBox.code}}</code> · 结构：1 位字母 + 12 位数字（末位 Luhn 校验位）
+        <div v-else-if="devBusy" class="empty">正在读取设备列表…</div>
+        <div v-else-if="devFilter" class="empty">
+          没有一台设备的名字或标识里有「{{devFilter}}」。<a href="javascript:void(0)" @click="devFilter=''">清空搜索</a>重新看全部。
+        </div>
+        <div v-else class="empty">
+          <p style="margin:0 0 8px"><b>现在还没有任何设备接入平台。</b></p>
+          <p style="margin:0">
+            这不是故障——设备要由家属在自己手机上安装 APP、输入激活码完成绑定后才会出现在这里。
+            平台管理员不负责登记设备。<br>
+            如果你确认家属已经装好 APP 却在这里看不到，请让家属打开 APP 的「我的设备」页，
+            确认设备已联网并完成绑定；仍看不到再提交工单，我们排查服务端日志。
           </p>
-          <div class="row"><button class="primary" @click="copy(codeBox.code)">复制</button></div>
         </div>
       </div>
     </section>
 
-    <!-- ---------------------- 提醒 ---------------------- -->
+    <!-- ---------------------- 提醒（只读为主） ---------------------- -->
+    <!-- 管理员在这里是「排障视角」：某台设备该响没响、家属到底确认了没有。
+         新增/编辑提醒是家属在 /user 自己做的事，管理员代设反而会让家属
+         在自己手机上看到一个自己没建过的提醒。 -->
     <section v-if="tab==='reminders'">
       <div class="card">
         <div class="row" style="justify-content:space-between">
           <h2>提醒规则</h2>
           <div class="row">
-            <select v-model="curDeviceId">
+            <select v-model="remDeviceFilter" @change="onRemDeviceFilter">
+              <option value="">全部设备</option>
               <option v-for="d in devices" :key="d.id" :value="d.id">{{d.name}}</option>
             </select>
-            <button class="primary" :disabled="!curDeviceId" @click="editReminder(null)">新增提醒</button>
+            <select v-model="remUserFilter" @change="applyRemFilter">
+              <option value="">全部用户</option>
+              <option v-for="u in ownerOptions" :key="u.id" :value="u.id">{{u.name}}</option>
+            </select>
+            <button @click="loadReminders">刷新</button>
           </div>
         </div>
-        <table v-if="reminders.length">
+        <p class="muted" style="font-size:12px;margin:0 0 10px">
+          这里只能查看和临时开关某条规则；<b>新增与修改请让家属在 APP 的「我的提醒」里操作</b>，
+          这样他们能看到自己刚改了什么。
+        </p>
+        <table v-if="shownReminders.length">
           <thead><tr><th>标题</th><th>类型</th><th>时间</th><th>重复</th><th>确认</th><th>状态</th><th>操作</th></tr></thead>
           <tbody>
-            <tr v-for="r in reminders" :key="r.id">
+            <tr v-for="r in shownReminders" :key="r.id">
               <td>
                 {{r.title}}
                 <div class="muted" style="font-size:12px" v-if="r.dose">剂量：{{r.dose}}</div>
                 <div class="muted" style="font-size:12px">下次：{{fmt(r.next_fire_at)}}</div>
+                <div class="muted" style="font-size:12px">设备：{{deviceName(r.device_id)}}</div>
               </td>
               <td>{{typeName(r.rtype)}}</td>
               <td>{{(r.times_of_day||[]).join(' ')}}</td>
@@ -236,18 +287,24 @@
                 <span class="tag" :class="r.enabled?'ok':''">{{r.enabled?'启用':'暂停'}}</span>
               </td>
               <td class="row">
-                <button @click="editReminder(r)">编辑</button>
                 <button @click="toggleReminder(r)">{{r.enabled?'暂停':'启用'}}</button>
-                <button class="danger" @click="removeReminder(r)">删除</button>
+                <button @click="openRemindersOf(r)">看回执</button>
               </td>
             </tr>
           </tbody>
         </table>
-        <div v-else class="empty">该设备还没有提醒规则</div>
+        <div v-else-if="remBusy" class="empty">正在读取提醒规则…</div>
+        <div v-else-if="remDeviceFilter || remUserFilter" class="empty">
+          当前筛选下没有提醒规则。切换设备或用户再看看。
+        </div>
+        <div v-else class="empty">
+          平台上一条提醒规则都没有。这说明还没有家属设置过服药 / 日程提醒——
+          设备本身不自带提醒，需要家属在 APP 里添加。
+        </div>
       </div>
 
       <div class="card" v-if="curDeviceId">
-        <h2>最近回执</h2>
+        <h2>最近回执<span v-if="curDeviceLabel"> · {{curDeviceLabel}}</span></h2>
         <table v-if="events.length">
           <thead><tr><th>应触发</th><th>状态</th><th>确认方式</th><th>确认时间</th><th>备注</th></tr></thead>
           <tbody>
@@ -260,80 +317,7 @@
             </tr>
           </tbody>
         </table>
-        <div v-else class="empty">暂无回执</div>
-      </div>
-
-      <div v-if="rBox" class="mask" @click.self="rBox=null">
-        <div class="modal">
-          <button class="close" @click="rBox=null">&times;</button>
-          <h2>{{rBox.id?'编辑提醒':'新增提醒'}}</h2>
-          <div class="grid g2">
-            <div><label>标题</label><input v-model="rForm.title" style="width:100%" /></div>
-            <div><label>类型</label>
-              <select v-model.number="rForm.rtype" style="width:100%">
-                <option :value="0">服药</option><option :value="1">日程</option>
-                <option :value="2">喝水</option><option :value="3">运动</option><option :value="4">自定义</option>
-              </select></div>
-            <div><label>播报文案（留空则读标题）</label><input v-model="rForm.speak_text" style="width:100%" /></div>
-            <div><label>剂量 / 备注</label><input v-model="rForm.dose" style="width:100%" placeholder="1 片，饭后" /></div>
-          </div>
-
-          <div class="grid g2" style="margin-top:10px">
-            <div><label>重复方式</label>
-              <select v-model.number="rForm.schedule_kind" style="width:100%">
-                <option :value="1">每天</option><option :value="2">每周指定几天</option>
-                <option :value="3">每月指定几号</option><option :value="4">每隔 N 天</option>
-                <option :value="0">指定日期一次</option>
-              </select></div>
-            <div><label>触发时刻（24h，逗号分隔，如 08:00, 20:00）</label>
-              <input v-model="timesText" style="width:100%" placeholder="08:00, 12:00, 18:00" /></div>
-          </div>
-
-          <div class="grid g3" style="margin-top:10px" v-if="rForm.schedule_kind===2">
-            <div><label>星期（1=周一）</label><input v-model="weekText" style="width:100%" placeholder="1,3,5" /></div>
-            <div><label>生效开始</label><input v-model="rForm.start_date" placeholder="2026-10-01" /></div>
-            <div><label>生效结束</label><input v-model="rForm.end_date" placeholder="2027-10-01" /></div>
-          </div>
-          <div class="grid g3" style="margin-top:10px" v-if="rForm.schedule_kind===3">
-            <div><label>每月几号</label><input v-model="monthText" placeholder="1,15" /></div>
-            <div><label>生效开始</label><input v-model="rForm.start_date" placeholder="2026-10-01" /></div>
-            <div><label>生效结束</label><input v-model="rForm.end_date" placeholder="2027-10-01" /></div>
-          </div>
-          <div class="grid g3" style="margin-top:10px" v-if="rForm.schedule_kind===4">
-            <div><label>每隔天数</label><input v-model.number="rForm.interval_days" type="number" min="1" /></div>
-            <div><label>起始日期</label><input v-model="rForm.start_date" placeholder="2026-10-01" /></div>
-            <div><label>结束日期</label><input v-model="rForm.end_date" placeholder="2026-12-31" /></div>
-          </div>
-          <div class="grid g3" style="margin-top:10px" v-if="rForm.schedule_kind===0">
-            <div><label>日期</label><input v-model="rForm.once_date" placeholder="2026-10-15" /></div>
-          </div>
-
-          <div class="grid g3" style="margin-top:10px">
-            <div><label>需要确认</label>
-              <select v-model="rForm.require_confirm" style="width:100%">
-                <option :value="true">需要</option><option :value="false">不需要</option>
-              </select></div>
-            <div><label>未确认重复间隔（分钟）</label><input v-model.number="rForm.repeat_interval_min" type="number" /></div>
-            <div><label>超时升级（分钟）</label><input v-model.number="rForm.escalate_after_min" type="number" /></div>
-          </div>
-
-          <div style="margin-top:10px">
-            <label>允许的确认方式</label>
-            <div class="row">
-              <label style="display:flex;gap:4px;align-items:center">
-                <input type="checkbox" value="voice" v-model="rForm.confirm_methods" /> 语音</label>
-              <label style="display:flex;gap:4px;align-items:center">
-                <input type="checkbox" value="button" v-model="rForm.confirm_methods" /> 按键（长按3秒+30秒内短按）</label>
-              <label style="display:flex;gap:4px;align-items:center">
-                <input type="checkbox" value="app" v-model="rForm.confirm_methods" /> 手机端</label>
-            </div>
-          </div>
-
-          <div class="row" style="margin-top:16px;justify-content:flex-end">
-            <button @click="rBox=null">取消</button>
-            <button class="primary" @click="saveReminder">保存</button>
-          </div>
-        </div>
+        <div v-else class="empty">该设备还没有回执记录（说明它近期没有触发过提醒，或一直没人确认）</div>
       </div>
     </section>
 
@@ -601,6 +585,136 @@
           <pre v-if="showDiff[a.id]">{{prettyDiff(a)}}</pre>
         </div>
       </div>
+
+      <!-- ===== 填写说明（页面下部 · 默认收起）===== -->
+      <!-- 为什么放这里而不是弹窗：填错 JSON 的后果是「保存成功但设备表现变了」，
+           报错还发生在设备端而不是这个页面上。用弹窗的话管理员点「确定」之后
+           手上就没东西可以对照了 —— 放在页面下部，他可以一边填一边往下翻。 -->
+      <details class="fold">
+        <summary>❓ 不知道怎么填？点这里看每个字段的说明和例子</summary>
+        <div class="inner">
+
+          <div class="guideblk">
+            <h2 style="margin-top:4px">系统提示词 / 人格提示词</h2>
+            <p><b>这是干什么的：</b>一句话说清「这个角色该怎么说话」。设备每次回答老人之前，
+              都会先读这段文字。写得越具体，说话风格越稳定。</p>
+            <p><b>可以直接抄的例子：</b></p>
+            <pre class="ex">你叫小暖，是给独居老人用的陪伴助手。
+说话像晚辈，语气温和但不幼稚。
+每次回答不超过两句话，老人容易听清。
+不要主动提医学建议；老人问吃药的事就提醒他按 APP 里设好的提醒来。
+老人说「不想活了」这类话时，立刻放慢语念一句「我在这儿，您先歇会儿」，
+然后提示他按桌上的呼叫按钮。</pre>
+            <p><b>建议多长：</b>5～10 句、200 字以内。超过一屏通常没人认真读完，
+              而且每轮对话都要把这段文字发给模型，写太长既费钱又容易被后面的闲聊冲淡。</p>
+            <p><b>留空会怎样：</b>机器人退回平台默认语气（中性、偏短）。
+              不会出错，但「每个角色听起来都一样」。</p>
+            <p class="warn"><b>注意：</b>这里<b>不需要</b>自己写安全底线（不能聊政治、
+              不能给医疗建议之类）。那些是平台强制注入的，你写了也会被忽略。
+              页面上的「安全底线」折叠区可以随时点开看平台到底强制了什么。</p>
+          </div>
+
+          <div class="guideblk">
+            <h2>片段映射 JSON<span class="where">（在「形象」页新增/编辑形象时填）</span></h2>
+            <p><b>这是干什么的：</b>告诉设备「屏幕上的表情动作叫什么名字」。
+              设备待机时要播 <code>idle</code>，张嘴说话时播 <code>mouth_open</code>，
+              就是靠这张对照表找到对应的动画片段的。</p>
+            <p><b>格式：</b>左边是「什么时候」（<b>这 9 个词是系统认定的，不能自己编</b>），
+              右边是「播哪个动画」。右边填你 EAF 资源包里真实存在的片段名，
+              最省事的做法是<b>左右两边填一样的词</b>。</p>
+            <p><b>可以直接抄的例子：</b></p>
+            <pre class="ex">{
+  "idle": "idle",
+  "listening": "listening",
+  "thinking": "thinking",
+  "mouth_open": "mouth_open",
+  "mouth_half": "mouth_half",
+  "smile": "smile",
+  "blink": "blink",
+  "sleepy": "sleepy",
+  "alert": "alert"
+}</pre>
+            <p><b>这 9 个词分别是什么意思：</b>
+              <code>idle</code> 待机 · <code>listening</code> 在听老人说话 ·
+              <code>thinking</code> 正在想 · <code>mouth_open</code> 说话时嘴张大 ·
+              <code>mouth_half</code> 说话时嘴半张（音量小的时候用）·
+              <code>smile</code> 微笑 · <code>blink</code> 眨眼 ·
+              <code>sleepy</code> 打哈欠/困 · <code>alert</code> 警示（提醒吃药没确认时用）。</p>
+            <p><b>留空会怎样：</b>新建形象时留空，系统会自动填上面这套默认值，
+              一般不用管。<b>只有当你的资源包里的片段换了名字</b>（比如资源包里叫
+              <code>wait</code> 而不是 <code>idle</code>），才需要回来改。</p>
+            <p class="warn"><b>填错的后果：</b>格式写错（少了大括号、末尾多逗号）保存会直接报错；
+              名字对不上则屏幕表情不动，但不会影响说话。</p>
+          </div>
+
+          <div class="guideblk">
+            <h2>情绪灯效 JSON<span class="where">（同样在「形象」页填）</span></h2>
+            <p><b>这是干什么的：</b>设备底部那圈灯的颜色。老人说话时亮蓝色、
+              提醒吃药没确认时闪红色，就是靠这张表。</p>
+            <p><b>格式：</b>左边是「什么情绪」，右边写两个东西：
+              <code>rgb</code> 颜色值（<code>#</code> 开头、6 位十六进制），
+              <code>effect</code> 灯的闪法。</p>
+            <p><b>可以直接抄的例子：</b></p>
+            <pre class="ex">{
+  "neutral":  {"rgb": "#4A90D9", "effect": "breath"},
+  "happy":    {"rgb": "#3AD07A", "effect": "breath"},
+  "sad":      {"rgb": "#5B6B8C", "effect": "solid"},
+  "angry":    {"rgb": "#E4573D", "effect": "blink"},
+  "alert":    {"rgb": "#FF2020", "effect": "solid"},
+  "speaking": {"rgb": "#7FD3FF", "effect": "breath"},
+  "listening":{"rgb": "#FFD24A", "effect": "breath"}
+}</pre>
+            <p><b>effect 只有 4 种可选：</b>
+              <code>breath</code> 缓慢呼吸（最柔和，适合日常）·
+              <code>solid</code> 常亮 ·
+              <code>blink</code> 闪烁（<b>只用在需要立刻注意到的情况</b>，长时间闪会让人烦躁）·
+              <code>rainbow</code> 彩虹流动（很少用）。</p>
+            <p><b>颜色怎么选：</b>红黄蓝这类饱和色在小屏幕上最醒目；
+              想柔和就用带一点灰的颜色（如 <code>#5B6B8C</code>）。
+              <b>不要只靠颜色区分状态</b>，屏幕上的表情同时也会变。</p>
+            <p><b>留空会怎样：</b>新建形象时留空会自动填上面这套默认值，灯会正常亮。</p>
+          </div>
+
+          <div class="guideblk">
+            <h2>TTS 音色</h2>
+            <p><b>这是干什么的：</b>决定机器人念话时是男声还是女声、什么口音。
+              这是最直观的一项——<b>改完当场就能听出来</b>。</p>
+            <p><b>怎么填：</b><b>从下拉框里选，不要手打。</b>
+              下拉框里每一项后面都写了「适合什么场景」，照着挑即可：陪伴聊天优先挑
+              温和中年女声；提醒播报挑清晰、语速稳的。</p>
+            <p><b>只有一个例外：</b>如果你用的是<b>自己搭建的语音服务</b>
+              （不是本平台预置的厂商），才需要选最后一项
+              「✎ 其他（自建服务，手填音色名）」，然后填那个服务认识的音色名。
+              选了那一项但没填名字，系统会拦下来不让保存。</p>
+            <p><b>留空会怎样：</b>用平台默认音色，或者由「AI 接入」页里配置的
+              TTS 服务决定。<b>不会没有声音</b>。</p>
+            <p class="warn"><b>常见误区：</b>在下拉框里选了自建服务那项、但把音色名
+              填在了别的框里。这样保存出来的声音会变掉。音色名只能填在它紧跟着出现的
+              那个输入框里。</p>
+          </div>
+
+          <div class="guideblk">
+            <h2>性格 10 维（人格预设专用）</h2>
+            <p><b>这一项不用填 JSON，也不用填数字</b>——每一维都是一组按钮，点一下选中即可。
+              点完按钮，下面那行灰字就是这一档的实际表现，看一眼就知道选对没有。</p>
+            <p>十维合起来决定「话多不多、幽默不幽默、称呼老人还是叫名字」这类整体风格。
+              <b>建议只调和你有明显想法的维度</b>，其余保持默认——
+              十维全拧到极端，角色反而会显得别扭。</p>
+            <p><b>能不能填 0.6 这种小数？</b>不能，也不该填。这里的选项是产品档位
+              不是数学数值，填下去你自己也判断不了它意味着什么。</p>
+          </div>
+
+          <div class="guideblk">
+            <h2>改完怎么验证</h2>
+            <p>人格预设页面里点「<b>预览编译产物</b>」，会显示保存后设备真正收到的那一整段文字。
+              <b>这个预览不会保存</b>，关掉就没了 —— 它就是给你在按下保存前做最后确认用的。</p>
+            <p>每次改动都会自动记进「审计」，谁在什么时候把哪一项从什么改成什么，
+              都可以回查。误操作可以用「恢复默认」退回出厂设置
+              （注意：已经派生给用户的角色是独立副本，不会跟着变）。</p>
+          </div>
+
+        </div>
+      </details>
     </section>
 
     <!-- ---------------------- AI 接入 -------------------- -->
@@ -775,16 +889,24 @@
             <div><label>模型</label><input v-model="pForm.model" style="width:100%" /></div>
             <div v-if="showEndpoint"><label>接口地址</label>
               <input v-model="pForm.endpoint" style="width:100%" />
-              <div v-if="pForm.kind==='tts'" style="font-size:12px;color:#888;margin-top:4px">
+              <!-- 这条提示对所有 kind 都给：endpoint 填错是本项目反复踩的坑，且
+                   LLM 侧更隐蔽 —— 少写 /v1 有时拿到的是 HTML 首页而不是报错 -->
+              <div style="font-size:12px;color:#888;margin-top:4px">
                 填到 <code>/v1</code> 这一级（如 <code>https://…/compatible-mode/v1</code>），
-                不要填官网首页。
+                不要填官网首页，也不要把整条接口地址（如 <code>…/chat/completions</code>）粘进来。
               </div>
             </div>
-            <div v-if="showApiKey"><label>{{apiKeyLabel}}</label>
-              <input v-model="pForm.api_key" type="password" style="width:100%" />
-              <div v-if="pForm.kind==='tts'" style="font-size:12px;color:#888;margin-top:4px">
-                {{vendorInfo ? vendorInfo.key_hint : '（OpenAI 兼容服务只填一段 key）'}}
-              </div>
+            <!-- ⚠️ 标签必须是**静态字面量**，不许写成 {{apiKeyLabel}} 这类插值。
+                 原因（2026-10-18 线上事故，用户截图里的 function () { [native code] }）：
+                 Vue 3 会把 methods 里每个方法 bind(publicThis)，而 bound 函数的
+                 toString() 在所有引擎上都恰好是 "function () { [native code] }"。
+                 一旦谁把标签用的标识符从 computed 挪进 methods，这个标签就会显示成
+                 那串乱码 —— 它长得像「代码泄露」，管理员不知道该不该继续填。
+                 真正的守门测试是 tools/smoke_frontend_hygiene.py（静态扫描：
+                 任何被插值的裸标识符都不许是 methods 里的方法）。 -->
+            <div v-if="showApiKey"><label for="pApiKey">API Key</label>
+              <input id="pApiKey" v-model="pForm.api_key" type="password" style="width:100%" />
+              <div style="font-size:12px;color:#888;margin-top:4px">{{apiKeyHint}}</div>
             </div>
             <div><label>优先级（越小越优先）</label><input v-model.number="pForm.priority" type="number" /></div>
             <div><label>启用</label>
@@ -963,6 +1085,172 @@
         <div v-else class="empty">暂无调用记录</div>
       </div>
     </section>
+
+    <!-- ---------------------- 邮件配置（仅管理员） ---------------------- -->
+    <!-- 后端：GET/PATCH /api/admin/mail/smtp + POST /api/admin/mail/test。
+         字段与校验规则以 schemas.SmtpConfigIn 为准，端口 1~65535、from_addr/notify_to
+         必须是合法邮箱格式，不合法由后端返 422。 -->
+    <section v-if="tab==='mail'">
+      <!-- smtpForm 在首次 GET 返回前是 null（watcher 是异步的，切换 tab 时
+           这一帧已经渲染出来了）。不套这层 v-if，v-model 会去读 null.host 直接抛错。 -->
+      <div class="card" v-if="smtpForm">
+        <div class="row" style="justify-content:space-between">
+          <h2>SMTP 配置</h2>
+          <div class="row">
+            <span class="tag" :class="smtp.enabled?'ok':'dim'">{{smtp.enabled?'已启用':'未启用'}}</span>
+            <button @click="loadSmtp">刷新</button>
+          </div>
+        </div>
+        <p class="muted" style="font-size:12px;margin:0 0 12px;line-height:1.8">
+          配好后「邮箱找回密码」与工单通知才能发信。<b>未启用时平台不会发信</b>，
+          用户点「找回密码」会收到 503「平台尚未配置可用的邮件服务」。
+          配置有误的概率很高，<b>请务必点下方「发送测试邮件」当场确认</b>，
+          不要靠等用户投诉才发现连不上。
+        </p>
+
+        <div class="grid g2">
+          <div>
+            <label>SMTP 服务器地址</label>
+            <input v-model="smtpForm.host" style="width:100%" placeholder="smtp.qq.com" />
+            <div class="muted" style="font-size:12px;margin-top:3px">
+              邮箱服务商提供的 SMTP 主机名，不含协议前缀与路径。
+            </div>
+          </div>
+          <div>
+            <label>端口</label>
+            <input v-model.number="smtpForm.port" type="number" min="1" max="65535" style="width:100%" />
+            <div class="muted" style="font-size:12px;margin-top:3px">
+              <b>465</b> = 直连 SSL（勾「使用 SSL」）；<b>587</b> = 明文连接后握手升级（勾「使用 STARTTLS」）。
+              两者与下面的加密方式必须配套。
+            </div>
+          </div>
+          <div>
+            <label>账号</label>
+            <input v-model="smtpForm.username" style="width:100%" placeholder="you@qq.com" />
+            <div class="muted" style="font-size:12px;margin-top:3px">登录 SMTP 用的用户名，通常就是邮箱地址。</div>
+          </div>
+          <div>
+            <label>密码 / 授权码</label>
+            <input v-model="smtpForm.password" type="password" style="width:100%"
+                   :placeholder="smtp.has_password?'已配置（留空表示不修改）':'尚未配置'" />
+            <div class="muted" style="font-size:12px;margin-top:3px">
+              这里要填的是邮箱服务商的<b>授权码</b>，不是登录邮箱的密码。
+              出于安全考虑系统不回显明文，只显示掩码；<b>留空保存表示不修改</b>，
+              想清空需先在数据库侧处理。当前状态：{{smtp.has_password?'已配置':'未配置'}}
+            </div>
+          </div>
+          <div>
+            <label>发件邮箱</label>
+            <input v-model="smtpForm.from_addr" style="width:100%" placeholder="you@qq.com" />
+            <div class="muted" style="font-size:12px;margin-top:3px">对外显示的发信地址，需是合法邮箱格式。</div>
+          </div>
+          <div>
+            <label>发件人名称</label>
+            <input v-model="smtpForm.from_name" style="width:100%" placeholder="老人陪伴提醒助手" />
+            <div class="muted" style="font-size:12px;margin-top:3px">收件人看到的发件人显示名，可留空。</div>
+          </div>
+          <div>
+            <label>工单通知收件人</label>
+            <input v-model="smtpForm.notify_to" style="width:100%" placeholder="you@qq.com" />
+            <div class="muted" style="font-size:12px;margin-top:3px">
+              留空则依次回落到「发件邮箱」→「账号」。测试邮件默认发到这个地址。
+            </div>
+          </div>
+          <div>
+            <label>连接加密方式（两者互斥，只能选一个）</label>
+            <div class="row" style="margin-top:2px">
+              <label style="display:flex;align-items:center;gap:5px;margin:0;font-size:13px;color:var(--text)">
+                <input type="checkbox" :checked="smtpForm.use_ssl"
+                       @change="smtpForm.use_ssl=$event.target.checked; if(smtpForm.use_ssl) smtpForm.use_tls=false" />
+                使用 SSL（465）
+              </label>
+              <label style="display:flex;align-items:center;gap:5px;margin:0;font-size:13px;color:var(--text)">
+                <input type="checkbox" :checked="smtpForm.use_tls"
+                       @change="smtpForm.use_tls=$event.target.checked; if(smtpForm.use_tls) smtpForm.use_ssl=false" />
+                使用 STARTTLS（587）
+              </label>
+            </div>
+            <div class="muted" style="font-size:12px;margin-top:3px">
+              两者都开时后端以 SSL 优先（已经是SSL 连接，再套一层没意义），
+              所以界面上做成互斥，避免配出「两个都勾」这种读不通的组合。
+              两个都不勾 = 明文连接，仅建议本机自测时用。
+            </div>
+          </div>
+        </div>
+
+        <div class="row" style="margin-top:8px">
+          <label style="display:flex;align-items:center;gap:6px;margin:0;font-size:13px;color:var(--text)">
+            <input type="checkbox" v-model="smtpForm.enabled" />
+            启用 SMTP（不勾选则平台不发信）
+          </label>
+        </div>
+
+        <div class="row" style="margin-top:14px">
+          <button class="primary" :disabled="smtpBusy || !smtpChanged" @click="saveSmtp">保存配置</button>
+          <button @click="loadSmtp">放弃修改</button>
+          <span v-if="smtpMsg" class="muted" style="font-size:13px;color:var(--ok)">{{smtpMsg}}</span>
+        </div>
+        <div v-if="smtpErr" class="err" style="margin-top:10px">{{smtpErr}}</div>
+      </div>
+      <div class="card" v-else-if="smtpErr">
+        <div class="err" style="margin:0">{{smtpErr}}</div>
+        <div class="row" style="margin-top:10px"><button @click="loadSmtp">重试</button></div>
+      </div>
+
+      <div class="card" v-if="smtpForm">
+        <h2>发送测试邮件</h2>
+        <p class="muted" style="font-size:12px;margin:0 0 10px;line-height:1.8">
+          直接用当前<strong>已保存</strong>的配置发一封真实邮件，不会使用上面未保存的输入。
+          失败时会把原因原样带回（连不上 / 鉴权失败 / 发件人被拒）。
+        </p>
+        <div class="row">
+          <input v-model="testTo" style="width:260px" placeholder="留空则发给上面的通知收件人" />
+          <button :disabled="testBusy" @click="sendTestMail">发送测试邮件</button>
+          <button :disabled="testBusy" @click="testTo='';mailTestResult=null">清空</button>
+        </div>
+        <div v-if="mailTestResult" class="card" style="margin:12px 0 0;background:#f8fafc">
+          <div>
+            <span class="tag" :class="mailTestResult.ok?'ok':'bad'">{{testResult.ok?'发送成功':'发送失败'}}</span>
+            <span v-if="mailTestResult.fake" class="tag warn" style="margin-left:6px">伪装发信（未真正投递）</span>
+          </div>
+          <div style="margin-top:6px;font-size:13px">{{mailTestResult.message}}</div>
+          <div v-if="testResult.to" class="muted" style="font-size:12px;margin-top:4px">收件人：{{mailTestResult.to}}</div>
+          <div v-if="mailTestResult.error" class="muted" style="font-size:12px;margin-top:4px;word-break:break-all">
+            失败原因：{{mailTestResult.error}}
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ---------------------- 修改密码弹窗 ---------------------- -->
+    <!-- POST /api/auth/password：原密码错->400「原密码不正确」（刻意不用 401，
+         否则会被统一请求层当成登录态失效踢回登录页），新密码不足 6 位->422。
+         校验规则与 /user 端完全一致，避免两个入口给出不同的报错。 -->
+    <div v-if="pwBox" class="mask" @click.self="pwBox=false">
+      <div class="modal" style="max-width:520px">
+        <button class="close" @click="pwBox=false">&times;</button>
+        <h2>修改密码</h2>
+        <p class="muted" style="font-size:12px;margin:0 0 10px">
+          当前账号：<code>{{user.username}}</code>
+        </p>
+        <div v-if="pwErr" class="err">{{pwErr}}</div>
+        <div v-if="pwMsg" class="muted" style="color:var(--ok);font-size:13px;margin-bottom:10px">{{pwMsg}}</div>
+        <div><label>当前密码</label>
+          <input id="mpwOld" v-model="pwForm.old_password" type="password" style="width:100%" /></div>
+        <div style="margin-top:10px"><label>新密码（至少 6 位）</label>
+          <input id="mpwNew" v-model="pwForm.new_password" type="password" style="width:100%" /></div>
+        <div style="margin-top:10px"><label>确认新密码</label>
+          <input id="mpwNew2" v-model="pwForm.new_password2" type="password" style="width:100%" /></div>
+        <div class="row" style="margin-top:16px;justify-content:flex-end">
+          <button @click="pwBox=false">关闭</button>
+          <button class="primary" :disabled="pwBusy" @click="changePassword">修改密码</button>
+        </div>
+        <p class="muted" style="font-size:12px;margin:12px 0 0;line-height:1.7">
+          下次登录请使用新密码。本平台密码为加盐哈希存储，服务端无法找回，
+          忘记了只能走「邮箱找回密码」或用 <code>ELDER_RESET_ADMIN_PASSWORD</code> 重置。
+        </p>
+      </div>
+    </div>
   </template>
 
   <!-- ============================ 非管理员提示 ============================ -->
@@ -1012,7 +1300,7 @@ createApp({
         {k:'home',n:'概览'},{k:'devices',n:'设备'},{k:'reminders',n:'提醒'},
         {k:'avatars',n:'形象'},{k:'personas',n:'人格预设'},
         {k:'providers',n:'AI 接入'},{k:'stats',n:'统计'},
-        {k:'usage',n:'token 用量'}
+        {k:'usage',n:'token 用量'},{k:'mail',n:'邮件配置'}
       ],
       err: '', busy: false,
       loginForm: { username:'', password:'' },
@@ -1063,7 +1351,7 @@ createApp({
       smtp: {has_password:false, updated_at:null},
       smtpForm: null, smtpLoaded: false,
       smtpBusy: false, smtpErr: '', smtpMsg: '',
-      testTo: '', testBusy: false, testResult: null
+      testTo: '', testBusy: false, mailTestResult: null,  // ⚠️ 不许改名回 testResult：AI 配置弹窗已占用同名键，data() 里同名会静默覆盖（smoke_frontend_hygiene L3 守着）
     };
   },
   computed:{
@@ -1074,7 +1362,69 @@ createApp({
     // 是否管理员。user 来自 localStorage 的 elder_user（登录时由 doLogin 写入）。
     // 两个入口（/ 与 /user）共用这套登录态：普通用户在 /user 登录后打开 /，
     // 这里就是 false —— 看到横幅、看不到任何管理 tab，而不是又弹一次登录框。
-    isAdmin(){ return !!(this.user && this.user.is_admin); }
+    isAdmin(){ return !!(this.user && this.user.is_admin); },
+    // 设备页列表：按搜索框过滤。**纯前端**过滤，不重新打接口 ——
+    // 搜索是管理员「在这几十台里找那一台」的操作，回一次网络会让打字卡顿。
+    shownDevices(){
+      const q = (this.devFilter||'').trim().toLowerCase();
+      if (!q) return this.devices;
+      return this.devices.filter(d =>
+        String(d.name||'').toLowerCase().indexOf(q) >= 0 ||
+        String(d.device_id||'').toLowerCase().indexOf(q) >= 0);
+    },
+    // 提醒页的「按用户筛」。**只能筛出 owner 已知的那些**：
+    // /api/reminders 不返回 creator 的用户名，而平台也没有「列出所有用户」的
+    // 接口，所以未绑定设备的规则在这份用户名表里查不到 —— 这类规则归到
+    //「未绑定用户」选项下，而不是让管理员以为筛漏了。
+    ownerOptions(){
+      const seen = {};
+      (this.reminders||[]).forEach(r => {
+        const d = this.devices.filter(x => x.id === r.device_id)[0];
+        if (!d || !d.owner_id) return;
+        seen[d.owner_id] = this.ownerName(d);
+      });
+      return Object.keys(seen).map(id => ({id: Number(id), name: seen[id]}));
+    },
+    shownReminders(){
+      const byUser = this.remUserFilter;
+      if (!byUser) return this.reminders;
+      const uid = Number(byUser);
+      return (this.reminders||[]).filter(r => {
+        const d = this.devices.filter(x => x.id === r.device_id)[0];
+        return !!d && d.owner_id === uid;
+      });
+    },
+    curDeviceLabel(){
+      const d = this.devices.filter(x => x.id === this.curDeviceId)[0];
+      return d ? d.name : '';
+    },
+    // 表单是否有改动。**故意不把 password 算进去**：输入框留空本来就代表
+    // 「不修改」，若把它算进来，管理员每次进来都会看到一个可点的「保存配置」，
+    // 点下去才发现其实什么都没改。真正的变更判定交给 saveSmtp 里的比对。
+    smtpChanged(){
+      if (!this.smtpLoaded || !this.smtpForm) return false;
+      const a = this.smtpForm, b = this.smtp || {};
+      const norm = v => (v === null || v === undefined) ? '' : String(v);
+      return ['host','port','username','use_tls','use_ssl','from_addr',
+              'from_name','notify_to','enabled']
+        .some(k => norm(a[k]) !== norm(b[k]));
+    },
+    // API Key 输入框下方的帮助文字。**标签本身是模板里的静态字面量**（见模板注释），
+    // 这里只负责「这家要填的 key 长什么样」—— 分成三族是因为填错的代价不同：
+    // 火山系要 AK:SK 两段（填成单段会鉴权失败且报错指向不明确），OpenAI 兼容都是
+    // 单段（填两段反而连不上），本地服务压根不需要（留空即可）。
+    apiKeyHint(){
+      const f = this.pForm || {};
+      if (f.kind === 'tts'){
+        return (this.vendorInfo && this.vendorInfo.key_hint) || '（OpenAI 兼容服务只填一段 key）';
+      }
+      // 火山系（方舟 / 语音）要的是 AK:SK 两段；provider 与 api_style 两条路都判，
+      // 因为方舟既可以配在非 TTS 行（api_style=volcengine）也可能是 TTS 行。
+      if (f.provider === 'volcengine' || f.api_style === 'volcengine'){
+        return '火山方舟要填 API 密钥：AK:SK 两段（Access Key 与 Secret Key 用英文冒号相连），从火山方舟控制台「API 密钥」页面复制。';
+      }
+      return '填该平台颁发的一段 API Key（OpenAI 兼容服务均为单段）。本地服务（如 Ollama）不需要密钥，可留空。';
+    },
   },
   methods:{
     async api(path, opt){
@@ -1136,7 +1486,10 @@ createApp({
     async loadAll(){
       await Promise.all([this.loadDevices(), this.loadAvatars(), this.loadProviders(),
                        this.loadVoiceCatalog()]);
-      if (this.curDeviceId) await this.loadReminders();
+      // 提醒页默认展示**全部设备**的规则（管理员排障的视角），不是 curDeviceId 那台。
+      // remDeviceFilter 留空即全量，与 loadReminders 里的「不传 device_pk」对齐。
+      this.remDeviceFilter = '';
+      await this.loadReminders();
     },
     // 人格预设页的数据**按需加载**（不进loadAll）：
     // 全平台只有管理员能进这一页，而 loadAll 是登录后必跑的，
@@ -1147,9 +1500,59 @@ createApp({
       await this.loadPresets();
     },
     async loadDevices(){
-      const r = await this.api('/api/devices'); if(!r) return;
-      this.devices = r;
-      if (!this.curDeviceId && r.length) this.curDeviceId = r[0].id;
+      this.devBusy = true;
+      try{
+        const r = await this.api('/api/devices'); if(!r) return;
+        this.devices = r;
+        if (this.curDeviceId && !r.some(d => d.id === this.curDeviceId)) this.curDeviceId = null;
+        if (!this.curDeviceId && r.length) this.curDeviceId = r[0].id;
+        await this.loadDeviceTokens();
+      }finally{ this.devBusy = false; }
+    },
+    // 每台设备的 token 用量：逐台调 /api/admin/usage/summary?device_id=<pk>。
+    //
+    // 为什么不是一次拿全量再在前端分桶：/api/admin/usage/summary 的聚合口径是
+    // **整段筛选**（calls/total_tokens/by_usage/by_day），没有 by_device 分组；
+    // /api/admin/usage/rows 虽带 device_id，但 limit 上限 200 条，前端分桶
+    // 只能得到「最近 200 次调用的分摊」，那不是用量，是流水抽样 —— 拿它当
+    // 「token 用量」列展示会得出错误的对账结论。
+    // 遗留项：后端在 usage_summary 里加 by_device，一次查询即可（现在是 N 次）。
+    async loadDeviceTokens(){
+      const ids = this.devices.map(d => d.id);
+      if (!ids.length){ this.devTokensById = {}; return; }
+      this.devUsageBusy = true;
+      try{
+        const rs = await Promise.all(ids.map(pk =>
+          this.api('/api/admin/usage/summary?device_id=' + pk)
+              .then(s => [pk, s && s.total_tokens ? s.total_tokens : 0])
+              .catch(() => [pk, 0])));
+        const map = {};
+        rs.forEach(it => { map[it[0]] = it[1]; });
+        this.devTokensById = map;
+      }finally{ this.devUsageBusy = false; }
+    },
+    devTokens(pk){ return this.devTokensById[pk]; },
+    // 设备的「类型」。⚠️ **后端目前没有 device_type 字段**（已核 Device 模型与
+    // DeviceOut，均无），所以这里给的是管理员唯一分得清的口径：绑定的屏幕规格。
+    // 留空文案必须明确指向原因，否则会被读成「查坏了」。
+    devType(d){
+      const a = this.avatars.filter(x => x.id === d.avatar_id)[0];
+      if (!a) return '未绑定形象（型号未上报）';
+      return a.screen_width + '×' + a.screen_height + ' 屏';
+    },
+    // 设备拥有者的用户名。⚠️ /api/devices 只返回 owner_id，**不返回用户名**，
+    // 而平台也没有「列出全部用户」的接口 —— 已知用户名只有两个来源：
+    // 自己登录的 this.user，以及审计记录里的 admin_username。
+    // 取不到时显示 owner_id 而不是「未知」，管理员至少还能拿它去工单里定位。
+    ownerName(d){
+      if (!d.owner_id) return '未绑定用户';
+      if (this.user && this.user.id === d.owner_id) return this.user.username;
+      const known = this.ownerNames[d.owner_id];
+      return known || ('用户 #' + d.owner_id);
+    },
+    deviceName(pk){
+      const d = this.devices.filter(x => x.id === pk)[0];
+      return d ? d.name : ('设备 #' + pk);
     },
     async loadAvatars(){ const r = await this.api('/api/avatars'); if(r) this.avatars = r; },
     async loadProviders(){ const r = await this.api('/api/providers'); if(r) this.providers = r; },
@@ -1219,85 +1622,71 @@ createApp({
       const hit = (this.readiness&&this.readiness.usages||[]).find(x=>x.usage===u);
       return hit ? hit.label : u;
     },
+    // 提醒列表。remDeviceFilter 为空 = 跨全部设备（管理员排障的默认视角，
+    // GET /api/reminders 不带 device_pk 时管理员拿到全量，非管理员仍按 owner 收窄，
+    // 鉴权在服务端 filters.py/reminders.py:list_reminders）。
+    // 回执与统计仍按 curDeviceId 单设备取 —— 那两个端点本来就是单设备口径。
     async loadReminders(){
-      if (!this.curDeviceId) return;
-      const r = await this.api('/api/reminders?device_pk='+this.curDeviceId);
-      if (r) this.reminders = r;
-      const e = await this.api('/api/devices/'+this.curDeviceId+'/events?limit=50');
-      if (e) this.events = e;
-      const s = await this.api('/api/stats/overview?device_pk='+this.curDeviceId);
-      this.stat = s;
+      this.remBusy = true;
+      try{
+        const q = this.remDeviceFilter ? '?device_pk=' + this.remDeviceFilter : '';
+        const r = await this.api('/api/reminders' + q);
+        this.reminders = r || [];
+        // ⚠️ 这里**不**回写 curDeviceId：curDeviceId 有 watcher（见 watch 段），
+        // 回写会触发第二次 loadReminders —— 一次筛选白打两遍接口。
+        // 需要同步的地方由 onRemDeviceFilter 显式做。
+        if (!this.curDeviceId){ this.events = []; this.stat = null; return; }
+        const e = await this.api('/api/devices/'+this.curDeviceId+'/events?limit=50');
+        if (e) this.events = e;
+        const s = await this.api('/api/stats/overview?device_pk='+this.curDeviceId);
+        this.stat = s;
+      }catch(e){ this.err = e.message; }
+      finally{ this.remBusy = false; }
+    },
+    // 切设备筛选：同步 curDeviceId（决定回执卡看哪台）后再取数。
+    // 写成显式两步而不是在 loadReminders 里回写，就是为了避开上面那条 watcher 回路。
+    onRemDeviceFilter(){
+      this.curDeviceId = this.remDeviceFilter ? Number(this.remDeviceFilter) : null;
+      this.loadReminders();
+    },
+    // 「按用户筛」是纯前端过滤，不重打接口：ownerOptions 由当前 reminders
+    // 派生，换一次筛选条件就要重算选项，重打接口会让下拉选项自己跳。
+    applyRemFilter(){ /* 响应式联动 shownReminders，此处仅留显式入口以便读懂模板 */ },
+
+    // -------- 设备（管理员端只读：这里只保留「跳去看」的方法）--------
+    openReminders(d){
+      // 顺序有意义：先定筛选范围再改 curDeviceId —— 后者有 watcher 负责取数，
+      // 两者同一 tick 内改完，watcher 触发时读到的已经是新范围。
+      this.remDeviceFilter = String(d.id);
+      this.remUserFilter = '';
+      this.curDeviceId = d.id;
+      this.tab = 'reminders';
+    },
+    openStats(d){
+      // 统计页只需要 stat 一个数，**不复用 loadReminders** —— 那个方法的
+      // reminders 查询走 remDeviceFilter（可能停在另一台设备上），拿它刷新统计
+      // 会顺带把提醒列表刷成别的设备的，看着像 bug。
+      this.curDeviceId = d.id; this.tab = 'stats';
+      this.api('/api/stats/overview?device_pk='+d.id)
+        .then(s => { this.stat = s; })
+        .catch(e => { this.err = e.message; });
     },
 
-    // -------- 设备 --------
-    async createDevice(){
-      try{
-        await this.api('/api/devices', {method:'POST', body:JSON.stringify(this.devForm)});
-        this.devForm = {device_id:'', name:'我的陪伴助手'};
-        await this.loadDevices();
-      }catch(e){ this.err = e.message; }
-    },
-    async genCode(d){
-      try{
-        this.codeBox = await this.api('/api/devices/'+d.id+'/code', {method:'POST'});
-      }catch(e){ this.err = e.message; }
-    },
-    async applyAvatar(d, ev){
-      const v = ev.target.value;
-      try{
-        if (v) await this.api('/api/avatars/'+v+'/apply/'+d.id, {method:'POST'});
-        else await this.api('/api/devices/'+d.id, {method:'PATCH', body:JSON.stringify({avatar_id:0})});
-        await this.loadDevices();
-      }catch(e){ this.err = e.message; }
-    },
-    async removeDevice(d){
-      if (!confirm('删除设备「'+d.name+'」及其全部提醒？')) return;
-      await this.api('/api/devices/'+d.id, {method:'DELETE'});
-      await this.loadDevices();
-    },
-    openReminders(d){ this.curDeviceId = d.id; this.tab='reminders'; this.loadReminders(); },
-    openStats(d){ this.curDeviceId = d.id; this.tab='stats'; this.loadReminders(); },
-    copy(t){ navigator.clipboard && navigator.clipboard.writeText(t); },
-
-    // -------- 提醒 --------
-    blankReminder(){
-      return { title:'', speak_text:'', rtype:0, schedule_kind:1,
-        times_of_day:['08:00'], weekdays:[], month_days:[], interval_days:1,
-        once_date:null, start_date:null, end_date:null, dose:'',
-        require_confirm:true, repeat_interval_min:10, repeat_times:3,
-        escalate_after_min:30, confirm_methods:['voice','button'], enabled:true };
-    },
-    editReminder(r){
-      this.rForm = r ? JSON.parse(JSON.stringify(r)) : this.blankReminder();
-      this.timesText = (this.rForm.times_of_day||[]).join(', ');
-      this.weekText = (this.rForm.weekdays||[]).join(',');
-      this.monthText = (this.rForm.month_days||[]).join(',');
-      this.rBox = true;
-    },
-    async saveReminder(){
-      this.rForm.times_of_day = this.timesText.split(/[,，\s]+/).filter(Boolean);
-      this.rForm.weekdays = this.weekText.split(/[,，\s]+/).filter(Boolean).map(Number);
-      this.rForm.month_days = this.monthText.split(/[,，\s]+/).filter(Boolean).map(Number);
-      const body = JSON.parse(JSON.stringify(this.rForm));
-      delete body.id; delete body.device_id; delete body.creator_id;
-      delete body.created_at; delete body.updated_at; delete body.next_fire_at;
-      try{
-        if (this.rForm.id){
-          await this.api('/api/reminders/'+this.rForm.id, {method:'PATCH', body:JSON.stringify(body)});
-        }else{
-          await this.api('/api/reminders?device_pk='+this.curDeviceId, {method:'POST', body:JSON.stringify(body)});
-        }
-        this.rBox = false; await this.loadReminders();
-      }catch(e){ this.err = e.message; }
-    },
+    // -------- 提醒（管理员端只读 + 一个排障用的开关）--------
+    // 从提醒列表点「看回执」：切到该条所属设备并把回执卡显示出来。
+    // 不跳 tab —— 回执卡就在同一页下方，管理员是在同一个上下文里比对
+    // 「规则这么设 ↔ 回执长这样」，跳走等于让他来回切两次。
+    openRemindersOf(r){ this.curDeviceId = r.device_id; this.loadReminders(); },
     async toggleReminder(r){
-      await this.api('/api/reminders/'+r.id+'/toggle', {method:'POST'});
-      await this.loadReminders();
-    },
-    async removeReminder(r){
-      if (!confirm('删除提醒「'+r.title+'」？')) return;
-      await this.api('/api/reminders/'+r.id, {method:'DELETE'});
-      await this.loadReminders();
+      // 暂停/启用是排障动作（提醒误报时先止血），刻意保留写操作：
+      // 它不改变规则内容，只决定「现在还响不响」，事后家属一看就懂。
+      const act = r.enabled ? '暂停' : '启用';
+      if (!confirm(act + '提醒「'+r.title+'」？\n\n不会删除规则，家属在 APP 上仍能看到它，'
+                   + '重新启用后立刻恢复。')) return;
+      try{
+        await this.api('/api/reminders/'+r.id+'/toggle', {method:'POST'});
+        await this.loadReminders();
+      }catch(e){ this.err = e.message; }
     },
 
     // -------- 形象 --------
@@ -1398,9 +1787,6 @@ createApp({
       if (this.pForm.provider==='edge') return false;
       if (this.pForm.provider==='__other__') return true;
       return !!(this.vendorInfo && this.vendorInfo.needs_key);
-    },
-    apiKeyLabel(){
-      return (this.pForm && this.pForm.provider==='volcengine') ? 'API 密钥（AK:SK）' : 'API Key';
     },
     // 选厂商 → 自动填好该家要的字段。
     // ⚠️ 只在「值还是空的时候」才填，不覆盖管理员已改过的内容 ——
@@ -1522,6 +1908,122 @@ createApp({
     },
     usageName(u){
       return {chat:'对话', light:'轻任务', embed:'向量化', rerank:'重排'}[u] || u || '—';
+    },
+
+    // -------- 账号安全（修改密码）--------
+    // 后端端点已存在（routers/auth.py change_password），这里只补管理后台入口：
+    // /user 端有一处，但没有入口的管理员根本不会想到去那边找。
+    openPassword(){
+      this.pwBox = true; this.pwErr = ''; this.pwMsg = '';
+      this.pwForm = {old_password:'', new_password:'', new_password2:''};
+    },
+    async changePassword(){
+      const f = this.pwForm;
+      this.pwErr = ''; this.pwMsg = '';
+      if (!f.old_password){ this.pwErr = '请填写当前密码'; return; }
+      if ((f.new_password||'').length < 6){ this.pwErr = '新密码至少 6 位'; return; }
+      if (f.new_password !== f.new_password2){ this.pwErr = '两次输入的新密码不一致'; return; }
+      if (f.new_password === f.old_password){ this.pwErr = '新密码不能与当前密码相同'; return; }
+      this.pwBusy = true;
+      try{
+        // 原密码错误后端返400（不是 401），避免被 api() 当成登录态失效而清token
+        await this.api('/api/auth/password', {
+          method:'POST',
+          body: JSON.stringify({old_password:f.old_password, new_password:f.new_password})
+        });
+        this.pwForm = {old_password:'', new_password:'', new_password2:''};
+        this.pwMsg = '密码已修改，下次登录请使用新密码。';
+      }catch(e){ this.pwErr = e.message; }
+      finally{ this.pwBusy = false; }
+    },
+
+    // -------- 邮件配置（SMTP）--------
+    // 字段与校验规则一律以 schemas.SmtpConfigIn / SmtpConfigOut 为准，不在前端另立一套。
+    async loadSmtp(){
+      this.smtpErr = ''; this.smtpMsg = '';
+      try{
+        const r = await this.api('/api/admin/mail/smtp');
+        if (!r) return;                // 401：api() 已清登录态
+        this.smtp = r;
+        // ★ 关键：password 用服务端给的掩码只做展示，**绝不回填进输入框**。
+        //   回填的话，管理员不改密码直接点保存，就会把 "ab******gh" 当成密码存回去，
+        //   之后所有邮件全部鉴权失败 —— 而界面上看不出任何异常。
+        this.smtpForm = {
+          host: r.host || '', port: r.port || 465, username: r.username || '',
+          password: '', use_tls: !!r.use_tls, use_ssl: !!r.use_ssl,
+          from_addr: r.from_addr || '', from_name: r.from_name || '',
+          notify_to: r.notify_to || '', enabled: !!r.enabled
+        };
+        this.smtpLoaded = true;
+      }catch(e){ this.smtpErr = 'SMTP 配置加载失败：' + e.message; }
+    },
+    async saveSmtp(){
+      const f = this.smtpForm;
+      this.smtpErr = ''; this.smtpMsg = '';
+      if (!f) return;
+      const host = (f.host||'').trim();
+      const fromAddr = (f.from_addr||'').trim();
+      const notifyTo = (f.notify_to||'').trim();
+      const pw = f.password||'';
+      // 端口/邮箱格式后端也会拦（422），这里先拦一遍是为了给出定位更准的提示，
+      // 而不是把 Pydantic 的英文 msg 直接甩给运维。
+      const port = Number(f.port);
+      if (!host){ this.smtpErr = '请填写 SMTP 服务器地址'; return; }
+      if (!Number.isInteger(port) || port < 1 || port > 65535){
+        this.smtpErr = '端口应是 1~65535 之间的整数'; return;
+      }
+      const addrRe = /^[^@\s]+@[^@\s]+\.[^@\s]+$/;
+      if (fromAddr && !addrRe.test(fromAddr)){
+        this.smtpErr = '发件邮箱格式不正确'; return;
+      }
+      if (notifyTo && !addrRe.test(notifyTo)){
+        this.smtpErr = '通知收件人格式不正确'; return;
+      }
+      // 端口与加密方式不配套是最常见的配错：465 配 STARTTLS、587 配 SSL，
+      // 服务端都能连上但握手失败，而报错发生在发信时、离配置动作很久远了。
+      // ⚠️ 四种错配都要拦，别只拦「两个都没勾」：465 只勾 STARTTLS（把 STARTTLS
+      // 打在已经隐式 SSL 的465 上）与 587 只勾 SSL 同属错配，只是形式不同。
+      if (port === 465 && !f.use_ssl){
+        this.smtpErr = '端口 465 是直连 SSL，请勾选「使用 SSL」而不是 STARTTLS'; return;
+      }
+      if (port === 587 && !f.use_tls){
+        this.smtpErr = '端口 587 是握手升级，请勾选「使用 STARTTLS」而不是 SSL'; return;
+      }
+      const body = {
+        host, port, username:(f.username||'').trim(),
+        use_tls: !!f.use_tls, use_ssl: !!f.use_ssl,
+        from_addr: fromAddr, from_name:(f.from_name||'').trim(),
+        notify_to: notifyTo, enabled: !!f.enabled
+      };
+      // ★ password 是**只写**字段：留空就**不传这个键**（而不是传空串）。
+      //   传空串是一个有效值，会把已存的密码清掉。
+      if (pw) body.password = pw;
+      this.smtpBusy = true;
+      try{
+        await this.api('/api/admin/mail/smtp', {method:'PATCH', body: JSON.stringify(body)});
+        // 先用服务端返回刷新（loadSmtp 开头会清空 smtpMsg），再置成功提示 ——
+        // 顺序反了的话这句提示会被自己清掉，保存成功却什么都不显示。
+        await this.loadSmtp();
+        this.smtpMsg = pw ? '配置已保存（密码已更新）' : '配置已保存';
+        this.mailTestResult = null;     // 配置变了，之前的测试结论作废
+      }catch(e){ this.smtpErr = '保存失败：' + e.message; }
+      finally{ this.smtpBusy = false; }
+    },
+    async sendTestMail(){
+      this.mailTestResult = null; this.smtpErr = ''; this.smtpMsg = '';
+      const to = (this.testTo||'').trim();
+      if (to && !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(to)){
+        this.smtpErr = '收件邮箱格式不正确'; return;
+      }
+      this.testBusy = true;
+      try{
+        // POST /api/admin/mail/test：后端始终返 200，成败看 ok/error，
+        // 所以这里不能靠抛异常判断失败，必须把结果整个渲染出来。
+        this.mailTestResult = await this.api('/api/admin/mail/test', {
+          method:'POST', body: JSON.stringify({to: to})
+        });
+      }catch(e){ this.mailTestResult = {ok:false, error:e.message, message:'请求失败：' + e.message}; }
+      finally{ this.testBusy = false; }
     },
 
 
@@ -1713,6 +2215,12 @@ createApp({
   },
   watch:{
     curDeviceId(){ this.loadReminders(); },
+    // 表单一改就把上一次的报错清掉：报错停在原地会让人以为「我明明已经改对了，
+    // 它还说不对」，于是反复点保存。错误提示应当描述的是**上一次提交**的那个状态。
+    smtpForm: {
+      deep: true,
+      handler(){ if (this.smtpErr) this.smtpErr = ''; }
+    },
     tab(t){
       // 进入人格预设页时才拉数据（理由见 loadPersonas 的注释）
       if(t === 'personas'){
@@ -1721,11 +2229,22 @@ createApp({
       if(t === 'usage'){
         this.loadUsage();
       }
+      // 提醒页：设备筛选项来自 devices，进页面时数据可能已过期
+      //（比如管理员刚从工单里知道了新的设备名）。按需拉，不进 loadAll 的理由
+      // 与 personas 一致：loadAll 是登录后必跑的。
+      if(t === 'reminders'){
+        this.loadReminders();
+      }
       // 就绪度按需拉：它是**当前配置的直接函数**，进页面就拉会与
       // loadProviders() 争一次数据库，且管理员在别处改完配置再回来时反而是旧的。
       if(t === 'providers'){
         this.loadReadiness();
         this.loadVoiceCatalog();
+      }
+      // 邮件配置按需拉：SMTP 密码是只写字段、GET 只给掩码，每次进页面重拉
+      // 既没新信息，又会把管理员正在输入的内容冲掉。
+      if(t === 'mail'){
+        this.loadSmtp();
       }
     }
   },
