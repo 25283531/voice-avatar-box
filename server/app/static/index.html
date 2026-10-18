@@ -378,7 +378,29 @@
             <label>系统提示词</label><textarea v-model="aForm.system_prompt"></textarea>
           </div>
           <div class="grid g2" style="margin-top:10px">
-            <div><label>TTS 音色</label><input v-model="aForm.tts_voice" style="width:100%" /></div>
+            <div><label>TTS 音色</label>
+              <select v-model="aForm.tts_voice" style="width:100%">
+                <option value="">（不指定 · 用 TTS 配置的音色，或厂商默认）</option>
+                <optgroup label="── 预置音色（Edge TTS 在线可用）──">
+                  <option v-for="v in ttsVoices" :key="v.id" :value="v.id">
+                    {{v.name}} — {{v.scene}}
+                  </option>
+                </optgroup>
+                <option value="__custom__">✎ 其他（自建服务，手填音色名）</option>
+              </select>
+              <template v-if="aForm.tts_voice==='__custom__'">
+                <input v-model="aForm.tts_voice_custom" style="width:100%;margin-top:6px"
+                       :placeholder="customVoicePlaceholder" />
+                <div style="font-size:12px;color:#888;margin-top:4px">
+                  自建 TTS 服务的音色名，各家命名不统一，无法预置。
+                </div>
+              </template>
+              <div v-else-if="voiceOf(aForm.tts_voice)" class="hint"
+                   style="margin-top:6px;font-size:12px">
+                <b>{{voiceOf(aForm.tts_voice).name}}</b>（{{voiceOf(aForm.tts_voice).gender}}）<br>
+                适合：{{voiceOf(aForm.tts_voice).scene}}
+              </div>
+            </div>
             <div><label>SHA256（资源包校验）</label><input v-model="aForm.eaf_pack_sha256" style="width:100%" /></div>
           </div>
           <div style="margin-top:10px">
@@ -452,8 +474,28 @@
           <div class="grid g3" style="margin-top:10px">
             <div><label>名称</label><input v-model="pEdit.name" style="width:100%" /></div>
             <div><label>音色</label>
-              <input v-model="pEdit.tts_voice" style="width:100%" list="ttsVoiceList" />
-              <datalist id="ttsVoiceList"><option v-for="v in ttsVoices" :key="v" :value="v"></option></datalist>
+              <select v-model="pEdit.tts_voice" style="width:100%">
+                <option value="">（不指定 · 用 TTS 配置的音色，或厂商默认）</option>
+                <optgroup label="── 预置音色（Edge TTS 在线可用）──">
+                  <option v-for="v in ttsVoices" :key="v.id" :value="v.id">
+                    {{v.name}} — {{v.scene}}
+                  </option>
+                </optgroup>
+                <option value="__custom__">✎ 其他（自建服务，手填音色名）</option>
+              </select>
+              <template v-if="pEdit.tts_voice==='__custom__'">
+                <input v-model="pEdit.tts_voice_custom" style="width:100%;margin-top:6px"
+                       :placeholder="customVoicePlaceholder" />
+                <div style="font-size:12px;color:#888;margin-top:4px;line-height:1.6">
+                  {{voiceCatalog.custom_hint}}
+                </div>
+              </template>
+              <div v-else-if="voiceOf(pEdit.tts_voice)" class="hint"
+                   style="margin-top:6px;font-size:12px">
+                <b>{{voiceOf(pEdit.tts_voice).name}}</b>（{{voiceOf(pEdit.tts_voice).gender}}）<br>
+                适合：{{voiceOf(pEdit.tts_voice).scene}}<br>
+                <span style="color:#666">{{voiceOf(pEdit.tts_voice).note}}</span>
+              </div>
             </div>
             <div><label>简介（给用户看）</label><input v-model="pEdit.description" style="width:100%" /></div>
           </div>
@@ -563,6 +605,64 @@
 
     <!-- ---------------------- AI 接入 -------------------- -->
     <section v-if="tab==='providers'">
+      <!-- 服务就绪度：回答「现在能不能说话」，而不是让人自己数配置行 -->
+      <div class="card" :style="readiness && readiness.missing_critical.length
+                ? 'border-color:#f3c7c7' : ''">
+        <div class="row" style="justify-content:space-between">
+          <h2>服务就绪度</h2>
+          <button @click="loadReadiness" :disabled="readyBusy">{{readyBusy?'检查中…':'重新检查'}}</button>
+        </div>
+
+        <div v-if="!readiness" class="empty">正在读取配置状态…</div>
+
+        <template v-else>
+          <div v-if="readiness.missing_critical.length" class="hint"
+               style="border-color:#f3c7c7;background:#fdf3f3">
+            <b>当前还不能提供完整的语音陪聊服务。</b>
+            缺少 <b>{{readiness.missing_critical.map(labelOfUsage).join('、')}}</b>
+            —— 设备能连上、能心跳，但老人说的话不会被理解，回答也念不出来。
+            请先补齐下面标红的几项。
+          </div>
+          <div v-else class="hint" style="border-color:#bfe3c0;background:#f4fbf4">
+            <b>语音链路已就绪。</b>下面绿色几项已配置并会实际生效；
+            灰色项未配置不影响说话（详见各自说明）。
+          </div>
+
+          <table style="margin-top:10px">
+            <thead><tr><th>用途</th><th>是否关键</th><th>状态</th><th>当前生效</th><th>说明</th></tr></thead>
+            <tbody>
+              <tr v-for="u in readiness.usages" :key="u.usage">
+                <td>{{u.label}}<br><small style="color:#888">{{u.usage}}</small></td>
+                <td><span class="tag" :class="u.critical?'':'ok'">{{u.critical?'缺了不能说话':'缺了降级'}}</span></td>
+                <td>
+                  <span class="tag" :class="u.configured?'ok':(u.critical?'':'ok')">
+                    {{u.configured?'已配置':'未配置'}}
+                  </span>
+                </td>
+                <td v-if="u.resolved">
+                  {{u.resolved.name}}
+                  <span class="tag">{{u.resolved.kind}}</span>
+                  <span v-if="u.resolved.fallback" class="tag" title="没命中首选类型，用的是候选链里的兜底项">兜底</span>
+                </td>
+                <td v-else style="color:#888">—</td>
+                <td style="max-width:520px;font-size:13px;line-height:1.7">
+                  {{u.hint || '已配置，当前生效。'}}
+                </td>
+              </tr>
+            </tbody>
+          </table>
+
+          <div class="hint" style="margin-top:12px">
+            <b>关于「默认值」：本项目不内置任何云端模型凭据。</b><br>
+            语音识别 / 语音合成 / 大模型三类<b>必须配置</b>，否则设备只是「能连上不能说话」——
+            这是刻意设计的：密钥不写进代码或镜像，就不会被别人连同镜像一起拿走。
+            选型与免费档对照见 <code>docs/免费语音服务商选型.md</code>。<br>
+            <b>端点检测（VAD）不用配</b>：设备端 esp-sr 已承担断句，断网也生效，
+            服务端这一项仅在你自建服务端 VAD 时才需要填。
+          </div>
+        </template>
+      </div>
+
       <div class="card">
         <div class="row" style="justify-content:space-between">
           <h2>AI 平台接入</h2>
@@ -851,13 +951,21 @@ createApp({
       // ---- 人格预设运营后台 ----
       presets: [], presetMeta: {trait_specs:[], soft_guardrails:[],
         hard_guardrails:[], guardrail_version:'', defaults:{}},
-      ttsVoices: ['zh-CN-XiaoxiaoNeural','zh-CN-XiaoyiNeural','zh-CN-YunjianNeural',
-                  'zh-CN-YunxiNeural','zh-CN-YunyangNeural'],
+      // 音色目录由服务端给出（GET /api/providers/catalog）。为什么不在前端硬编码：
+      // 出厂默认音色以服务端 app/voice/catalog.py 为单一真源，前端再抄一份必然
+      // 出现「下拉框里有的音色，恢复默认后却是另一个」。
+      voiceCatalog: {voices:[], allow_custom:true, custom_hint:'', custom_mismatch_hint:''},
+      // 就绪度面板数据（GET /api/providers/readiness）
+      readiness: null, readyBusy:false,
       pEditBox: false, pEdit: null, presetBusy:false,
       pPreview: null, auditBox:null, audits: [], showDiff:{}
     };
   },
   computed:{
+    ttsVoices(){ return this.voiceCatalog.voices || []; },
+    customVoicePlaceholder(){
+      return '例：cosyvoice-zh-female、GPT_SoVITS 角色名…';
+    },
     // 是否管理员。user 来自 localStorage 的 elder_user（登录时由 doLogin 写入）。
     // 两个入口（/ 与 /user）共用这套登录态：普通用户在 /user 登录后打开 /，
     // 这里就是 false —— 看到横幅、看不到任何管理 tab，而不是又弹一次登录框。
@@ -921,7 +1029,8 @@ createApp({
     },
     logout(){ this.token=''; localStorage.removeItem('elder_token'); },
     async loadAll(){
-      await Promise.all([this.loadDevices(), this.loadAvatars(), this.loadProviders()]);
+      await Promise.all([this.loadDevices(), this.loadAvatars(), this.loadProviders(),
+                       this.loadVoiceCatalog()]);
       if (this.curDeviceId) await this.loadReminders();
     },
     // 人格预设页的数据**按需加载**（不进loadAll）：
@@ -939,6 +1048,33 @@ createApp({
     },
     async loadAvatars(){ const r = await this.api('/api/avatars'); if(r) this.avatars = r; },
     async loadProviders(){ const r = await this.api('/api/providers'); if(r) this.providers = r; },
+    // 音色目录 + 就绪度面板。两者都**不能阻塞**页面其他部分：
+    // 音色目录拉不到时音色框退化成「只有自定义输入」仍可用（宁可少功能不可报错），
+    // 就绪度拉不到只显示「读取中」而不是把整页卡住。
+    async loadVoiceCatalog(){
+      try{
+        const r = await this.api('/api/providers/catalog');
+        if (r && r.voices) {
+          this.voiceCatalog = Object.assign(this.voiceCatalog, r);
+          // 目录到达后要重新拆分：openPreset/editAvatar 可能在目录还空时
+          // 就把存量音色判成了「不在清单里」，落进自定义框。
+          if (this.pEdit) Object.assign(this.pEdit, this.splitVoice(this.pEdit.tts_voice));
+          if (this.aForm) Object.assign(this.aForm, this.splitVoice(this.aForm.tts_voice));
+        }
+      }catch(e){ /* 目录缺失不致命：自定义输入仍然可用 */ }
+    },
+    async loadReadiness(){
+      this.readyBusy = true;
+      try{
+        const r = await this.api('/api/providers/readiness');
+        if (r) this.readiness = r;
+      }catch(e){ this.readiness = null; }
+      finally{ this.readyBusy = false; }
+    },
+    labelOfUsage(u){
+      const hit = (this.readiness&&this.readiness.usages||[]).find(x=>x.usage===u);
+      return hit ? hit.label : u;
+    },
     async loadReminders(){
       if (!this.curDeviceId) return;
       const r = await this.api('/api/reminders?device_pk='+this.curDeviceId);
@@ -1028,15 +1164,45 @@ createApp({
     },
     editAvatar(a){
       this.aForm = a ? JSON.parse(JSON.stringify(a)) : this.blankAvatar();
+      Object.assign(this.aForm, this.splitVoice(this.aForm.tts_voice));
       this.clipsText = JSON.stringify(this.aForm.clips||{}, null, 2);
       this.lightsText = JSON.stringify(this.aForm.emotion_lights||{}, null, 2);
       this.aBox = true;
     },
+    // 把库里存的音色值拆成「下拉框选中的项」+「自定义文本」两半。
+    // 存量数据里可能有不在预置清单里的音色（自建服务），这类必须落到
+    // 自定义输入框里展示，而不是让下拉框「什么都不选」——那会让人以为音色丢了，
+    // 一存就真的清空了。
+    //
+    // 返回值要用 Object.assign 写回 pEdit.tts_voice（而不是新开一个字段），
+    // 因为模板里的 <select v-model="pEdit.tts_voice"> 绑定的是这一个字段；
+    // 若拆到别的字段上，下拉框会显示空选中项，与「什么都不选」无法区分。
+    splitVoice(v){
+      v = (v||'').trim();
+      if (!v) return { tts_voice:'', tts_voice_custom:'' };
+      if (this.ttsVoices.some(x=>x.id===v)) return { tts_voice:v, tts_voice_custom:'' };
+      return { tts_voice:'__custom__', tts_voice_custom:v };
+    },
+    // 保存前把选择结果收敛成一个真实字符串。
+    // ⚠️ 漏了这一步会把字面量 '__custom__' 存进库：那是个不存在的音色，
+    // 表现为「保存成功但声音变了」，属于最难自查的一类静默故障。
+    resolveVoice(sel, custom){
+      sel = sel || '';
+      if (sel === '__custom__') return (custom||'').trim();
+      return sel;
+    },
+    voiceOf(v){ return this.ttsVoices.find(x=>x.id===v) || null; },
     async saveAvatar(){
       try{
         this.aForm.clips = this.clipsText.trim() ? JSON.parse(this.clipsText) : {};
         this.aForm.emotion_lights = this.lightsText.trim() ? JSON.parse(this.lightsText) : {};
       }catch(e){ this.err = 'JSON 格式错误：'+e.message; return; }
+      if (this.aForm.tts_voice === '__custom__' && !(this.aForm.tts_voice_custom||'').trim()){
+        this.err = '选了「其他」但没填音色名。请填写，或改选一个预置音色。';
+        return;
+      }
+      this.aForm.tts_voice = this.resolveVoice(this.aForm.tts_voice, this.aForm.tts_voice_custom);
+      delete this.aForm.tts_voice_custom;
       const body = JSON.parse(JSON.stringify(this.aForm));
       delete body.id; delete body.created_at;
       try{
@@ -1086,13 +1252,13 @@ createApp({
       try{
         if (this.pForm.id) await this.api('/api/providers/'+this.pForm.id, {method:'PATCH', body:JSON.stringify(body)});
         else await this.api('/api/providers', {method:'POST', body:JSON.stringify(body)});
-        this.pBox = false; await this.loadProviders();
+        this.pBox = false; await this.loadProviders(); await this.loadReadiness();
       }catch(e){ this.err = e.message; }
     },
     async removeProvider(p){
       if (!confirm('删除配置「'+p.name+'」？')) return;
       await this.api('/api/providers/'+p.id, {method:'DELETE'});
-      await this.loadProviders();
+      await this.loadProviders(); await this.loadReadiness();
     },
     async exportXiaozhi(){
       const d = await this.api('/api/providers/export/xiaozhi');
@@ -1191,6 +1357,7 @@ createApp({
       this.pEdit = JSON.parse(JSON.stringify(p));
       this.pEdit.traits = this.pEdit.traits || {};
       this.pEdit.guardrails_soft = this.pEdit.guardrails_soft || [];
+      Object.assign(this.pEdit, this.splitVoice(this.pEdit.tts_voice));
       this.pEditBox = true;
     },
     closePreset(){ this.pEditBox = false; this.pEdit = null; },
@@ -1234,13 +1401,19 @@ createApp({
       // 而噪音确认框会训练运营闭眼点确定，那才是真风险）。
       if(n > 0 &&
          !confirm('保存后立即对 ' + n + ' 台设备生效，确定？')) return;
+      // 与 saveAvatar 同一套收敛：__custom__ 是前端占位符，绝不能进库
+      if (this.pEdit.tts_voice === '__custom__' && !(this.pEdit.tts_voice_custom||'').trim()){
+        this.err = '音色选了「其他」但没填音色名。请填写，或改选一个预置音色。';
+        return;
+      }
+      const voice = this.resolveVoice(this.pEdit.tts_voice, this.pEdit.tts_voice_custom);
       this.presetBusy = true; this.err = '';
       try{
         await this.api('/api/admin/presets/'+this.pEdit.id, {
           method:'PATCH',
           body: JSON.stringify({name:this.pEdit.name, description:this.pEdit.description,
                                 system_prompt:this.pEdit.system_prompt,
-                                tts_voice:this.pEdit.tts_voice, traits:this.pEdit.traits})
+                                tts_voice:voice, traits:this.pEdit.traits})
         });
         await this.persistSoft();
         this.pEditBox = false; this.pEdit = null;
@@ -1307,6 +1480,12 @@ createApp({
       }
       if(t === 'usage'){
         this.loadUsage();
+      }
+      // 就绪度按需拉：它是**当前配置的直接函数**，进页面就拉会与
+      // loadProviders() 争一次数据库，且管理员在别处改完配置再回来时反而是旧的。
+      if(t === 'providers'){
+        this.loadReadiness();
+        this.loadVoiceCatalog();
       }
     }
   },

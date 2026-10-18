@@ -32,10 +32,17 @@ from ..model_catalog import (
     EXPORT_KINDS,
     KIND_LABELS,
     KIND_LIST,
-    USAGE_LABELS,
-    USAGE_LIST,
+    USAGE_ASR,
+    USAGE_CHAT,
     USAGE_EMBED,
+    USAGE_LABELS,
+    USAGE_LIGHT,
+    USAGE_LIST,
+    USAGE_RERANK,
     USAGE_ROUTES,
+    USAGE_TTS,
+    USAGE_VAD,
+    USAGE_VISION,
     describe_kinds,
 )
 from ..schemas import (
@@ -162,8 +169,14 @@ def provider_catalog(user: models.User = Depends(get_current_user)):
 
     枚举值会随业务增长（比如以后加 kind=tts_stream），硬编码在前端的话每次都要
     改两个地方；这里做成接口，前端跟着它走就行。
+
+    同时带上**音色目录**：音色是厂商侧标识符，填错会静默失败（厂商悄悄用
+    自己的默认音色，管理员以为换成功了）。所以音色框必须由服务端给清单，
+    见 ``app.voice.catalog`` 的模块说明。
     """
-    return {
+    from ..voice import catalog as voice_catalog
+
+    payload = {
         "kinds": [{"value": k, "label": KIND_LABELS.get(k, k)} for k in KIND_LIST],
         "usages": [
             {"value": u, "label": USAGE_LABELS.get(u, u), "kinds": list(USAGE_ROUTES[u])}
@@ -171,6 +184,102 @@ def provider_catalog(user: models.User = Depends(get_current_user)):
         ],
         "api_styles": [{"value": v, "label": t} for v, t in API_STYLES.items()],
     }
+    payload.update(voice_catalog.catalog_payload())
+    return payload
+
+
+@router.get("/readiness")
+def provider_readiness(db: Session = Depends(get_db),
+                       user: models.User = Depends(get_current_user)):
+    """每个用途**现在能不能用** —— 管理页顶部的「服务就绪度」面板数据源。
+
+    为什么必须做这个，而不是在页面上写死一句「已配置 0 项请去配置」
+    --------------------------------------------------------------
+    管理员最痛的时刻不是「没配置」，而是「配了但设备还是不说话」。
+    两种情况在页面上长得一模一样（都是没声音），排查方向却相反：前者是
+    这里少了行，后者是 endpoint/key/音色错了。
+
+    所以这里返回**分层**事实，而不是一个笼统的 bool：
+
+    - ``configured``  该用途有没有启用且健康的配置行（能否解析出候选）
+    - ``resolved``    现在实际会选中哪一条（kind + 名字，**脱敏**）
+    - ``hint``        没配时给出**具体**该配什么，含 kind 与 endpoint 形状
+    - ``critical``    缺它设备就完全不能说话（asr/tts/chat），与
+                     「锦上添花」（rerank/vision）区分开，避免吓人
+
+    脱敏：只回 provider/kind/name，绝不回 api_key（这是管理端点，
+    但仍按最小必要原则 —— 前端并不需要密钥就能渲染这个面板）。
+    """
+    rows: dict[str, dict] = {}
+    for usage in USAGE_LIST:
+        plan = resolve_plan(db, usage)
+        if plan:
+            kind, row = plan[0]
+            rows[usage] = {
+                "usage": usage,
+                "label": USAGE_LABELS.get(usage, usage),
+                "configured": True,
+                "resolved": {
+                    "kind": kind,
+                    "name": row.name,
+                    "provider": row.provider,
+                    "model": row.model,
+                    # fallback=True 表示这是从候选链兜底来的（如退回旧 llm），
+                    # 值得让管理员知道「你现在用的不是你以为的那个」
+                    "fallback": kind != USAGE_ROUTES[usage][0],
+                },
+                "hint": None,
+                "critical": usage in _CRITICAL_USAGES,
+            }
+        else:
+            rows[usage] = {
+                "usage": usage,
+                "label": USAGE_LABELS.get(usage, usage),
+                "configured": False,
+                "resolved": None,
+                "hint": _MISSING_HINTS.get(usage, "请在「AI 接入」里添加并启用对应类型的配置"),
+                "critical": usage in _CRITICAL_USAGES,
+            }
+    return {
+        "usages": [rows[u] for u in USAGE_LIST],
+        "missing_critical": [u for u in USAGE_LIST
+                             if u in _CRITICAL_USAGES and not rows[u]["configured"]],
+    }
+
+
+# 缺这三项，设备「能连上但一句话也说不出」；缺其余项功能降级但仍可用。
+_CRITICAL_USAGES: frozenset[str] = frozenset({USAGE_ASR, USAGE_TTS, USAGE_CHAT})
+
+# 没配时给出的提示。刻意写清 endpoint 的**形状**而不只是名称：
+# 老人场景下最大的坑是把「OpenAI 兼容地址」理解成厂商官网首页。
+_MISSING_HINTS: dict[str, str] = {
+    USAGE_ASR: (
+        "未配置语音识别：老人说话服务端听不懂。"
+        "请添加 kind=asr 的行。OpenAI 兼容写法 endpoint 填到"
+        "「…/v1」一级（如 https://api.openai.com/v1），"
+        "不要填官网首页；本项目上传音频走 multipart，"
+        "字段名 file。完整对比见 docs/免费语音服务商选型.md §3"
+    ),
+    USAGE_TTS: (
+        "未配置语音合成：服务端无法把回答念给老人听。"
+        "请添加 kind=tts 的行，endpoint 同样是「…/v1」一级。"
+        "音色可选本平台的预置清单（音色框下拉），"
+        "自建服务则手填其音色名。详见 docs/免费语音服务商选型.md §2"
+    ),
+    USAGE_CHAT: (
+        "未配置大模型：识别到的语音无法变成回答。"
+        "请添加 kind=llm_main（或旧值 llm）的行。"
+        "详见 docs/免费语音服务商选型.md §5"
+    ),
+    USAGE_LIGHT: "未配置轻量模型：提醒解析等简单任务会退回主模型（能跑，但更慢更贵）",
+    USAGE_EMBED: "未配置向量化：语义记忆检索不可用（其余功能正常）",
+    USAGE_RERANK: "未配置重排：记忆检索只按向量相似度排序（可用，质量略低）",
+    USAGE_VISION: "未配置视觉理解：摄像头画面无法理解（不影响对话）",
+    USAGE_VAD: (
+        "未配置独立 VAD：端点检测由设备端 esp-sr 承担"
+        "（已随固件启用，联网与断网都生效），此项可不配"
+    ),
+}
 
 
 @router.get("/resolve", response_model=ResolvedModelOut)
