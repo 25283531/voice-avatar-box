@@ -75,9 +75,15 @@ def _mysql_admin_conn(url):
     import pymysql
     from sqlalchemy.engine import make_url
     u = make_url(url)
+    # ⚠️ **不要传 charset** —— 它与认证无关。
+    # MySQL 8 的 caching_sha2_password 认证码是
+    #   XOR(SHA256(pw), SHA256(SHA256(SHA256(pw)), nonce))
+    # 只吃 (口令, nonce)，PyMySQL 的 pymysql/_auth.py 里 charset 出现 0 次。
+    # charset 只影响建连后的 SET NAMES。带上它会让人误以为「成功那步没传、
+    # 失败那步传了」是差异变量 —— 这正是本 bug 当时最大的误导点。
     return pymysql.connect(host=u.host or "127.0.0.1", user=u.username or "root",
                            password=u.password or "", port=u.port or 3306,
-                           charset="utf8mb4", autocommit=True)
+                           autocommit=True)
 
 
 def prepare_db() -> tuple[str, str | None]:
@@ -99,7 +105,24 @@ def prepare_db() -> tuple[str, str | None]:
             "CREATE DATABASE IF NOT EXISTS elder_droptables_test "
             "CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci")
         conn.close()
-        return str(make_url(url).set(database="elder_droptables_test")), None
+        # ⚠️⚠️ 这里**绝不能用 str()** —— 这是本脚本曾经把 CI 跑红的原因
+        # ------------------------------------------------------------------
+        # SQLAlchemy 的 ``URL.__str__`` 默认 ``hide_password=True``，会把口令
+        # 替换成**字面量** ``***``：
+        #     str(make_url("mysql+pymysql://root:smoke-pass@h/d"))
+        #       -> "mysql+pymysql://root:***@h/d"
+        # 把它写回 os.environ 之后，app/db.py 的 engine 拿到的口令就是三个星号，
+        # 必然 1045 "Access denied ... (using password: YES)"。
+        #
+        # 为什么当初极难定位：GitHub Actions 的 secret masking **也**把
+        # CI 注入的真值打印成 ``***``，于是日志里「真的」和「假的」长得一模一样，
+        # 肉眼无法区分。只有回到「对象上的属性 vs 字符串往返后的属性」这一层
+        # 才看得见：``url.password == 'smoke-pass'`` 而 ``make_url(str(url)).password == '***'``。
+        #
+        # 正确的写法是显式要求不隐藏口令（SQLAlchemy >= 1.4）：
+        #     make_url(url).set(database=...).render_as_string(hide_password=False)
+        return make_url(url).set(database="elder_droptables_test").render_as_string(
+            hide_password=False), None
     return url, None
 
 

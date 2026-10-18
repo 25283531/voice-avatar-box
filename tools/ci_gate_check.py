@@ -323,6 +323,68 @@ def check_workflows(report: "CheckReport") -> None:
 
 
 # ---------------------------------------------------------------------------
+# 检查 4：禁止把 SQLAlchemy URL 转成会洗白口令的字符串
+# ---------------------------------------------------------------------------
+
+#: 会触发口令洗白的写法。
+#:
+#: ⚠️ 只收 ``str(make_url(...))`` 这一种**明确无歧义**的形态，不收裸 ``str(url)``。
+#:    理由：裸 ``str(url)`` 在本仓库是合法的其它用法（``llm_gateway.py:821`` 用它把
+#:    data-URL 拆出 base64），收进来就是纯误报；一条会误报的检查等于没有检查 ——
+#:    真出事时它先被人加进白名单，然后永远失效。
+#:
+#:    真正的风险形态是「SQLAlchemy 的 ``URL`` 对象被 str() 化后再喂回
+#:    ``make_url()``/``create_engine()``」，而本仓库里 ``URL`` 的来源就是
+#:    ``make_url()``。所以按来源收口，既精准又不漏当前的实际模式。
+_URL_STR_TRAPS: tuple[tuple[str, str], ...] = (
+    (r"str\(\s*make_url\(", "str(make_url(...))"),
+)
+
+#: 本文件自己必然含这些字面量（正则与提示文案），检查器不能检自己
+_SELF = Path(__file__).relative_to(ROOT).as_posix()
+
+
+def check_no_url_str_trap(report: "CheckReport") -> None:
+    """扫仓库里会把数据库连接串的口令洗白的写法。
+
+    ``URL.render_as_string(hide_password=False)`` 是**允许**的，
+    所以命中行里同时出现 ``hide_password`` 时放行。
+    """
+    hits: list[str] = []
+    scanned = 0
+    for path in sorted(ROOT.rglob("*.py")):
+        rel = path.relative_to(ROOT).as_posix()
+        if rel == _SELF:
+            continue
+        if any(part in {".git", "node_modules", "build", "dist", "__pycache__",
+                        "managed_components", ".venv"}
+               for part in path.parts):
+            continue
+        try:
+            text = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue
+        scanned += 1
+        for lineno, line in enumerate(text.splitlines(), 1):
+            for pattern, label in _URL_STR_TRAPS:
+                if not re.search(pattern, line):
+                    continue
+                if "hide_password" in line or line.lstrip().startswith("#"):
+                    continue
+                hits.append(f"{rel}:{lineno}  {label}  →  {line.strip()[:90]}")
+
+    if hits:
+        report.fail(
+            "发现会把 SQLAlchemy URL 的口令洗成字面量 '***' 的写法"
+            f"（扫描 {scanned} 个 .py，命中 {len(hits)} 处）"
+            "—— 改用 render_as_string(hide_password=False)：\n    "
+            + "\n    ".join(hits)
+        )
+    else:
+        report.ok(f"没有 str(make_url(...)) 这类口令洗白写法（已扫 {scanned} 个 .py）")
+
+
+# ---------------------------------------------------------------------------
 # 主流程
 # ---------------------------------------------------------------------------
 
@@ -354,6 +416,9 @@ def main() -> int:
 
     # ---- 检查 3 ----
     check_workflows(report)
+
+    # ---- 检查 4 ----
+    check_no_url_str_trap(report)
 
     print("-" * 72)
     print(f"通过 {len(report.passes)} 项，失败 {len(report.failures)} 项")
