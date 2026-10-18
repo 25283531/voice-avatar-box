@@ -3,7 +3,7 @@
 # 端口约定：
 #   容器内固定监听 8080（ELDER_PORT 可覆盖）
 #   对外只发布一个端口，默认 8064：  -p 8064:8080
-#   生产环境由 nginx 反代 https://voice.250886.xyz -> 127.0.0.1:8064
+#   生产环境由 nginx 反代 https://152.136.230.132 -> 127.0.0.1:8064（IP 直连）
 FROM python:3.11-slim
 
 # 默认用内置 SQLite，库文件放在 /data（docker-compose.yml 把命名卷挂到这里）。
@@ -30,7 +30,7 @@ ENV PYTHONUNBUFFERED=1 \
 #             值是一份写进配置的意图声明 + 启动摘要里明确的模式名。
 #   tunnel —— Cloudflare Tunnel 等「TLS 在前置终止」的形态：**必须**配对外
 #             地址，否则容器启动直接失败（不静默降级）。配套变量：
-#               ELDER_PUBLIC_BASE_URL=https://voice.250886.xyz   （HTTP/OTA，必需）
+#               ELDER_PUBLIC_BASE_URL=https://152.136.230.132   （HTTP/OTA，必需）
 #               ELDER_WS_PUBLIC_BASE_URL=wss://voice-ws.250886.xyz （WS 单独域名，可选）
 #             旧变量 ELDER_VOICE_PUBLIC_BASE 仍然有效（向后兼容），新部署建议用
 #             ELDER_PUBLIC_BASE_URL（任何模式下都校验 scheme）。

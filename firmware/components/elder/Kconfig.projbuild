@@ -2,11 +2,16 @@ menu "老人陪伴 & 提醒助手 (Elder Companion)"
 
     config ELDER_SERVER_URL
         string "业务后端地址 (FastAPI)"
-        default "http://192.168.1.100:8000"
+        default "https://152.136.230.132"
         help
-            老人陪伴助手业务后端的根地址，形如 http://192.168.1.100:8000。
+            老人陪伴助手业务后端的根地址，形如 https://152.136.230.132。
             固件会在其后拼接 /api/device/sync、/api/device/events 等路径。
             末尾不要带斜杠。
+
+            2026-10-18 起为 IP 直连（域名未备案被厂商按 SNI 阻断，连 IP
+            不带 SNI 可绕过）。服务端配 IP 证书（SAN 含该 IP）后即可在
+            net.c 挂证书包开启校验；当前 net.c 未挂证书包，https 握手
+            不验证服务器身份（能通、但理论可被中间人冒充）。
 
     config ELDER_SERVER_TOKEN
         string "设备令牌 device_token（留空则用激活码流程获取）"

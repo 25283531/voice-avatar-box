@@ -197,8 +197,9 @@ CONFIG_CUSTOM_WAKE_WORD_THRESHOLD=20
 # mn7_cn：官方推荐（S3/P4），比 mn6_cn 小约 1MB。
 # 模型 2671229 字节 + fst 9648 字节 = 2680877 字节，进 assets 分区。
 CONFIG_SR_MN_CN_MULTINET7_QUANT=y
-# 业务后端地址（按实际部署修改，也可 idf.py menuconfig 调整）
-CONFIG_ELDER_SERVER_URL="http://192.168.1.100:8000"
+# 业务后端地址（2026-10-18 起 IP 直连：域名未备案被厂商按 SNI 阻断，
+# 连 IP 不带 SNI 可绕过；服务端配 IP 证书后可开证书校验，见 Kconfig 帮助）
+CONFIG_ELDER_SERVER_URL="https://152.136.230.132"
 CONFIG_ELDER_SERVER_TOKEN=""
 CONFIG_ELDER_SYNC_INTERVAL_SEC=300
 CONFIG_ELDER_HTTP_TIMEOUT_MS=8000

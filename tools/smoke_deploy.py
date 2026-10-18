@@ -341,6 +341,12 @@ def main() -> int:
                     fake_request("https", "voice.250886.xyz"),
                     f"wss://voice.250886.xyz{WS_PATH}",
                     f"https://voice.250886.xyz{OTA_PATH}")
+        # 2026-10-18 起生产形态：IP 直连（域名未备案被厂商按 SNI 阻断，
+        # 连 IP 不带 SNI 可绕过）。Host 头是 IP ⇒ 下发的 WS/OTA 也必须是 IP。
+        expect_call("A2b auto + IP 直连（生产形态：Host=IP）", {},
+                    fake_request("https", "152.136.230.132"),
+                    f"wss://152.136.230.132{WS_PATH}",
+                    f"https://152.136.230.132{OTA_PATH}")
         expect_http("A3 auto + 旧变量 https", {
             "ELDER_VOICE_PUBLIC_BASE": "https://voice.250886.xyz"},
             f"wss://voice.250886.xyz{WS_PATH}",

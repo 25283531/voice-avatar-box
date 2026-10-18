@@ -13,10 +13,15 @@ const TOKEN_KEY = 'elder_token'
 const USER_KEY = 'elder_user'
 
 /**
- * 业务后端地址（服务端接口 + 业务接口统一走这个域名）。
- * 生产域名由 nginx 反代到 Docker 容器的 8064 端口。
+ * 业务后端地址（服务端接口 + 业务接口统一走这个地址）。
+ *
+ * 2026-10-18 起为 **IP 直连**：国内云服务器域名未备案被厂商按 SNI 阻断
+ * （非浏览器客户端全死于 TLS 握手、仅浏览器时通时断），连 IP 不带 SNI 可绕过。
+ * 前提：服务端必须配 **IP 证书**（SAN 含 152.136.230.132，Let's Encrypt 自
+ * 2026-01 起可发行，160 小时有效期需自动续期）——否则 OkHttp 主机名校验失败。
+ * 备案完成后切回域名：同步改这里与固件 Kconfig 的 OTA 默认值即可。
  */
-const BASE_URL = 'https://voice.250886.xyz'
+const BASE_URL = 'https://152.136.230.132'
 
 /** 返回写死的业务后端地址（只读，不允许运行时修改） */
 export function getElderBaseUrl(): string {

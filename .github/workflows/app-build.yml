@@ -5,7 +5,7 @@ name: app-build
 #   push / PR          -> 构建 H5 自检（验证依赖、页面、打包链路），产物保留 7 天
 #   workflow_dispatch  -> 可选 h5 / mp-weixin / both，产物保留 30 天，用于正式发包
 #
-# 后端地址固定在 env/.env 的 VITE_ELDER_BASEURL（https://voice.2508866.xyz），
+# 后端地址固定在 src/http/elder.ts 的 BASE_URL（https://152.136.230.132，IP 直连），
 # 手动触发时可临时覆盖 server_baseurl。
 #
 # Android / iOS 原生包不走本工作流：uni-app 的 App 端打包依赖 HBuilderX 云端证书与
@@ -116,10 +116,10 @@ jobs:
         if: steps.gate.outputs.skip != 'true' && matrix.key == 'h5'
         working-directory: app
         run: |
-          if grep -rq "voice.2508866.xyz" dist/build/h5; then
-            echo "已包含 https://voice.2508866.xyz"
+          if grep -rq "152.136.230.132" dist/build/h5; then
+            echo "已包含 https://152.136.230.132"
           else
-            echo "产物中未找到后端地址，检查 VITE_ELDER_BASEURL 是否被内联"; exit 1
+            echo "产物中未找到后端地址，检查 elder.ts 的 BASE_URL 是否被内联"; exit 1
           fi
 
       - name: 上传产物

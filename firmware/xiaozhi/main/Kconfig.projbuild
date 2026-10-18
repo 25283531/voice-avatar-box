@@ -2,7 +2,7 @@ menu "Xiaozhi Assistant"
 
 config OTA_URL
     string "Default OTA URL"
-    default "https://voice.250886.xyz/api/voice/ota"
+    default "https://152.136.230.132/api/voice/ota"
     help
         The application will access this URL to check for new firmwares and server address.
 
@@ -18,6 +18,11 @@ config OTA_URL
         部署在别的域名或局域网时：改 sdkconfig 的 CONFIG_OTA_URL；固件运行时
         优先读 NVS（settings("wifi") 的 ota_url，见 ota.cc 的
         GetCheckVersionUrl），写该 NVS 项即可覆盖，不必重新烧录。
+
+        2026-10-18 起改为 IP 直连：域名未备案被厂商按 SNI 阻断（非浏览器
+        客户端全死于握手），连 IP 不带 SNI 可绕过。⚠️ 服务端必须配 IP 证书
+        （SAN 含该 IP）：esp-tls 的证书链验证用系统证书包能过，但主机名
+        校验拿 URL 里的 IP 去比对证书，域名证书必失败。
 
 choice
     prompt "Flash Assets"

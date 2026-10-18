@@ -7,10 +7,16 @@
 | **默认（推荐先跑通）** | 单机 / 家用 / 快速验证 | **内置 SQLite**（零外部依赖，开箱即用） | `docker compose up -d` |
 | MySQL | 多人共用、数据量大、需要外部运维工具 | MySQL 8（自带容器或外部实例） | 叠加 `docker-compose.mysql.yml` |
 
-端口与域名是硬性约定，不要改：
+端口与对外地址是硬性约定，不要改：
 
 - 容器内固定监听 **8080**，对外只发布 **8064**（`ELDER_HTTP_PORT` 可改宿主机侧端口）
-- 生产域名 `https://voice.250886.xyz`（手机 APP 在 `app/src/http/elder.ts` 里代码级写死，无设置入口）
+- 生产地址 `https://152.136.230.132`（**IP 直连**，2026-10-18 起；域名 `voice.250886.xyz`
+  未备案被厂商按 SNI 阻断，详见 [4.3 IP 直连部署](#43-ip-直连部署域名被按-sni-阻断的形态)）。
+  手机 APP 与固件的地址是代码级写死的（`app/src/http/elder.ts` 的 `BASE_URL` /
+  `CONFIG_OTA_URL`），没有设置入口
+- ⚠️ **IP 直连的前提是服务器持有 SAN 含 `152.136.230.132` 的 IP 证书**
+  （Let's Encrypt 2026-01-15 起支持，见 [4.3](#43-ip-直连部署域名被按-sni-阻断的形态)）。
+  证书没就绪时，固件与 APP 会报「证书名不符」——这是预期的中间态，不是代码问题
 
 ---
 
@@ -148,7 +154,7 @@ docker compose exec elder-server ls -l /data # 容器视角
 "配网成功但连不上云"通常是这两件事，和配网本身无关：
 
 1. **固件 OTA 地址指向了别处**。设备连上 Wi-Fi 后会去 `CONFIG_OTA_URL` 换 WebSocket 地址与 token，
-   出厂默认已指向本项目的 `https://voice.250886.xyz/api/voice/ota`。
+   出厂默认已指向本项目的 `https://152.136.230.132/api/voice/ota`。
    若刷的是早期固件，默认值可能仍指向第三方域名——OTA 请求（含 MAC / UUID / 板子信息）
    会发给第三方，而响应里的 WebSocket 地址与 token 也由第三方下发，等于把整条语音链路的控制权交出去。
    处置：改 `CONFIG_OTA_URL` 后重新编译，或写 NVS 里 `settings("wifi")` 的 `ota_url` 覆盖
@@ -471,7 +477,16 @@ docker compose -f docker-compose.yml -f docker-compose.mysql.yml run --rm \
 
 ## 4. 反向代理 / HTTPS
 
-手机 APP 里的后端地址是**代码级写死**的 `https://voice.250886.xyz`（`app/src/http/elder.ts` 的 `BASE_URL`），没有网络设置入口。所以对外域名只能是这个，Nginx 负责把 443 转到容器发布的 8064。
+手机 APP 与固件里的后端地址是**代码级写死**的，没有网络设置入口：
+`app/src/http/elder.ts` 的 `BASE_URL`（APP）与 `CONFIG_OTA_URL`（固件）。
+
+**当前生产形态（2026-10-18 起）是 IP 直连**：域名 `voice.250886.xyz` 未备案，
+被云厂商按 SNI 阻断，代码已全部改为 `https://152.136.230.132`。IP 直连形态的
+完整部署步骤（IP 证书、Nginx 双证书、环境变量）见
+[4.3 IP 直连部署](#43-ip-直连部署域名被按-sni-阻断的形态)。
+
+下面这节是**域名形态**的配置（有域名、或备案恢复后的形态），IP 直连形态
+请直接看 §4.3，两者只在证书与 `server_name` 上有区别，其余完全相同。
 
 ```nginx
 server {
@@ -528,7 +543,7 @@ server {
 
 注意点：
 
-- **`ELDER_CORS` 要跟着改**：`*` 在开发时方便，上线后建议写成 `https://voice.250886.xyz`（多个来源用逗号分隔）。
+- **`ELDER_CORS` 要跟着改**：`*` 在开发时方便，上线后建议写成实际对外地址（IP 直连形态是 `https://152.136.230.132`，域名形态是 `https://voice.250886.xyz`；多个来源用逗号分隔）。
   FastAPI 的 CORS 中间件在 `allow_origins=["*"]` 时不会带 `Allow-Credentials`，若前端要传凭证必须写明确来源。
 - 反向代理之后，容器内仍然认为自己是 HTTP，不需要在应用侧开 TLS。
 - **WebSocket 必须显式放行 Upgrade**：见上面 `location /api/voice/` 那段。这是本项目最容易踩的坑。
@@ -539,11 +554,16 @@ server {
 
 ---
 
-### 4.1 Cloudflare Tunnel + iStoreOS 部署（当前生产形态）
+### 4.1 Cloudflare Tunnel + iStoreOS 部署（家庭软路由形态）
 
-> 本节记录 2026-10 上线的实际形态：**iStoreOS（OpenWrt 软路由）+ Docker + cloudflared**，
+> ⚠️ **本节已不是当前生产形态**：2026-10-18 起生产迁到国内 VPS 的 IP 直连
+> （域名未备案被按 SNI 阻断），见 [§4.3](#43-ip-直连部署域名被按-sni-阻断的形态)。
+> 本节保留作家庭软路由 + Tunnel 的完整参考，两节除了证书与 `server_name`
+> 之外完全相同。
+>
+> 本节记录 2026-10 上线的家庭形态：**iStoreOS（OpenWrt 软路由）+ Docker + cloudflared**，
 > 对外 `https://voice.250886.xyz`，源站 `http://127.0.0.1:8064`（容器内 8080）。
-> 域名以仓库内配置为准（`firmware/xiaozhi/main/Kconfig.projbuild` 的 `CONFIG_OTA_URL`、
+> 地址以仓库内配置为准（`firmware/xiaozhi/main/Kconfig.projbuild` 的 `CONFIG_OTA_URL`、
 > `server/app/config.py` 的注释、`server/docker-compose.yml` 的示例），不要凭记忆改。
 
 #### 4.1.1 链路形态
@@ -580,19 +600,19 @@ ingress:
 怎么确认 WS 真的过了隧道（抄走即用）：
 
 ```bash
-# 1) HTTP 面：期望 {"ok":true,...}
-curl -s https://voice.250886.xyz/api/health
+# 1) HTTP 面：期望 {"ok":true,...}（IP 直连形态）
+curl -s https://152.136.230.132/api/health
 
 # 2) WS 升级面：不带设备 token，期望先看到 101，紧接着连接被服务端以 4401 关闭
 #    （4401 = token 缺失，见 server/app/voice/session.py 的 CLOSE_UNAUTHORIZED；
 #     服务端是"先 accept 再鉴权"，所以 101 一定会出现）。
-#    看到 101 就证明 Cloudflare → cloudflared → 源站的升级链路是通的；
+#    看到 101 就证明 Nginx/cloudflared → 源站的升级链路是通的；
 #    4401 是预期的，不代表配置有问题。
 curl -si -N --max-time 5 \
   -H 'Connection: Upgrade' -H 'Upgrade: websocket' \
   -H 'Sec-WebSocket-Version: 13' \
   -H 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==' \
-  https://voice.250886.xyz/api/voice/v1/ws
+  https://152.136.230.132/api/voice/v1/ws
 ```
 
 #### 4.1.3 ⚠️ ws:// vs wss://：隧道形态下**必须**声明 `tunnel` 模式并配对外地址
@@ -612,19 +632,21 @@ curl -si -N --max-time 5 \
 **Docker 网桥网关**（cloudflared 在宿主机，查法见 §4.1.4），不在信任名单里
 —— 即使 cloudflared 正确传了 `X-Forwarded-Proto: https`，uvicorn 眼里自己
 永远是明文 HTTP。于是 `request.url.scheme` 恒为 `http`，设备拿到的是
-`ws://voice.250886.xyz/api/voice/v1/ws`：明文 WS 打到 443。表现是**设备能配网、
+`ws://<对外地址>/api/voice/v1/ws`：明文 WS 打到 443。表现是**设备能配网、
 能心跳，一开口说话就断**，极易误判成固件问题。
 
 解决办法（二选一，**推荐前者**）：
 
 ```bash
 # ① 新变量（任何模式下都校验 scheme；WS 可单独配域名）
+#    生产形态（2026-10-18 起，IP 直连）：
 ELDER_DEPLOY_MODE=tunnel
-ELDER_PUBLIC_BASE_URL=https://voice.250886.xyz
-# ELDER_WS_PUBLIC_BASE_URL=wss://voice-ws.250886.xyz   # 可选：WS 单独域名
+ELDER_PUBLIC_BASE_URL=https://152.136.230.132
+# ELDER_WS_PUBLIC_BASE_URL=wss://152.136.230.132   # 可选：WS 单独地址
+#    域名形态（备案恢复后）把上面两行换成 voice.250886.xyz 即可，其余不变
 
 # ② 旧变量（向后兼容，语义与历史上逐字一致；tunnel 模式下同样满足"有显式地址"）
-# ELDER_VOICE_PUBLIC_BASE=https://voice.250886.xyz
+# ELDER_VOICE_PUBLIC_BASE=https://152.136.230.132
 ```
 
 注意：
@@ -694,15 +716,15 @@ XFF，且**从右往左**跳过可信段、取第一个不可信地址（攻击�
 - **时区**：镜像内 `TZ=Asia/Shanghai` 且装了 tzdata（`server/Dockerfile`），容器内
   `ZoneInfo("Asia/Shanghai")` 恒为 +8，与宿主机时区无关 —— iStoreOS 默认 UTC 也不影响
   提醒时间。固件侧时间由心跳下发的 `server_time` 校准。
-- **固件与服务的分工**（改域名时最容易漏）：
-  - OTA 检查地址：编译期 `CONFIG_OTA_URL`（默认 `https://voice.250886.xyz/api/voice/ota`，
+- **固件与服务的分工**（改地址时最容易漏）：
+  - OTA 检查地址：编译期 `CONFIG_OTA_URL`（默认 `https://152.136.230.132/api/voice/ota`，
     见 `firmware/xiaozhi/main/Kconfig.projbuild`），设备运行时还可被 NVS 覆盖
     （`settings("wifi")` 的 `ota_url`，见 `firmware/xiaozhi/main/ota.cc` 的 `GetCheckVersionUrl`）。
   - 语音 WS 地址：每次心跳由服务端按 §4.1.3 的逻辑重新下发。
-  - 所以换域名要**三处一起改**：固件默认值或 NVS、部署模式对应的对外地址变量
+  - 所以换地址（域名 ↔ IP）要**三处一起改**：固件默认值或 NVS、部署模式对应的对外地址变量
     （`ELDER_PUBLIC_BASE_URL` / 旧变量 `ELDER_VOICE_PUBLIC_BASE`，
-    WS 单独域名再加 `ELDER_WS_PUBLIC_BASE_URL`）、Cloudflare 隧道主机名。
-    漏一处的典型症状是"能心跳不能说话"或"OTA 打到旧域名"。
+    WS 单独域名再加 `ELDER_WS_PUBLIC_BASE_URL`）、TLS 前置（Tunnel 主机名或 Nginx server）。
+    漏一处的典型症状是"能心跳不能说话"或"OTA 打到旧地址"。
 - cloudflared 在 iStoreOS 上的安装方式（opkg 包或官方二进制）与隧道创建
   （Cloudflare Zero Trust 后台）以各自官方文档为准，本文不复述可能过时的步骤。
 
@@ -803,7 +825,185 @@ XFF，且**从右往左**跳过可信段、取第一个不可信地址（攻击�
 
 ---
 
+## 4.3 IP 直连部署（域名被按 SNI 阻断的形态）
+
+> **这是 2026-10-18 起的本项目生产形态。** 域名 `voice.250886.xyz` 未备案，
+> 被云厂商按 SNI 阻断；APP 与固件已代码级改为直连服务器 IP
+> `https://152.136.230.132`。本节讲这形态与域名形态的差异与操作步骤。
+
+### 4.3.1 为什么是 IP 直连（证据链）
+
+阻断不是网络层不可达，而是厂商 DPI 按 TLS ClientHello 里的 **SNI** 杀连接
+（2026-10-18 在用户本机实测）：
+
+| 探针 | 结果 | 说明 |
+| --- | --- | --- |
+| `Test-NetConnection 152.136.230.132 -Port 443` | **True** | TCP 层通，没有 IP 阻断 |
+| `openssl s_client -connect 152.136.230.132:443`（连 IP、**无 SNI**） | **TLS 1.3 握手成功，证书链 Verification: OK** | 不带 SNI 的 TLS 连接畅通 |
+| `openssl s_client -connect voice.250886.xyz:443 -servername voice.250886.xyz` | `write:errno=113`，连接被杀 | 带域名 SNI 立即被杀 |
+| 浏览器访问域名 | 时通时断 | Chrome 走 HTTP/3（QUIC）时 SNI 被加密、DPI 看不见 ⇒ 通；回落到 TCP+TLS 就被杀 ⇒ 断。这个现象本身就是 SNI 判据的佐证 |
+
+结论：**换 IP 直连（不带 SNI）确实能绕过阻断**，HTTPS 完全可用。
+⚠️ 用户本机 `curl.exe` 报 `CRYPT_E_REVOCATION_OFFLINE` 与阻断无关——那是
+Windows Schannel 握过手后去查证书吊销状态（CRL）连不上吊销服务器；
+openssl 默认不查所以显示 OK。真实客户端（ESP32 mbedtls、Android OkHttp）
+不做 CRL 检查，不受影响。
+
+### 4.3.2 IP 证书是硬前提（不是可选项）
+
+固件的 TLS 实现（托管组件 `78__esp-ml307` 的 `esp_ssl.cc`）用系统证书包
+验证证书链、**并按 URL 主机名校验证书**。连 IP 时拿 IP 去比对域名证书的
+主机名 ⇒ 必然失败。所以服务器**必须持有 SAN 含 `152.136.230.132` 的
+IP 证书**，否则固件与 APP（OkHttp 同样做主机名校验）都会报「证书名不符」。
+
+Let's Encrypt 自 2026-01-15 起正式发行 IP 证书（GA），要点：
+
+- IPv4/IPv6 均可；**有效期只有 160 小时（约 6 天）**，必须选 `shortlived` profile
+- 验证方式只支持 **http-01 / tls-alpn-01**（没有 DNS-01、没有通配符）
+- Certbot 5.4+ 支持 `--ip-address`；`webroot` / `standalone` / `manual` 插件可用，
+  **`--nginx` / `--apache` 插件尚不支持**，需自己配 reload hook
+
+申请命令（80 端口要可达，LE 走 http-01 验证）：
+
+```bash
+# webroot 方式（80 已有服务在跑时用；目录要和 Nginx 的 ACME challenge location 对上）
+sudo certbot certonly --preferred-profile shortlived \
+  --webroot --webroot-path /var/www/certbot \
+  --ip-address --key-type ecdsa \
+  -d 152.136.230.132 --deploy-hook "systemctl reload nginx"
+```
+
+⚠️ 160 小时有效期 ⇒ **续期必须自动化**，`--deploy-hook` 里 reload Nginx；
+忘了续期的表现是所有设备在第 6 天开始证书过期报错。续期频率建议
+`--cert-name` 固定 + systemd timer 每天两次（Let's Encrypt 建议）。
+
+### 4.3.3 Nginx：default_server + 双证书
+
+IP 直连时客户端**不带 SNI**，TLS 握手落到 `default_server`。
+所以 default_server 必须挂 **IP 证书**；域名 server（带 SNI 的请求才落到它）
+继续用域名证书——两个 server 并存：
+
+```nginx
+# 不带 SNI 的连接（IP 直连的 APP/固件/curl）落到这里 ⇒ 必须是 IP 证书
+server {
+    listen 443 ssl default_server;
+    http2 on;
+    server_name 152.136.230.132;
+
+    ssl_certificate     /etc/letsencrypt/live/152.136.230.132/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/152.136.230.132/privkey.pem;
+    ssl_protocols       TLSv1.2 TLSv1.3;
+
+    client_max_body_size 20m;
+
+    # ---------------------------------------------------------- 语音 WebSocket
+    # ⚠️ 这一段不能省。语音链路和 API 共用 8064，设备会往
+    #    /api/voice/v1/ws 发起 WebSocket 升级。Nginx 默认不转发 Upgrade 头，
+    #    漏了这三行的表现是：设备能配网、能心跳（HTTP 正常），
+    #    但一开口说话就断连，看日志是 200 而不是 101 —— 很容易误判成固件问题。
+    location /api/voice/ {
+        proxy_pass http://127.0.0.1:8064;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade    $http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host              $host;
+        proxy_set_header X-Real-IP         $remote_addr;
+        proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_read_timeout 3600s;   # 一次语音对话可能很长；不要设成几十秒
+        proxy_send_timeout 3600s;
+        proxy_buffering off;        # Opus 音频不能攒着发，否则明显延迟
+    }
+
+    location / {
+        proxy_pass http://127.0.0.1:8064;
+        proxy_http_version 1.1;
+        proxy_set_header Host              $host;
+        proxy_set_header X-Real-IP         $remote_addr;
+        proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_read_timeout 300s;      # 管理后台长轮询
+        proxy_send_timeout 300s;
+    }
+}
+
+# 带 SNI=voice.250886.xyz 的连接（浏览器、备案恢复后的 APP/固件）落到这里 ⇒ 域名证书
+server {
+    listen 443 ssl;
+    http2 on;
+    server_name voice.250886.xyz;
+
+    ssl_certificate     /etc/letsencrypt/live/voice.250886.xyz/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/voice.250886.xyz/privkey.pem;
+
+    # location 段与上面完全相同（可抽成 include 文件共享）
+    include /etc/nginx/elder_locations.conf;
+}
+
+# HTTP 全量跳 HTTPS（IP 直连形态下浏览器输 http://IP 也会被跳转）
+server {
+    listen 80 default_server;
+    return 301 https://$host$request_uri;
+}
+
+# ACME http-01 验证用（IP 证书续期靠它）
+location /.well-known/acme-challenge/ {
+    root /var/www/certbot;
+}
+```
+
+（80 server 与 ACME location 二选一即可，看 certbot 用的是 webroot 还是 standalone。）
+
+### 4.3.4 容器侧环境变量
+
+```bash
+ELDER_DEPLOY_MODE=tunnel
+ELDER_PUBLIC_BASE_URL=https://152.136.230.132
+ELDER_JWT_SECRET=<随机长字符串>
+ELDER_SEED_ADMIN_PASSWORD=<强口令>               # 首启必填，不填则随机化
+```
+
+⚠️ `ELDER_PUBLIC_BASE_URL` 用 **https://** 开头（不是 `wss://`、不带路径尾斜杠）。
+WS 地址由它自动换 scheme 推导成 `wss://152.136.230.132/api/voice/v1/ws`。
+IP 直连下 Host 头就是 IP ⇒ auto 模式按请求推导也会得到 IP 地址，但
+**tunnel 模式显式配置仍是推荐做法**（推导依赖请求头，遇到畸形请求会给出错地址）。
+
+### 4.3.5 备选方案：连 IP、按域名验证书（不申请 IP 证书）
+
+如果暂时不想申请 IP 证书，另一个办法是让客户端「连 IP、但按域名校验证书」：
+
+| 端 | 做法 | 代价 |
+| --- | --- | --- |
+| Android APP | 自定义 `HostnameVerifier`，把 `152.136.230.132` 映射回 `voice.250886.xyz` 校验 | 需要改 APP 代码并重新出包；**与 IP 证书方案互斥**（有 IP 证书时域名证书就不在 443 默认路径上了） |
+| ESP32 固件 | `esp_ssl.cc` 的 esp-tls 按 URL 主机名校验，无法只改配置绕过 | **不可行**，除非改托管组件 |
+
+结论：固件这一端没有「免 IP 证书」的选项，**IP 证书是必选项**。
+
+### 4.3.6 备案之后怎么切回域名
+
+域名备案恢复后，SNI 阻断解除，按以下顺序切换（**服务端先行，客户端最后**）：
+
+1. 服务器确认域名证书就位、Nginx 域名 server 生效（`openssl s_client
+   -connect voice.250886.xyz:443 -servername voice.250886.xyz` 通过）
+2. 改代码三处真源回域名：`app/src/http/elder.ts` 的 `BASE_URL`、
+   `firmware/xiaozhi/main/Kconfig.projbuild` 的 `CONFIG_OTA_URL`、
+   `firmware/components/elder/Kconfig.projbuild` 的 `ELDER_SERVER_URL`
+   （后者在 `sdkconfig.defaults` 与 `tools/merge_to_xiaozhi.py` 还有两份同源副本）
+3. 重打包 APP、重烧固件（存量设备可先用 NVS `ota_url` 覆盖顶一阵）
+4. `ELDER_PUBLIC_BASE_URL` 改回 `https://voice.250886.xyz`
+5. CI 两条工作流的白名单已同时放行 IP 与域名（firmware-build 的 OTA 校验、
+   app-build 的产物地址校验），无需改 CI
+
+⚠️ **不要在证书没就绪前就切客户端**：固件/APP 会报证书名不符，
+表现为「OTA 检查失败」而非提示证书问题，很难归因。
+
+---
+
 ## 4.4 公网 VPS + 自管 TLS 证书（不用 Cloudflare Tunnel）
+
+> ⚠️ **当前国内 VPS 生产形态见 §4.3（IP 直连）**：证书来源不同（IP 证书而非
+> 域名证书）、Nginx 要 default_server 双证书。本节讲的是**域名形态**下的
+> VPS 自管证书（备案恢复后 / 有其他域名时）。
 
 这一形态的要点与 §4.1 相同（**都是「TLS 在前置终止」**），但证书来源不同，
 所以单独写一节，避免被误以为「不部署 Tunnel 就跟文档不一样」。
@@ -881,7 +1081,7 @@ WS 地址由它自动换 scheme 推导成 `wss://voice.example.com/api/voice/v1/
 | `ELDER_HTTP_PORT` | `8064` | 宿主机对外端口（容器内固定 8080） |
 | `ELDER_PORT` | `8080` | 容器内监听端口，一般不改 |
 | `ELDER_JWT_SECRET` | `please-change-this-secret-in-production` | JWT 签名密钥，**生产必须换成随机长字符串** |
-| `ELDER_CORS` | `*` | 允许的跨域来源，逗号分隔；上线建议填 `https://voice.250886.xyz` |
+| `ELDER_CORS` | `*` | 允许的跨域来源，逗号分隔；上线建议填实际对外地址（IP 直连 `https://152.136.230.132`，域名形态 `https://voice.250886.xyz`） |
 | `ELDER_DB_WAIT_SEC` | `180` | 启动阶段等待数据库可用的秒数（仅 MySQL 生效，SQLite 是本地文件无需等待） |
 | `ELDER_TZ` | `Asia/Shanghai` | 业务时区，改了会整体影响提醒时间计算 |
 | `MYSQL_ROOT_PASSWORD` | `123456` | 仅在使用自带 `elder-db` 容器时生效，**生产必须改** |
@@ -1077,7 +1277,7 @@ ELDER_BOOTSTRAP_ADMIN_USERNAME=zhangjiashu_admin
 * **已经跑起来的库**（含正在运行的生产库）：那个 `admin` 的口令**至今仍是 `admin123`**，
   升级代码**不会**自动改掉它 —— 因为根本不会再走 `_seed()`。
 
-本服务是公开部署的（`voice.250886.xyz`，APP 把 `BASE_URL` 写死成它），
+本服务是公开部署的（`https://152.136.230.132`，APP 把 `BASE_URL` 写死成它），
 所以存量的 `admin/admin123` 等于"任何人都能当平台管理员"：改 AI 配置（含厂商
 API Key 的读写口径）、查看全部用户用量与记忆、给设备核销付费开通。
 
@@ -1107,13 +1307,13 @@ hash 带随机盐，同一个口令两次 hash 出来的字符串不同，字符
 **方式 A —— 能登录，直接改密码**（最推荐）
 
 ```bash
-# 1) 拿 token
-TOKEN=$(curl -s -X POST https://voice.250886.xyz/api/auth/login \
+# 1) 拿 token（把 152.136.230.132 换成你的对外地址）
+TOKEN=$(curl -s -X POST https://152.136.230.132/api/auth/login \
   -H 'Content-Type: application/json' \
   -d '{"username":"admin","password":"admin123"}' | python -c 'import sys,json;print(json.load(sys.stdin)["access_token"])')
 
 # 2) 改密码（新口令自己换掉）
-curl -X POST https://voice.250886.xyz/api/auth/password \
+curl -X POST https://152.136.230.132/api/auth/password \
   -H "Authorization: Bearer $TOKEN" \
   -H 'Content-Type: application/json' \
   -d '{"old_password":"admin123","new_password":"换成你的强口令"}'
@@ -1406,7 +1606,7 @@ docker inspect --format '{{.State.ExitCode}}' elder-server
    ```bash
    curl -i -N -H "Connection: Upgrade" -H "Upgrade: websocket" \
         -H "Sec-WebSocket-Version: 13" -H "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==" \
-        https://voice.250886.xyz/api/voice/v1/ws
+        https://152.136.230.132/api/voice/v1/ws
    # 正确：HTTP/1.1 101 Switching Protocols
    # 错误：HTTP/1.1 200 或 400 —— 说明 Upgrade 头被反代吃掉了
    ```
@@ -1419,14 +1619,15 @@ docker inspect --format '{{.State.ExitCode}}' elder-server
 4. **确认设备拿到的地址对不对**：看启动日志里的部署摘要（`docker compose logs elder-server | grep 【部署】`），
    或调一次心跳看 `ws_url` 字段。
 
-   走 HTTPS 域名时必须是 `wss://voice.250886.xyz/api/voice/v1/ws`。
+   走 HTTPS 时必须是 `wss://<对外地址>/api/voice/v1/ws`（IP 直连形态：
+   `wss://152.136.230.132/api/voice/v1/ws`）。
    如果显示的是内网 IP 或 `ws://`（非加密），按部署形态二选一：
 
    ```bash
    # 隧道 / TLS 反代（推荐）：显式声明模式 + 对外地址，缺地址会启动失败
    ELDER_DEPLOY_MODE=tunnel
-   ELDER_PUBLIC_BASE_URL=https://voice.250886.xyz
-   # 旧变量仍然有效：ELDER_VOICE_PUBLIC_BASE=https://voice.250886.xyz
+   ELDER_PUBLIC_BASE_URL=https://152.136.230.132
+   # 旧变量仍然有效：ELDER_VOICE_PUBLIC_BASE=https://152.136.230.132
    ```
 
    机制说明：uvicorn 对 `X-Forwarded-Proto` **只信任来自 127.0.0.1 的对端**
@@ -1561,9 +1762,9 @@ export ELDER_LIBOPUS_PATH=C:/lib/opus.dll
 
 **现象**：页面本身能打开（HTTPS 正常），但一调用某些接口就失败：
 
-- 浏览器 Console：`Mixed Content: The page at 'https://voice.250886.xyz/' was loaded
+- 浏览器 Console：`Mixed Content: The page at 'https://152.136.230.132/' was loaded
   over HTTPS, but requested an insecure XMLHttpRequest endpoint
-  'http://voice.250886.xyz/api/admin/presets/'. This request has been blocked;
+  'http://152.136.230.132/api/admin/presets/'. This request has been blocked;
   the content must be served over HTTPS.`
 - 前端只显示一个没有细节的 `Failed to fetch`（fetch 被浏览器拦下，
   连 socket 都没建，所以服务端日志里**一行都没有**）。
@@ -1586,14 +1787,14 @@ export ELDER_LIBOPUS_PATH=C:/lib/opus.dll
 
 ```bash
 curl -sI http://<宿主机>:8064/api/admin/presets | grep -i '^location'
-# 错：location: http://voice.250886.xyz/api/admin/presets/
-# 对：location: https://voice.250886.xyz/api/admin/presets/
+# 错：location: http://152.136.230.132/api/admin/presets/
+# 对：location: https://152.136.230.132/api/admin/presets/
 ```
 
 **处置**（按推荐顺序）：
 
 1. **显式配对外地址**（治本，与 §4.1.3 同一套药）：
-   `ELDER_DEPLOY_MODE=tunnel` + `ELDER_PUBLIC_BASE_URL=https://<域名>`。
+   `ELDER_DEPLOY_MODE=tunnel` + `ELDER_PUBLIC_BASE_URL=https://152.136.230.132`。
    配了之后地址与请求无关，scheme 推导退居二线，307 自然带上 `https://`。
 2. **把可信反代填进 `ELDER_TRUSTED_PROXY_IPS`**（让推导自动生效）：
    填 Docker 网桥网关（查法见 §4.1.4）。注意这一个变量同时决定两层 ——
