@@ -50,7 +50,7 @@ import tempfile
 from pathlib import Path
 
 from sqlalchemy import Column, DateTime, ForeignKey, Integer, String, Table
-from sqlalchemy import inspect, text
+from sqlalchemy import event, inspect, text
 
 ROOT = Path(__file__).resolve().parent.parent
 SERVER = ROOT / "server"
@@ -178,18 +178,72 @@ def build_legacy_tables(engine) -> None:
         _LEGACY_DEFINED = True
     md.create_all(bind=engine, tables=[md.tables[t] for t in DROPPED])
     with engine.begin() as conn:
-        # 插一行：确保「有数据的表也会一起消失」。
-        # ⚠️ 先清行再插：场景 B 是在场景 A 之后重建同一批表，而**删表逻辑若被
-        # 变异掏空，表就还在、行也还在** —— 不清行会撞主键抛 IntegrityError，
-        # 把「断言失败」变成「脚本崩了」，反而掩盖真正该看的那几条断言。
+        # ⚠️⚠️ 必须先造出被外键引用的 users 行，否则**只有 MySQL 会红**
+        # ------------------------------------------------------------------
+        # memberships.user_id / membership_orders.user_id|admin_id 都
+        # `ForeignKey("users.id")`。插数时引用 users.id=1，就必须真有这一行。
+        #
+        # SQLite **默认不强制外键**（`PRAGMA foreign_keys` 默认 OFF），
+        # 所以少了这一行本地照样 14/14 全绿；MySQL/InnoDB 立即强制，
+        # 抛 `IntegrityError 1452 Cannot add or update a child row`。
+        # 这就是「本地绿灯、CI 红灯」的一个真实样本。
+        #
+        # ⚠️ 顺序要求：**先删子表、再删父行**。
+        # 场景 B 是在场景 A 之后重建同一批表；若删表逻辑被变异掏空 / 真的有回归，
+        # 旧表和旧行都还在，此时 ``DELETE FROM users WHERE id=1`` 会因
+        # memberships 仍引用着 user_id=1 而抛 FOREIGN KEY constraint failed ——
+        # 脚本崩掉，后面的断言一条都跑不到。**红灯必须是断言的红，不是脚本的红**，
+        # 否则真正该看的「★ A2 五张表全部不再存在」会被掩盖。
         for table in DROPPED:
             conn.execute(text(f"DELETE FROM {table}"))
+        conn.execute(text("DELETE FROM users WHERE id = 1"))
+        # ⚠️⚠️ 必须**显式写全每一列**，不能靠 default 兜：
+        #   users 的 nickname / phone / email / is_admin / created_at 都是
+        #   ``nullable=False``，它们挂的是 **Python 层 Column default** ——
+        #   只在 ORM 走 INSERT 时生效；本脚本用裸 ``text()`` 插，default 不参与，
+        #   于是 NOT NULL 直接违反（实测踩到：`NOT NULL constraint failed:
+        #   users.nickname`）。这与方言无关，SQLite/MySQL 都会红。
+        #   全列写死还有个好处：两种方言行为完全一致，不依赖各自的默认值语义。
+        conn.execute(text(
+            "INSERT INTO users (id, username, password_hash, nickname, phone, "
+            "email, is_admin, created_at) VALUES "
+            "(1, 'legacy_fk_sentinel', 'not-a-real-hash', '', '', '', 0, "
+            "CURRENT_TIMESTAMP)"))
+        # 插一行：确保「有数据的表也会一起消失」。
+        # ⚠️ 上面的 DELETE 之所以必要：不清行会撞主键抛 IntegrityError，
+        # 把「断言失败」变成「脚本崩了」，同样掩盖真正该看的那几条断言。
         conn.execute(text("INSERT INTO memberships (id,user_id) VALUES (1,1)"))
         conn.execute(text("INSERT INTO membership_plans (id,code) VALUES (1,'m1')"))
         conn.execute(text("INSERT INTO membership_orders (id,code,user_id,amount_cents)"
                           " VALUES (1,'A1B2',1,1234)"))
         conn.execute(text("INSERT INTO membership_amount_range (id,min_cents) VALUES (1,1000)"))
         conn.execute(text("INSERT INTO payment_config (id,account) VALUES (1,'acct')"))
+
+
+def force_sqlite_fk_checks() -> None:
+    """在 SQLite 上打开外键强制，让本地就能抓出 MySQL 才会犯的错。
+
+    为什么需要：SQLite 的 ``PRAGMA foreign_keys`` **默认 OFF**，也就是说
+    本地跑出来��「14/14 全绿」对「引用的父行存不存在」这件事**毫无分辨力**。
+    真实缺陷正是这样溜过去的 —— 五张表插数引用 users.id=1 而 users 是空的，
+    SQLite 静默放行、MySQL 立刻 1452。
+
+    打开后 SQLite 才有和 MySQL 同等的约束力，本地即可复现。
+    这个 PRAGMA 是**按连接**生效的，所以要挂在 engine 的 connect 事件上，
+    一次性设给池里后续借出的每一条连接。
+    """
+    if engine.dialect.name != "sqlite":
+        return
+
+    @event.listens_for(engine, "connect")
+    def _fk_on(dbapi_conn, _rec):  # noqa: ANN001
+        cur = dbapi_conn.cursor()
+        cur.execute("PRAGMA foreign_keys=ON")
+        cur.close()
+
+    # 已借出的连接不受上面这个 hook 影响，给当前连接也立刻补上
+    with engine.connect() as conn:
+        conn.exec_driver_sql("PRAGMA foreign_keys=ON")
 
 
 def scenario_run_all(engine) -> None:
@@ -262,6 +316,7 @@ def main() -> int:
 
     try:
         init_db()
+        force_sqlite_fk_checks()
         fresh = set(inspect(engine).get_table_names())
         ok("0 全新库里 ORM 不再建这五张表（它们只能来自老库）",
            not (set(DROPPED) & fresh), str(sorted(set(DROPPED) & fresh)))
