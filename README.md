@@ -535,6 +535,33 @@ LVGL display，真机表现为全黑屏 + `font context is NULL`。
 探不到就打一条 WARNING 跳过，既不占 DVP 的 11 个 IO 也不刷 ERROR；接上排线重启
 即自动启用。
 
+### 唤醒词与离线命令词
+
+**唤醒词是「你好小智」**（拼音 `ni hao xiao zhi`），在设备端**离线识别**，
+不联网也能响应。识别引擎是乐鑫 esp-sr 的 **MultiNet** 中文命令词模型
+（不是上游默认的 WakeNet 专用唤醒模型），识别阈值 20%（越小越灵敏）。
+配置的真源是 `sdkconfig.defaults` 与 `tools/merge_to_xiaozhi.py` 的
+`SDKCONFIG_OVERLAY`，**改词必须两处同步**，否则本地构建与 CI 产物不一致。
+
+⚠️ **刻意保留「你好小智」没换成「小暖」之类**：从 WakeNet 换到 MultiNet 只是
+识别引擎的更替，词本身没换——老人已经习惯的叫法，不能因为底层换实现而失效。
+
+除唤醒词外还有 **6 条离线命令词，无需先说唤醒词，直接说即生效**：
+
+| 命令词 | 拼音（MultiNet 注册用） | 作用 |
+| --- | --- | --- |
+| 新建早上吃药提醒 | `xin jian zao shang chi yao ti xing` | 建每天早上服药提醒 |
+| 新建中午吃药提醒 | `xin jian zhong wu chi yao ti xing` | 建每天中午服药提醒 |
+| 新建晚上吃药提醒 | `xin jian wan shang chi yao ti xing` | 建每天晚上服药提醒 |
+| 新建吃药提醒 | `xin jian chi yao ti xing` | 按默认时段建提醒 |
+| 吃过了 | `chi guo le` | 确认本次服药 |
+| 我吃过了 | `wo chi guo le` | 确认本次服药 |
+
+词表本体在 `firmware/components/elder/include/elder_cmd_words.h`，
+**短语与拼音逐条对齐是铁律**：改了短语忘了改拼音，老人说那句话就没反应
+（现场排查时，看启动日志打印的拼音比看汉字有用）。断网时「吃过了」是老人
+唯一能自助完成的确认动作，与硬件按钮确认（长按 3s + 30s 内短按）互为备份。
+
 ⚠️ `idf.py build` **不读**板级 `config.json`（那是上游 `scripts/release.py` 做
 多板发布时才读的）。驱动必须经 `tools/merge_to_xiaozhi.py` 里的
 `SDKCONFIG_OVERLAY` 真源启用——写进 `config.json` 属于死配置，CI 产物里根本没编进来。
@@ -561,3 +588,56 @@ CI 不受影响：`firmware-build.yml` 走 `idf.py set-target` 重新生成 `sdk
 固件运行时还可被 NVS（`settings("wifi")` 的 `ota_url`）覆盖，不必重新烧录。
 
 固件烧录步骤见 [`docs/烧录指南.md`](docs/烧录指南.md)。
+
+## 后续开发计划
+
+以下三项已排定方向、**均未开工**，写在这里是为了让贡献者知道演进路线与边界。
+
+### 1. 固件迁移到 ESP32-P4
+
+当前硬件基线是立创·实战派 ESP32-S3（`CONFIG_BOARD_TYPE_LICHUANG_DEV_S3`）。
+P4 的算力与 PSRAM 更适合本地形象渲染（EAF 序列帧）与更大的 MultiNet 命令词表。
+上游源码树已带 `sdkconfig.defaults.esp32p4`，唤醒词引擎依赖
+（`USE_CUSTOM_WAKE_WORD`）也已覆盖 P4 目标，迁移工作量集中在**板级驱动**
+（音频 codec / 触摸 / 摄像头）与分区表，语音链路本身不用动。
+
+### 2. 接入 Home Assistant（MCP 能力）
+
+计划给服务端增加 **MCP（Model Context Protocol）能力**，把设备与提醒能力
+以 MCP 工具形式暴露给 Home Assistant，让「提醒老人吃药」这类动作可以编进
+HA 的自动化（门磁触发、夜间场景联动等）。
+⚠️ 边界：提醒数据的单一真源仍是服务端 `reminders` 表，MCP 只是新的暴露面，
+**不引入第二份数据**；设备的本地 MCP（音量/电量/摄像头）保持现状。
+
+### 3. 独立药盒硬件（ESP + 实时时钟）
+
+解决「提醒响了但药盒不在手边、事后无法证明吃没吃」的问题：
+
+- **硬件**：药盒内置 ESP 模块 + **实时时钟芯片（RTC）**，断网也走得准；
+- **日程下发**：药盒 ESP 通过**局域网 WiFi** 从主机下载服药日程
+  （时段 → 格口映射），不依赖公网；
+- **指示灯**：到达服药时段，对应格口亮起指示灯，老人不用记「哪个盒」；
+- **开盒通讯**：打开药盒后 ESP 模块立即与主机通讯，记录取药时间；
+- **语音确认**：关闭药盒后，**主机在 5 分钟内语音向用户确认本次服药是否
+  完成**（复用现有语音链路与确认状态机；超时未确认按未服药处理）。
+
+## 参考与致谢
+
+### 源代码与协议参考
+
+| 来源 | 用途 | 说明 |
+| --- | --- | --- |
+| [xinnan-tech/xiaozhi-esp32](https://github.com/xinnan-tech/xiaozhi-esp32) | 固件源码树与设备侧协议 | `firmware/xiaozhi/` 即在其源码树上合入本项目 `components/elder` 组件（`tools/merge_to_xiaozhi.py`） |
+| [xinnan-tech/xiaozhi-esp32-server](https://github.com/xinnan-tech/xiaozhi-esp32-server) | 协议与固件设计参考 | **不部署、不调用**（早期跑过它的容器，已删除）；本项目语音链路为自研实现 |
+| [78/esp-wifi-connect](https://github.com/78/esp-wifi-connect) | 浏览器配网 | `managed_components/78__esp-wifi-connect`，配网热点 `http://192.168.4.1` |
+| [espressif/esp-sr](https://github.com/espressif/esp-sr) | 离线命令词识别 | MultiNet 中文模型：唤醒词「你好小智」+ 6 条服药命令词 |
+| [78/xiaozhi-assets-generator](https://github.com/78/xiaozhi-assets-generator) | 自定义资产生成 | 唤醒词 / 字体 / 表情的在线编辑与打包 |
+
+### 致谢
+
+- **WorkBuddy** —— 本项目的主力开发协作者：服务端、固件、APP、CI 与全套冒烟测试均在它上面完成。
+- **Edge TTS** —— 微软 Edge 浏览器的语音合成协议，本项目的零成本 TTS 兜底（`server/app/voice/tts_edge.py`）；⚠️ 非公开协议且无商业授权，正式部署建议另配商业 TTS。
+- **乐鑫 ESP-IDF / esp-sr / esp-ml307** —— 固件框架与离线语音识别。
+- **LVGL** —— 设备端显示与形象渲染。
+- **FunASR / SenseVoice 与 Silero VAD** —— 可选的本地 ASR / VAD 旁路服务。
+- **PyAV** —— Edge TTS 的 mp3 解码与重采样。
