@@ -11,18 +11,26 @@
 [xiaozhi-esp32-server](https://github.com/xinnan-tech/xiaozhi-esp32-server) 只作为协议与固件设计的参考，
 本项目不部署、不调用它（早期曾跑过它的容器，已删除）。设备出厂 OTA 地址默认指向本项目自己的域名。
 
-本项目自己做的「业务面」：设备绑定、提醒与回执、形象/提示词、AI 平台配置、交互统计、手机端与管理后台。
+本项目自己做的「业务面」：设备绑定、提醒与回执、形象/提示词、AI 平台配置、交互统计、
+**双界面**（浏览器管理后台 `/` + 浏览器用户端 `/user`，配网也不需要 APP）、手机端 APP。
+
+⚠️ **两件反直觉的事实，先知道能省很多排查时间**：
+
+1. **「零配置即可提供服务」不成立**。全新空库下 ASR / TTS / VAD / Chat 四项全未就绪，
+   `resolve_provider` 直接返 503。管理后台「服务就绪度」面板的作用是**如实反映未就绪**。
+2. **平台会员制已取消**（commit `e264200`）。已授权设备陪聊恒为无限量，没有订单、
+   没有核销、没有会员期限。
 
 ## 目录
 
 | 路径 | 说明 |
 | --- | --- |
-| `server/` | **单一镜像**的服务端：FastAPI 业务后端 + 自研语音链路 + 记忆与人格模块 + 多模型网关 + Docker 部署文件 |
+| `server/` | **单一镜像**的服务端：FastAPI 业务后端 + 自研语音链路 + 记忆与人格模块 + 多模型网关 + Docker 部署文件（`docker-compose.local.yml` 是可选的本地 ASR/VAD profile） |
 | `app/` | 手机端家属端 APP（uni-app v3 + Vue3），四个栏目：首页 / 设备 / 日程 / 我的；出 H5 / 微信小程序 / Android APK |
 | `android/` | Android 原生壳工程（WebView + `WebViewAssetLoader`），把 H5 打成 APK，不依赖 DCloud |
-| `firmware/` | ESP32-S3 固件（`components/elder` 为本项目新增组件，编译前需合入 xiaozhi 源码树） |
-| `tools/` | 辅助脚本：`smoke_server.py` 后端冒烟、`make_firmware.py` 合并烧录 bin、`idfwin.py` / `winrun.py` Windows 下的 IDF 包装 |
-| `docs/` | [`架构设计.md`](docs/架构设计.md) 平台整体架构与选型 · [`DEPLOY.md`](docs/DEPLOY.md) 部署与 MySQL 接入 · [`会员功能规划.md`](docs/会员功能规划.md) 会员与人工核销 · [`决策记录.md`](docs/决策记录.md) 用户拍板的决策及其边界 · 烧录指南 · 手机 APP 开发说明 |
+| `firmware/` | ESP32-S3 固件（`components/elder` 为本项目新增组件，编译前由 `tools/merge_to_xiaozhi.py` 合入 xiaozhi 源码树） |
+| `tools/` | 辅助脚本：`smoke_*.py` 后端冒烟（端口唯一真源 `tools/smoke_ports.py`）、`ci_gate_check.py` 本地门禁判据、`merge_to_xiaozhi.py` 注入 elder 组件与 sdkconfig 覆盖、`make_firmware.py` 合并烧录 bin、`idfwin.py` / `winrun.py` Windows 下的 IDF 包装 |
+| `docs/` | [`架构设计.md`](docs/架构设计.md) 平台整体架构与选型 · [`DEPLOY.md`](docs/DEPLOY.md) 部署与 MySQL 接入 · [`决策记录.md`](docs/决策记录.md) 用户拍板的决策及其边界 · [`免费语音服务商选型.md`](docs/免费语音服务商选型.md) ASR/TTS 厂商选型 · [`架构设计-角色模型与人格能力.md`](docs/架构设计-角色模型与人格能力.md) · [`架构设计-人格预设运营后台.md`](docs/架构设计-人格预设运营后台.md) · [`烧录指南.md`](docs/烧录指南.md) · [`手机APP开发说明.md`](docs/手机APP开发说明.md) |
 | `老人陪伴提醒助手-技术方案-v1.md` | 完整技术方案（硬件、形象引擎、激活码算法、风险清单） |
 
 ## 端口与地址约定
@@ -33,44 +41,124 @@
 | **对外发布** | **`8064`** | 镜像只发布这一个端口，`-p 8064:8080`。HTTP API、语音 WebSocket、OTA 全复用它 |
 | 语音 WebSocket | `ws(s)://<域名>/api/voice/v1/ws` | **自研链路**，与 API 同源同端口，不需要额外开端口 |
 | 生产域名 | `https://voice.2508866.xyz` | 手机端已固化此地址；当前经 Cloudflare Tunnel（iStoreOS + cloudflared）转发到 `127.0.0.1:8064`，Nginx 形态见 DEPLOY.md §4，隧道形态见 §4.1（含 WebSocket 与 `ELDER_VOICE_PUBLIC_BASE` 必配项） |
-| 管理后台 | `https://voice.2508866.xyz/` | 默认账号 `admin` / `admin123`，登录后请立即改密 |
+| 管理后台 | `https://voice.2508866.xyz/` | 源码在 `server/app/static/index.html`，按 `is_admin` 过滤入口。账号 `admin` 的口令**不再有硬编码默认值**（`admin/admin123` 已从代码移除，commit `bb5ca98`）：首次启动必须经 `ELDER_SEED_ADMIN_PASSWORD` 显式提供，否则随机化并打进启动日志 `ELDER-INITIAL-PASSWORD=<pwd>` |
+| 用户端 | `https://voice.2508866.xyz/user` | 源码在 `server/app/static/user.html`，**浏览器直接用，不需要装 APP**；绑定设备等操作全在 web 完成 |
 | 接口文档 | `https://voice.2508866.xyz/docs` | FastAPI 自动生成 |
 
 ## GitHub Actions 工作流
 
 | 工作流 | 触发 | 作用 |
 | --- | --- | --- |
-| `pr-gate.yml` | push 到 `main` + **每个 PR**（刻意不加 paths 过滤） | 常驻门禁「守门人自检」：CODEOWNERS 覆盖 + workflows 可解析。push 时自动跑，结果可见但**不再拦截推送**（见下方流程变更） |
-| `server-ci.yml` | push/PR 改动 `server/`、`tools/`；可手动 | 安装依赖跑 `tools/smoke_server.py`（21 项业务闭环）+ Dockerfile 语法检查 |
-| `docker-build.yml` | push/PR 改动 `server/`；可手动 | 构建镜像 → 起容器校验 `/api/health`；**push 到 `main` 通过冒烟后自动推送 `ghcr.io/25283531/voice-avatar-box` 的 `latest` + 短 SHA tag**；PR 只构建不推送；手动触发勾选 `publish` 可覆盖 tag 发布 |
+| `pr-gate.yml` | push 到 `main`/`master` + **每个 PR**（刻意不加 paths 过滤） | 常驻门禁「守门人自检」：CODEOWNERS 覆盖 + workflows 可解析。push 时自动跑，结果可见但**不再拦截推送**（见下方流程变更） |
+| `server-ci.yml` | push/PR 改动 `server/`、`tools/`、`firmware/components/elder/`；可手动 | 装依赖（含 `libopus0`）后跑 **8 个 `smoke_*.py` 冒烟脚本 + 6 个 QA/审计脚本**（清单见下方），另有 5 个 job：elder 组件宿主测试、MySQL 真实路径冒烟、Compose 文件校验、Dockerfile 语法检查（hadolint） |
+| `docker-build.yml` | push/PR 改动 `server/`；可手动 | 构建镜像 → 起容器校验 `/api/health`；**push 到 `main` 且容器冒烟通过后**才推 `ghcr.io/25283531/voice-avatar-box` 的 `latest` + 短 SHA（冒烟失败不推，`latest` 不被污染）；PR 只构建不推送；手动触发勾选 `publish` 可覆盖 tag 发布 |
+| `firmware-build.yml` | push 改动 `firmware/`、`tools/merge_to_xiaozhi.py` 或本文件；可手动 | 在 `espressif/idf:v5.5.1` 容器里编译 ESP32-S3 固件 → 合并单文件烧录镜像 → 上传 artifact。**每次构建都会打印生效的 `CONFIG_OTA_URL` 并在偏离本项目域名时告警**；手动触发可自选板卡与后端地址 |
 | `app-build.yml` | push/PR 改动 `app/`；可手动 | 构建 H5 / 微信小程序并上传产物；校验后端地址已内联 |
 | `android-build.yml` | push/PR 改动 `app/`、`android/`；可手动 / 发 Release | **一次产出可安装的 Android APK**（H5 + WebView 壳，全程在 runner 内，不用 DCloud 账号） |
+| `app-pack.yml` | **仅手动**（workflow_dispatch）/ 发 Release | ⚠️ **已废弃**：uni-app 云打包，DCloud 账号登录失败且强制实名认证。保留文件只为留档，现走 `android-build.yml`（见下文「Android APK」） |
+
+#### `server-ci.yml` 实际跑哪些冒烟
+
+⚠️ **不是只有一个 `smoke_server.py`**。数口径时要分清三件事：**脚本个数 ≠ 调用次数**：
+
+- `smoke:` job 里跑 **8 个不同的 `smoke_*.py`**（端口已登记在 `tools/smoke_ports.py`，
+  那是唯一真源，新脚本先登记再写死）：
+
+| 脚本 | 端口 | 守什么 |
+| --- | --- | --- |
+| `smoke_server.py` | 8100 | 业务闭环：注册/登录/设备/激活码(Luhn 与固件一致)/绑定/提醒复杂规则/排期/同步/回执/统计/鉴权 |
+| `smoke_auth.py` | 8121 | 注册鉴权、公开开关、初始管理员引导 |
+| `smoke_roles.py` | 8101 | 角色域 + P0 越权断言 |
+| `smoke_admin_presets.py` | 8118 | 人格预设运营后台：红线不出库 + 审计同事务 + 重启不变式 |
+| `smoke_quota.py` | 8106 | 陪聊计量 + 「授权设备无限量」不变量（原 `smoke_membership`，会员端点须已下线） |
+| `smoke_usage.py` | 8120 | token 用量：网关提取 + 双端接口对账 + 越权隔离 |
+| `smoke_voice_catalog.py` | 8124 | 音色目录单一真源 + **就绪度面板如实反映零配置未就绪** |
+| `smoke_voice.py` | 8119 | 自研语音链路：WS 协议逐字段对固件 + Opus 编解码 + OTA 签发口径 |
+
+- 另有 **6 个 QA / 审计脚本**同在 `smoke:` job 里，它们**不属于 `smoke_*.py` 系列**，
+  别数漏也别数重：
+
+| 脚本 | 端口 | 守什么 |
+| --- | --- | --- |
+| `qa_audit_rollback.py` | 不占端口（进程内直调端点） | 审计写失败时业务写必须回滚 |
+| `eval_persona.py` | 不占端口 | 人格 eval 门禁，医疗安全类硬失败 |
+| `qa3_r2_restart.py` | 8113 | 重启不变式：回填不得改写角色归属 |
+| `qa3_migration.py` | 不起服务 | 迁移完整性：ORM 列与 `schema_patch.NEW_COLUMNS` 对账 |
+| `qa3_device_binding.py` | 8114 | 设备绑定归属：重启不被绑上平台预设 |
+| `qa3_drop_tables.py` | 不占端口 | 会员遗留五张表必须真删，**掏空实现必变红** |
+
+- `mysql-smoke:` job **复跑 2 个**：`smoke_server.py 8100` 与 `smoke_roles.py 8101`
+  走真实 MySQL 往返，另加 `eval_persona.py` 与 `qa3_drop_tables.py`。
+  **这是同一批脚本的方言复跑，不是新脚本** —— 所以全仓「不同脚本数」是 8 + 6 = **14 个**，
+  而 CI 里 `python tools/smoke_*.py` 的**调用次数**是 8（SQLite）+ 2（MySQL）= **10 次**。
+
+⚠️ 其余 4 个 `qa3_*` 脚本**刻意不进 MySQL job**——它们直连 `sqlite3` 且 `boot()` 里
+无条件 `env["ELDER_DB"] = f"sqlite:///{DB}"`，会**覆盖掉 CI 传入的 MySQL 连接串**。
+硬塞进去的话，步骤名写着 mysql+pymysql、实际跑的是 SQLite ——
+那正是本项目最该防的「假绿」，比不接更坏。
+
+#### CI 发布策略
+
+- push 到 `main` 且**触及 `server/**`** → 构建 + 容器冒烟，**通过后**才推
+  `ghcr.io/25283531/voice-avatar-box:latest` + 短 SHA tag。
+  **冒烟失败不推镜像，`latest` 不被污染。**
+- PR **只构建不推送**（PR 代码可能从未被 review，但触发的构建一旦推上 ghcr
+  就是公共产物；且 `pull_request` 事件下 `GITHUB_TOKEN` 只读，`packages: write` 不生效）。
+- ⚠️ **本机无 GitHub API 凭据**（未装 `gh`、无 PAT），只有 git SSH ⇒ **无法用 API 触发 workflow**。
+  固件构建靠 push 触及 `firmware/**` 自动触发；需要自选板卡时在 GitHub UI 点
+  Actions → firmware-build → Run workflow（**推荐，可自选板卡**）。
 
 增量触发：每个工作流都带 `paths` 过滤，推送只跑受影响的那条
-（例如只改 `docs/` 或 `firmware/` 不会触发任何构建；改 `tools/` 只跑 `server-ci`）。
+（例如只改 `docs/` 不会触发任何构建；改 `tools/` 只跑 `server-ci`；
+改 `firmware/components/elder/` 会同时触发 `server-ci` 的宿主测试 job 和
+`firmware-build`——两者守的是不同的东西）。
 
 手动产出最终产物：**Actions → 对应工作流 → Run workflow**。
 
 - `docker-build`：合入 `main` 即自动发布 `latest`（iStoreOS 上 `docker pull ghcr.io/25283531/voice-avatar-box:latest` 即用）；也可手动触发勾选 `publish`、填 `tag`（如 `v0.1.0`）发布指定版本，产物在 ghcr 包列表
 - `app-build`：选 `both` / `h5` / `mp-weixin` → 产物在 Actions 运行页的 Artifacts
 - `android-build`：选 `self`（仓库证书签名）/ `debug` → 产物为可直接安装的 APK
+- `firmware-build`：产物 artifact 名 `elder-firmware-esp32s3`，**日常只下 `elder-firmware-esp32s3-merged-flash.bin`**（offset `0x0`，esptool 单文件直烧）；其余 bin 是按 `flasher_args.json` 分地址烧写的备选
 
 ### 手机 APP 栏目
 
 APP 是给家属用的，不接入小智任何服务，业务后端地址在代码级写死
 （`app/src/http/elder.ts`，域名 `https://voice.2508866.xyz`），**不提供任何网络设置入口**。
 
+⚠️ **APP 不是唯一入口**：绑定设备等操作在浏览器打开 `/user` 同样能做完，
+固件配网也不需要 APP（见下文「双界面与配网」）。
+
 | 栏目 | 内容 |
 | --- | --- |
-| 首页 | 已绑定设备、设备状态（网络连接 / 设备时间）、当日服药状态（待服数量、待服时间点、已确认次数）、会员状态（是否开通 / 到期时间 / 权益） |
+| 首页 | 已绑定设备、设备状态（网络连接 / 设备时间）、当日服药状态（待服数量、待服时间点、已确认次数） |
 | 设备 | 添加设备（激活码）、删除设备、重命名、给设备配网、为每台设备绑定不同 agent 角色 |
 | 日程 | 服药提醒与日程提醒：新增 / 编辑 / 暂停 / 代老人确认 / 删除 |
-| 我的 | 账户名、修改密码、更换绑定邮箱、开通（续费）会员、创建自有 agent 角色、系统形象库、缓存管理、应用信息、隐私政策、用户协议 |
-- `android-build`：填版本号 → 产物 Artifacts 里的 `elder-app-android-apk`
+| 我的 | 账户名、修改密码、更换绑定邮箱、创建自有 agent 角色、系统形象库、缓存管理、隐私政策、用户协议 |
 
-## 分支保护与 PR 流程
+> **平台会员制已取消**（commit `e264200`）：会员状态、开通/续费会员、订单与人工核销
+> 全部不存在，相关五张表由 `server/app/schema_patch.py::drop_membership_tables()`
+> 在启动期真正 DROP。**已授权（已绑定）的设备陪聊恒为无限量**；时长计量仍在，
+> 但只用于展示与对账，不再拦人（`server/app/chat_quota.py`）。
+> 代码里「授权」的判据就是**设备是否已绑定到某个用户**（`dev.owner_id is not None`），
+> 绑定动作本身在 `/user` 或 APP 里输激活码完成，**没有在线支付环节**。
 
-仓库默认分支是 **`main`**。
+## 分支保护、门禁与实际提交流程
+
+> ⚠️ **先读这一句免得白忙**：本项目**不开分支、不开 PR，所有改动直接提交并推送到 `main`**
+> （用户 2026-10-16 拍板，下称 D5）。本节描述的是 **GitHub 仓库侧的分支保护设置**
+> 与**推送前的本地门禁**，不是「你需要提 PR」。下面那段历史（曾经要求 PR + 评审）
+> 只作为「为什么规则被改成现在这样」的记录保留。
+
+仓库默认分支是 **`main`**（本地还有一个落后 19 个提交的僵尸 `master`，不要往它推）。
+远端 `github` = `git@github.com:25283531/voice-avatar-box.git`（HTTPS 在本机被网络阻断），
+推送必须显式指定 key：
+
+```bash
+GIT_SSH_COMMAND="ssh -i C:/Users/Administrator/.ssh/id_ed25519_25283531 -o StrictHostKeyChecking=no" \
+  git push github main
+```
+
+### 为什么没有 PR
 
 ⚠️ **流程已变更（2026-10-16，决策 D5）**：早期是「功能分支 + PR + 评审批准」，
 实测跑不通后改为**直接提交并推送到 `main`**。原因是单协作者仓库的自审被 GitHub
@@ -90,6 +178,8 @@ review is required」），而"过严的守门人等于没有守门人"—— �
 commit 页可见，**只是不再拦截**。若将来恢复多人协作，把它加回来即可
 （`PATCH /repos/{o}/{r}/branches/main/protection`，改名前先改 GitHub 仓库设置，
 改必需状态检查名 = 保护失效）。
+
+### 推送前的本地门禁
 
 推 main 前，本地先跑一遍门禁判据（与 CI 同一个脚本，exit 0 才推）：
 
@@ -149,7 +239,7 @@ python tools/ci_gate_check.py
 
 ## 服务器部署
 
-默认**单一镜像**：业务、会员、语音链路、角色与记忆、邮件——全部平台级能力都在同一个容器里，
+默认**单一镜像**：业务、语音链路、角色与记忆、邮件——全部平台级能力都在同一个容器里，
 默认内置 SQLite，不需要任何外部数据库或额外的语音服务容器。
 
 ```bash
@@ -161,6 +251,50 @@ docker compose up -d            # 对外 http://<host>:8064
 > 语音链路是自研的（`server/app/voice/`），与本服务同进程、**同端口 8064**，
 > 设备连 `ws(s)://<域名>/api/voice/v1/ws`，地址由服务端自动下发。
 > **不再依赖任何第三方语音服务端**，镜像也不需要第二个端口。
+
+⚠️ **`server/.env.example` 里全是本地示例值，一个都不能照抄进生产**。
+下表是这个文件里**全部未被注释、真正生效**的 7 个值：
+
+| 变量 | 示例值 | 生产怎么办 |
+| --- | --- | --- |
+| `ELDER_JWT_SECRET` | `please-change-this-secret-in-production` | **必须**换成随机长字符串，否则任何人可伪造 token |
+| `ELDER_CORS` | `*` | 收窄到 `https://voice.2508866.xyz` |
+| `MYSQL_ROOT_PASSWORD` | `123456` | 仅 MySQL 变体用得到，改强口令 |
+| `ELDER_MAIL_FAKE` | `0` | ⚠️ **必须留 `0`**。这是唯一一个「留着默认值就可能出事」的：设为 `1` 时 `send_mail()` 不碰网络，邮件全写进进程内发件箱——用户点「找回密码」永远收不到邮件。上表其余几项不改只是「不安全」，这一项不改是**功能直接坏掉** |
+| `ELDER_TZ` | `Asia/Shanghai` | **建议别动**。服药提醒是时间强相关业务，服务端/设备端/展示层必须同一时区；改了整体影响提醒的时间计算 |
+| `ELDER_HTTP_PORT` | `8064` | 宿主机发布端口。改它要同步改反代的 `proxy_pass` |
+| `ELDER_DB_WAIT_SEC` | `180` | 只在 MySQL 形态生效（等数据库就绪），SQLite 用不到 |
+
+> `ELDER_ORDER_TTL_HOURS` 曾在这个文件里，是会员制残留（人工核销订单有效期），
+> 已随会员制取消（commit `e264200`）连同 example 里的示例一并清掉。
+> **没有任何代码读它**，旧 `.env` 里还留着的话直接删掉，无副作用。
+
+⚠️ **`.env.example` 里没有、也不该有管理员口令示例**。服务端**已经不再有硬编码弱口令**
+（`admin/admin123` 于 commit `bb5ca98` 移除），所以「照着示例填 `admin123`」这条路
+根本不存在——不设 `ELDER_SEED_ADMIN_PASSWORD` 时种子口令**随机化**，日志打一次
+`ELDER-INITIAL-PASSWORD=<pwd>`，你必须从日志里捞出来登录，否则登不进去。
+**已经在跑的生产库不受种子改动影响**，存量口令要么登录后走 `/api/auth/password` 改，
+要么设 `ELDER_RESET_ADMIN_PASSWORD` 重启一次（日志出现 `ELDER-ADMIN-PASSWORD-ROTATED`
+后**立刻删掉这个变量**，否则每次重启都会改写）。
+
+⚠️ **隧道形态必须显式配对外地址**：镜像的 CMD 没加 `--proxy-headers`，
+`X-Forwarded-Proto` 不被采纳，uvicorn 看到的 scheme 恒为 http ⇒ 设备拿到 `ws://域名`
+去打 443，表现为**能心跳但不能说话**（最难归因的一类故障）。生产形态是
+iStoreOS（OpenWrt 软路由）+ Docker 对外 `8064`（容器内 `8080`）+ Cloudflare Tunnel，
+`.env` / compose 里必须给：
+
+```bash
+ELDER_DEPLOY_MODE=tunnel
+ELDER_PUBLIC_BASE_URL=https://voice.2508866.xyz
+# WS 想用单独域名再加：
+# ELDER_WS_PUBLIC_BASE_URL=wss://voice-ws.2508866.xyz
+```
+
+旧变量 `ELDER_VOICE_PUBLIC_BASE` 仍向后兼容（语义逐字未变），新变量在任何模式下
+都校验 scheme。⚠️ **不要配 uvicorn `--forwarded-allow-ips=*`**：那会取
+`X-Forwarded-For` 最左段（可伪造），登录限速器形同虚设。真实客户端 IP 默认只认
+`request.client.host`，可信反代用 `ELDER_TRUSTED_PROXY_IPS` 显式配置
+（cloudflared 在宿主机时，容器看到的 TCP 对端是 Docker 网桥网关，不是 `127.0.0.1`）。
 
 只有在用户量上来之后才需要接 MySQL（**仅换数据库，不拆分服务**），
 详见 [`docs/DEPLOY.md`](docs/DEPLOY.md)。
@@ -187,6 +321,124 @@ server {
     }
 }
 ```
+
+### 本地语音服务（可选 compose profile）
+
+`server/docker-compose.local.yml` 提供两个**可选**旁路服务，只含 CPU 跑得动的部分：
+
+| 服务 | 内容 | 端口（只绑 `127.0.0.1`） |
+| --- | --- | --- |
+| `local-asr` | FunASR / SenseVoice 中文识别，纯 CPU，约 254MB 模型 | `10095` |
+| `local-vad` | Silero VAD 端点检测，2MB 级 ONNX | `8081`（容器内 `8080`） |
+
+```bash
+cd server
+docker compose -f docker-compose.yml -f docker-compose.local.yml up -d
+```
+
+⚠️ **刻意不含本地中文 TTS**，这是从部署形态倒推的结论而不是偷懒：生产是 iStoreOS
+软路由、**无独立显卡**，而 CosyVoice 2 推理需要 8GB 显存起步，塞进去的结果是
+「容器能起、合成一句话要几十秒」，对老人场景比用云端 TTS 更糟。
+
+这两个服务**没有任何鉴权**，所以端口刻意只绑 `127.0.0.1`，主服务在同一 compose
+网络内用 `http://local-asr:10095` 访问。⚠️ 起来之后**仍需在管理后台「AI 接入」里
+手工添加两行**（项目刻意不自动写库）：`kind=asr` 指向 `http://local-asr:10095/v1`，
+`kind=vad` 指向 `http://local-vad:8080`。首次启动要下 254MB 模型，冷启动 30~60 秒
+是正常的。
+
+## 语音能力：TTS 三家预置 + 服务就绪度
+
+### 三家 TTS 预置，服务端自动分发
+
+音色目录的**唯一真源**是 `server/app/voice/catalog.py`，管理后台的音色下拉框通过
+`GET /api/voice-catalog` 拉取，不在前端另抄一份。三家厂商预置：
+
+| key | api_style | endpoint | model | 要 Key | 预置音色数 |
+| --- | --- | --- | --- | --- | --- |
+| `edge` | `edge` | （空，走内置桥） | — | 否 | 11 |
+| `volcengine` | `volcengine` | `https://openspeech.bytedance.com` | `volc.tts_async` | 是（AK:SK，英文冒号分隔） | 5 |
+| `aliyun` | `openai_compatible` | `https://dashscope.aliyuncs.com/compatible-mode/v1` | `qwen-tts` | 是（`sk-` 开头） | 4 |
+
+`VOICE_CATALOG` 的 11 条 Edge 音色按**老人友好度**排序（温和在前、活泼在后），
+出厂默认音色 `DEFAULT_PRESET_TTS_VOICE = "zh-CN-XiaoxiaoNeural"`（这个值不能改，
+管理后台的「恢复出厂默认」依赖它）。
+
+**服务端自动切换**在 `server/app/voice/asr_tts.py::_tts_dispatch_style()`：
+判据顺序是 **provider 优先于 api_style**（预填的 api_style 会截胡，是个真实修过的
+bug），都不匹配则回落 `openai_compatible`。`tts_stream()` 内部做了同样分发 ——
+否则 Edge 会出现"非流式能出声、流式不出声"。
+
+三家各自的坑：
+
+- **Edge TTS 不是 HTTP API**，是微软 Edge 浏览器的非公开 WebSocket 协议，只出 mp3。
+  桥在 `server/app/voice/tts_edge.py`，用 PyAV 解码重采样。
+  ⚠️ **实测限制：连续调用 3 次，第 3 次会 ConnectionTimeoutError**（上游限流），
+  非代码问题。且无商业授权，只适合当零成本兜底。
+- **火山引擎是私有协议**：AK/SK + 四级派生 HMAC-SHA256 签名，自定义报文，
+  实现在 `server/app/voice/tts_volc.py`。⚠️ **签名无法本地实测**（需真实 AK/SK），
+  首次使用必须用后台的「真实测试」按钮验证。
+- **阿里云百炼 `qwen-tts`** 是真 OpenAI 兼容，endpoint 到 `compatible-mode/v1` 为止一级。
+
+**TTS 音频契约（硬约束）**：客户端只吃 24kHz / mono / S16LE **裸 PCM**
+（`asr_tts.TTS_RESPONSE_FORMAT="pcm"`、`TTS_SAMPLE_RATE=24000`），固件按服务端
+声明的采样率逐帧 Opus 编码。
+
+### 服务就绪度面板：「零配置即可服务」不成立
+
+管理后台 AI 接入页顶部有「服务就绪度」卡片（`GET /api/providers/readiness`），
+返回四层事实：`configured` / `resolved`（脱敏）/ `hint` / `critical`。
+
+- **关键项**（`critical`）：`asr` / `tts` / `chat` —— 缺任一则无法提供完整服务。
+  `vad` **不算**关键项：断句已由设备端 esp-sr 承担。
+- ⚠️ **全新空库下 asr/tts/vad/chat 四项全部未就绪**，`resolve_provider` 返 503。
+  也就是说**「零配置即可提供服务」这个假设不成立**——面板的作用正是**如实反映未就绪**，
+  不是粉饰。配完 AI 平台行之后才会转绿。
+
+`POST /api/providers/test-voice` 会**真打一次** TTS 合成并回 `audio_bytes` /
+`duration_ms`；旧的 `POST /api/providers/test` **不覆盖** asr/tts，会掉进兜底逻辑
+返回"请先创建角色"，别拿它判断语音配置对不对。
+
+## 双界面与配网（不需要 APP）
+
+| 入口 | 路径 | 源码 |
+| --- | --- | --- |
+| 管理后台 | `/` | `server/app/static/index.html`，按 `is_admin` 过滤 |
+| 用户端 | `/user` | `server/app/static/user.html`，8 个 tab：我的设备 / 提醒 / 记忆管理 / 形象 / 人格预设 / 用量统计 / 交互统计 / 帮助与工单 |
+
+绑定设备的后端端点早就存在且只挂普通用户鉴权（`POST /api/devices/bind`），
+缺的只是 `user.html` 里的调用——所以**用户端不推去 APP，浏览器就能绑**。
+
+**WiFi 配网固件已原生支持浏览器配网，不需要 APP**：ESP32 自开热点
+（前缀 `XiaoNuan-` + MAC 后两位，**不是上游项目的 `Xiaozhi-`**），屏显热点名与
+`http://192.168.4.1`，DNS 强制门户，HTML 页在
+`firmware/xiaozhi/managed_components/78__esp-wifi-connect/assets/wifi_configuration.html`。
+APP 只是另一层封装。
+
+## 语音链路要点
+
+- 语音链路自研（`server/app/voice/`，xiaozhi 公开协议服务端），
+  **不得依赖任何第三方服务器**：固件 `CONFIG_OTA_URL` 默认已指向自己的 `/api/voice/ota`
+  （默认值在 `firmware/xiaozhi/main/Kconfig.projbuild`；`sdkconfig` 是构建产物、被 gitignore）。
+  OTA 只给已绑定设备签发 token，未绑定只返激活码。
+- Opus 编解码 = **ctypes 直连系统 libopus**（零新增 Python 依赖；
+  Docker / CI 都 apt 装 `libopus0`）。
+- **提醒工具调用走服务端 function calling，不走设备 MCP 通道**：固件的 "MCP" 是
+  设备本地 JSON-RPC 工具（音量/电量/摄像头），提醒数据在服务端 `reminders` 表，
+  设备本地没有。工具在 `server/app/voice/tools.py`。
+  **歧义时间必须反问**（「三点」不猜上下午、「每天」缺时间）——静默建错时间的提醒
+  对老人最糟。
+- **流式 TTS**：`tts_stream()` 增量吐 PCM；厂商不发流式时降级为非流式、不假装。
+  下行时序 `stt → tts start → sentence_start×N → tts stop` 不能改（设备靠它回落 idle）。
+- **老人语速 / 停顿是默认值即改善，不需运维调参**：
+  `ELDER_VOICE_SILENCE_MS` 默认 `2000`（句末停顿）、`ELDER_VOICE_SILENCE_MAX_MS`
+  默认 `6000`（句中最长停顿自适应 = 最长句中停顿 ×1.5 + 500ms）。
+
+### 登录限速
+
+`server/app/ratelimit.py`：默认 5 秒冷却 / 每分钟 6 次 / 每小时 20 次，
+**只计失败次数**，同时按 IP 和按用户名两道闸门。关键设计：**口令正确的请求不过闸门**
+——先验口令，对了直接发证不看配额。所以「被锁死」只会作用于不知道口令的人，
+不会变成 DoS 武器。计数在进程内存里，不落库。
 
 ## 手机端
 
@@ -233,8 +485,47 @@ pnpm build:mp-weixin   # 产物 app/dist/build/mp-weixin，用微信开发者工
 
 ## 固件
 
-`firmware/components/elder` 已实现：RGB 指示灯与情绪同步、长按 3s + 30s 内短按的服药确认状态机、
-离线提醒（DS3231 + NVS）、13 位激活码（1 字母 + 11 位数字 + Luhn 校验位，与后端算法一致）。
+**硬件基线**：立创·实战派 ESP32-S3，板型符号 `CONFIG_BOARD_TYPE_LICHUANG_DEV_S3`
+（板目录 `lichuang-dev`），ESP-IDF v5.5.1。板上关键器件：ES8311（音频 codec）、
+ES7210（ADC）、FT5x06（触摸）、**GC0308（摄像头，DVP）**。
 
-**尚未编译**：需先合入 xiaozhi-esp32 v2.0.5 源码树（ESP-IDF v5.5.1）并补齐 EAF 形象播放、
-提醒与后端同步、离线提示音，完成后再统一编译，详见 `docs/烧录指南.md`。
+`firmware/components/elder` 是本项目新增的组件（编译前由
+`tools/merge_to_xiaozhi.py` 合入 xiaozhi 源码树），已实现：RGB 指示灯与情绪同步、
+长按 3s + 30s 内短按的服药确认状态机、离线提醒（DS3231 + NVS）、
+13 位激活码（**1 位字母 + 12 位数字，第 12 位为 Luhn 校验位**，与后端算法一致；
+屏显按 `A-3829-4471-0056` 四段分组，12 位连写在 320×240 上抄错率太高）。
+
+显示走**标准 LVGL 路径**（`lv_init()` + `lv_display_get_default()` +
+`SpiLcdDisplay`），不是 `esp_emote_gfx` 自绘——开 emote 路径时它根本不创建
+LVGL display，真机表现为全黑屏 + `font context is NULL`。
+
+**摄像头驱动已真正编进固件**，初始化改为「探到硬件才起来」：先用 SCCB 探地址，
+探不到就打一条 WARNING 跳过，既不占 DVP 的 11 个 IO 也不刷 ERROR；接上排线重启
+即自动启用。
+
+⚠️ `idf.py build` **不读**板级 `config.json`（那是上游 `scripts/release.py` 做
+多板发布时才读的）。驱动必须经 `tools/merge_to_xiaozhi.py` 里的
+`SDKCONFIG_OVERLAY` 真源启用——写进 `config.json` 属于死配置，CI 产物里根本没编进来。
+
+### ⚠️ 打包固件前必须 `rm -rf firmware/xiaozhi/build`
+
+`firmware/xiaozhi/build/config/sdkconfig.h` 是**未入库的本地构建产物**
+（`.gitignore` 里 `firmware/xiaozhi/build/` 被忽略），里面的 `CONFIG_OTA_URL`
+可能仍是上游的 `api.tenclass.net`。不清理就打包，打出来的设备会去连别人的服务器。
+
+**症状**：设备**能启动、能联网、能心跳，但语音链路永远不通** —— 因为
+WebSocket 地址与 token 都由第三方在 OTA 响应里下发，我们没有任何侧信道能通知
+设备改地址。而第三方一旦限流或切断，全部设备同时失声。
+
+```bash
+rm -rf firmware/xiaozhi/build
+```
+
+正确的默认值在 `firmware/xiaozhi/main/Kconfig.projbuild`：
+`CONFIG_OTA_URL` 默认 `https://voice.2508866.xyz/api/voice/ota`。
+
+CI 不受影响：`firmware-build.yml` 走 `idf.py set-target` 重新生成 `sdkconfig`，
+并且**每次构建都打印生效的 `CONFIG_OTA_URL`**，偏离本项目域名时告警。
+固件运行时还可被 NVS（`settings("wifi")` 的 `ota_url`）覆盖，不必重新烧录。
+
+固件烧录步骤见 [`docs/烧录指南.md`](docs/烧录指南.md)。

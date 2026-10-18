@@ -201,6 +201,35 @@ def main() -> int:
               preset_voice == default_voice,
               f"预设={preset_voice} 目录={default_voice}")
 
+        # 出厂默认音色只能有一处定义（不看「值相等」，看「有几个人写下这个赋值」）。
+        # 为什么要这条：`voice/catalog.py` 曾自己定义过一个同值的
+        # DEFAULT_PRESET_TTS_VOICE 副本（真源在 persona/catalog.py），
+        # 而上面 B1/B2/B3 全都只比**值** —— 两份同值常量永远能通过，
+        # 于是这个「第二份真源」的破口长期绿灯，直到有人改了其中一份才炸。
+        #
+        # 这里用**静态扫描**而不是 import 比身份：本冒烟脚本从 tools/ 运行，
+        # `app` 不在 sys.path（import 会 ModuleNotFoundError）。
+        # 静态扫描其实更严格 —— 它抓的是「有几个人写下这个赋值」，
+        # 连「定义了但没用到」的死副本也不放过，而 import 比身份抓不到那种。
+        try:
+            import pathlib
+            import re
+            _root = pathlib.Path(__file__).resolve().parents[1] / "server" / "app"
+            _defs = []
+            # 匹配 `NAME: Final = ...` / `NAME: str = ...` 这类**带类型标注的赋值定义**，
+            # 但不能匹配 `from x import NAME`（那是转出，不是定义）。
+            _pat = re.compile(r"^DEFAULT_PRESET_TTS_VOICE\s*:\s*\w+\s*=")
+            for _p in sorted(_root.rglob("*.py")):
+                for _no, _line in enumerate(
+                        _p.read_text(encoding="utf-8", errors="replace").splitlines(), 1):
+                    if _pat.match(_line.strip()):
+                        _defs.append(f"{_p.relative_to(_root)}:{_no}")
+            check("B4 出厂默认音色只有一处定义（杜绝第二份真源分叉）",
+                  len(_defs) == 1 and _defs[0].startswith("persona"),
+                  f"定义点={_defs or '无'}")
+        except Exception as exc:  # pragma: no cover
+            check("B4 出厂默认音色只有一处定义（杜绝第二份真源分叉）", False, repr(exc))
+
         # ================================== C. 零配置如实反映「不能服务」（核心）
         print("\n── C. 零配置时就绪度如实反映（核心断言）──")
         code, rd = req("GET", "/api/providers/readiness", token=token)

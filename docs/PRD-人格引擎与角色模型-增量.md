@@ -247,7 +247,7 @@ B 也要P  → B 的 uvicorn bind 失败退出
 - `smoke_ports.py` 已提供 **`guard_or_die()` 标准三段式守卫**（查占用 → 占位 → 检测 `ADDR_IN_USE_MARKERS`），docstring 原话：「给每个起真实 HTTP 子进程的冒烟脚本统一调用，省得各自重写一遍—— 之前 `is_port_free` 写好了却零调用，就是因为"每处自己写一遍"的代价高于"抽出来"」。
 - **三个 QA 脚本均已迁移**：`qa4_dirty_all_readpoints.py:87` 与 `qa_probe_memory.py` 改用 `resolve_port()`（不再硬写 8123），`qa3_false_green.py:152` 同理；三个脚本都已在 `main()` 调`guard_or_die()`。
 - **`DEFAULT_PORTS` 已收录全部 QA 脚本**（8110-8115 段），含 `qa3_false_green: 8115`。
-- 全部 14 个自起服务的脚本（5 个 smoke + QA 轮次产出）均已接入。
+- ⚠️ **覆盖率实测（2026-10-18 复核，原"全部 14 个均已接入"不成立）**：`tools/smoke_*.py` 共 15 个文件，`smoke_ports.py` 是登记表 ⇒ 实际冒烟脚本 **14 个**。`guard_or_die()` 接入 **12 个**，未接入的是 `smoke_admin_presets`（会重启服务两次，守卫三段在重启路径上语义不适用）与 `smoke_roles`（**属遗漏**）；`ProxyHandler({})` 接入 **13 个**，未接入的是 `smoke_deploy`。另有 3 个 QA 脚本（`qa4_dirty_all_readpoints` / `qa_probe_memory` / `qa3_false_green`）已接入两项。
 
 **结构性教训（本轮最重要的一条，已落地为 P1-7）**：「本地测试环境假设」（端口登记 / 起前查占用 / 就绪判定看自己进程 / 本地请求绕代理）**是每个脚本都要重复的**，必须沉到公共层。否则修复成果随"谁改过哪个文件"分布，**安全水位取决于改动历史而不是当前代码状态**。
 
@@ -497,7 +497,7 @@ L2.manual（家属对角色的手动覆盖） > L1 画像统计值 > traits 声�
 | `sanitize_for_prompt()` 做**不可逆删除**（非全角化），配 NFKC 不可还原，判据是 `has_role_marker()` 恒为 False | `server/app/memory/textutil.py:256-352` |
 | `agent_id` 可空表示"通用"，`IS NULL` 匹配已统一封装 | `persona._match_agent` / `store._agent_match` |
 | 三张人格表均按 `(user_id, agent_id)` 组织 | `models.py:892-1013` |
-| 现有 6 个冒烟脚本约 400 条断言全绿 | `tools/smoke_{server,models,memory,membership,home,mail}.py` |
+| **测试规模**：CI（`.github/workflows/server-ci.yml`）实际跑的**冒烟脚本共 8 个**：`smoke_server` / `smoke_auth` / `smoke_roles` / `smoke_admin_presets` / `smoke_quota` / `smoke_usage` / `smoke_voice_catalog` / `smoke_voice`；另有非冒烟脚本 `qa3_migration` / `qa3_r2_restart` / `qa3_device_binding` / `qa3_drop_tables` / `qa_audit_rollback` / `eval_persona`。⚠️ **本行不写"约 N 条断言"的合计数** —— 合计会随任意一条新增断言而漂移，写进文档就等于埋一个必然过期的数字；要数字请查各脚本自己的实跑输出。<br>⚠️ `smoke_home` / `smoke_memory` / `smoke_models` / `smoke_mail` / `smoke_local_reminders` / `smoke_deploy` **本地有、CI 没跑** | `.github/workflows/server-ci.yml`；`tools/smoke_ports.py` `DEFAULT_PORTS` |
 | 无 Alembic；加列**必须**登记进 `schema_patch.NEW_COLUMNS`，否则老库升级即 `no such column` | `server/app/schema_patch.py:27-52` |
 | 设备绑定角色只落库，`/api/device/sync` 尚未下发 | `routers/devices.py:96-98` TODO |
 | 用户主体是「子女/管理员」，老人是设备侧 | `models.py:46` `User` 文档字符串 |

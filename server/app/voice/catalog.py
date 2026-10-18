@@ -11,15 +11,21 @@
 
 为什么这个目录放在服务端而不是 index.html 里
 --------------------------------------------
-出厂默认音色（``DEFAULT_PRESET_TTS_VOICE``）本来就以本目录为真源
-（见 main.py 种子处注释：「运营后台的恢复出厂默认需要单一真源」）。若前端
-再抄一份，就是第二份真源 —— 迟早出现「下拉框里选得到的音色，恢复默认后却
-是另一个」。前端改为 ``GET /api/voice-catalog`` 拉取。
+出厂默认音色（``DEFAULT_PRESET_TTS_VOICE``）的真源在``app.persona.catalog``
+（见 main.py 种子处注释：「运营后台的恢复出厂默认需要单一真源」，且
+``admin_presets.py`` 的默认值比对也读那一份）。若前端再抄一份，就是第二份
+真源 —— 迟早出现「下拉框里选得到的音色，恢复默认后却是另一个」。
+前端因此改为 ``GET /api/providers/catalog`` 拉取。
+
+⚠️ **本模块曾定义过一份同值的 ``DEFAULT_PRESET_TTS_VOICE``，是无人使用的副本**
+（所有消费者都从 ``app.persona.catalog`` 取）。两份同名常量迟早会分叉，
+故已删除，只保留 ``persona.catalog`` 一处。改动请先看
+``docs/决策记录.md`` 里「音色目录单一真源」那条。
 
 预置的是哪一组
 --------------
-Edge TTS（微软）官方音色。它不需要自建服务、免费、Python 侧零新增依赖
-（走 HTTP + SSML），与项目现有默认技术栈一致。**不混入本地开源 TTS
+Edge TTS（微软）官方音色。它不需要自建服务、免费，
+与项目现有默认技术栈一致。**不混入本地开源 TTS
 （CosyVoice / GPT-SoVITS 等）的音色名**：那些填进去在当前部署下必然调用
 失败，混在一起会让管理员误以为「从下拉框里选就能用」。
 
@@ -137,10 +143,16 @@ def _volc_voices() -> tuple[dict, ...]:
     from .tts_volc import VOLC_VOICES
     return VOLC_VOICES
 
-# 出厂默认音色。⚠️ 这个值被 main.py 的种子写入人格预设，
-# 「恢复出厂默认」也读它。**值不可随意改**：改了等于给所有已有部署
-# 的默认音色换人，且不会触发任何迁移（已在库里的行仍是旧值）。
-DEFAULT_PRESET_TTS_VOICE: Final = "zh-CN-XiaoxiaoNeural"
+# 出厂默认音色：⚠️ **这里只做转出，不做定义**。
+#
+# 真源在 ``app.persona.catalog.DEFAULT_PRESET_TTS_VOICE`` —— main.py 的种子写入、
+# admin_presets.py 的默认值比对、smoke_admin_presets.py 的断言都读那一份。
+# 本模块此前自己定义过一个同值副本，是**无人使用的第二份真源**（已删除）。
+# 保留这个转出名只为兼容既有 import，不要在这里改值。
+#
+# ⚠️ 改这个值等于给所有已有部署的默认音色换人，且**不会触发任何迁移**
+#（已在库里的行仍是旧值）。真要换，必须同时写迁移。
+from ..persona.catalog import DEFAULT_PRESET_TTS_VOICE  # noqa: F401
 
 
 def voice_known(voice_id: str) -> bool:

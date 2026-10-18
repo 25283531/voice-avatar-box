@@ -33,7 +33,11 @@ docker compose up -d
 
 默认只起 **一个** 服务 `elder-server`，不会再拉数据库容器。数据库是镜像内置的 SQLite 文件，落在命名卷 `elder-data` 里的 `/data/elder.db`。
 
-首次启动会自动建表并写入种子数据（默认形象、会员套餐、种子管理员等）。
+首次启动会自动建表并写入种子数据（平台预设角色与其人格、默认形象「小暖」、陪聊计量配额、种子管理员 `admin` 等）。
+
+> ⚠️ 这里曾写过种子里还有「会员套餐」。**会员制已取消（commit `e264200`）**，
+> `membership_*` / `payment_config` 五张表由启动期的
+> `schema_patch.drop_membership_tables()` 真正 DROP，不再是种子数据的一部分。
 
 **种子管理员的初始口令是随机的**（`secrets.token_urlsafe(16)`），只在启动日志里出现**一次**，形如：
 
@@ -47,6 +51,14 @@ WARNING elder | 【安全】种子管理员已创建：用户名 admin，ELDER-I
 > docker compose logs elder-server | grep ELDER-INITIAL-PASSWORD
 > ```
 > 想自己指定初始口令，部署前设 `ELDER_SEED_ADMIN_PASSWORD=<口令>`（见 §5.2）。
+> 设了它则口令取该值，且**刻意不回显进日志**（它已经在 `.env` 里躺着，
+> 再抄一份进日志只是多一个泄露面），只打一行
+> `seed: 已按 ELDER_SEED_ADMIN_PASSWORD 创建种子管理员 admin（口令不打印）`。
+
+> ⚠️ **硬编码弱口令 `admin/admin123` 已从 `main.py` 移除**（commit `bb5ca98`）——
+> 现在不设 `ELDER_SEED_ADMIN_PASSWORD` 就一定是随机口令，代码里**不再存在**
+> 任何 `admin123` 的兜底分支。所以「按文档装完用 admin/admin123 登进去」这条路
+> 已经没有了；要么去日志里取随机口令，要么显式设该变量。
 
 ### 1.3 访问
 
@@ -112,7 +124,8 @@ docker compose exec elder-server ls -l /data # 容器视角
 流程（让用户照做即可）：
 
 1. **给设备通电、进入配网模式** —— 屏幕上会显示热点名和网址。
-   热点名形如 `Xiaozhi-A1B2`（`Xiaozhi` 前缀 + MAC 后两位），网址固定是 `http://192.168.4.1`。
+   热点名形如 `XiaoNuan-A1B2`（`XiaoNuan` 前缀 + MAC 后两位，**不是**上游项目的
+   `Xiaozhi-`），网址固定是 `http://192.168.4.1`。
 2. **用手机或电脑连上这个热点**（热点本身没有密码）。
 3. **浏览器打开屏幕上那个网址**（`http://192.168.4.1`）。
 4. **在页面里选家里的 Wi-Fi 名称、输入密码、提交**。
@@ -323,7 +336,10 @@ PY
 
 ---
 
-## 2.3 可选：加本地语音服务（`docker-compose.local.yml`）
+### 2.6 可选：加本地语音服务（`docker-compose.local.yml`）
+
+> 与 MySQL 无关，只是同属"叠加文件"这一类，所以放在这一节。
+> SQLite 与 MySQL 两种形态都可以叠加它，也可以完全不叠。
 
 想让 ASR / VAD 不出本机、且不依赖任何云厂商时，叠加本地服务文件：
 
@@ -352,7 +368,19 @@ kind=vad   endpoint=http://local-vad:8080
 管理后台顶部的**服务就绪度**面板会显示当前缺哪几项、缺了会怎样，
 不必数配置行来判断。首次启动要下模型，冷启动可能 30~60 秒。
 
-本地服务的端口只绑定 `127.0.0.1`，**不对外暴露**——这两个服务没有任何鉴权。
+> ⚠️ **就绪度面板的作用是"如实反映未就绪"，不是粉饰**。全新空库下
+> asr / tts / vad / chat 四项都是未配置状态，`resolve_provider` 会返 503 ——
+> **"不配置也能用"这个假设不成立**。关键项是 `asr` / `tts` / `chat`（缺任一
+> 就无法提供完整服务）；VAD 不算关键项，断句已由设备端 esp-sr 承担。
+
+本地服务的端口只绑定 `127.0.0.1`（`local-asr` 宿主 10095、`local-vad` 宿主 8081
+→ 容器 8080），**不对外暴露**——这两个服务没有任何鉴权。上面的
+`endpoint=http://local-vad:8080` 走的是 compose 内网（容器端口），
+不是宿主机的 8081，主服务与它们在同一网络里不需要绕宿主端口。
+
+> 这两个服务在 `docker-compose.local.yml` 里**没有 `profiles:` 键** ——
+> 只要 `-f` 加载了这个叠加文件就会一起起，不需要额外的 profile 名。
+> 反过来说，**不加载这个文件就一个都不会起**。
 
 ---
 
@@ -726,6 +754,25 @@ XFF，且**从右往左**跳过可信段、取第一个不可信地址（攻击�
 | `ELDER_PUBLIC_BASE_URL` 不是 http(s) / `ELDER_WS_PUBLIC_BASE_URL` 不是 ws(s) | **启动失败**，点名是哪个变量、哪里不合法 |
 | `tunnel` 下旧变量给了 `wss://` | **启动失败**（auto/direct 下旧变量不校验，保持历史语义） |
 
+**⚠️ 三个地址变量的校验强度不一样（最容易踩的坑就在这里）**
+
+| 变量 | `auto` / `direct` | `tunnel` | 说明 |
+| --- | --- | --- | --- |
+| `ELDER_PUBLIC_BASE_URL`（新） | **校验** scheme，必须 http(s):// | **校验**，且缺了直接启动失败 | 新变量没有历史语义要保，所以**任何模式下都严格校验**。推荐用它 |
+| `ELDER_VOICE_PUBLIC_BASE`（旧） | **故意不校验** scheme（逐字保持历史宽松语义） | **强制必须是 https**，给 `wss://` 直接启动失败 | 加校验就改了存量部署的语义，所以只在显式 opt-in 的 tunnel 下严格 |
+| `ELDER_WS_PUBLIC_BASE_URL` | 校验 ws(s):// | 同左 | 只配它不配 HTTP 地址 = 启动失败（OTA 仍需要 http(s) 地址） |
+
+**这张表解释的那个真实坑**：「我配了旧变量、`direct` 模式跑得好好的，
+怎么一换成隧道就连不上」—— 因为旧变量在 `direct` 下**根本不检查 scheme**，
+你填 `wss://voice.2508866.xyz` 它照收不误、照跑不误；直到你把
+`ELDER_DEPLOY_MODE` 改成 `tunnel`，才会在启动时被拦下来。
+**这不是 bug，是刻意的**（不校验是为了不打断存量部署），但必须知道。
+
+`tunnel` 缺地址是**启动失败**而不是「告警后继续跑」，也是刻意的 fail-fast：
+缺地址时服务端一切「正常」（心跳成功、管理台能开、日志干净），只有设备一开口
+就断，**运行期零信号**。用一次启动失败换掉一次线上静默故障。
+不设 `ELDER_DEPLOY_MODE` 则是 `auto`，行为与历史逐字一致，存量部署升级不受影响。
+
 冒烟覆盖：`tools/smoke_deploy.py`（86 条断言：三模式推导逐条断言、启动失败
 必红、auto/direct 与 git 基线逐字一致、反向验证三处）。
 
@@ -746,12 +793,17 @@ XFF，且**从右往左**跳过可信段、取第一个不可信地址（攻击�
 | `ELDER_DB_WAIT_SEC` | `180` | 启动阶段等待数据库可用的秒数（仅 MySQL 生效，SQLite 是本地文件无需等待） |
 | `ELDER_TZ` | `Asia/Shanghai` | 业务时区，改了会整体影响提醒时间计算 |
 | `MYSQL_ROOT_PASSWORD` | `123456` | 仅在使用自带 `elder-db` 容器时生效，**生产必须改** |
-| `ELDER_ORDER_TTL_HOURS` | `48` | 会员订单（人工核销）占用有效期，超时置 `expired` 并释放号段与金额 |
 | `ELDER_VOICE_PUBLIC_BASE` | 留空（自动推导） | 语音链路对外地址（**旧变量，向后兼容，语义逐字未变**）。自研链路与 API 同源同端口，未配时服务端按请求 Host 推导；反代（含 Cloudflare Tunnel）下**必须**有显式对外地址（新变量或本变量），否则设备拿到 `ws://`。与 `ELDER_PUBLIC_BASE_URL` 同时配置时以新变量为准并 WARNING。见 §4.2 |
 | `ELDER_DEPLOY_MODE` | `auto`（未设置） | **部署模式**：`auto` / `direct` / `tunnel`（大小写不敏感）。`tunnel` = Cloudflare Tunnel 等 TLS 前置形态，**必须**配对外地址否则启动失败；`direct` = 公网直暴露/反代后置，按请求推导；`auto` = 未声明，行为同 direct 但启动日志说明推断依据。写错取值启动失败。见 §4.2 |
 | `ELDER_PUBLIC_BASE_URL` | 留空 | **HTTP/OTA 对外地址**（新变量，http/https，启动期校验 scheme）。配了就在所有模式下优先使用；tunnel 模式下必需 |
 | `ELDER_WS_PUBLIC_BASE_URL` | 留空 | **WebSocket 单独域名**（可选，ws/wss，启动期校验）。Cloudflare Tunnel 可给同一源站配多个 hostname；不配则 WS 由 HTTP 地址换 scheme 推导。只配它不配 HTTP 地址会启动失败 |
 | `ELDER_SCHEDULE_AHEAD_HOURS` | `36` | 服务端预生成提醒实例的提前量 |
+| `ELDER_SCHEDULER_INTERVAL` | `60` | 后台定时任务间隔秒数（排期补全 / 超时升级 / 离线清扫，见 §7.1） |
+| `ELDER_HOST` | `0.0.0.0` | 容器内监听地址。镜像 CMD 用它，一般不改 |
+| `ELDER_USER_TOKEN_DAYS` | `30` | 用户登录令牌有效期（天） |
+| `ELDER_DEVICE_TOKEN_DAYS` | `365` | 设备令牌有效期（天） |
+| `ELDER_ACT_TTL_MIN` | `10` | 激活码有效期（分钟），与固件 `elder_activation.c` 的格式约定配套 |
+| `ELDER_LIBOPUS_PATH` | 空（自动探测） | **Opus 编解码库文件的绝对路径**。**Docker 部署不需要设** —— 镜像已 `apt-get install libopus0`。只在**本机裸跑**（§1.9）且自动探测失败时才需要，见 §6.12 |
 | `ELDER_DB_ECHO` | `0` | 设为 `1` 打印所有 SQL，排查问题时开，平时关 |
 | `ELDER_ALLOW_PUBLIC_REGISTER` | `1`（开启） | **是否开放匿名自助注册**。设为 `0`/`false`/`no`/`off`/空串即关闭，关闭时 `POST /api/auth/register` 返回 `403` + 「当前未开放自助注册，请联系管理员开通账号」。详见 §5.1 |
 | `ELDER_BOOTSTRAP_ADMIN_USERNAME` | 空（未配置） | **初始管理员（bootstrap）的用户名**。只有用户名**逐字等于**它的注册者会成为管理员；未配置时**任何人注册都不是管理员**。详见 §5.1 |
@@ -765,7 +817,78 @@ XFF，且**从右往左**跳过可信段、取第一个不可信地址（攻击�
 | `ELDER_TRUSTED_PROXY_IPS` | 空（谁都不信） | **可信反代地址**（逗号分隔，支持 CIDR）。留空 = 只认 TCP 对端、`X-Forwarded-For` 一律不信；填了且**对端在名单里**时才解析 XFF，并**从右往左**跳过可信段取第一个不可信地址。**切勿在 uvicorn 侧用 `--forwarded-allow-ips=*`**。详见 §5.3 |
 | `ELDER_MAIL_FAKE` | `0` | **测试专用**。设为 `1` 时邮件不真投递、写进进程内发件箱。**生产必须为 `0`**，留空等同 `0` |
 
-> **SMTP 不在环境变量里** —— 存数据库，在管理后台配，见 1.7。
+**找回密码与 SMTP 超时（`server/app/mailer.py`）** —— 这一组**不在 `config.py` 里**，
+是邮件模块自己读的，但同样是运维会要调的：
+
+| 变量 | 默认值 | 说明 |
+| --- | --- | --- |
+| `ELDER_RESET_CODE_TTL_MIN` | `15` | 验证码有效期（分钟） |
+| `ELDER_RESET_CODE_MAX_ATTEMPTS` | `5` | 同一验证码最多校验次数，超过即作废（防爆破） |
+| `ELDER_RESET_RESEND_COOLDOWN` | `60` | 重发冷却（秒）。**防止「找回密码」被当成邮件轰炸器** —— 不限速的话谁都能拿一个邮箱地址无限刷验证码 |
+| `ELDER_RESET_PURGE_BUFFER` | `3600` | 过期验证码清理缓冲（秒）：只删「过期超过这个缓冲」的行，避免删掉还能用几秒的 |
+| `ELDER_SMTP_CONNECT_TIMEOUT` | `10` | 单次 SMTP 连接超时（秒） |
+| `ELDER_SMTP_READ_TIMEOUT` | `10` | 单次 SMTP 读取超时（秒）。发送是**同步阻塞在请求线程里**的，超时太长会把工作线程拖死 |
+
+> 用户反馈「收不到邮件」时，**先查超时而不是先查 DNS** ——
+> `Connection refused` 通常是端口错或服务没监听（见 §6.10），
+> 而「一直转圈最后才报错」通常是这两个超时在起作用。
+
+**语音链路调参（`ELDER_VOICE_*`）** —— 老人体验的核心可调项。
+**默认值就是调好的值，正常部署一格都不要动**；调错的表现是「老人听不清 /
+说得太急 / 抢话 / 半天不应」，所以下表只作备案，改之前先读 `config.py` 里
+每个变量上方的取舍注释：
+
+| 变量 | 默认值 | 说明 |
+| --- | --- | --- |
+| `ELDER_VOICE_SAMPLE_RATE` | `24000` | **下行 TTS 输出采样率**。客户端只吃 24kHz/mono/S16LE 裸 PCM，固件按服务端声明的速率逐帧 Opus 编码。**客户端的硬约束，改了要连固件一起改** |
+| `ELDER_VOICE_ASR_LANGUAGE` | `zh` | ASR 语言。默认中文：多数厂商不传会用默认（英文），老人场景必须显式给 |
+| `ELDER_VOICE_FRAME_DURATION_MS` | `60` | Opus 帧长。只支持 2.5/5/10/20/40/60，且 60 是固件 `audio_service.cc` 里写死的 `OPUS_FRAME_DURATION_MS`，**改它等于换一套帧协商** |
+| `ELDER_VOICE_SILENCE_MS` | `2000` | **服务端静音兜底阈值（断句判据）**。固件默认走 realtime 模式、服务端无 AEC，这个阈值是唯一的断句依据。老人口语中超过 1.5s 的停顿常见，1500 会把「话说一半」判成说完、内容直接丢失且不可恢复。**两类错误代价不对称：宁可多等，不可截断** |
+| `ELDER_VOICE_SILENCE_MAX_MS` | `6000` | 停顿自适应的上限（毫秒）。本轮出现过「停顿后又继续说」的长停顿就按比例放大断句阈值，但不超过它，否则一句不停地说下去会让阈值无限膨胀 |
+| `ELDER_VOICE_PAUSE_FACTOR` | `1.5` | 停顿自适应系数：阈值 = `max(SILENCE_MS, min(SILENCE_MAX_MS, 最长句中停顿 × 1.5 + 500ms))`。取 1.5 是给「停顿后还会接着说」留余量，调成 1.0 等于没有自适应 |
+| `ELDER_VOICE_PAUSE_MIN_MS` | `600` | 多长的「停顿后又继续」才记入自适应（毫秒）。低于它的是词间间隙，不是思考停顿，不拿来做依据 |
+| `ELDER_VOICE_MIN_SPEECH_MS` | `300` | 触发兜底前至少要听到这么多语音，防止「一句都没说就静音触发」把环境噪声当一整句送去 ASR（老人会听到一串乱码） |
+| `ELDER_VOICE_MAX_LISTEN_MS` | `60000` | 单轮收听安全上限（毫秒）。老人说着说着离开/卡住时兜底 finalize，避免会话永远挂在 listening。60s 足够任何正常单句 |
+| `ELDER_VOICE_SPEECH_RMS` | `0.005` | 「判定开口了」的高门限（绝对下限，约 -46dBFS）。**调低**能救回轻声/离得远的老人，**调高**能压住嘈杂房间里的误触发 |
+| `ELDER_VOICE_SPEECH_RMS_KEEP` | `0.0025` | 「还在说」的低门限（约 -52dBFS）。句中轻声音节/远场衰减落在高低门限之间时靠它续住语音态，否则话说到一半就掉出语音态 |
+| `ELDER_VOICE_SOFT_GRACE_MS` | `2000` | 软语音（能量落在两门限之间）最长续多久（毫秒）。**不设期限**的话，持续底噪会让会话永远挂住 |
+| `ELDER_VOICE_TOOL_MAX_ROUNDS` | `3` | LLM 工具调用（提醒的增删查改）单轮最多几轮。**防 LLM 反复调用同一工具形成死循环** —— 每轮都是一次真实的 token 花费，不设上限等于把账单交给模型的坏心情 |
+| `ELDER_VOICE_HISTORY_TURNS` | `4` | 会话内保留的历史轮数。语音链路每轮都要塞人格 + 记忆召回，窗口比纯文本更紧，老人话题跳跃少，所以留得少 |
+| `ELDER_VOICE_WS_PATH` | `/api/voice/v1/ws` | 语音 WebSocket 路径。换路径要同步改反代的 `location` 与固件侧预期 |
+| `ELDER_VOICE_OTA_PATH` | `/api/voice/ota` | OTA 地址路径，**必须与固件 `CONFIG_OTA_URL` 一致** |
+
+> ⚠️ **这一组里只有 `ELDER_VOICE_SAMPLE_RATE` 是"客户端硬约束"**（客户端只吃
+> 24kHz/mono/S16LE 裸 PCM），其余都是纯服务端行为参数。
+> 调参前先看现象：老人**说得太急**（话被截断）→ 调大 `SILENCE_MS`；
+> 老人**抢话/应得太慢**（明显停顿才应答）→ 调小。**别一次改多个变量**，
+> 一次只动一个、观察一天，否则分不清是哪个起的作用。
+
+
+> **SMTP 不在环境变量里** —— 存数据库，在管理后台配，见 §1.8。
+
+> ⚠️ **陪聊时长上限不在环境变量里**。它曾经和会员核销配置写在同一段代码里，
+> 随会员制取消**那段配置整体删掉了，但时长上限本身没删** —— 它现在是
+> `chat_quota_config` 表里的**数据**（由 `app/chat_quota.py` 管理），
+> 在管理后台改，不在 `.env` 里。排查「陪聊被切断」请查这张表，不要去 `.env` 里找变量。
+>
+> 这张表单行两个字段（默认值见 `chat_quota.py:56-57`）：
+>
+> | 字段 | 默认 | 含义 |
+> | --- | --- | --- |
+> | `free_daily_seconds` | `3600` | 未授权设备的每日陪聊秒数。**`0` = 不限制** |
+> | `idle_timeout_seconds` | `90` | 空闲多久判定对话结束（秒） |
+>
+> ⚠️ **`free_daily_seconds` 只对未授权（未绑定）设备有意义，已授权设备一律无限量**
+> —— 这是一条硬不变量，由 `tools/smoke_quota.py` 守着，改动前先看它。
+> 换句话说，「已付费开通的设备会不会被时长切断」这个问题的答案是**不会**。
+> 另外这个秒数**现在只用于展示与对账，不再用于拦人**（会员制取消后失去了拦人的语义）。
+
+> ⚠️ **已随会员制取消、不要再往 `.env` 里配的**：`ELDER_ORDER_TTL_HOURS`
+> （会员订单人工核销的有效期）在 `config.py` 里**已彻底不存在** ——
+> 那段会员核销配置随 commit `e264200` 整体删除，全仓没有任何代码读它。
+> 早期版本的 `server/.env.example` 里有一行示例，现已一并清掉；
+> **你的旧 `.env` 里如果还留着它，直接删掉，无副作用。**
+> 设备付费开通走的是「线下转账 + 管理员人工核销」的设备订单，与平台会员制无关。
 
 完整清单以 `server/app/config.py` 为准。
 
@@ -819,12 +942,44 @@ ELDER_BOOTSTRAP_ADMIN_USERNAME=zhangjiashu_admin
 > **把管理员发给第一个点开注册页的路人**，已在本轮移除。
 > 回归网在 `tools/smoke_auth.py`（含一条专门甄别该规则的最小场景）。
 
+### 5.1.1 管理员的操作留痕：两张审计表
+
+管理员能改的东西里有两类是「改了别人能看见、且事后可能被质疑」的，
+它们各有专门的审计表（`server/app/models.py`）。**排障时先查这两张表，
+不要只翻应用日志** —— 应用日志会滚，审计表不会。
+
+| 表 | 记什么 | 关键字段 |
+| --- | --- | --- |
+| `admin_preset_audits` | **管理员改平台人格预设**的逐字段审计 | `action`（`update`/`reset`/`archive`）、`changed_fields`、`diff`（`{"字段": {"from":…, "to":…}}`）、`admin_username`（**快照不 join**）、`guardrail_version` |
+| `agent_persona_audits` | **人格自动演化**的每一条推断 | `signal`、`user_text`/`bot_text`/`prev_bot_text`、`inferred`（人话描述）、`valid`、**`reason`**、`discarded_at`/`discard_reason` |
+
+运维时有三个要点：
+
+- **「机器人为什么这么说话」查 `agent_persona_audits`**。它的设计重点不是记录
+  学到了什么，而是**每条推断先判有效性再入库、判定结果原样留档** ——
+  判定为无效（`valid=False`）也照记一条，家属能看到「机器人刚才差点被逗，
+  还好没学」。家属作废某条学习走 `discarded_at`（**不删行**，删行就谈不上审计）。
+- **「谁改了平台预设、改了什么」查 `admin_preset_audits`**。
+  `admin_username` 刻意存**快照**而不是 join `users` —— 用户改名后，
+  审计仍必须能回答「当时是谁改的」。
+- ⚠️ **这两张表刻意不存放什么**（将来有人要加字段时必读）：
+  硬红线正文与红线 tokens（那是 `guardrails.assert_present()` 做 fail-closed
+  自检的唯一判定基准，写进运营可读的表等于把门禁怎么判交出去）、
+  任何用户派生角色的内容（派生角色带 `owner_id`，抄进来就成了跨用户数据表，
+  而这张表只受 `get_current_admin` 保护，比 `ai_providers` 的行级可见性更弱）、
+  以及任何编译产物全文（画像摘要、偏好示例、家属写的话 —— 含私密内容）。
+  **审计表绝不能成为用户内容的副本。**
+
+> `preset_id` 不设 `ON DELETE`：预设只能 archive 不能硬删
+> （`DELETE /api/roles/{id}` 对 preset 永远 403），所以审计不会因删除而悬空。
+
 ### 5.2 种子管理员口令与**存量**默认口令处置（P0）
 
 #### 背景：为什么"改种子"救不了存量库
 
 旧代码在 `main._seed()` 里写死了 `password_hash=hash_password("admin123")`。
-那段代码**只在空库首次启动时执行**，于是：
+那段代码**只在空库首次启动时执行**，而硬编码弱口令本身**已从 `main.py` 移除**
+（commit `bb5ca98`），于是：
 
 * **新装库**：本版已换成随机口令（或 `ELDER_SEED_ADMIN_PASSWORD` 指定的值）；
 * **已经跑起来的库**（含正在运行的生产库）：那个 `admin` 的口令**至今仍是 `admin123`**，
@@ -832,7 +987,7 @@ ELDER_BOOTSTRAP_ADMIN_USERNAME=zhangjiashu_admin
 
 本服务是公开部署的（`voice.2508866.xyz`，APP 把 `BASE_URL` 写死成它），
 所以存量的 `admin/admin123` 等于"任何人都能当平台管理员"：改 AI 配置（含厂商
-API Key 的读写口径）、核销会员订单、查看全部用户用量与记忆。
+API Key 的读写口径）、查看全部用户用量与记忆、给设备核销付费开通。
 
 #### 一、先确认你的库是不是中招
 
@@ -921,6 +1076,33 @@ PY
 
 > 回归网：`tools/smoke_auth.py` 场景 4~7（65 条断言，含"随机口令分支"、"存量告警"、
 > "轮换幂等"、"不误伤其它账号"）。
+
+#### 四、跑冒烟时必须显式给 `ELDER_SEED_ADMIN_PASSWORD`
+
+`tools/` 下十余个冒烟脚本（`smoke_server` / `smoke_home` / `smoke_mail` /
+`smoke_quota` / `smoke_voice_catalog` 等）都用 `admin/admin123` 登录，
+`smoke_mail`、`smoke_home` 还会**故意输错一次**。硬编码弱口令从
+`main.py` 移除后，这些脚本在自己起子进程时必须显式带上：
+
+```bash
+export ELDER_SEED_ADMIN_PASSWORD=admin123      # Windows Git Bash 同语法
+python tools/smoke_server.py
+```
+
+**忘了带会红**（登录 401/403），这是**预期行为、不是回归**。
+部分脚本（`smoke_auth` / `smoke_local_reminders` / `smoke_voice_catalog`）
+已在内部按场景显式设置，不需要外部导出；其余脚本靠继承环境变量。
+CI 里在 job 级设同一个值即可 —— runner 是一次性且不可公网访问，
+那里用弱口令没有现实风险。
+
+同时建议本地跑冒烟时把限速放宽，否则几秒内连续登录同一台服务会被闸门拦下：
+
+```bash
+export ELDER_LOGIN_FAIL_PER_MINUTE=9999 ELDER_LOGIN_FAIL_PER_HOUR=9999
+```
+
+三条日志标记（`ELDER-INITIAL-PASSWORD` / `ELDER-DEFAULT-PASSWORD-ALERT` /
+`ELDER-ADMIN-PASSWORD-ROTATED`）是冒烟断言的锚点，**改文案会让 `smoke_auth` 转红**。
 
 ### 5.3 登录失败限速（5 秒冷却 / 每分钟 6 次 / 每小时 20 次）
 
@@ -1229,6 +1411,48 @@ docker inspect --format '{{.State.ExitCode}}' elder-server
 （容量 32，满了丢最旧一条），联网后 `flush_queue()` 逐条补发。
 排查漏掉的服药记录时看 `补发 N 条离线回执，剩余 M`。
 
+### 6.12 本机跑语音链路：Opus 编解码不可用 / 冒烟「假绿」
+
+⚠️ **Docker 部署不会遇到这个问题** —— 镜像构建时已
+`apt-get install -y --no-install-recommends libopus0`（`server/Dockerfile:63`，
+走 apt 而不是 pip 是有意的：pip 的 opus 绑定会把同一份 C 代码再编一遍）。
+**只有本机裸跑（§1.9）才可能撞上。**
+
+**现象**：日志里一条 WARNING：
+
+```
+WARNING elder.voice.opus | libopus 未找到，语音编解码不可用（装 libopus0 或设
+ELDER_LIBOPUS_PATH 后可恢复）。协议链路不受影响，音频将退化为静音/跳过。
+```
+
+**为什么这条最危险**：它**不是报错**。WS 握手、心跳、STT、下行时序全对，
+设备端也认这套协议 —— 唯独音频编解码这一步不能做，结果是
+**协议层一切正常、老人就是听不见声音**。这与文档里记的「静默故障」同类：
+轮数用尽的兜底话术只赋给 reply 不推 speaker，也是协议正常但老人听不到。
+
+**排查**：
+
+```bash
+# 1) 确认是不是真的缺库（Windows 上尤其常见）
+python -c "from app.voice.opus_codec import libopus_available; print(libopus_available())"
+
+# 2) 装库
+#    Debian/Ubuntu: apt-get install -y libopus0
+#    macOS:        brew install opus
+#    Windows:      把 opus.dll 放到 PATH 或项目目录下
+# 3) 还找不到就显式指路径（优先级最高，会跳过自动探测）
+export ELDER_LIBOPUS_PATH=C:/lib/opus.dll
+```
+
+自动探测会依次尝试 `libopus.so.0` / `libopus.so` / `libopus-0.dll` / `opus.dll` /
+`libopus.0.dylib` / `libopus.dylib`；失败时报错文案会列出**全部已试过的候选**，
+照着那个列表定位最快。
+
+> ⚠️ **「冒烟全绿」不等于编解码被验过** —— 这是本项目真实踩过的**假绿**：
+> 缺可选依赖时测试会静默 SKIP 而不是 FAIL，断言根本没跑，报告却是绿的。
+> 现在已加独立的 `libopus_available()` 前置断言把「跳过」变成「红」，
+> 但**你自己新写的测试若依赖 libopus，仍然必须配一条前置断言**，否则会重蹈覆辙。
+
 ---
 
 ## 7. 健康检查与监控
@@ -1238,8 +1462,13 @@ docker inspect --format '{{.State.ExitCode}}' elder-server
 
 ### 7.1 后台定时任务
 
-排期、订单过期、会员过期、离线清扫等由 lifespan 里起的 `scheduler` 后台任务驱动
+排期补全、超时升级、离线清扫由 lifespan 里起的 `scheduler` 后台任务驱动
 （间隔 `ELDER_SCHEDULER_INTERVAL`，默认 60 秒一轮，预排期提前量 `ELDER_SCHEDULE_AHEAD_HOURS` 默认 36 小时）。
+
+> 这里的「订单过期」「会员到期标记」两步已随平台会员制取消删除 —— 它们服务的
+> `membership_orders` / `memberships` 表已无 ORM 映射且被启动期的
+> `schema_patch.drop_membership_tables()` DROP。设备付费开通（线下转账 +
+> 管理员人工核销）走的是设备订单表，不在这个定时任务里。
 
 - 它挂掉**不会**让 API 不可用，所以 `/api/health` 仍然 200 —— 监控探活探不出定时任务半瘫。
 - 一轮里某一步抛异常会带走**这一轮剩下的所有步骤**，所以日志里出现 scheduler 的 traceback
@@ -1271,7 +1500,7 @@ curl -s http://<host>:8064/api/health/scheduler
 **为什么单独开一个端点，而不把状态并进 `/api/health`**：
 `HEALTHCHECK` 每 30 秒打一次 `/api/health`，它一旦非 200，容器就被判定
 `unhealthy` —— 可此时进程还在、`8064` 上的业务 API 也照样能服务，只是后台的
-排期补全 / 订单过期没跑成。为了后台任务把整个容器判死，连带代价太大。
+排期补全 / 离线清扫没跑成。为了后台任务把整个容器判死，连带代价太大。
 所以两者职责严格分开：`/api/health` 只表达「进程活着」（永远 200），
 `/api/health/scheduler` 只给运维和监控看，**不参与任何探活链路**。
 
@@ -1319,17 +1548,29 @@ docker compose -f docker-compose.yml -f docker-compose.mysql.yml exec -T elder-d
 - MySQL：每天 `mysqldump` 一次，异地留存。
 - 升级版本前**务必**先备份：表结构靠 `create_all` 自动建，**没有 Alembic，升级没有回滚脚本**。
 - 新增列由 `server/app/schema_patch.py` 的 `ensure_missing_columns()` 在启动时**幂等**补齐。
-  当前 `NEW_COLUMNS` 登记了 6 列（SQLite 类型 / MySQL 类型）：
+  当前 `NEW_COLUMNS` 登记了 **26 列**（SQLite 类型 / MySQL 类型），分布在 5 张表上：
+  `users` 1 列、`devices` 1 列、`ai_providers` 20 列、`avatars` 3 列、
+  `agent_persona_profiles` 1 列。其中最关键的几条：
 
   | 表 | 列 | SQLite | MySQL |
   | --- | --- | --- | --- |
   | `users` | `email` | `VARCHAR(128) DEFAULT ''` | `VARCHAR(128) DEFAULT ''` |
   | `devices` | `agent_id` | `INTEGER` | `INT NULL` |
-  | `ai_providers` | `description` | `VARCHAR(255) DEFAULT ''` | `VARCHAR(255) DEFAULT ''` |
   | `ai_providers` | `system_prompt` | `TEXT DEFAULT ''` | `TEXT` |
-  | `ai_providers` | `tts_voice` | `VARCHAR(64) DEFAULT ''` | `VARCHAR(64) DEFAULT ''` |
-  | `ai_providers` | `is_default` | `BOOLEAN DEFAULT 0` | `TINYINT(1) DEFAULT 0` |
+  | `ai_providers` | `api_style` | `VARCHAR(32) DEFAULT ''` | `VARCHAR(32) DEFAULT ''` |
+  | `ai_providers` | `record_type` | `VARCHAR(16) DEFAULT 'config'` | `VARCHAR(16) DEFAULT 'config'` |
+  | `ai_providers` | `traits` / `guardrails` | `TEXT DEFAULT '{}'` | `JSON`（MySQL 的 JSON 不允许带 DEFAULT） |
+  | `avatars` | `record_type` | `VARCHAR(16) DEFAULT 'preset'` | `VARCHAR(16) DEFAULT 'preset'` |
+  | `agent_persona_profiles` | `agent_key` | `INTEGER DEFAULT 0` | `INT NOT NULL DEFAULT 0` |
+
+  > ⚠️ **`api_style` 这条是真实踩过的坑**：它在 `models.py` 里早就带
+  > `server_default`，但一直没登记进 `NEW_COLUMNS` —— 比它更老的老库升级上来后
+  > 第一次 `SELECT ai_providers` 就抛 `no such column: api_style`，服务直接起不来。
+  > 同一批补登记的还有 `supports_stream` / `timeout_sec` / `max_retries` /
+  > `context_window`。完整清单请直接看 `schema_patch.NEW_COLUMNS`，不要照抄本表。
 
   **以后每新增一个模型字段，都要同步往 `schema_patch.NEW_COLUMNS` 里登记一行**
-  （SQLite 与 MySQL 两种 DDL 都要写），否则老库升级上来会 `no such column` —— 这个坑踩过一次就够了。
+  （SQLite 与 MySQL 两种 DDL 都要写，且**必须带 `server_default`** ——
+  不带默认值时老行读出 NULL，第一次 SELECT 就会把 Pydantic 序列化炸掉），
+  否则老库升级上来会 `no such column` —— 这个坑踩过一次就够了。
   只补列、不改类型、不删列、不建索引；需要完整迁移能力时再考虑引入 Alembic。

@@ -1,5 +1,19 @@
 # 手机端（含小程序）开发说明
 
+> ⚠️ **APP 不是必需路径（2026-10-16 用户拍板）**
+> 本项目的服务端已提供完整的**网页用户端** `/user`（`server/app/static/user.html`），
+> **设备绑定与付费开通在网页上全部可以完成，不需要 APP**。
+> 关键事实：后端端点早就存在且只挂 `get_current_user`
+> （如 `POST /api/devices/bind`），缺的只是网页端的调用。
+>
+> 此外，**WiFi 配网也不需要 APP**：固件原生支持浏览器配网（ESP32 自开热点
+> `XiaoNuan-XXXX`，屏显热点名与 `http://192.168.4.1`，DNS 强制门户拦截），
+> 页面在 `firmware/xiaozhi/managed_components/78__esp-wifi-connect/assets/wifi_configuration.html`。
+> APP 只是这层浏览器配网的另一层封装。
+>
+> 所以本文档描述的是**可选增强渠道**（子女想要更顺手时的选择），
+> 不是产品的必要组成部分。管理后台另有 `/`（按 `is_admin` 过滤）。
+
 ## 1. 来源与二次开发策略
 
 手机端直接基于小智官方的 **`xiaozhi-esp32-server / main/manager-mobile`** 二次开发：
@@ -78,3 +92,16 @@ pnpm build:app            # App 资源包，再用 HBuilderX 云打包 / 离线�
 - 设备每 5 分钟 `POST /api/device/sync` 拉配置，形象切换最迟 5 分钟内生效
 - 提醒由设备本地 RTC 触发，联网后回传 `/api/device/events`，APP 看到的就是对账结果
 - 交互事件由设备 `POST /api/device/interactions` 上报，统计页按天聚合
+- **OTA 只给已绑定设备签发 token**；未绑定只返激活码。
+  固件 `CONFIG_OTA_URL` 默认已指向自己的 `/api/voice/ota`
+  （真源在 `Kconfig.projbuild`），**不依赖任何第三方服务器**。
+
+## 7. 音频契约（写流式播放代码前必读）
+
+- 下行音频是 **24kHz / mono / S16LE裸 PCM**，不是 wav/mp3
+  （`TTS_RESPONSE_FORMAT="pcm"`、`TTS_SAMPLE_RATE=24000`）
+- 固件按服务端声明的采样率**逐帧**做 Opus 编码
+- ⚠️ 服务端下行时序 `stt → tts start → sentence_start×N → tts stop` **不能改**——
+  设备靠它回落 idle 状态
+- 连续多次快速合成可能被上游限流（Edge TTS 实测第 3 次会超时），
+  客户端重试要有退避，不要立即连打

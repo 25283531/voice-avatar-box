@@ -1,7 +1,11 @@
 # 老人陪伴提醒助手 · 业务后端
 
 Docker 一键部署的业务后端，负责**设备绑定、提醒规则与回执、形象与提示词、AI 供应商配置、交互统计**。
-语音 / AI 链路（ASR / LLM / TTS / OTA）复用 [xiaozhi-esp32-server](https://github.com/xinnan-tech/xiaozhi-esp32-server)，不重复造轮子。
+语音 / AI 链路（ASR / LLM / TTS / OTA）**自研**，实现在 `app/voice/`，对外兼容 xiaozhi 公开协议。
+
+> **不依赖任何第三方服务器。** 早期版本曾用 `profiles: xiaozhi` 复用
+> xiaozhi-esp32-server 的官方容器，把角色、音色、记忆、大模型调用都放在第三方进程里；
+> 现已整体自研，该 profile 与其容器、端口**全部移除**，不要试图启动它。
 
 ## 1. 快速开始
 
@@ -13,7 +17,20 @@ cp .env.example .env          # 可选；至少改 ELDER_JWT_SECRET
 docker compose up -d          # 只起业务后端（内置 SQLite）
 ```
 
-打开 <http://localhost:8064> 进入管理后台，默认账号 `admin` / `admin123`（**登录后立即改密码**）。
+打开 <http://localhost:8064> 进入管理后台（用户端在 `/user`）。
+
+⚠️ **默认 `admin/admin123` 已移除**（commit `bb5ca98`）。首次启动必须显式提供种子口令：
+
+```bash
+# .env 里加一行，值换成自己的
+ELDER_SEED_ADMIN_PASSWORD=<你的强口令>
+```
+
+不提供则种子口令**随机化**，你也登不进去。
+⚠️ **已在跑的生产库不受种子改动影响**，存量口令需另行处置：
+登录后走 `/api/auth/password` 改密，或设`ELDER_RESET_ADMIN_PASSWORD` 重启一次
+（日志出现 `ELDER-ADMIN-PASSWORD-ROTATED` 即成功）**并立刻删掉该变量**。
+
 容器内监听 8080，对外只发布 8064（`ELDER_HTTP_PORT` 可改）。
 
 数据落在命名卷 `elder-data` 的 `/data/elder.db`。`docker compose down` 不会删卷，
@@ -25,15 +42,23 @@ docker compose up -d          # 只起业务后端（内置 SQLite）
 docker compose -f docker-compose.yml -f docker-compose.mysql.yml up -d
 ```
 
-连带语音链路一起起（可选，需联网拉官方镜像）：
+可选：叠加本地语音服务（FunASR ASR + Silero VAD，**纯 CPU，不需要显卡**）。
+
+这是一个**纯叠加文件**，本身不含 `profiles`——加载即启动其中全部服务：
 
 ```bash
-docker compose --profile xiaozhi up -d
-#  8000  小智 WebSocket 语音通道
-#  8002  小智智控台
-#  8003  OTA / 视觉分析
-#  8064  本服务（业务面 + 管理后台，容器内 8080）
+cd server
+docker compose -f docker-compose.yml -f docker-compose.local.yml up -d
+#  8064  本服务（业务面 + 管理后台 + 自研语音链路，容器内 8080）
+# 10095  本地 ASR（仅 127.0.0.1）
+#  8081  本地 VAD（容器内 8080，仅 127.0.0.1）
 ```
+
+⚠️ 两个端口**只绑 `127.0.0.1`**（服务本身无鉴权，暴露到公网等于把麦克风内容敞开）。
+主服务在同一 compose 网络内走 `http://local-asr:10095` 访问，不经宿主机端口。
+
+⚠️ **刻意不提供本地中文 TTS**：生产是 iStoreOS 软路由、**无独显**，
+CosyVoice 2 这类模型需要 8GB 显存起步，跑不动。这是硬件约束下的裁剪，不是遗漏。
 
 > 完整的部署文档（接入 MySQL 的完整步骤、SQLite→MySQL 迁移、Nginx 反代与 HTTPS、
 > 环境变量对照表、排障、备份恢复）见 **[../docs/DEPLOY.md](../docs/DEPLOY.md)**。
@@ -67,8 +92,17 @@ python tools/smoke_quota.py 8106 & \
 wait
 ```
 
-端口表的**唯一真源**是 `tools/smoke_ports.py`；端口可用位置参数或 `--port N`
-覆盖（CI 就是这么用的）。查看当前端口表与占用情况：
+⚠️ **本地跑冒烟必须显式带种子口令**：
+
+```bash
+export ELDER_SEED_ADMIN_PASSWORD=admin123
+```
+
+因为 `admin/admin123` 硬编码已移除（见第 1 节），不提供时种子口令会随机化，
+依赖管理员登录的脚本就会红。**这是预期行为，不是回归。**
+
+完整脚本清单见 `tools/smoke_*.py`，端口表的**唯一真源**是 `tools/smoke_ports.py`；
+端口可用位置参数或 `--port N` 覆盖（CI 就是这么用的）。查看当前端口表与占用情况：
 
 ```bash
 python tools/smoke_ports.py --check
@@ -78,7 +112,9 @@ python tools/smoke_ports.py --check
 
 | 能力 | 归属 |
 | --- | --- |
-| WebSocket 语音对话、ASR/LLM/TTS 编排、OTA | xiaozhi-esp32-server（官方镜像，不改） |
+| WebSocket 语音对话、ASR/LLM/TTS 编排、OTA | **本服务自研**（`app/voice/`） |
+| 提醒工具调用（增删查改提醒） | 本服务服务端 function calling（`app/voice/tools.py`） |
+| Opus 编解码 | ctypes 直连系统 libopus（零新增 Python 依赖） |
 | 设备注册与激活码绑定 | 本服务 |
 | 提醒规则编排、排期实例、回执对账 | 本服务 |
 | 形象 / 系统提示词 / 音色 / 情绪灯效 | 本服务 |
@@ -86,6 +122,7 @@ python tools/smoke_ports.py --check
 | 交互次数统计 | 本服务 |
 
 设备通过 `POST /api/device/sync` 一次拉全：服务器时间、提醒规则与排期、当前形象、AI 供应商、WS/OTA 地址。
+OTA 只给**已绑定设备**签发 token；未绑定只返激活码。
 
 ## 4. 关键设计
 
@@ -125,7 +162,11 @@ python tools/smoke_ports.py --check
 | POST | `/api/avatars/{a}/apply/{d}` | 形象应用到设备 |
 | GET/POST/PATCH/DELETE | `/api/providers` | AI 平台接入配置 |
 | GET | `/api/providers/safe` | 脱敏列表（不含密钥） |
+| GET | `/api/providers/catalog` | 音色目录 + 三家 TTS 厂商预置（Edge / 火山 / 阿里百炼） |
+| GET | `/api/providers/readiness` | 服务就绪度（哪些已配、哪些缺、缺了会怎样） |
+| POST | `/api/providers/test-voice` | **真打一次** TTS 合成，返回音频字节与时长 |
 | GET | `/api/providers/export/xiaozhi` | 导出为小智 config 片段 |
+| GET | `/api/usage/summary` `/api/usage/rows` | token 用量（用户看自己设备 / 管理端看全量） |
 | GET | `/api/stats/overview` | 交互统计概览 |
 | POST | `/api/device/sync` | 设备心跳，拉全量配置 |
 | POST | `/api/device/events` | 提醒回执上报 |
@@ -141,12 +182,22 @@ python tools/smoke_ports.py --check
 | `ELDER_DATA_DIR` | `/data` | 内置 SQLite 的持久化目录（容器里是命名卷） |
 | `ELDER_HTTP_PORT` | 8064 | 宿主机对外端口（容器内固定 8080） |
 | `ELDER_JWT_SECRET` | 弱默认值 | **生产必须改** |
+| `ELDER_SEED_ADMIN_PASSWORD` | 无 | **首次启动必填**，不填则种子口令随机化 |
+| `ELDER_DEPLOY_MODE` | `auto` | `auto` / `direct` / `tunnel`。**用 Cloudflare Tunnel 必须设 `tunnel`**，否则缺对外地址不会被发现 |
+| `ELDER_PUBLIC_BASE_URL` | 空 | 对外地址（推荐）。**任何模式下都校验 scheme** |
+| `ELDER_VOICE_PUBLIC_BASE` | 空 | 旧变量，向后兼容。auto/direct 下不校验 scheme，**tunnel 下强制 https** |
+| `ELDER_TRUSTED_PROXY_IPS` | 空 | 可信反代 IP。⚠️ **绝不要用 `--forwarded-allow-ips=*`**，会取可伪造的 XFF 最左段 |
+| `ELDER_LOGIN_RATE_LIMIT` | 1 | 登录限速开关（`0` 关闭）。只计失败；口令正确直接发证不看配额 |
+| `ELDER_LOGIN_RATE_LIMIT_MAX_KEYS` | 10000 | 限速器键容量，超出按 LRU 淘汰 |
 | `ELDER_CORS` | `*` | 跨域来源，逗号分隔 |
 | `ELDER_TZ` | `Asia/Shanghai` | 业务时区，影响提醒时间计算 |
 | `ELDER_DB_WAIT_SEC` | 180 | 启动等待数据库秒数（仅 MySQL 生效） |
-| `ELDER_VOICE_PUBLIC_BASE` | 留空自动推导 | 语音链路对外地址。**默认不用配**——自研语音链路与 API 同源同端口，服务端按请求 Host 自动推导。仅在反代未透传 Host 时显式指定，填 `https://voice.2508866.xyz`（会自动换成 `wss://`）|
 | `ELDER_ACT_TTL_MIN` | 10 | 激活码有效分钟数 |
 | `ELDER_SCHEDULE_AHEAD_HOURS` | 36 | 预排期提前量 |
+| `ELDER_VOICE_SILENCE_MS` | 2000 | 老人说话静音判定阈值。**默认值已是改善**，一般不用调 |
+
+完整清单（约 39 个变量，含全部 `ELDER_VOICE_*` 语音参数）见
+[../docs/DEPLOY.md](../docs/DEPLOY.md) 第 5 节。
 
 完整清单与接入 MySQL 的步骤见 [../docs/DEPLOY.md](../docs/DEPLOY.md)。
 
