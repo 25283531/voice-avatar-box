@@ -429,8 +429,23 @@ def test_voice(payload: ModelTestIn, db: Session = Depends(get_db),
         return {"ok": False, "usage": usage,
                 "message": "该用途没有语音侧测试，请在下方选择 ASR 或 TTS"}
     except VoiceConfigMissingError as exc:
+        # ⚠️ error_code 必须保持 "no_config" 不变 —— 它是机器可读的契约
+        #（tools/smoke_models.py 等冒烟按它断言，客户端也按它分流）。
+        # 这里只把**人读**的 message 补全。
+        #
+        # 为什么必须补：管理员的典型路径是「后台新增一条 TTS 配置 -> 填音色 ->
+        # 点真实测试」，此时表单内容**还没进库**，而本端点一律
+        # ``resolve_row(db, usage)`` 从数据库读配置 —— 于是回 no_config。
+        # 管理员看到「未配置可用的 tts 能力」会得出完全错误的结论：
+        # 「Edge TTS 不能用 / 得去别处配」，而真相只是「你还没点保存」。
+        # 把这层歧义在文案里直接说破，比让管理员自己反推便宜得多。
         return {"ok": False, "usage": usage, "error_code": "no_config",
-                "message": str(exc)}
+                "message": (
+                    f"{exc}。"
+                    "这通常是因为配置还没保存 —— 本次测试读的是**数据库里已保存**的"
+                    "配置，页面上填了但没点「保存」的内容在这里读不到。"
+                    "请先点「保存」再点「真实测试」。"
+                )}
     except VoiceUpstreamError as exc:
         return {"ok": False, "usage": usage, "error_code": "upstream_error",
                 "message": str(exc)}

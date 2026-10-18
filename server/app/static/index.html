@@ -1020,11 +1020,20 @@ createApp({
       curDeviceId: null, stat: null,
       // ---- token 用量（全平台，仅管理员）----
       usageSummary: null, usageRows: [], usageFilter: '',
-      devForm: { device_id:'', name:'我的陪伴助手' },
-      codeBox: null,
-      rBox: null, rForm: null, timesText:'', weekText:'', monthText:'',
+      // 设备页的只读态：搜索框 + 每台设备的 token 用量。
+      // 用量按设备逐台取（见 loadDeviceTokens 的注释），故与 devices 分开存。
+      devFilter: '', devBusy: false, devUsageBusy: false, devTokensById: {},
+      ownerNames: {},
+      // 提醒页筛选（管理员跨用户排查用）。remDeviceFilter 传后端过滤，
+      // remUserFilter 是前端过滤 —— 后端 reminders 列表不返回 creator 的用户名，
+      // 只能在已知 owner 里筛，见 ownerName 的注释。
+      remDeviceFilter: '', remUserFilter: '', remBusy: false,
       aBox: null, aForm: null, clipsText:'', lightsText:'',
       pBox: null, pForm: null, paramsText:'',
+      // 打开 AI 配置弹窗那一刻的表单快照（editProvider 赋值）。
+      // 用途：testVoice 要能识别「表单有未保存改动」，因为测试读的是数据库里
+      // 已保存的配置，表单里没保存的内容服务端一概看不见。
+      pFormSnapshot: null,
       testUsage: 'chat', testResult: null,
       // ---- 人格预设运营后台 ----
       presets: [], presetMeta: {trait_specs:[], soft_guardrails:[],
@@ -1169,6 +1178,29 @@ createApp({
     // 不能复用 /api/providers/test —— 那个只覆盖 chat/embed/rerank，
     // 语音点过去会得到「请先创建角色」，管理员会以为是自己建错了角色。
     async testVoice(){
+      // ---- 前置提醒：测试读的是**数据库里已保存**的配置 ----
+      // 这个端点一律 resolve_row(db, usage)从库里取配置，表单里没保存的内容
+      // 它一概看不见。管理员的典型误判是「新增一条配置 -> 填音色 -> 点真实测试
+      // -> 看到 no_config -> 认定 Edge TTS 不能用」，而真相只是「你没点保存」。
+      // 所以在白跑一趟之前先说破。注意是**提示后照旧调用**，不是静默中止 ——
+      // 管理员可能只是想验证「库里那条已保存的配置还通不通」。
+      if (this.pForm){
+        const snap = this.pFormSnapshot;
+        const isNew = !this.pForm.id;
+        // 深比较：JSON.stringify 逐字比（不引 lodash；本仓已有同款写法）。
+        // 快照缺失（理论上不会，editProvider 一定会赋值）时保守当成「有改动」。
+        const dirty = !snap
+          || JSON.stringify(this.pForm) !== JSON.stringify(snap.form)
+          || this.paramsText !== snap.paramsText;
+        if (isNew || dirty){
+          alert('本次测试会使用**已保存**的配置。\n\n'
+            + (isNew
+                ? '当前是一条尚未保存的新增配置，数据库里还没有它 —— 服务端读不到。'
+                : '当前表单有未保存改动，服务端读的仍是上次保存时的内容。')
+            + '\n\n建议先点「保存」再点「真实测试」。'
+            + '\n（现在仍会继续发起测试，用的是已保存的那份配置。）');
+        }
+      }
       this.testResult = null;
       const usage = (this.pForm && this.pForm.kind==='asr') ? 'asr' : 'tts';
       const d = await this.api('/api/providers/test-voice',
@@ -1424,6 +1456,15 @@ createApp({
         else { this.pForm.params_text_voice = '__custom__'; this.pForm.tts_voice_custom = savedVoice; }
       }
       this.paramsText = JSON.stringify(this.pForm.params||{}, null, 2);
+      // 打开弹窗那一刻的深拷贝快照，供 testVoice 判断「表单有没有未保存改动」。
+      // 必须放在 params_text_voice / tts_voice_custom 归一化**之后**取，否则
+      // 快照里存的是归一化前的形态，点测试时立刻被误判成「有改动」。
+      // 连 paramsText 一起存：它才是 params 的编辑真相 —— 只比 pForm.params
+      // 的话，管理员在 JSON 框里改了音色而没点任何地方，是检测不出来的改动。
+      this.pFormSnapshot = {
+        form: JSON.parse(JSON.stringify(this.pForm)),
+        paramsText: this.paramsText,
+      };
       this.testResult = null;
       this.pBox = true;
     },
