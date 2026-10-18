@@ -55,6 +55,10 @@ RUN mkdir -p /data
 # 而 Opus 是 C 扩展，pip 生态里没有"纯数据"替代，可选只有自带 vendor 的
 # wheel（把同一份 C 代码装第二遍）。且 Debian slim 里 apt 的 libopus0 是
 # 官方维护包，能直接吃到安全更新。装完立刻清 apt 列表，别让层变大。
+#
+# ⚠️ edge-tts / av（requirements.txt 里，Edge TTS 内置桥所需）**都是纯 wheel**，
+# 自带 ffmpeg，不需要 apt 装 ffmpeg —— 别看着"要解 mp3"就顺手加
+# ffmpeg，那会让镜像白白大几百 MB。
 RUN apt-get update \
     && apt-get install -y --no-install-recommends libopus0 \
     && rm -rf /var/lib/apt/lists/*

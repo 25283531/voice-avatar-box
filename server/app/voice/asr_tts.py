@@ -245,11 +245,69 @@ def asr(db: Any, pcm_16k: bytes) -> str:
 
 
 # ---------------------------------------------------------------- TTS
+def _tts_dispatch_style(row: Any) -> str:
+    """判断这一行该走哪条 TTS 实现。
+
+    判据优先级（顺序不能换）
+    ------------------------
+    1. ``provider`` 命中预置厂商 → 用厂商自带的 api_style。
+       ⚠️ **这条必须排在 api_style 之前**：管理后台选「火山引擎」时会把
+       ``api_style`` 预填成 ``openai_compatible``（因为火山列表里第一项是它，
+       或是历史默认值残留），若让 api_style 优先，火山行会被静默路由到
+       OpenAI 路径 —— 表现为「配好了火山，却报 endpoint 格式不对」。
+       这正是「选了预置还要手改字段」会引发的坑，判据要防住它。
+    2. ``provider == "edge"`` → 内置 Edge 桥（Edge 无 endpoint，
+       不能靠 api_style 判）。
+    3. 显式填了 ``api_style`` → 按它走（手填厂商/自建网关的正规入口）。
+    4. 都认不出 → OpenAI 兼容（历史行为：绝大多数自建服务是兼容的）。
+
+    ⚠️ 第 4 条回落到 OpenAI 兼容而不是报错，是为了**不破坏存量配置**：
+    本项目历史上所有 TTS 行都走 OpenAI 兼容，改成「认不出就报错」会让全部
+    旧部署在升级瞬间失效。
+    """
+    from .catalog import vendor_entry
+
+    provider = (getattr(row, "provider", "") or "").strip().lower()
+    preset = vendor_entry(provider)
+    if preset is not None:
+        return str(preset["api_style"])
+
+    if provider == "edge":
+        return "edge"
+    style = (getattr(row, "api_style", "") or "").strip()
+    if style in ("edge", "volcengine"):
+        return style
+    return "openai_compatible"
+
+
+def _volc_keys(row: Any) -> tuple[str, str]:
+    """从密钥字段里拆出火山要的 ``(ak, sk)``。
+
+    接受两种写法（都要支持，否则管理员会以为自己填错了）：
+      * ``AK:SK``（推荐，冒号分隔）
+      * 只有一段 → 当作 AK，SK 留空（此时火山会 403，错误文案会指明）
+
+    用中文冒号不行 —— 从网页上复制的文案里经常混进全角冒号，
+    而用户**看不出**自己复制了什么，必须在这里兜住。
+    """
+    raw = (getattr(row, "api_key", "") or "").strip()
+    for sep in (":", "："):     # 全角冒号一并处理
+        if sep in raw:
+            ak, _, sk = raw.partition(sep)
+            return ak.strip(), sk.strip()
+    return raw, ""
+
+
 def tts(db: Any, sentence: str, *, voice: str = "", speed: float = 1.0) -> bytes:
-    """一句话 -> 24kHz/mono/S16LE 裸 PCM。
+    """一句话 -> 24kHz/mono/S16LE 裸 PCM（**统一分发入口**）。
+
+    按当前配置行的 ``provider``/``api_style`` 自动切换到对应实现：
+      - ``edge``          → :mod:`app.voice.tts_edge`（免密钥，合成+解码）
+      - ``volcengine``    → :mod:`app.voice.tts_volc`（私有协议 + 签名）
+      - 其他/未填          → OpenAI 兼容 ``/audio/speech``（阿里云百炼等）
 
     :param voice: 音色。空串表示**不带 voice 字段**，让厂商用默认
-        （见 _pick_voice 的回落链）。
+        （见 pick_voice 的回落链）。
     :raises VoiceConfigMissingError / VoiceUpstreamError
     """
     from ..llm_gateway import resolve_row
@@ -257,6 +315,41 @@ def tts(db: Any, sentence: str, *, voice: str = "", speed: float = 1.0) -> bytes
     row = resolve_row(db, "tts")
     if row is None:
         raise VoiceConfigMissingError("tts")
+
+    style = _tts_dispatch_style(row)
+    if style == "edge":
+        from . import tts_edge
+        try:
+            return tts_edge.synth_pcm(sentence, voice)
+        except tts_edge.MissingEdgeDeps as exc:
+            raise VoiceConfigMissingError(str(exc)) from None
+        except TimeoutError as exc:
+            raise VoiceUpstreamError(
+                f"Edge TTS 超时未返回（微软可能限流，本机连续调用会触发）：{exc}") from None
+        except Exception as exc:  # noqa: BLE001
+            raise VoiceUpstreamError(f"Edge TTS 调用失败：{exc}") from None
+
+    if style == "volcengine":
+        from . import tts_volc
+        ak, sk = _volc_keys(row)
+        endpoint = _row_endpoint(row)
+        try:
+            return tts_volc.tts(sentence, voice, access_key=ak, secret_key=sk,
+                                 endpoint=endpoint,
+                                 speed_ratio=speed,
+                                 timeout=_row_timeout(row, TTS_TIMEOUT_SEC))
+        except Exception as exc:  # noqa: BLE001
+            raise VoiceUpstreamError(f"火山引擎 TTS 失败：{exc}") from None
+
+    return _tts_openai(row, sentence, voice=voice, speed=speed)
+
+
+def _tts_openai(row: Any, sentence: str, *, voice: str, speed: float) -> bytes:
+    """OpenAI 兼容 ``/audio/speech`` 那一路（阿里云百炼、各家网关、自建服务）。
+
+    抽成独立函数是为了让 :func:`tts` 只做「分发」，各家协议差异各自成文件。
+    改动前这里是 ``tts`` 本体；现在 ``tts`` 是分发入口，**调用方不用改**。
+    """
     timeout = _row_timeout(row, TTS_TIMEOUT_SEC)
     model = (getattr(row, "model", "") or "").strip() or "tts-1"
 
@@ -339,6 +432,17 @@ def tts_stream(db: Any, sentence: str, *, voice: str = "",
     row = resolve_row(db, "tts")
     if row is None:
         raise VoiceConfigMissingError("tts")
+
+    # ---- 与 tts() 同样的分发（判据见该函数注释）----
+    # ⚠️ 必须在这里也分一次，否则 Edge/火山 配置下行时会走 OpenAI 路径：
+    # Edge 的 endpoint 是空串 → 拼出 "/audio/speech" → 连到本机自己 → 失败。
+    # 症状是「非流式能出声、流式不出声」，属于最难自查的一类不一致。
+    _style = _tts_dispatch_style(row)
+    if _style in ("edge", "volcengine"):
+        for chunk in tts(db, sentence, voice=voice, speed=speed):
+            yield chunk
+        return
+
     timeout = _row_timeout(row, TTS_TIMEOUT_SEC)
     model = (getattr(row, "model", "") or "").strip() or "tts-1"
 

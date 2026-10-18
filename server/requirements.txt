@@ -11,3 +11,16 @@ tzdata>=2024.1
 # 版本锁 <14：13.x 与 14.x 的同步 API（connect/asyncio.run）行为有差异，
 # 而本仓库的冒烟脚本全部用同步写法，锁在小版本区间内最稳。
 websockets>=12,<14
+
+# ---------------------------------------------------------------- Edge TTS 内置桥
+# 这两个是**可选**依赖：只服务「Edge TTS」这一条 TTS 实现
+# （server/app/voice/tts_edge.py）。缺失时服务照常启动，Edge 选项在后台
+# 显示为不可用并给出安装命令 —— 由 edge_available() 判定，不会静默失败。
+#
+# edge-tts：微软 Edge 语音的 WebSocket 客户端。**没有它就没有零成本免密钥 TTS**。
+#   它拉入 aiohttp（这是选择它而非裸实现的代价，约 +10MB）。
+# av：mp3 解码。Edge 只吐 mp3，而本项目客户端只吃 24kHz 裸 PCM，
+#   两者之间的转换必须有人做 —— 否则选 Edge 音色会「配置正常但一点声音没有」。
+#   PyAV 自带 ffmpeg，不需要系统装 ffmpeg。
+edge-tts>=7.0,<8.0
+av>=13.0

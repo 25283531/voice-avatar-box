@@ -19,6 +19,8 @@ llm_light）；usage 是**调用方的意图**（"我要聊天"、"我要抽意�
 """
 from __future__ import annotations
 
+import time
+
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -185,7 +187,20 @@ def provider_catalog(user: models.User = Depends(get_current_user)):
         "api_styles": [{"value": v, "label": t} for v, t in API_STYLES.items()],
     }
     payload.update(voice_catalog.catalog_payload())
+    payload.update(voice_catalog.vendors_payload())
+    # 让前端知道 Edge 这条路在本部署里**现在到底能不能走**。
+    # 缺依赖时返回 false 而不是静默：否则管理员配好 Edge、页面一切正常，
+    # 直到老人没声音才发现少装了两个包。
+    payload["edge_available"] = _edge_available()
     return payload
+
+
+def _edge_available() -> bool:
+    try:
+        from ..voice.tts_edge import edge_available
+    except Exception:  # noqa: BLE001  模块本身出问题也按不可用处理
+        return False
+    return edge_available()
 
 
 @router.get("/readiness")
@@ -357,6 +372,71 @@ def test_provider(payload: ModelTestIn, db: Session = Depends(get_db),
             ok=False, usage=usage, error_code=exc.code, message=exc.message,
             attempts=exc.attempts,
         )
+
+
+@router.post("/test-voice")
+def test_voice(payload: ModelTestIn, db: Session = Depends(get_db),
+               admin: models.User = Depends(get_current_admin)):
+    """**真打一次**语音合成/识别，验证整条链路（不是只查库）。
+
+    为什么必须单独做一个端点，而不是复用 ``/api/providers/test``
+    --------------------------------------------------------
+    那个端点只覆盖 embed / rerank / chat 三类。asr / tts 会掉到最后的
+    兜底分支，被当成「请先创建角色」返回 —— 管理员看到这句会以为是自己建错了
+    角色，实际上他只是点了「测试连接」。
+
+    更糟的是**它不会真的调用**：配置错了、密钥错了、火山签名错了，
+    全都是「测试通过」，直到老人没声音才发现。火山的签名/AK-SK 尤其如此
+    （本仓已实现完整适配，见 app/voice/tts_volc.py）。
+
+    所以语音侧必须**打真实请求**。它会消耗厂商额度（一次合成约几十字），
+    这是应该的 —— 不消耗任何额度的「测试通过」没有任何证明力。
+    """
+    from ..voice import asr_tts
+    from ..voice.asr_tts import VoiceConfigMissingError, VoiceUpstreamError
+
+    usage = _require_usage(payload.usage)
+    text = (payload.text or "老人，今天该吃药了").strip()
+    started = time.monotonic()
+    try:
+        if usage == USAGE_TTS:
+            pcm = asr_tts.tts(db, text)
+            return {
+                "ok": True, "usage": usage,
+                "elapsed_ms": int((time.monotonic() - started) * 1000),
+                # 回长度而不是回音频：音频没必要给前端，字节数足够证明
+                # 「真的合成出了音频」，且能被老人语音时长换算出来。
+                "audio_bytes": len(pcm),
+                "duration_ms": int(len(pcm) / 2 / 24000 * 1000),
+                "detail": "已真实合成并解码为 24kHz 裸 PCM",
+            }
+        if usage == USAGE_ASR:
+            # ⚠️ 这里**不**真调 ASR：要真调必须先有真实录音，
+            # 而冒烟/测试环境里没有（伪造音频只会得到一个识别不出的空串，
+            # 让人误以为 ASR 配好了）。所以 ASR 只校验配置链路是否成立，
+            # 并明确告诉管理员这一点 —— 宁可说「没验」，不可假装「验过」。
+            from ..llm_gateway import resolve_row
+            row = resolve_row(db, USAGE_ASR)
+            if row is None:
+                raise VoiceConfigMissingError(USAGE_ASR)
+            return {
+                "ok": True, "usage": usage,
+                "elapsed_ms": int((time.monotonic() - started) * 1000),
+                "detail": "已找到可用的 ASR 配置（未发起真实识别："
+                          "需要真实录音，验证请直接对设备说一句话）",
+                "endpoint": (getattr(row, "endpoint", "") or "")[:60],
+            }
+        return {"ok": False, "usage": usage,
+                "message": "该用途没有语音侧测试，请在下方选择 ASR 或 TTS"}
+    except VoiceConfigMissingError as exc:
+        return {"ok": False, "usage": usage, "error_code": "no_config",
+                "message": str(exc)}
+    except VoiceUpstreamError as exc:
+        return {"ok": False, "usage": usage, "error_code": "upstream_error",
+                "message": str(exc)}
+    except Exception as exc:  # noqa: BLE001  适配层抛的原生异常也要能显示
+        return {"ok": False, "usage": usage, "error_code": "error",
+                "message": f"{type(exc).__name__}: {exc}"}
 
 
 @router.patch("/{provider_pk}", response_model=ProviderOut)

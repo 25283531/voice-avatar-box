@@ -710,15 +710,67 @@
                 <option value="vision">视觉理解 Vision（预留）</option>
               </select></div>
             <div><label>平台</label>
-              <select v-model="pForm.provider" style="width:100%">
-                <option value="aliyun">阿里云百炼</option><option value="volcengine">火山引擎</option>
-                <option value="deepseek">DeepSeek</option><option value="zhipu">智谱</option>
-                <option value="openai">OpenAI 兼容</option><option value="ollama">Ollama（自部署）</option>
-                <option value="dify">Dify</option><option value="xinference">Xinference（自部署）</option>
+              <select v-model="pForm.provider" style="width:100%"
+                      @change="onProviderChange">
+                <!-- TTS 时厂商下拉来自服务端预置（三家协议不同，字段差异大） -->
+                <template v-if="pForm.kind==='tts'">
+                  <option v-for="v in ttsVendors" :key="v.value" :value="v.value">{{v.label}}</option>
+                  <option value="__other__">其他 / 自建服务（OpenAI 兼容）</option>
+                </template>
+                <template v-else>
+                  <option value="aliyun">阿里云百炼</option><option value="volcengine">火山引擎</option>
+                  <option value="deepseek">DeepSeek</option><option value="zhipu">智谱</option>
+                  <option value="openai">OpenAI 兼容</option><option value="ollama">Ollama（自部署）</option>
+                  <option value="dify">Dify</option><option value="xinference">Xinference（自部署）</option>
+                </template>
               </select></div>
+            <div v-if="pForm.kind==='tts' && vendorInfo" class="hint"
+                 style="grid-column:1/-1;border-color:#cfe0f7;background:#f4f8fd">
+              <div style="margin-bottom:4px"><b>{{vendorInfo.label}}</b></div>
+              <div style="font-size:13px;line-height:1.7">
+                <div><b>费用口径：</b>{{vendorInfo.free_tier}}</div>
+                <div v-if="vendorInfo.needs_key"><b>密钥怎么填：</b>{{vendorInfo.key_hint}}</div>
+                <div v-else><b>密钥：</b>不需要填，直接保存即可。</div>
+                <div v-if="vendorInfo.notes" style="color:#8a5a00;margin-top:4px">{{vendorInfo.notes}}</div>
+              </div>
+            </div>
+            <div v-if="pForm.kind==='tts' && !edgeAvailable" class="hint"
+                 style="grid-column:1/-1;border-color:#f3c7c7;background:#fdf3f3">
+              <b>本机缺少 Edge TTS 运行依赖。</b>
+              服务端需要 <code>edge-tts</code>（合成）与 <code>av</code>（mp3 解码）两个包。
+              执行 <code>pip install edge-tts av</code> 后重启服务即可；
+              或改选阿里云百炼 / 火山引擎（只需网络，无需这两个依赖）。
+            </div>
+            <div v-if="pForm.kind==='tts'">
+              <label>音色</label>
+              <select v-model="pForm.params_text_voice" style="width:100%">
+                <option value="">（不指定 · 走角色的音色回落链）</option>
+                <optgroup label="── 预置音色 ──">
+                  <option v-for="v in vendorVoices" :key="v.id" :value="v.id">
+                    {{v.name}} — {{v.scene}}
+                  </option>
+                </optgroup>
+                <option value="__custom__">✎ 其他（自建服务，手填音色名）</option>
+              </select>
+              <template v-if="pForm.params_text_voice==='__custom__'">
+                <input v-model="pForm.tts_voice_custom" style="width:100%;margin-top:6px"
+                       placeholder="填该服务认识的音色名" />
+              </template>
+            </div>
             <div><label>模型</label><input v-model="pForm.model" style="width:100%" /></div>
-            <div><label>接口地址</label><input v-model="pForm.endpoint" style="width:100%" /></div>
-            <div><label>API Key</label><input v-model="pForm.api_key" type="password" style="width:100%" /></div>
+            <div v-if="showEndpoint"><label>接口地址</label>
+              <input v-model="pForm.endpoint" style="width:100%" />
+              <div v-if="pForm.kind==='tts'" style="font-size:12px;color:#888;margin-top:4px">
+                填到 <code>/v1</code> 这一级（如 <code>https://…/compatible-mode/v1</code>），
+                不要填官网首页。
+              </div>
+            </div>
+            <div v-if="showApiKey"><label>{{apiKeyLabel}}</label>
+              <input v-model="pForm.api_key" type="password" style="width:100%" />
+              <div v-if="pForm.kind==='tts'" style="font-size:12px;color:#888;margin-top:4px">
+                {{vendorInfo ? vendorInfo.key_hint : '（OpenAI 兼容服务只填一段 key）'}}
+              </div>
+            </div>
             <div><label>优先级（越小越优先）</label><input v-model.number="pForm.priority" type="number" /></div>
             <div><label>启用</label>
               <select v-model="pForm.enabled" style="width:100%">
@@ -757,7 +809,16 @@
               <option value="embed">embed 向量化</option>
               <option value="rerank">rerank 重排</option>
             </select>
-            <button style="width:auto;padding:6px 14px" @click="testModel()">测试连接</button>
+            <button style="width:auto;padding:6px 14px" @click="testModel()"
+                    :disabled="pForm.kind==='tts' || pForm.kind==='asr'"
+                    :title="(pForm.kind==='tts'||pForm.kind==='asr') ? '语音请用下面的「真实测试」' : ''">测试连接（文本类）</button>
+            <!-- 语音必须**真打一次**：/api/providers/test 不覆盖 asr/tts，
+                 走它只会得到「请先创建角色」这种完全误导的文案 -->
+            <button v-if="pForm.kind==='tts' || pForm.kind==='asr'"
+                    style="width:auto;padding:6px 14px" class="primary"
+                    @click="testVoice()">
+              真实测试（{{pForm.kind==='tts'?'会真合成一句中文':'只校验配置链路'}}）
+            </button>
             <button style="width:auto;padding:6px 14px" @click="resolveUsage()">解析这条用途落到谁</button>
           </div>
           <div v-if="testResult" style="margin-top:8px;font-size:12px;line-height:1.6">
@@ -765,8 +826,10 @@
               {{ testResult.ok ? '调用成功' : '调用失败' }}
               <span v-if="testResult.error_code">（{{testResult.error_code}}）</span>
               <span v-if="testResult.model">· {{testResult.model}} · {{testResult.elapsed_ms}}ms</span>
+              <span v-if="testResult.audio_bytes">· 合成 {{testResult.audio_bytes}} 字节
+                ≈ {{(testResult.duration_ms/1000).toFixed(2)}} 秒语音</span>
             </div>
-            <pre style="white-space:pre-wrap;word-break:break-all;margin:4px 0 0">{{ testResult.ok ? (testResult.text || JSON.stringify(testResult.vectors || testResult.scores)) : testResult.message }}</pre>
+            <pre style="white-space:pre-wrap;word-break:break-all;margin:4px 0 0">{{ testResult.ok ? (testResult.text || testResult.detail || JSON.stringify(testResult.vectors || testResult.scores)) : testResult.message }}</pre>
             <div v-if="(testResult.attempts||[]).length" style="color:#666">
               尝试记录：{{ testResult.attempts.map(a=>a.name+'('+a.kind+'/'+(a.ok?'成功':a.error_code)+')').join(' → ') }}
             </div>
@@ -955,6 +1018,10 @@ createApp({
       // 出厂默认音色以服务端 app/voice/catalog.py 为单一真源，前端再抄一份必然
       // 出现「下拉框里有的音色，恢复默认后却是另一个」。
       voiceCatalog: {voices:[], allow_custom:true, custom_hint:'', custom_mismatch_hint:''},
+      // TTS 厂商预置（也来自 /api/providers/catalog）。
+      // ⚠️ 必须服务端下发：三家要填的字段差别太大（火山是 AK:SK 两段、
+      // Edge 完全不用填），硬编码在前端等于把「每家要什么」抄成第二份真源。
+      ttsVendors: [], voicesByVendor: {}, edgeAvailable: true,
       // 就绪度面板数据（GET /api/providers/readiness）
       readiness: null, readyBusy:false,
       pEditBox: false, pEdit: null, presetBusy:false,
@@ -1056,12 +1123,25 @@ createApp({
         const r = await this.api('/api/providers/catalog');
         if (r && r.voices) {
           this.voiceCatalog = Object.assign(this.voiceCatalog, r);
-          // 目录到达后要重新拆分：openPreset/editAvatar 可能在目录还空时
-          // 就把存量音色判成了「不在清单里」，落进自定义框。
+          this.ttsVendors = r.vendors || [];
+          this.voicesByVendor = r.voices_by_vendor || {};
+          this.edgeAvailable = r.edge_available !== false;
+          // 目录到达后要重新拆分：openPreset/editAvatar/openProvider 可能在
+          // 目录还空时就把存量音色判成了「不在清单里」，落进自定义框。
           if (this.pEdit) Object.assign(this.pEdit, this.splitVoice(this.pEdit.tts_voice));
           if (this.aForm) Object.assign(this.aForm, this.splitVoice(this.aForm.tts_voice));
         }
       }catch(e){ /* 目录缺失不致命：自定义输入仍然可用 */ }
+    },
+    // 语音侧的「测试连接」走独立端点：**真打一次**合成。
+    // 不能复用 /api/providers/test —— 那个只覆盖 chat/embed/rerank，
+    // 语音点过去会得到「请先创建角色」，管理员会以为是自己建错了角色。
+    async testVoice(){
+      this.testResult = null;
+      const usage = (this.pForm && this.pForm.kind==='asr') ? 'asr' : 'tts';
+      const d = await this.api('/api/providers/test-voice',
+        {method:'POST', body:JSON.stringify({usage, text:'老人，今天该吃药了'})});
+      if (d) this.testResult = d;
     },
     async loadReadiness(){
       this.readyBusy = true;
@@ -1221,7 +1301,49 @@ createApp({
     blankProvider(){
       return { name:'', kind:'llm_main', provider:'deepseek', endpoint:'', api_key:'',
         model:'', api_style:'', supports_stream:false, timeout_sec:30, max_retries:1,
-        context_window:0, params:{}, priority:10, enabled:true };
+        context_window:0, params:{}, priority:10, enabled:true,
+        params_text_voice:'', tts_voice_custom:'' };
+    },
+    // ---- TTS 厂商联动 ----
+    // 三个派生量都来自 pForm，所以用 computed 而不是 data —— data 里的副本
+    // 会在「改了厂商没同步」时静默出错，而这类错误表现为「音色是上一家的」。
+    vendorInfo(){
+      if (!this.pForm || this.pForm.kind!=='tts') return null;
+      return this.ttsVendors.find(v=>v.value===this.pForm.provider) || null;
+    },
+    vendorVoices(){
+      if (!this.pForm) return [];
+      const map = this.voicesByVendor || {};
+      return map[this.pForm.provider] || [];
+    },
+    // Edge 没有 endpoint、没有 key —— 显示这两个输入框只会让人瞎填
+    showEndpoint(){
+      if (!this.pForm || this.pForm.kind!=='tts') return true;
+      if (this.pForm.provider==='edge') return false;
+      if (this.pForm.provider==='__other__') return true;
+      return !!(this.vendorInfo && this.vendorInfo.endpoint);
+    },
+    showApiKey(){
+      if (!this.pForm || this.pForm.kind!=='tts') return true;
+      if (this.pForm.provider==='edge') return false;
+      if (this.pForm.provider==='__other__') return true;
+      return !!(this.vendorInfo && this.vendorInfo.needs_key);
+    },
+    apiKeyLabel(){
+      return (this.pForm && this.pForm.provider==='volcengine') ? 'API 密钥（AK:SK）' : 'API Key';
+    },
+    // 选厂商 → 自动填好该家要的字段。
+    // ⚠️ 只在「值还是空的时候」才填，不覆盖管理员已改过的内容 ——
+    //    否则每次切回上一个厂商，endpoint 就被冲掉，配置根本没法微调。
+    onProviderChange(){
+      const info = this.vendorInfo;
+      if (!info) return;                      // __other__ / 非 TTS：不干预
+      if (!this.pForm.endpoint) this.pForm.endpoint = info.endpoint;
+      if (!this.pForm.model)    this.pForm.model    = info.model;
+      if (info.api_style)       this.pForm.api_style = info.api_style;
+      // 换厂商后音色必然失效（火山只认 BV00x、百炼只认 Cherry）
+      this.pForm.params_text_voice = '';
+      this.pForm.tts_voice_custom = '';
     },
     // 「测试连接」与「解析用途」：调到新增的两个网关端点上
     async testModel(){
@@ -1240,6 +1362,15 @@ createApp({
     },
     editProvider(p){
       this.pForm = p ? JSON.parse(JSON.stringify(p)) : this.blankProvider();
+      if (!('params_text_voice' in this.pForm)) this.pForm.params_text_voice='';
+      if (!('tts_voice_custom' in this.pForm)) this.pForm.tts_voice_custom='';
+      // 音色存在 params.voice（服务端 pick_voice 的第三级回落），不是独立字段
+      const savedVoice = (this.pForm.params && this.pForm.params.voice) || '';
+      if (savedVoice){
+        const known = (this.voicesByVendor||{})[this.pForm.provider] || [];
+        if (known.some(x=>x.id===savedVoice)) this.pForm.params_text_voice = savedVoice;
+        else { this.pForm.params_text_voice = '__custom__'; this.pForm.tts_voice_custom = savedVoice; }
+      }
       this.paramsText = JSON.stringify(this.pForm.params||{}, null, 2);
       this.testResult = null;
       this.pBox = true;
@@ -1247,8 +1378,24 @@ createApp({
     async saveProvider(){
       try{ this.pForm.params = this.paramsText.trim() ? JSON.parse(this.paramsText) : {}; }
       catch(e){ this.err = 'JSON 格式错误：'+e.message; return; }
+      // 音色：把下拉/自定义收敛成 params.voice 这一个字段。
+      // ⚠️ 漏了会把字面量 '__custom__' 存进库 —— 那是个不存在的音色，
+      // 表现为「保存成功但声音变了」，属于最难自查的静默故障。
+      if (this.pForm.kind==='tts'){
+        let voice = '';
+        if (this.pForm.params_text_voice==='__custom__'){
+          voice = (this.pForm.tts_voice_custom||'').trim();
+          if (!voice){ this.err='音色选了「其他」但没填音色名。'; return; }
+        } else if (this.pForm.params_text_voice){
+          voice = this.pForm.params_text_voice;
+        }
+        if (voice) this.pForm.params.voice = voice;
+        else delete this.pForm.params.voice;
+      }
       const body = JSON.parse(JSON.stringify(this.pForm));
       delete body.id; delete body.created_at;
+      // 这两个是纯前端的临时字段，不入库
+      delete body.params_text_voice; delete body.tts_voice_custom;
       try{
         if (this.pForm.id) await this.api('/api/providers/'+this.pForm.id, {method:'PATCH', body:JSON.stringify(body)});
         else await this.api('/api/providers', {method:'POST', body:JSON.stringify(body)});

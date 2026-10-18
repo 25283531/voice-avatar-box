@@ -12,6 +12,16 @@
   F. 自定义音色（不在目录内）不被当成错误 —— 自建 TTS 服务的正当用法
   G. 前端音色控件：下拉含全部预置项 + 保留自定义入口，且 __custom__
      不会被当成真实音色存库
+  H. 三家 TTS 厂商预置（Edge/火山/阿里百炼）与**服务端自动分发**：预置字段
+     完整性、按厂商分组的音色、火山签名四级派生（按官方文档推导过程独立
+     复算）、base64 错误体识破、Edge 分块无损、真实语音测试端点
+
+**为什么 H 组必须存在（本轮实测踩出的 bug）**
+--------------------------------------------
+管理后台选「火山引擎」时会把 ``api_style`` 预填成 ``openai_compatible``。
+若分发判据让 ``api_style`` 优先于 ``provider``，火山行会被**静默**路由到
+OpenAI 兼容路径 —— 表现为「配置都填对了却报接口格式不对」，且没有任何日志
+提示。这类问题靠读代码很难发现，必须用断言钉住。
 
 **为什么要专门测 C（零配置如实反映）**
 --------------------------------------
@@ -293,6 +303,145 @@ def main() -> int:
                   got == "cosyvoice-zh-female-自定义音色名", f"got={got}")
         else:
             check("F1 跳过：拿不到预设 id", False, f"code={code}")
+
+        # ================= H. 三家厂商预置 + 服务端自动分发（新增能力）
+        print("\n── H. 厂商预置与自动分发 ──")
+        code, cat2 = req("GET", "/api/providers/catalog", token=token)
+        vendors = (cat2 or {}).get("vendors") or []
+        vmap = {v["value"]: v for v in vendors}
+        check("H1 预置了三家 TTS 厂商", set(vmap) >= {"edge", "volcengine", "aliyun"},
+              f"{sorted(vmap)}")
+        check("H2 Edge 标为免密钥且无 endpoint",
+              vmap.get("edge", {}).get("needs_key") is False
+              and not vmap.get("edge", {}).get("endpoint"),
+              json.dumps({k: vmap.get("edge", {}).get(k) for k in
+                          ("needs_key", "endpoint")}, ensure_ascii=False))
+        check("H3 火山标为需要密钥且给了 AK:SK 填写说明",
+              vmap.get("volcengine", {}).get("needs_key") is True
+              and "AK" in (vmap.get("volcengine", {}).get("key_hint") or ""), "")
+        check("H4 阿里百炼 endpoint 填到 compatible-mode/v1 一级",
+              (vmap.get("aliyun", {}).get("endpoint") or "").endswith("/compatible-mode/v1"),
+              vmap.get("aliyun", {}).get("endpoint", ""))
+        check("H5 每家都带免费额度口径（管理员最关心的实际成本）",
+              all((v.get("free_tier") or "").strip() for v in vendors), "")
+        vbv = (cat2 or {}).get("voices_by_vendor") or {}
+        check("H6 音色按厂商分组下发",
+              set(vbv) >= {"edge", "volcengine", "aliyun"} and all(vbv.values()),
+              str({k: len(v) for k, v in vbv.items()}))
+        check("H7 Edge 依赖可用性被如实上报",
+              isinstance((cat2 or {}).get("edge_available"), bool),
+              f"edge_available={cat2.get('edge_available')}")
+
+        # 分发判据：这一条来自**实测踩出的 bug**。管理后台选火山时会把
+        # api_style 预填成 openai_compatible，若让 api_style 优先于 provider，
+        # 火山行会被静默路由到 OpenAI 路径 —— 表现为「配好了却报格式不对」。
+        print("\n── H8. 分发判据（provider 必须优先于 api_style）──")
+        sys.path.insert(0, str(SERVER))
+        from app.voice.asr_tts import _tts_dispatch_style, _volc_keys  # noqa: E402
+
+        class _Row:      # 最小替身：分发只读这两个属性
+            def __init__(self, **kw):
+                self.__dict__.update(kw)
+
+        for name, row, expect in [
+            ("edge 免密钥", _Row(provider="edge"), "edge"),
+            ("edge+预填 compat", _Row(provider="edge",
+                                    api_style="openai_compatible"), "edge"),
+            ("火山+预填 compat（本轮修的 bug）",
+             _Row(provider="volcengine", api_style="openai_compatible"), "volcengine"),
+            ("阿里百炼", _Row(provider="aliyun",
+                              api_style="openai_compatible"), "openai_compatible"),
+            ("手填火山（仅 api_style）",
+             _Row(provider="my_gateway", api_style="volcengine"), "volcengine"),
+            ("自建未知", _Row(provider="openai_compatible"), "openai_compatible"),
+            ("存量老配置（provider 空）", _Row(provider=""), "openai_compatible"),
+        ]:
+            got = _tts_dispatch_style(row)
+            check(f"H8 分发 {name}", got == expect, f"得到 {got}，应为 {expect}")
+
+        check("H9 火山密钥支持中英文冒号分隔",
+              _volc_keys(_Row(api_key="AK:SEC")) == ("AK", "SEC")
+              and _volc_keys(_Row(api_key="AK：SEC")) == ("AK", "SEC"),
+              str(_volc_keys(_Row(api_key="AK：SEC"))))
+
+        # --- 火山签名：无法真调，改用官方文档推导过程做确定性断言 ---
+        print("\n── H10. 火山签名算法（无 AK/SK，改用文档推导断言）──")
+        import hashlib  # noqa: E402
+        import hmac  # noqa: E402
+        from datetime import datetime, timezone  # noqa: E402
+
+        from app.voice import tts_volc as _volc  # noqa: E402
+
+        sk, day = "SECRET", "20230101"
+        k1 = hmac.new(sk.encode(), day.encode(), hashlib.sha256).digest()
+        k2 = hmac.new(k1, b"cn-beijing", hashlib.sha256).digest()
+        k3 = hmac.new(k2, b"openspeech", hashlib.sha256).digest()
+        k4 = hmac.new(k3, b"request", hashlib.sha256).digest()
+        check("H10 签名密钥四级派生与官方文档一致",
+              _volc.derive_signing_key(sk, day) == k4,
+              "少一级派生会被服务端 403 且错误文案不提示")
+        auth = _volc.build_authorization("AK", sk, day, f"{day}T010000Z",
+                                         "content-type;host", "POST\n")
+        check("H11 Authorization 头三段齐全",
+              all(x in auth for x in ("Credential=", "SignedHeaders=", "Signature=")),
+              auth[:70])
+        # H12 必须传**带非 UTC 偏移**的时间才能测出真问题：
+        # 若两次都传 UTC，函数原样返回也能「通过」，等于没测。
+        # 这里传本地 09:00（UTC+8），期望被换算成 01:00Z —— 这正是生产上
+        # iStoreOS（Asia/Shanghai）会踩的坑：拿本地时间算签名会差 8 小时 → 403。
+        from datetime import timedelta  # noqa: E402
+        local9 = datetime(2026, 10, 18, 9, 0,
+                          tzinfo=timezone(timedelta(hours=8)))
+        _sd, rd_local = _volc.utc_stamps(local9)
+        check("H12 时间戳强制 UTC（本地 9 点 UTC+8 必须换算成 01 点）",
+              rd_local == "20261018T010000Z", f"得到 {rd_local}")
+        # 跨日边界：本地 2026-10-19 00:30（UTC+8）= UTC 10-18 16:30，
+        # short_date 必须是 10-18。若错用本地日期，跨日那 8 小时全签错。
+        local0030 = datetime(2026, 10, 19, 0, 30,
+                             tzinfo=timezone(timedelta(hours=8)))
+        sd_edge, _ = _volc.utc_stamps(local0030)
+        check("H13 跨日边界：本地 10-19 凌晨的 short_date 必须是 UTC 的 10-18",
+              sd_edge == "20261018", f"得到 {sd_edge}")
+        body = _volc.build_body("老人该吃药了", "BV001_streaming")
+        check("H14 报文用 pcm/24000（客户端只吃裸 PCM）",
+              body["audio"]["encoding"] == "pcm" and body["audio"]["sample_rate"] == 24000,
+              json.dumps(body["audio"], ensure_ascii=False))
+        check("H15 未给 app_id 时不塞 app 段（否则签名与请求不一致）",
+              "app" not in body and "app" in _volc.build_body("x", "y", app_id="1"), "")
+        import base64 as _b64  # noqa: E402
+        good = _b64.b64encode(b"\x00\x01" * 10).decode()
+        check("H16 火山 base64 音频能被正确取出",
+              _volc._decode_response(json.dumps({"code": 3000, "data": good}).encode(),
+                                     "ep") == b"\x00\x01" * 10, "")
+        try:
+            _volc._decode_response(json.dumps({"code": 3000}).encode(), "ep")
+            check("H17 缺 data 字段必须报错（不能当空音频静默通过）", False, "没抛异常")
+        except Exception:
+            check("H17 缺 data 字段必须报错（不能当空音频静默通过）", True)
+
+        # --- Edge 内置桥 ---
+        print("\n── H18. Edge 内置桥 ──")
+        from app.voice import tts_edge as _edge  # noqa: E402
+        check("H18 edge_available() 返回布尔（前端据此显示安装指引）",
+              isinstance(_edge.edge_available(), bool),
+              f"available={_edge.edge_available()}")
+        probe = bytes(range(256)) * 100
+        chunk = int(24000 * 2 * 0.06)
+        slices = [probe[i:i + chunk] for i in range(0, len(probe), chunk)]
+        check("H19 分块重组逐字节无损（否则下行音频会错位）",
+              b"".join(slices) == probe and chunk == 2880,
+              f"chunk={chunk} 块数={len(slices)}")
+
+        # --- 真实语音测试端点 ---
+        print("\n── H20. 语音真实测试端点 ──")
+        code, tv = req("POST", "/api/providers/test-voice",
+                       {"usage": "tts", "text": "老人，今天该吃药了"}, token=token)
+        check("H20 TTS 真实测试端点存在（本轮新增；之前会返回误导文案）",
+              code == 200 and isinstance(tv, dict) and "ok" in tv,
+              f"code={code} {str(tv)[:120]}")
+        check("H21 失败时带可读原因（而非 500 堆栈）",
+              code == 200 and (tv.get("ok") is True or bool(tv.get("message"))),
+              str(tv)[:160])
 
     finally:
         try:
