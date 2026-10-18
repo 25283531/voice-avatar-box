@@ -275,10 +275,22 @@ VOICE_OTA_PATH = os.getenv("ELDER_VOICE_OTA_PATH", "/api/voice/ota")
 #
 #   direct —— 公网 IP:端口直暴露，或前置反代能保证 scheme 正确的场景。
 #             **按原方案**：从 request.url.scheme + Host 推导 ws/wss 与 OTA 地址。
-#   tunnel —— Cloudflare Tunnel 等「TLS 在前置终止、源站只看到明文」的形态。
+#   tunnel —— 「TLS 在前置终止、源站只看到明文」的形态。
+#             ⚠️ **不是「用了 Cloudflare Tunnel」才选它**——判据是拓扑，
+#             不是工具。**Nginx / Caddy / OpenResty 在前置做 TLS 终止、
+#             后端只收到明文 HTTP 的，一律属于这一类**（本项目生产早期就是
+#             Cloudflare Tunnel，但那只是 tunnel 的一种实现，不是它的定义）。
 #             **必须**有一个显式对外地址，否则**启动直接失败**（见下）。
 #   auto   —— 未显式设置 ELDER_DEPLOY_MODE 时的默认值：推导逻辑与 direct
 #             完全相同（= 历史行为），但启动日志会说明推断依据，便于排障。
+#
+# 判据速查（一句话）
+# ----------------------------------------
+#   「我的后端容器收到的是 http:// 还是 https://？」
+#       收到 https://        → direct（或 auto，按请求推导就够）
+#       收到 http:// 但对外是域名 HTTPS → tunnel（**必须**配显式地址）
+#   「我有没有前置反代做 TLS 终止？」
+#       有（Nginx / Caddy / Cloudflare Tunnel 都算）→ 通常是 tunnel
 #
 # ⚠️ 为什么 tunnel 缺地址是**启动失败**而不是告警后继续跑
 # ----------------------------------------------------
@@ -318,7 +330,8 @@ _DEPLOY_MODES = ("auto", "direct", "tunnel")
 _MODE_DESC = {
     "auto": "auto（未显式设置 ELDER_DEPLOY_MODE，按请求现场推导）",
     "direct": "direct（公网直暴露 / 反代后置，按请求现场推导）",
-    "tunnel": "tunnel（Cloudflare Tunnel 等 TLS 在前置终止的形态）",
+    "tunnel": "tunnel（TLS 在前置终止：Cloudflare Tunnel / Nginx / Caddy 都适用，"
+              "判据是拓扑不是工具）",
 }
 
 _deploy_log = logging.getLogger("elder.deploy")
@@ -432,13 +445,15 @@ def _deploy_startup_check() -> None:
         if not PUBLIC_BASE_URL:
             raise SystemExit(
                 "【启动失败】ELDER_DEPLOY_MODE=tunnel 但没有配置对外地址。\n"
-                "    tunnel 形态（Cloudflare Tunnel 等）的 TLS 在前置终止，源站\n"
-                "    看到的永远是明文 HTTP：不配对外地址，设备心跳会拿到\n"
-                "    ws://<域名>/... 去打 443 —— 能心跳、不能说话，且运行期零报错。\n"
+                "    tunnel 形态（Cloudflare Tunnel / Nginx / Caddy 等 TLS 前置\n"
+                "    终止的场景）的源站看到的永远是明文 HTTP：不配对外地址，\n"
+                "    设备心跳会拿到 ws://<域名>/... 去打 443 —— 能心跳、不能说话，\n"
+                "    且运行期零报错。\n"
                 "    修法只需一行（二选一）：\n"
                 "        ELDER_PUBLIC_BASE_URL=https://voice.2508866.xyz\n"
                 "        ELDER_VOICE_PUBLIC_BASE=https://voice.2508866.xyz   （旧变量）\n"
-                "    WS 想用单独域名，再加 ELDER_WS_PUBLIC_BASE_URL=wss://<WS域名>。"
+                "    WS 想用单独域名，再加 ELDER_WS_PUBLIC_BASE_URL=wss://<WS域名>。\n"
+                "    （若你的后端容器确实直接收到 https:// 请求，用 auto 即可。）"
             )
         if PUBLIC_BASE_SOURCE.startswith("ELDER_VOICE_PUBLIC_BASE"):
             # 旧变量在 auto/direct 下故意不校验（保持历史语义），但 tunnel 模式

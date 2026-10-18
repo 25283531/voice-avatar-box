@@ -708,9 +708,28 @@ XFF，且**从右往左**跳过可信段、取第一个不可信地址（攻击�
 `ELDER_DEPLOY_MODE` 把"当前是哪种拓扑"变成显式配置，启动时还会打一行摘要
 （模式 / HTTP 地址 / WS 地址 / 设备将拿到的 ws URL）—— 排障第一现场。
 
+#### 先看这两句，能省掉整张表的犹豫
+
+> **`tunnel` 这个名字有误导性：它的判据是「拓扑」，不是「你用了什么工具」。**
+> 真正的含义是 **TLS 在前置终止、源站只收到明文 HTTP**。
+>
+> **所以：你在前面挂了 Nginx / Caddy / OpenResty / Cloudflare Tunnel 任何一个，
+> 哪怕完全没用 Cloudflare Tunnel，也应该用 `tunnel`。**
+> 名字里带"tunnel"只是因为本项目最早用它，不代表它是唯一适用场景。
+
+一句话判据：
+
+```
+你的后端容器收到的请求，是 http:// 还是 https://？
+  收到 https://                  → direct（或 auto，按请求推导就够）
+  收到 http://，但对外是域名 HTTPS → tunnel ← 必须配 ELDER_PUBLIC_BASE_URL
+```
+
+不确定就看启动日志那行摘要，它会明写「设备将拿到的 ws URL」。
+
 | 拓扑 | `ELDER_DEPLOY_MODE` | 还要配什么 | 设备拿到的地址 | 主要坑 |
 | --- | --- | --- | --- | --- |
-| **Cloudflare Tunnel**（或任何 TLS 在前置终止的反代） | `tunnel` | `ELDER_PUBLIC_BASE_URL=https://<域名>`（**必需**，缺了启动失败）；`ELDER_WS_PUBLIC_BASE_URL=wss://<WS域名>`（可选） | 配置的地址，与请求无关；WS 域名分开配时两者各自生效 | uvicorn 不信任非回环对端的 `X-Forwarded-Proto`，自动推导会给出 `ws://`；长连接可能被 Cloudflare 空闲断开（§4.1.5） |
+| **TLS 在前置终止**（Cloudflare Tunnel / Nginx / Caddy / OpenResty —— **工具不限**） | `tunnel` | `ELDER_PUBLIC_BASE_URL=https://<域名>`（**必需**，缺了启动失败）；`ELDER_WS_PUBLIC_BASE_URL=wss://<WS域名>`（可选） | 配置的地址，与请求无关；WS 域名分开配时两者各自生效 | uvicorn 不信任非回环对端的 `X-Forwarded-Proto`，自动推导会给出 `ws://`；用 Cloudflare 时长连接可能被空闲断开（§4.1.5） |
 | **公网直暴露**（有公网 IP，对外 `http://IP:8064`） | `direct`（或留空 = `auto`） | 不用配对外地址 | 按请求 Host 推导：`ws://IP:8064/...`、`http://IP:8064/...` | 明文 HTTP：流量、登录口令、设备 token 全部裸奔；谁扫到这个端口都能打你的 AI token（建议同时 `ELDER_ALLOW_PUBLIC_REGISTER=0`）。详见下方"直暴露的风险" |
 | **有头域的反代**（自管 Nginx/Caddy，TLS 在反代上终止） | `tunnel` + 对外地址（**推荐**）；反代确实把源站当明文 HTTP 用时 `direct` 即可 | 同第一行 | 配了就用配置的；没配按请求推导 | 与隧道同源的问题：TLS 在前置终止 ⇒ scheme 推导不可信。别指望反代传了 `X-Forwarded-Proto` 就没事（§4.1.3） |
 
@@ -778,6 +797,73 @@ XFF，且**从右往左**跳过可信段、取第一个不可信地址（攻击�
 
 ---
 
+## 4.4 公网 VPS + 自管 TLS 证书（不用 Cloudflare Tunnel）
+
+这一形态的要点与 §4.1 相同（**都是「TLS 在前置终止」**），但证书来源不同，
+所以单独写一节，避免被误以为「不部署 Tunnel 就跟文档不一样」。
+
+> **结论先说：`ELDER_DEPLOY_MODE=tunnel` 依然要设。**
+> 你有没有用 Cloudflare Tunnel，和这个值**没有任何关系**。
+
+### 架构
+
+```
+设备 / 浏览器 ──HTTPS 443──> Caddy 或 Nginx（宿主机，做 TLS 终止）
+                             └─> http://127.0.0.1:8064 ──> 容器 8080
+```
+
+后端容器收到的永远是 `http://` ⇒ **必须显式配对外地址**，否则设备拿到
+`ws://<域名>` 去打 443 ⇒ **能心跳、不能说话，且日志一片干净**。
+
+### 容器侧环境变量
+
+```bash
+ELDER_DEPLOY_MODE=tunnel
+ELDER_PUBLIC_BASE_URL=https://voice.example.com   # 你自己的域名
+ELDER_JWT_SECRET=<随机长字符串>
+ELDER_SEED_ADMIN_PASSWORD=<强口令>               # 首启必填，不填则随机化
+```
+
+⚠️ `ELDER_PUBLIC_BASE_URL` 用 **https://** 开头（不是 `wss://`、不带路径尾斜杠）。
+WS 地址由它自动换 scheme 推导成 `wss://voice.example.com/api/voice/v1/ws`。
+
+### 证书怎么来
+
+| 方式 | 说明 |
+| --- | --- |
+| **Caddy 自动签发（推荐）** | Caddy 自动完成 ACME 挑战与续期，配置里只要有域名和一份指向自己的邮箱即可。**80 端口必须可达**（ACME HTTP-01 验证要用）。 |
+| Nginx + Certbot | `certbot --nginx -d voice.example.com`，证书 90 天有效期，需配续期定时任务。 |
+| 自带证书 | Nginx `ssl_certificate` 指向自己的 `.crt/.key`，注意证书链要完整（缺中间证书部分客户端会报错）。 |
+
+### 三个最容易踩的点
+
+1. **443 证书 ≠ 容器的事**。后端容器只监听 HTTP，TLS 完全由前置代理负责。
+   容器映射仍是 `8064:8080`，**不要**试图在容器里做 TLS。
+2. **别用 `--forwarded-allow-ips=*`**。那会让 uvicorn 采信可伪造的
+   `X-Forwarded-Proto` 最左段，登录限速器随之形同虚设（见 §5.3）。
+   要让 uvicorn 信任反代，用 `ELDER_TRUSTED_PROXY_IPS` 显式列出反代 IP。
+3. **80/443 都要放通**，另确认云厂商安全组与宿主防火墙两处都开了
+   （只开一层是最常见的「证书签发失败」原因）。
+
+### 验证是否配对了
+
+启动日志里这几行就是判据（**认准 `设备心跳将拿到：ws=` 后面是 `wss://` 还是 `ws://`**）：
+
+```
+【部署】模式：tunnel（TLS 在前置终止：Cloudflare Tunnel / Nginx / Caddy 都适用）
+【部署】   HTTP/OTA 对外地址：https://voice.example.com（来源 ELDER_PUBLIC_BASE_URL）
+【部署】   WS 对外地址：wss://voice.example.com （由 HTTP 地址换 scheme 推导）
+【部署】   设备心跳将拿到：ws=wss://voice.example.com/api/voice/v1/ws  ota=https://voice.example.com/api/voice/ota
+```
+
+看到 **`ws=wss://`** 就是配对了。若看到 `ws=ws://`（或看到「未配置 → 按请求推导」）
+就是两个变量没配上。
+
+设备侧实测：先看设备能否完成 `/api/device/sync` 心跳（能），再让老人说一句话
+—— **能心跳但不能说话，就是这一节的故障**（而不是网络不通）。
+
+---
+
 ## 5. 环境变量对照表
 
 变量写在 `server/.env`（从 `server/.env.example` 复制），Compose 会自动读取。
@@ -794,7 +880,7 @@ XFF，且**从右往左**跳过可信段、取第一个不可信地址（攻击�
 | `ELDER_TZ` | `Asia/Shanghai` | 业务时区，改了会整体影响提醒时间计算 |
 | `MYSQL_ROOT_PASSWORD` | `123456` | 仅在使用自带 `elder-db` 容器时生效，**生产必须改** |
 | `ELDER_VOICE_PUBLIC_BASE` | 留空（自动推导） | 语音链路对外地址（**旧变量，向后兼容，语义逐字未变**）。自研链路与 API 同源同端口，未配时服务端按请求 Host 推导；反代（含 Cloudflare Tunnel）下**必须**有显式对外地址（新变量或本变量），否则设备拿到 `ws://`。与 `ELDER_PUBLIC_BASE_URL` 同时配置时以新变量为准并 WARNING。见 §4.2 |
-| `ELDER_DEPLOY_MODE` | `auto`（未设置） | **部署模式**：`auto` / `direct` / `tunnel`（大小写不敏感）。`tunnel` = Cloudflare Tunnel 等 TLS 前置形态，**必须**配对外地址否则启动失败；`direct` = 公网直暴露/反代后置，按请求推导；`auto` = 未声明，行为同 direct 但启动日志说明推断依据。写错取值启动失败。见 §4.2 |
+| `ELDER_DEPLOY_MODE` | `auto`（未设置） | **部署模式**：`auto` / `direct` / `tunnel`（大小写不敏感）。⚠️ **`tunnel` 的判据是拓扑不是工具** =「TLS 在前置终止、源站只收到明文」，**Nginx / Caddy / Cloudflare Tunnel 一律适用，不用 Cloudflare Tunnel 也该设 `tunnel`**；必须配 `ELDER_PUBLIC_BASE_URL`否则启动失败。`direct` = 公网直暴露/后端直接收到 https，按请求推导；`auto` = 未声明，行为同 direct 但启动日志说明推断依据。写错取值启动失败。见 §4.2 |
 | `ELDER_PUBLIC_BASE_URL` | 留空 | **HTTP/OTA 对外地址**（新变量，http/https，启动期校验 scheme）。配了就在所有模式下优先使用；tunnel 模式下必需 |
 | `ELDER_WS_PUBLIC_BASE_URL` | 留空 | **WebSocket 单独域名**（可选，ws/wss，启动期校验）。Cloudflare Tunnel 可给同一源站配多个 hostname；不配则 WS 由 HTTP 地址换 scheme 推导。只配它不配 HTTP 地址会启动失败 |
 | `ELDER_SCHEDULE_AHEAD_HOURS` | `36` | 服务端预生成提醒实例的提前量 |

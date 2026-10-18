@@ -68,6 +68,9 @@ def _voice_endpoints(request: Request) -> tuple[str, str]:
       TLS 反代 / 隧道后面必须显式配对外地址。
     - ``tunnel``：启动期强制要求显式对外地址（缺了直接启动失败，不静默
       降级），本函数优先用它下发，与请求无关。
+      ⚠️ 判据是**拓扑**不是工具：**任何在前面做 TLS 终止的后端容器**
+      （Cloudflare Tunnel / Nginx / Caddy / OpenResty……）拿到的都是明文
+      HTTP，都属于这一类——**不用 Cloudflare Tunnel 也要设 tunnel**。
 
     显式对外地址的来源与优先级（``config.PUBLIC_BASE_URL`` 已合并好）：
     ``ELDER_PUBLIC_BASE_URL`` > ``ELDER_VOICE_PUBLIC_BASE``（旧逃生舱，
