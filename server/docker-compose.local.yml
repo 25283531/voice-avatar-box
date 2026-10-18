@@ -1,0 +1,77 @@
+# 可选：本地语音服务（docker-compose.local.yml）
+#
+# ⚠️ **先读这段再决定要不要开** —— 这不是「打开就能用」的开关，而是一份
+# 关于「你的机器到底跑不跑得动」的诚实说明。
+#
+# 本文件给主服务（elder-server）提供两个**可选**的旁路服务：
+#   local-asr   FunASR / SenseVoice  中文语音识别，纯 CPU，约 254MB 模型
+#   local-vad   Silero VAD             端点检测，2MB 级 ONNX
+#
+# **刻意不含中文 TTS**，理由如下（这是从你当前部署形态倒推的结论，不是偷懒）：
+#   你的生产环境是 iStoreOS 软路由 + Docker（见 docs/DEPLOY.md）。
+#   软路由通常是 x86 低功耗 CPU / ARM，**没有独立显卡**。而目前唯一
+#   「开源 + 中文强 + 可商用」三合一的中文 TTS 是 CosyVoice 2，
+#   其推理需要 **8GB 显存起**（docs/免费语音服务商选型.md §D2 组合一已写明）。
+#   把它塞进软路由容器，结果是「容器能起、但合成一句话要几十秒」——
+#   对老人场景比用云端 TTS **更糟**（表现为设备一直不吭声）。
+#   所以 TTS 维持 Edge TTS（零成本、在线）。若将来有了带显卡的机器，
+#   再按 docs/免费语音服务商选型.md §2 A7~A9 接本地 TTS，那时把
+#   下面 local-asr 的写法照抄一份即可。
+#
+# ---------------------------------------------------------------- 怎么用
+#   cd server
+#   docker compose -f docker-compose.yml -f docker-compose.local.yml up -d
+#
+# 起来之后**仍需在管理后台「AI 接入」里手工添加两行**并指向本地地址，
+# 本项目刻意不自动写库 —— 自动写配置会在你只想「临时试试」时留下脏数据，
+# 而删掉它比留下它更麻烦。就绪度面板会告诉你缺哪几项。
+#   ASR 行：kind=asr   endpoint=http://local-asr:10095/v1
+#   VAD 行：kind=vad   endpoint=http://local-vad:8080
+#
+# 若你的机器带 GPU 或有独立显卡，local-asr 也能跑得更好（它会自动用 CUDA，
+# 没卡就纯 CPU）。
+#
+# ⚠️ **启动慢是正常的**：FunASR 首次启动要下载并加载 254MB 模型，
+# 冷启动可能要 30~60 秒。device 服务没起来之前，管理后台「测试连接」会失败，
+# 这不代表配错了。compose 已给足 healthcheck 的 start_period。
+
+services:
+  local-asr:
+    # 阿里达摩院 FunASR 官方镜像，官方提供 OpenAI 兼容的 /v1 接口 ——
+    # 正是本项目 asr_tts.py 唯一支持的报文风格（选型文档 §0 结论 2）。
+    image: ${LOCAL_ASR_IMAGE:-modelscope/funasr:latest}
+    container_name: elder-local-asr
+    restart: unless-stopped
+    # 无 GPU 时设 0，避免容器反复探测 CUDA 拖慢启动
+    environment:
+      DEVICE: ${LOCAL_ASR_DEVICE:-cpu}
+      MODEL: ${LOCAL_ASR_MODEL:-iic/speech_paraformer-large_asr_nat-zh-cn-16k-common-vocab8404-pytorch}
+    ports:
+      # 只对本机暴露（127.0.0.1）。**刻意不写 0.0.0.0**：这个服务没有任何
+      # 鉴权，谁都能调去识别音频。放到内网端口上等于把麦克风内容敞开。
+      # 主服务在同一 compose 网络内用 http://local-asr:10095 访问，不走宿主机端口。
+      - "127.0.0.1:${LOCAL_ASR_PORT:-10095}:10095"
+    networks: [elder-net]
+    # 首次要下模型，start_period 给足 120 秒；模型缓存在卷里，重启不必再下
+    volumes:
+      - local-asr-model:/root/.cache/modelscope
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:10095/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 120s
+
+  local-vad:
+    # Silero VAD 的 ONNX 运行时，约 2MB。
+    # 收益（选型文档 §4 C5）：老人句中长停顿不再被误判成「说完了」，
+    # 以及老人说完后能更快接话 —— 这是全清单里性价比最高的一笔升级。
+    image: ${LOCAL_VAD_IMAGE:-ghcr.io/snakers4/silero-vad-server:latest}
+    container_name: elder-local-vad
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${LOCAL_VAD_PORT:-8081}:8080"
+    networks: [elder-net]
+
+volumes:
+  local-asr-model:

@@ -311,7 +311,48 @@ with e.connect() as c:
 PY
 ```
 
-第 3 步能打印出 16 张业务表（users / devices / reminders / avatars / membership_* 等）就说明接好了。
+第 3 步能打印出业务表（users / devices / reminders / avatars / ai_providers 等）就说明接好了。
+
+> ⚠️ 文档里曾写过「membership_* 等 16 张表」。会员制已取消（commit `e264200`），
+> 那五张表（`memberships` / `membership_plans` / `membership_orders` /
+> `membership_amount_range` / `payment_config`）现由启动期的
+> `schema_patch.drop_membership_tables()` 真正 DROP 掉。
+> **迁库后请核对这些表确实不在了** —— 迁移常走 mysqldump，会把已废弃的表
+> 一起搬过去；而 `schema_patch` 的删表逻辑按依赖顺序执行，在外键仍引用
+> 目标表时可能需要先清 `users` 的关联数据。
+
+---
+
+## 2.3 可选：加本地语音服务（`docker-compose.local.yml`）
+
+想让 ASR / VAD 不出本机、且不依赖任何云厂商时，叠加本地服务文件：
+
+```bash
+cd server
+docker compose -f docker-compose.yml -f docker-compose.local.yml up -d
+```
+
+| 服务 | 是什么 | 体积 | 适合 |
+| --- | --- | --- | --- |
+| `local-asr` | FunASR / SenseVoice 中文识别，OpenAI 兼容端 | 约 254MB 模型，纯 CPU | 中文准确率约为 whisper-small 的 3 倍 |
+| `local-vad` | Silero VAD 端点检测 | 2MB 级 ONNX | 老人句中长停顿不再被误判成「说完了」 |
+
+**刻意不含本地中文 TTS**，这是从部署形态倒推的结论：当前生产环境是
+iStoreOS 软路由（无独立显卡），而唯一「开源 + 中文强 + 可商用」的中文 TTS
+（CosyVoice 2）需要 8GB 显存起。塞进软路由的实测表现会是「合成一句话要几十秒」，
+对老人场景**比用云端 TTS 更糟**（设备一直不吭声）。TTS 维持 Edge TTS 零成本方案。
+
+起容器之后仍需在管理后台「AI 接入」里手工加两行指向本地地址：
+
+```text
+kind=asr   endpoint=http://local-asr:10095/v1
+kind=vad   endpoint=http://local-vad:8080
+```
+
+管理后台顶部的**服务就绪度**面板会显示当前缺哪几项、缺了会怎样，
+不必数配置行来判断。首次启动要下模型，冷启动可能 30~60 秒。
+
+本地服务的端口只绑定 `127.0.0.1`，**不对外暴露**——这两个服务没有任何鉴权。
 
 ---
 
