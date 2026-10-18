@@ -158,6 +158,30 @@ jobs:
       - name: 音色目录与就绪度冒烟（零配置如实反映 + 音色单一真源）
         run: python tools/smoke_voice_catalog.py 8124
 
+      # 可信反代 + 307 scheme（端口 8125，已在 smoke_ports.py 登记）。
+      # 守的是 2026-10-18 线上事故：管理后台在 HTTPS 页面里请求
+      # /api/admin/presets 被浏览器 Mixed Content 拦掉（Failed to fetch），
+      # 根因是 uvicorn 不信任 Docker 网桥网关对端的 X-Forwarded-Proto，
+      # Starlette 的 307 重定向于是生成 http:// 绝对地址。
+      # 药方曾是「--forwarded-allow-ips=*」—— 本脚本的 B3/A3 断言专门钉死
+      # 那个药方为什么错（两层语义相反：uvicorn 层信任所有人取 XFF 最左段，
+      # ratelimit 层谁都不信，合起来限速器两头落空）。
+      # D 组还静态核对 Dockerfile CMD：--proxy-headers 必须在、
+      # 默认值不能写死 *（写成 * 会当场转红）。
+      - name: 可信反代与 307 scheme 冒烟（Mixed Content 事故回归）
+        run: python tools/smoke_proxy_headers.py 8125
+
+      # 前端模板卫生（静态扫描，不起服务、不占端口）。
+      # 守的是 2026-10-18 线上事故：AI 配置弹窗的 API Key 标签渲染成
+      # 「function () { [native code] }」—— 标签用的标识符被放进了
+      # methods: 段，Vue 3 bind 之后 toString() 就是那串乱码。
+      # L3（data() 重复键）还当场抓到过一个真 bug：SMTP 测试结果与
+      # AI 测试结果同名，后者静默覆盖前者。
+      # 这三个缺陷在浏览器里都不报错（一个显示乱码、一个渲染成空、
+      # 一个互相串数据），只有静态扫描能在合并前抓住。
+      - name: 前端模板卫生冒烟（方法插值 / 孤儿引用 / 重复键）
+        run: python tools/smoke_frontend_hygiene.py
+
       # 语音链路冒烟（WS 协议逐字段对固件 + Opus 编解码 + OTA 签发口径）。
       # 挂在 SQLite job：它直连 sqlite 造激活码/设备，且进程内起 uvicorn。
       #

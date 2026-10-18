@@ -1,0 +1,330 @@
+"""前端模板卫生冒烟（静态扫描，不起服务、不占端口）。
+
+用法：
+    python tools/smoke_frontend_hygiene.py
+
+覆盖
+----
+L1. **没有把方法当值插值**（本脚本存在的核心理由）：
+    ``{{apiKeyLabel}}`` 这类**不带括号**的裸标识符插值，如果标识符定义在
+    ``methods:`` 里，Vue 3 会把方法 ``bind(publicThis)``，而 bound 函数的
+    ``toString()`` 在所有引擎上都恰好是 ``"function () { [native code] }"``
+    —— 页面上就会显示那串乱码。2026-10-18 线上事故就是这么来的（用户截图
+    里的 API Key 标签；``apiKeyLabel`` 当时确实定义在 methods 段里）。
+    computed/data 的插值是安全的；方法要么搬进 computed，要么写成
+    ``{{apiKeyHint()}}`` 显式调用。
+L2. **模板里没有孤儿引用**：``@click="xxx"`` / ``v-model="xxx"`` /
+    ``{{xxx}}`` / ``v-if="xxx"`` 里出现的**根标识符**，必须在
+    ``data()`` / ``computed:`` / ``methods:`` 里有定义。孤儿引用在 Vue 3 里
+    **不报错**，只是渲染成空字符串或点击没反应 —— 属于"看着像功能在，
+    其实没了"的静默失效，正是最难发现的那类。
+L3. **data() 里没有重复键**：同一行里写两遍同名键，后者静默覆盖前者，
+    而两处往往隔得很远（多人改同一文件时高发）。
+
+为什么不起服务：这三类缺陷全是**静态可判**的，起服务只会让 CI 多等几十秒，
+却一条断言都多不了。端口表（tools/smoke_ports.py）因此不收本脚本。
+
+⚠️ 扫描器的三个坑（第一版全踩过，改法写在这里免得再踩）：
+   1. **HTML 注释必须先剥掉** —— 注释里常写着示例代码（``{{apiKeyLabel}}``），
+      不剥就会把示例当成真实引用，报出不存在的孤儿。
+   2. **字符串字面量必须跳过** —— ``:class="tab==='home'"`` 里的 ``'home'``
+      不是标识符；不跳的话每个三元表达式都会造出一堆假孤儿。
+   3. **只取成员表达式的根** —— ``d.api_key`` 里 ``api_key`` 是属性名，
+      ``d`` 才是引用；全抓的话每个字段名都会变成假孤儿。对象字面量的键
+      （``:style="{height:...}"`` 里的 ``height``）同理，按花括号深度跳过。
+"""
+from __future__ import annotations
+
+import re
+import sys
+from pathlib import Path
+
+SERVER = Path(__file__).resolve().parent.parent / "server"
+INDEX = SERVER / "app" / "static" / "index.html"
+USER = SERVER / "app" / "static" / "user.html"
+
+results: list[tuple[str, bool, str]] = []
+
+#: JS 关键字与语言内置，不算"未定义"
+BUILTINS = {
+    "true", "false", "null", "undefined", "new", "typeof", "instanceof",
+    "in", "of", "this", "delete", "void", "if", "else", "return", "const",
+    "let", "var", "function", "async", "await", "for", "while", "switch",
+    "case", "default", "break", "continue", "try", "catch", "finally",
+    "throw", "do",
+    "Math", "String", "Number", "Object", "Array", "JSON", "Date",
+    "parseInt", "parseFloat", "isNaN", "Boolean", "Infinity", "NaN",
+}
+#: 模板局部变量与 Vue 特殊对象，不是 app 成员
+LOCAL_VARS = {
+    "$event", "$refs", "index", "key", "value", "name", "id", "label",
+}
+
+
+def check(name: str, ok: bool, detail: str = "") -> bool:
+    results.append((name, bool(ok), detail))
+    print(f"  [{'PASS' if ok else 'FAIL'}] {name}"
+          + (f"\n         -> {detail}" if detail else ""))
+    return bool(ok)
+
+
+def parse_app(script: str) -> tuple[set[str], set[str], set[str], str,
+                                    list[tuple[str, int]]]:
+    """从 createApp({...}) 源码里取 data / computed / methods 顶层键 + data 段原文。
+
+    用正则而不是 exec：exec 会真的跑一遍 Vue 应用代码（碰 localStorage、
+    fetch），在这个纯静态脚本里既没必要也不安全。
+    """
+    dm = re.search(r"data\(\)\s*\{\s*return\s*\{(.*?)\n    \};", script, re.S)
+    data_src = dm.group(1) if dm else ""
+    # data() 里常有多个键写在同一行（devFilter: '', devBusy: false, ...），
+    # 且混着嵌套对象（loginForm/tabs/...）—— 用深度感知的扫描只取第一层。
+    data_pairs = top_level_keys(data_src)
+    data_keys = {name for name, _ln in data_pairs}
+    computed_keys: set[str] = set()
+    methods_keys: set[str] = set()
+    for sec, sink in (("computed", computed_keys), ("methods", methods_keys)):
+        sm = re.search(r"\n  " + sec + r"\s*:\s*\{\n(.*?)\n  \},", script, re.S)
+        if sm:
+            sink.update(re.findall(r"^\s{4}(?:async\s+)?([a-zA-Z_$][\w$]*)\s*\(",
+                                   sm.group(1), re.M))
+    return data_keys, computed_keys, methods_keys, data_src, data_pairs
+
+
+def top_level_keys(src: str) -> list[tuple[str, int]]:
+    """取对象字面量**第一层**的键（带行号）。
+
+    为什么不能直接用 ``name:`` 全文抓：``data()`` 里混着嵌套对象
+    （``loginForm: { username:'', password:'' }``、``tabs: [{k:'home',n:'概
+'}
+    }]``），全文抓会把 ``username`` / ``k`` 这些**嵌套键**当成 data 成员。
+    后果有两个方向：L2 的"已定义"集合被污染（真孤儿被放过），L3 把嵌套键
+    误报成重复键。所以必须按花括号深度只取第一层。
+    """
+    out: list[tuple[str, int]] = []
+    depth = 1  # src 是对象内部（data(){ return { 之后的内容）
+    i, n = 0, len(src)
+    line = 1
+    while i < n:
+        ch = src[i]
+        if ch == "\n":
+            line += 1
+            i += 1
+            continue
+        if ch in "'\"`":
+            quote = ch
+            i += 1
+            while i < n and src[i] != quote:
+                if src[i] == "\n":
+                    line += 1
+                if src[i] == "\\":
+                    i += 1
+                i += 1
+            i += 1
+            continue
+        if ch == "{":
+            depth += 1
+            i += 1
+            continue
+        if ch == "}":
+            depth -= 1
+            i += 1
+            continue
+        if ch == "/" and i + 1 < n and src[i + 1] == "/":
+            nl = src.find("\n", i)
+            i = n if nl == -1 else nl
+            continue
+        if (ch.isalpha() or ch in "_$") and depth == 1:
+            j = i
+            while j < n and (src[j].isalnum() or src[j] in "_$"):
+                j += 1
+            k = j
+            while k < n and src[k] in " \t":
+                k += 1
+            if k < n and src[k] == ":" and not (k + 1 < n and src[k + 1] == ":"):
+                out.append((src[i:j], line))
+            i = j
+            continue
+        i += 1
+    return out
+
+
+def vfor_aliases(tpl: str) -> set[str]:
+    """v-for 的循环变量是模板局部的，不算孤儿。
+
+    ``v-for="d in devices"`` 的 ``d``、``v-for="(a, b) in pairs"`` 的
+    ``a``/``b`` 都不在 app 成员里，但确实是合法引用。
+    """
+    aliases: set[str] = set()
+    for expr in re.findall(r'v-for="([^"]+)"', tpl):
+        head = expr.split(" in ", 1)[0] if " in " in expr else ""
+        for name in re.findall(r"[a-zA-Z_$][\w$]*", head):
+            aliases.add(name)
+    return aliases
+
+
+def root_identifiers(expr: str) -> list[str]:
+    """取一段 Vue/JS 表达式里的**根标识符**。
+
+    规则（对应模块docstring 里的三个坑）：
+      * 跳过 '...' / "..." / `...` 字符串字面量（三元里的 'ok' 不是标识符）；
+      * ``a.b.c`` 只取 ``a``（b/c 是属性名）；
+      * 花括号内的 ``name:`` 是对象字面量的键（CSS 属性名），跳过。
+    """
+    out: list[str] = []
+    i, n = 0, len(expr)
+    depth = 0
+    expect_property = False
+    while i < n:
+        ch = expr[i]
+        if ch in "'\"`":
+            quote = ch
+            i += 1
+            while i < n and expr[i] != quote:
+                if expr[i] == "\\":
+                    i += 1
+                i += 1
+            i += 1
+            expect_property = False
+            continue
+        if ch == "{":
+            depth += 1
+            expect_property = False
+            i += 1
+            continue
+        if ch == "}":
+            depth = max(0, depth - 1)
+            expect_property = False
+            i += 1
+            continue
+        if ch == "/" and i + 1 < n and expr[i + 1] == "/":
+            break  # 行注释：表达式结束
+        if ch.isalpha() or ch in "_$":
+            j = i
+            while j < n and (expr[j].isalnum() or expr[j] in "_$"):
+                j += 1
+            name = expr[i:j]
+            k = j
+            while k < n and expr[k] in " \t\n":
+                k += 1
+            is_object_key = (k < n and expr[k] == ":" and depth > 0
+                             and not (k + 1 < n and expr[k + 1] == ":"))
+            is_property_chain = k < n and expr[k] == "."
+            if not expect_property and not is_object_key:
+                out.append(name)
+            if is_property_chain:
+                # a.b.c：跳到链尾，链上后续标识符都是属性名
+                while k < n and expr[k] in " \t\n.":
+                    k += 1
+                while k < n and (expr[k].isalnum() or expr[k] in "_$"):
+                    k += 1
+                expect_property = False
+                i = k
+                continue
+            expect_property = False
+            i = j
+            continue
+        if ch == ".":
+            # 点号后永远是属性名：a.b 与 (a||[]).length 两种形态都靠它。
+            # 少了这一条，链尾的 length/join/toFixed 会被当成根标识符
+            # （第一版就是这么冒出十几个假孤儿的）。
+            expect_property = True
+            i += 1
+            continue
+        if ch == "?":
+            # ?. 可选链：问号本身重置，紧随的点号由上面接管
+            expect_property = False
+            i += 1
+            continue
+        expect_property = False
+        i += 1
+    return out
+
+
+def strip_comments(html: str) -> str:
+    """剥掉 HTML 注释（里面有示例代码，不剥会造出假孤儿）。"""
+    return re.sub(r"<!--.*?-->", "", html, flags=re.S)
+
+
+def scan_file(path: Path) -> None:
+    print(f"\n==== {path.relative_to(SERVER.parent)} ====")
+    html = path.read_text(encoding="utf-8")
+    m = re.search(r"<script>(.*)</script>", html, re.S)
+    if not m:
+        check(f"{path.name} 含内联 script", False, "没找到 <script> 块")
+        return
+    script = m.group(1)
+    tpl = strip_comments(re.sub(r"<script>.*?</script>", "", html, flags=re.S))
+
+    data_keys, computed_keys, methods_keys, data_src, data_pairs = parse_app(script)
+    defined = data_keys | computed_keys | methods_keys
+
+    # ---------------------------------------------------------- L1 方法插值
+    # 只抓「整个插值就是一个裸标识符」的形态：带括号（{{foo()}}）是调用，安全；
+    # 带点号/运算符的走 L2 的根标识符通道，那里只要求"有定义"。
+    bare_interp = re.findall(r"\{\{\s*([a-zA-Z_$][\w$]*)\s*\}\}", tpl)
+    bad = sorted({n for n in bare_interp if n in methods_keys})
+    check("L1 没有被插值的方法名（Vue 3 bind 后会显示 function () { [native code] }）",
+          not bad,
+          f"这些名字定义在 methods: 里却被当成值插值: {bad}。"
+          f"搬进 computed:，或在模板里写成 名字() 显式调用")
+
+    # ---------------------------------------------------------- L2 孤儿引用
+    used: set[str] = set()
+    # 事件处理器：整段都是代码，取全部根标识符
+    for attr in re.findall(r'@[\w.]+="([^"]+)"', tpl):
+        used |= set(root_identifiers(attr))
+    # v-model：单个路径
+    for vm in re.findall(r'v-model(?::[\w.]+)?="([^"]+)"', tpl):
+        used |= set(root_identifiers(vm))
+    # 文本插值
+    for expr in re.findall(r"\{\{(.*?)\}\}", tpl):
+        used |= set(root_identifiers(expr))
+    # 条件/循环/绑定属性
+    for expr in re.findall(
+            r'(?:v-if|v-else-if|v-show|v-for|:[\w-]+|v-bind:[\w-]+)="([^"]+)"', tpl):
+        used |= set(root_identifiers(expr))
+    orphans = sorted(
+        n for n in used
+        if n not in defined and n not in BUILTINS and n not in LOCAL_VARS
+        and n not in vfor_aliases(tpl))
+    check("L2 模板无孤儿引用（每个根标识符都在 data/computed/methods 里有定义）",
+          not orphans,
+          f"未定义: {orphans}。Vue 3 对孤儿引用不报错，只渲染成空 —— "
+          f"表现为「功能看着在，点了没反应」")
+
+    # ---------------------------------------------------------- L3 重复键
+    seen: dict[str, int] = {}
+    dupes: list[str] = []
+    for name, ln in data_pairs:
+        if name in seen:
+            dupes.append(f"{name}（第 {seen[name]} 行与第 {ln} 行）")
+        else:
+            seen[name] = ln
+    check("L3 data() 无重复键（后者会静默覆盖前者，且两处往往隔得很远）",
+          not dupes, f"重复: {dupes}")
+
+
+def main() -> int:
+    print("=" * 64)
+    print("前端模板卫生（静态扫描：方法插值 / 孤儿引用 / 重复键）")
+    print("=" * 64)
+    missing = [p for p in (INDEX, USER) if not p.exists()]
+    if missing:
+        print(f"[fatal] 找不到文件: {[str(m) for m in missing]}")
+        return 1
+    for path in (INDEX, USER):
+        scan_file(path)
+
+    passed = sum(1 for _n, ok, _d in results if ok)
+    failed = [n for n, ok, _d in results if not ok]
+    print("\n" + "=" * 64)
+    print(f"共 {len(results)} 条断言：通过 {passed}，失败 {len(failed)}")
+    for name in failed:
+        print(f"  ✗ {name}")
+    print("=" * 64)
+    return 0 if not failed else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

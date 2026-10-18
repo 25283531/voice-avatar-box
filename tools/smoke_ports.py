@@ -115,6 +115,7 @@ DEFAULT_PORTS: dict[str, int] = {
     "smoke_deploy": 8122,          # 部署模式：tunnel/direct/auto 三模式地址推导 + 启动自检
     "smoke_local_reminders": 8123, # 断网自建提醒上报：鉴权 + 幂等 + sync 可见性
     "smoke_voice_catalog": 8124,   # 音色目录 + 服务就绪度：预置清单单一真源 + 零配置如实反映
+    "smoke_proxy_headers": 8125,   # 可信反代：ProxyHeaders 算法 + 307 Location 的 scheme 推导
 }
 
 
