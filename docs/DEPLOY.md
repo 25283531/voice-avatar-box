@@ -605,9 +605,10 @@ curl -si -N --max-time 5 \
 - `tunnel` / `direct` 且配了对外地址 -> 用配置的地址，与请求无关；
 - 否则按 `request.url.scheme` 决定下发 `ws://` 还是 `wss://`，Host 取请求头。
 
-坑在于：**uvicorn 对 `X-Forwarded-Proto` 的处理只信任来自 127.0.0.1 的对端**
-（框架默认值 `proxy_headers=True, forwarded_allow_ips=127.0.0.1`；镜像 CMD 没有
-传任何 proxy 参数，用的是这个默认值）。本形态里容器看到的 TCP 对端是
+坑在于：**uvicorn 对 `X-Forwarded-Proto` 的处理只信任来自 `127.0.0.1` 的对端**
+（框架默认值 `proxy_headers=True, forwarded_allow_ips=127.0.0.1`；镜像 CMD 显式传了
+`--proxy-headers --forwarded-allow-ips ${ELDER_TRUSTED_PROXY_IPS:-127.0.0.1}`，
+不设该变量时与框架默认值逐字等价，存量部署升级不受影响）。本形态里容器看到的 TCP 对端是
 **Docker 网桥网关**（cloudflared 在宿主机，查法见 §4.1.4），不在信任名单里
 —— 即使 cloudflared 正确传了 `X-Forwarded-Proto: https`，uvicorn 眼里自己
 永远是明文 HTTP。于是 `request.url.scheme` 恒为 `http`，设备拿到的是
@@ -637,6 +638,11 @@ ELDER_PUBLIC_BASE_URL=https://voice.2508866.xyz
   "正常"（心跳成功、管理台能开），只有设备一开口就断，运行期没有任何信号。
   用一次启动失败换掉一次线上静默故障。不设 `ELDER_DEPLOY_MODE` 则是 `auto`，
   行为与今天完全一致，存量部署升级不受影响。
+- **同一个 `scheme` 坑还会打到管理后台**：Starlette 的 `redirect_slashes` 对
+  `/api/admin/presets` 这类少结尾斜杠的请求发 307，`Location` 头的 scheme 取自
+  `scope["scheme"]` —— 即上面这个被改写的值。于是浏览器在 HTTPS 页面上收到一个
+  `http://` 的绝对跳转地址，**先按 Mixed Content 策略拦下来**（`Failed to fetch`），
+  请求根本发不出去。处置见 §6.13。
 - 改完 `docker compose up -d`（重建容器）生效；启动日志会打一行部署摘要
   （模式 / HTTP 地址 / WS 地址 / 设备将拿到的 ws URL），然后按 §4.1.2 的方法实测一次 WS。
 
@@ -649,11 +655,11 @@ XFF，且**从右往左**跳过可信段、取第一个不可信地址（攻击�
 对应到本形态：
 
 - **绝不要**给 uvicorn 传 `--forwarded-allow-ips=*`。传 `*` 时 uvicorn 会把 XFF 最左段
-  （请求方随便写的那段）当作对端 IP，限速器直接形同虚设。镜像 CMD 没有传任何 proxy
-  参数，用的是框架默认值（`proxy_headers=True` 但 `forwarded_allow_ips=127.0.0.1`）：
-  只有回环对端的 XFF 会被框架采纳，其余一律交给应用层按可信名单从右往左解析 ——
-  这是刻意的最安全默认；要改 Dockerfile CMD 属于 `server/**` 改动，需单独评审，
-  不要在执行 docker run 时顺手加参数。
+  （请求方随便写的那段）当作对端 IP，限速器直接形同虚设。镜像 CMD 传的是
+  `--forwarded-allow-ips ${ELDER_TRUSTED_PROXY_IPS:-127.0.0.1}`：只有回环对端
+  （或显式填进 `ELDER_TRUSTED_PROXY_IPS` 的地址）的 XFF 会被框架采纳，其余一律交给
+  应用层按可信名单从右往左解析 —— 这是刻意的最安全默认；要改 Dockerfile CMD 属于
+  `server/**` 改动，需单独评审，不要在执行 docker run 时顺手加参数。
 - cloudflared 跑在宿主机时，容器看到的 TCP 对端**不是 127.0.0.1**，而是 Docker 网桥网关
   （compose 网络 `server_elder-net` 的 Gateway，通常 `172.x.0.1`）。查法：
 
@@ -900,7 +906,7 @@ WS 地址由它自动换 scheme 推导成 `wss://voice.example.com/api/voice/v1/
 | `ELDER_LOGIN_FAIL_PER_MINUTE` | `6` | 每个主体（IP / 用户名）每分钟最多几次失败。`0` = 该窗口不生效。详见 §5.3 |
 | `ELDER_LOGIN_FAIL_PER_HOUR` | `20` | 每个主体每小时最多几次失败。`0` = 该窗口不生效。NAT 后面人多时调大这一条。详见 §5.3 |
 | `ELDER_LOGIN_RATE_LIMIT_MAX_KEYS` | `10000` | 限速表最多记多少个主体，超出按 LRU 淘汰。挡住"拿一万个假用户名各错一次"把内存撑爆。详见 §5.3 |
-| `ELDER_TRUSTED_PROXY_IPS` | 空（谁都不信） | **可信反代地址**（逗号分隔，支持 CIDR）。留空 = 只认 TCP 对端、`X-Forwarded-For` 一律不信；填了且**对端在名单里**时才解析 XFF，并**从右往左**跳过可信段取第一个不可信地址。**切勿在 uvicorn 侧用 `--forwarded-allow-ips=*`**。详见 §5.3 |
+| `ELDER_TRUSTED_PROXY_IPS` | 空（框架层回落 `127.0.0.1`，应用层谁都不信） | **可信反代地址**（逗号分隔，支持 CIDR）。**同时驱动两层**：① 框架层 —— Dockerfile CMD 的 `--forwarded-allow-ips ${ELDER_TRUSTED_PROXY_IPS:-127.0.0.1}`，决定 uvicorn 是否采信 XFF/XFP（不设时与框架默认 `127.0.0.1` 等价）；② 应用层 —— `ratelimit.client_ip()` 只在**对端在名单里**时才解析 XFF，并**从右往左**跳过可信段取第一个不可信地址。⚠️ 两层语义必须一致：uvicorn 侧的 `*` = 信任所有人（取最左段，可伪造），应用层的 `*` = 谁都不信（解析不成网段），合起来限速器两头落空。**切勿传 `*`**。详见 §5.3、§6.13 |
 | `ELDER_MAIL_FAKE` | `0` | **测试专用**。设为 `1` 时邮件不真投递、写进进程内发件箱。**生产必须为 `0`**，留空等同 `0` |
 
 **找回密码与 SMTP 超时（`server/app/mailer.py`）** —— 这一组**不在 `config.py` 里**，
@@ -1220,18 +1226,22 @@ export ELDER_LOGIN_FAIL_PER_MINUTE=9999 ELDER_LOGIN_FAIL_PER_HOUR=9999
 就换一个主体 —— 限速器形同虚设。本项目的规则是**两层**：
 
 **第 1 层（uvicorn 自带）** —— uvicorn 默认开启 `ProxyHeadersMiddleware`，
-且默认 `--forwarded-allow-ips=127.0.0.1`：只要 TCP 对端是 127.0.0.1，它会先把
+镜像 CMD 显式传 `--proxy-headers --forwarded-allow-ips ${ELDER_TRUSTED_PROXY_IPS:-127.0.0.1}`
+（不设变量时与框架默认 `127.0.0.1` 逐字等价）：只要 TCP 对端在名单里，它会先把
 `request.client` 改写成 XFF 里解析出来的地址，才轮到应用代码看到。
 
 > ⚠️⚠️ **绝对不要传 `--forwarded-allow-ips=*`**。此时 uvicorn 取的是 XFF 的
 > **最左边一段**，那正是攻击者伪造着塞进来的；`*` 等于把限速器关掉。
-> 生产必须把它写成**反代那一个地址**（或最小网段），例如：
+> 更阴的是：`*` 在 uvicorn 层是"信任所有人"，而在应用层
+> （`ratelimit._parse_trusted("*")` 解析不成网段，退化成永不匹配的字面量）
+> 是"谁都不信" —— 两层语义相反，合起来的效果是 uvicorn 把对端改写成攻击者
+> 选的 IP，限速器再拿它当键，**两头落空**。生产必须把它写成**反代那一个地址**
+> （或最小网段），例如：
 >
 > ```yaml
 > # docker-compose.yml（Nginx 也在容器里时填容器名/网段，不要用 *）
-> command: >
->   uvicorn app.main:app --host 0.0.0.0 --port 8080
->   --forwarded-allow-ips 172.18.0.5
+> environment:
+>   ELDER_TRUSTED_PROXY_IPS: "172.18.0.5"
 > ```
 >
 > 反代就在本机（对端是 127.0.0.1）时保持默认值即可，不用配。
@@ -1252,7 +1262,8 @@ export ELDER_LOGIN_FAIL_PER_MINUTE=9999 ELDER_LOGIN_FAIL_PER_HOUR=9999
 
 > 排障：如果所有人共用一个出口 IP（公司 NAT / 家里多个人），会表现为"一个人输错
 > 几次、别人也跟着被限"。此时把 `ELDER_LOGIN_FAIL_PER_HOUR` 调大，
-> 或让运维确认第 1 层的 `--forwarded-allow-ips` 是不是误配成了 `*`。
+> 或让运维确认第 1 层的 `ELDER_TRUSTED_PROXY_IPS` 是不是误配成了 `*`
+> （uvicorn 侧等价的 `--forwarded-allow-ips=*` 同理）。
 
 #### 三、计数存哪、怎么清理
 
@@ -1419,9 +1430,16 @@ docker inspect --format '{{.State.ExitCode}}' elder-server
    ```
 
    机制说明：uvicorn 对 `X-Forwarded-Proto` **只信任来自 127.0.0.1 的对端**
-   （框架默认值），生产里容器看到的对端是 Docker 网桥网关，该头不被采纳，
+   （镜像 CMD 的 `--forwarded-allow-ips ${ELDER_TRUSTED_PROXY_IPS:-127.0.0.1}`，
+   默认即 127.0.0.1），生产里容器看到的对端是 Docker 网桥网关，该头不被采纳，
    scheme 推导恒为 http —— 所以**只要走了 TLS 反代（Nginx / Cloudflare Tunnel
    都一样）就必须配对外地址**，详见 §4.1.3，三种拓扑的完整决策表见 §4.2。
+
+   > 想把网关加进信任名单、让 scheme 推导自动生效，需要同时改两层：
+   > `ELDER_TRUSTED_PROXY_IPS`（应用层 ratelimit）与 Dockerfile CMD 的
+   > `--forwarded-allow-ips`（框架层，读同一个变量，见 §5.3）。
+   > **但不推荐用它替代对外地址** —— 名单只解决"对端是谁"，不解决
+   > "该给设备发什么地址"，配错域名时照样错。
 
 5. 若完全没有到 `/api/voice/` 的日志，检查容器的 8064 端口映射是否已发布、
    以及有没有别的进程抢占了它。
@@ -1538,6 +1556,57 @@ export ELDER_LIBOPUS_PATH=C:/lib/opus.dll
 > 缺可选依赖时测试会静默 SKIP 而不是 FAIL，断言根本没跑，报告却是绿的。
 > 现在已加独立的 `libopus_available()` 前置断言把「跳过」变成「红」，
 > 但**你自己新写的测试若依赖 libopus，仍然必须配一条前置断言**，否则会重蹈覆辙。
+
+### 6.13 管理后台报 `Failed to fetch` / Mixed Content（HTTPS 页面里的 http 跳转）
+
+**现象**：页面本身能打开（HTTPS 正常），但一调用某些接口就失败：
+
+- 浏览器 Console：`Mixed Content: The page at 'https://voice.2508866.xyz/' was loaded
+  over HTTPS, but requested an insecure XMLHttpRequest endpoint
+  'http://voice.2508866.xyz/api/admin/presets/'. This request has been blocked;
+  the content must be served over HTTPS.`
+- 前端只显示一个没有细节的 `Failed to fetch`（fetch 被浏览器拦下，
+  连 socket 都没建，所以服务端日志里**一行都没有**）。
+- 常见触发路径是**少写了结尾斜杠**的接口，例如 `/api/admin/presets`
+  （带斜杠的 `/api/admin/presets/` 反而是 200）。
+
+**根因**（与 §4.1.3 的 `ws://` 是同一个 scheme 坑，换了个马甲）：
+
+1. Starlette 的 `redirect_slashes` 对少斜杠路径发 **307**，
+   `Location` 是**绝对地址**，其 scheme 取自 `scope["scheme"]`；
+2. 而 `scope["scheme"]` 正是 uvicorn `ProxyHeadersMiddleware` 改写的那一环 ——
+   TLS 在前置终止（Cloudflare Tunnel / Nginx / Caddy）时，容器看到的 TCP 对端是
+   Docker 网桥网关，不在 `--forwarded-allow-ips` 名单里，
+   `X-Forwarded-Proto: https` 不被采纳，scheme 恒为 `http`；
+3. 于是浏览器在 HTTPS 页面上收到一个 `http://` 的跳转目标，被 Mixed Content
+   策略**先于任何网络请求**拦掉。
+
+**自证**（一条命令，看 `Location` 的 scheme；注意 uvicorn 发出的头名是**小写**
+`location`）：
+
+```bash
+curl -sI http://<宿主机>:8064/api/admin/presets | grep -i '^location'
+# 错：location: http://voice.2508866.xyz/api/admin/presets/
+# 对：location: https://voice.2508866.xyz/api/admin/presets/
+```
+
+**处置**（按推荐顺序）：
+
+1. **显式配对外地址**（治本，与 §4.1.3 同一套药）：
+   `ELDER_DEPLOY_MODE=tunnel` + `ELDER_PUBLIC_BASE_URL=https://<域名>`。
+   配了之后地址与请求无关，scheme 推导退居二线，307 自然带上 `https://`。
+2. **把可信反代填进 `ELDER_TRUSTED_PROXY_IPS`**（让推导自动生效）：
+   填 Docker 网桥网关（查法见 §4.1.4）。注意这一个变量同时决定两层 ——
+   框架层读 Dockerfile CMD 的 `--forwarded-allow-ips ${ELDER_TRUSTED_PROXY_IPS:-...}`，
+   应用层读 `server/app/ratelimit.py` 的同一变量。**两层语义必须一致，
+   切勿一边填网关一边把 CMD 写成 `*`**（`*` 的两层语义相反，见 §5.3）。
+3. ~~前端统一补结尾斜杠~~：这只是让 307 不发生，属于绕过；换一个
+   不带斜杠的接口（或将来加一个需要跳转的路由）照样复发。**不建议**作为修复。
+
+**回归看守**：`tools/smoke_proxy_headers.py` 的 C1/C2（同一配置下 307 的
+`Location` 必须是 `https://`；把 `forwarded_allow_ips` 换成不可信地址即复现事故）、
+C3（`proxy_headers=False` 的反向验证）与 D 组（Dockerfile 静态核对：
+`--proxy-headers` 必须在、默认值不能是 `*`）。CI 已接入。
 
 ---
 

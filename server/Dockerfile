@@ -37,9 +37,26 @@ ENV PYTHONUNBUFFERED=1 \
 #
 # ⚠️ 上面 ENV 里的 auto 与 config.py 的默认值一致，显式声明只是为了让
 # `docker inspect` 能一眼看到当前模式；compose 的 environment 会覆盖它。
-# ⚠️ 刻意**不**给 CMD 的 uvicorn 加 --proxy-headers / --forwarded-allow-ips：
-# 传 * 会让登录限速形同虚设（XFF 最左段可伪造），应用层按
-# ELDER_TRUSTED_PROXY_IPS 名单从右往左解析，见 docs/DEPLOY.md §4.1.4。
+# ⚠️ 这里给 uvicorn 传 --proxy-headers，但 **--forwarded-allow-ips 绝不写 `*`**：
+#   传 * 时 uvicorn 的 ProxyHeadersMiddleware.get_trusted_client_host() 走
+#   `always_trust` 分支，取 X-Forwarded-For 的**最左段** —— 而那正是请求方可以
+#   随便写的一段，等于让攻击者每次换个头就换一个主体，登录限速形同虚设。
+#   写成具体 IP 时它走的是**从右往左跳过可信代理**，取到第一个不可信地址，
+#   与 app/ratelimit.py::client_ip() 的算法逐字一致 —— 两边解析出的真实客户端
+#   是同一个，限速器照常工作。详见 docs/DEPLOY.md §4.1.4。
+#
+# 为什么必须传（不传的代价不只是限速）
+# -------------------------------------
+# uvicorn 用它来决定 `request.url.scheme`。不传时只有来自 127.0.0.1 的
+# X-Forwarded-Proto 被采纳，而生产里对端是 Docker 网桥网关 ⇒ scheme 恒为
+# http。后果有两个，都是**运行期零报错**的那类：
+#   1. FastAPI 的 redirect_slashes 生成 307 时拼出 `Location: http://域名/...`，
+#      浏览器在 HTTPS 页面上跟这个重定向 → Mixed Content → "Failed to fetch"；
+#   2. config.py 按请求 scheme 推导下发地址，设备拿到 ws:// 打 443，
+#      表现为"能心跳不能说话"。
+# 默认值 127.0.0.1 与 uvicorn 自己的默认值相同，**不改变任何现有部署的行为**；
+# 反代在容器里的（Caddy / Nginx / OpenResty 与后端同 compose 网络）把
+# ELDER_TRUSTED_PROXY_IPS 设成 Docker 网桥网关即可（查法见 DEPLOY.md）。
 
 WORKDIR /app
 
@@ -73,4 +90,8 @@ EXPOSE 8080
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
     CMD python -c "import os,urllib.request;urllib.request.urlopen('http://127.0.0.1:%d/api/health' % int(os.environ.get('ELDER_PORT','8080')))"
 
-CMD ["sh", "-c", "exec uvicorn app.main:app --host 0.0.0.0 --port ${ELDER_PORT:-8080}"]
+# ⚠️ ELDER_TRUSTED_PROXY_IPS 与 ELDER_PORT 同样用 `${VAR:-默认}` 展开，
+#    由 `sh -c` 完成（exec 形式里 Docker 自身不做变量替换，交给 shell）。
+#    ⚠️ 这个值**不要带空格**：未加引号展开时 "172.18.0.1, 10.0.0.5" 会被 shell
+#    切成两个参数，uvicorn 直接报参数错误。逗号紧挨着写。
+CMD ["sh", "-c", "exec uvicorn app.main:app --host 0.0.0.0 --port ${ELDER_PORT:-8080} --proxy-headers --forwarded-allow-ips ${ELDER_TRUSTED_PROXY_IPS:-127.0.0.1}"]
