@@ -5,9 +5,10 @@
 
 覆盖（与 2026-10-18 线上事故一一对应）
 --------------------------------------
-A. **uvicorn ProxyHeadersMiddleware 单元层**（0.23.2 源码级行为钉住）：
-   对端在信任名单内才理会 X-Forwarded-*；从右往左跳过可信代理取第一个
-   不可信地址；``*`` 走 always_trust 分支取**最左段**（可伪造）。
+A. **uvicorn ProxyHeadersMiddleware 单元层**（跨版本行为钉住）：
+   主路径（对端可信取第一个不可信地址 / 对端不可信全忽略 / `*` 取最左段 /
+   XFP 改写 scheme）在 0.23.2 与 ≥0.30 上实测一致；唯一分叉点是
+   「XFF 全段可信」（≤0.30 置 (None, 0)，≥0.31 置最左段），A5 按版本门控。
 B. **两层算法一致性**：uvicorn 的 ``get_trusted_client_host`` 与
    ``app/ratelimit.py::client_ip`` 在主路径上必须给出同一个真实客户端 IP
    —— 同一个 ``ELDER_TRUSTED_PROXY_IPS`` 旋钮同时驱动它们，算法分叉会让
@@ -173,8 +174,28 @@ def _run_mw(trusted_hosts: str, client: tuple[str, int], headers: list[tuple[byt
     return captured
 
 
+def _uvicorn_flavor() -> str:
+    """本环境 uvicorn 在「XFF 全段可信」上的形态。
+
+    - ``"none"``：≤0.30，client 置 ``(None, 0)``（issue #1068 讨论前的形态）
+    - ``"leftmost"``：≥0.31，client 置 XFF **最左段**（该段由最外层可信代理
+      写入，是真实客户端而非伪造段；同一 issue 的最终修法）
+    - ``"unknown"``：版本号解析失败（调用方退化为两种形态都接受）
+
+    边界实证过，不是推理：下载 0.30.0 / 0.31.0 / 0.32.0 / 0.33.0 / 0.34.0
+    的 wheel 读 ``proxy_headers.py`` 源码，0.30.0 仍返回 None、0.31.0 起
+    返回最左段；本地 0.23.2 与 elder venv 0.54.0 各实跑一遍全量冒烟。
+    """
+    parts = uvicorn.__version__.split(".")
+    try:
+        major, minor = int(parts[0]), int(parts[1])
+    except (ValueError, IndexError):
+        return "unknown"
+    return "none" if (major, minor) < (0, 31) else "leftmost"
+
+
 def group_a() -> None:
-    group("A. ProxyHeadersMiddleware 单元层（uvicorn 0.23.2 行为钉住）")
+    group("A. ProxyHeadersMiddleware 单元层（跨版本行为钉住）")
 
     # A1 主路径：对端可信（Caddy 在名单里）+ 两跳 XFF，左边还有一段伪造。
     # 从右往左跳过可信的 10.0.0.9，第一个不可信的是 1.2.3.4 —— 真实客户端。
@@ -205,13 +226,30 @@ def group_a() -> None:
     check("A4 对端可信 + X-Forwarded-Proto: https ⇒ scheme 改写为 https",
           sc["scheme"] == "https", f"scheme={sc.get('scheme')}")
 
-    # A5 XFF 全段都可信时框架把 client 置成 (None, 0)。这是 uvicorn 的既有
-    # 边界行为，钉住它：将来若有人"顺手修掉"，本断言会提示重新评估对
-    # ratelimit（其 client_ip 对 None 对端会归成 "unknown"）的影响。
+    # A5 XFF 全段都可信时的框架边界行为 —— **版本分叉点，按版本门控**：
+    #   uvicorn ≤0.30：client 置成 (None, 0)
+    #   uvicorn ≥0.31：client 置成 XFF **最左段**（最外层可信代理写入的真实
+    #     客户端，不是伪造段）
+    # 两种形态对本站点都无害：ratelimit.client_ip 对 None 对端归 "unknown"，
+    # 对最左段正常限速。但**不容第三方形态**（如 ("", 0)、或不在信任名单里的
+    # 地址）—— 那说明 trusted_hosts 解析或 always_trust 判断被改坏，必须停下
+    # 来重评对限速键的影响。
+    # ⚠️ requirements 允许 uvicorn>=0.30,<1.0 ⇒ CI 装的是最新版（≥0.31 形态），
+    # 本地曾是 0.23.2（≤0.30 形态）—— 本断言两条路径都实测绿过。
+    flavor = _uvicorn_flavor()
     sc = _run_mw("127.0.0.1", ("127.0.0.1", 5000),
                  [(b"x-forwarded-for", b"127.0.0.1")])
-    check("A5 XFF 全段可信 ⇒ client 变 (None, 0)（框架边界行为，勿静默改）",
-          sc["client"] == (None, 0), f"client={sc.get('client')}")
+    client = sc.get("client")
+    if flavor == "none":
+        ok, expect = client == (None, 0), "(None, 0)"
+    elif flavor == "leftmost":
+        ok, expect = client == ("127.0.0.1", 0), "('127.0.0.1', 0)"
+    else:  # 版本号解析不了：两种已知形态都接受，仍不容第三方形态
+        ok = client in ((None, 0), ("127.0.0.1", 0))
+        expect = "(None, 0) 或 ('127.0.0.1', 0)"
+    check(f"A5 XFF 全段可信 ⇒ client={expect}"
+          f"（uvicorn {uvicorn.__version__} ⇒ {flavor} 形态）",
+          ok, f"client={client}")
 
 
 # ================================================================ B. 两层一致性
