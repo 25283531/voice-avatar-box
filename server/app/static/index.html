@@ -717,11 +717,16 @@
                   <option v-for="v in ttsVendors" :key="v.value" :value="v.value">{{v.label}}</option>
                   <option value="__other__">其他 / 自建服务（OpenAI 兼容）</option>
                 </template>
+                <!-- 非 TTS：下拉与预填全部来自服务端预置表（provider_presets）。
+                     ⚠️ 不能在这里硬编码厂商名 —— 预置表是「厂商→endpoint/模型/免费口径」
+                     的唯一真源，前端再抄一份就会漂移（改了一处忘了另一处）。
+                     下面三行自部署服务不在预置表里（没有统一 endpoint 口径），故显式保留。 -->
                 <template v-else>
-                  <option value="aliyun">阿里云百炼</option><option value="volcengine">火山引擎</option>
-                  <option value="deepseek">DeepSeek</option><option value="zhipu">智谱</option>
-                  <option value="openai">OpenAI 兼容</option><option value="ollama">Ollama（自部署）</option>
-                  <option value="dify">Dify</option><option value="xinference">Xinference（自部署）</option>
+                  <option v-for="p in providerPresets" :key="p.value" :value="p.value">{{p.label}}</option>
+                  <option value="volcengine">火山方舟（OpenAI 兼容）</option>
+                  <option value="ollama">Ollama（自部署）</option>
+                  <option value="dify">Dify</option>
+                  <option value="xinference">Xinference（自部署）</option>
                 </template>
               </select></div>
             <div v-if="pForm.kind==='tts' && vendorInfo" class="hint"
@@ -732,6 +737,16 @@
                 <div v-if="vendorInfo.needs_key"><b>密钥怎么填：</b>{{vendorInfo.key_hint}}</div>
                 <div v-else><b>密钥：</b>不需要填，直接保存即可。</div>
                 <div v-if="vendorInfo.notes" style="color:#8a5a00;margin-top:4px">{{vendorInfo.notes}}</div>
+              </div>
+            </div>
+            <div v-if="pForm.kind!=='tts' && providerPreset" class="hint"
+                 style="grid-column:1/-1;border-color:#cfe0f7;background:#f4f8fd">
+              <div style="margin-bottom:4px"><b>{{providerPreset.label}}</b></div>
+              <div style="font-size:13px;line-height:1.7">
+                <div><b>免费口径：</b>{{providerPreset.free_tier}}</div>
+                <div v-if="providerPreset.needs_key"><b>密钥怎么填：</b>{{providerPreset.key_hint}}</div>
+                <div v-else><b>密钥：</b>不需要填，直接保存即可。</div>
+                <div v-if="providerPreset.notes" style="color:#8a5a00;margin-top:4px">{{providerPreset.notes}}</div>
               </div>
             </div>
             <div v-if="pForm.kind==='tts' && !edgeAvailable" class="hint"
@@ -1022,10 +1037,24 @@ createApp({
       // ⚠️ 必须服务端下发：三家要填的字段差别太大（火山是 AK:SK 两段、
       // Edge 完全不用填），硬编码在前端等于把「每家要什么」抄成第二份真源。
       ttsVendors: [], voicesByVendor: {}, edgeAvailable: true,
+      // 非 TTS 厂商预置（同一接口的 provider_presets 字段）。
+      // 与 ttsVendors 同理走服务端下发，理由同上：厂商→endpoint/模型/免费口径
+      // 只有 provider_presets.py 一份真源。字段缺失时回落成空数组（见装载处）。
+      providerPresets: [],
       // 就绪度面板数据（GET /api/providers/readiness）
       readiness: null, readyBusy:false,
       pEditBox: false, pEdit: null, presetBusy:false,
-      pPreview: null, auditBox:null, audits: [], showDiff:{}
+      pPreview: null, auditBox:null, audits: [], showDiff:{},
+      // ---- 账号安全（修改密码）----
+      pwBox: false, pwBusy: false, pwErr: '', pwMsg: '',
+      pwForm: {old_password:'', new_password:'', new_password2:''},
+      // ---- 邮件配置（SMTP）----
+      // smtp 是服务端返回的只读快照（password 是掩码），smtpForm 是可编辑副本。
+      // 两者分开的原因：GET 回来的 password 是掩码，直接双向绑定会把掩码当密码存回去。
+      smtp: {has_password:false, updated_at:null},
+      smtpForm: null, smtpLoaded: false,
+      smtpBusy: false, smtpErr: '', smtpMsg: '',
+      testTo: '', testBusy: false, testResult: null
     };
   },
   computed:{
@@ -1126,6 +1155,9 @@ createApp({
           this.ttsVendors = r.vendors || [];
           this.voicesByVendor = r.voices_by_vendor || {};
           this.edgeAvailable = r.edge_available !== false;
+          // ⚠️ 用 Array.isArray 兜住，而不是 `|| []`：预置字段缺失/类型不对时
+          // 退回「只有自部署三项」的下拉，而不是让模板里 v-for 拿到非数组直接抛错。
+          this.providerPresets = Array.isArray(r.provider_presets) ? r.provider_presets : [];
           // 目录到达后要重新拆分：openPreset/editAvatar/openProvider 可能在
           // 目录还空时就把存量音色判成了「不在清单里」，落进自定义框。
           if (this.pEdit) Object.assign(this.pEdit, this.splitVoice(this.pEdit.tts_voice));
@@ -1311,6 +1343,12 @@ createApp({
       if (!this.pForm || this.pForm.kind!=='tts') return null;
       return this.ttsVendors.find(v=>v.value===this.pForm.provider) || null;
     },
+    // 非 TTS 的对应物。与 vendorInfo 严格互斥（一个认 tts，一个认 !tts），
+    // 这样 onProviderChange 可以靠「先看哪个非空」来分派，不用再判 kind。
+    providerPreset(){
+      if (!this.pForm || this.pForm.kind==='tts') return null;
+      return this.providerPresets.find(p=>p.value===this.pForm.provider) || null;
+    },
     vendorVoices(){
       if (!this.pForm) return [];
       const map = this.voicesByVendor || {};
@@ -1337,7 +1375,21 @@ createApp({
     //    否则每次切回上一个厂商，endpoint 就被冲掉，配置根本没法微调。
     onProviderChange(){
       const info = this.vendorInfo;
-      if (!info) return;                      // __other__ / 非 TTS：不干预
+      if (!info) {
+        // 非 TTS：走 provider_presets 预置。__other__ / 自部署 / Dify /
+        // 火山方舟 都不在预置表里 —— 这时**不干预**，让管理员自己填。
+        const preset = this.providerPreset;
+        if (!preset) return;
+        if (!this.pForm.endpoint)  this.pForm.endpoint  = preset.endpoint;
+        if (!this.pForm.api_style) this.pForm.api_style = preset.api_style;
+        // 模型按当前 kind 取；该 kind 预置里没有（如 deepseek 没有 rerank）
+        // 就**什么都不做** —— 既不清空也不瞎填，清空会毁掉管理员手填的模型名。
+        if (!this.pForm.model) {
+          const m = (preset.models || {})[this.pForm.kind];
+          if (m) this.pForm.model = m;
+        }
+        return;
+      }
       if (!this.pForm.endpoint) this.pForm.endpoint = info.endpoint;
       if (!this.pForm.model)    this.pForm.model    = info.model;
       if (info.api_style)       this.pForm.api_style = info.api_style;
