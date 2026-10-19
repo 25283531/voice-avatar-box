@@ -113,30 +113,54 @@ function openDoc(url: string) {
         <text class="agree-link" @click="openDoc('/pages/login/privacy-policy-zh')">《隐私政策》</text>
       </view>
 
-      <view class="tip">
+      <view v-if="mode === 'login'" class="tip">
         忘记密码可在「我的 → 修改密码」处理，或联系管理员重置
       </view>
     </view>
   </view>
 </template>
 
+<!--
+  一屏显示（2026-10-19 用户实测修复）
+
+  现象：安卓 APP 注册页装不下，底部「注册」按钮和协议勾选要滚动才看得到。
+
+  原因（按 rpx 算的，750rpx = 屏幕宽）：
+    原布局注册态总高 ≈ 1326rpx，而典型安卓视口可用高只有 ~1200rpx
+    （16:9 屏扣掉状态栏/导航栏），必然溢出。逐项构成：
+      page padding 96 + brand 326（logo 150 + 名称 + 副标题 + 48 下边距）
+      + card padding 72 + tabs 138 + 5 个输入框 535 + 按钮 89
+      + 协议行 56 + 底部提示 62。
+
+  做法：压「非信息」的垂直开销，信息本身不动。
+    · brand 是装饰，占了 326rpx 却零信息量 → logo 与间距各砍 ~40%
+    · 输入框上下内边距 22→16、间距 20→16（5 个框省 60rpx）
+    · card / page 内边距同步收窄
+    · 底部「忘记密码」提示**注册态隐藏**：它讲的是登录态的事，
+      注册的人此刻根本用不上（登录态仍保留）
+    · 协议行仍允许折行（宽屏一行、小屏两行都放得下）
+
+  结果：注册态 ≈ 1047rpx、登录态 ≈ 1140rpx，均在一屏内，且仍保留
+  页面滚动作为极小屏（< 5 吋）的兜底——不写 overflow:hidden，
+  免得万一装不下时用户连滚动都没得滚。
+-->
 <style scoped>
-.page { padding: 48rpx 40rpx; background: #f5f7fa; min-height: 100vh; }
-.brand { text-align: center; margin-bottom: 48rpx; }
-.logo { width: 150rpx; height: 150rpx; border-radius: 32rpx; }
-.brand-name { font-size: 44rpx; font-weight: 700; margin-top: 20rpx; }
-.brand-sub { font-size: 26rpx; color: #8a8f99; margin-top: 10rpx; }
-.card { background: #fff; border-radius: 24rpx; padding: 36rpx 32rpx; }
-.tabs { display: flex; margin-bottom: 24rpx; }
-.tab { flex: 1; text-align: center; padding: 16rpx 0; font-size: 30rpx; color: #6b7280; }
+.page { padding: 24rpx 32rpx; background: #f5f7fa; min-height: 100vh; box-sizing: border-box; }
+.brand { text-align: center; margin-bottom: 24rpx; }
+.logo { width: 112rpx; height: 112rpx; border-radius: 26rpx; }
+.brand-name { font-size: 40rpx; font-weight: 700; margin-top: 14rpx; }
+.brand-sub { font-size: 24rpx; color: #8a8f99; margin-top: 6rpx; }
+.card { background: #fff; border-radius: 24rpx; padding: 28rpx; box-sizing: border-box; }
+.tabs { display: flex; margin-bottom: 18rpx; }
+.tab { flex: 1; text-align: center; padding: 14rpx 0; font-size: 30rpx; color: #6b7280; }
 .tab.on { color: #e8590c; font-weight: 700; border-bottom: 4rpx solid #e8590c; }
-.input { border: 1rpx solid #e3e8ef; border-radius: 12rpx; padding: 22rpx; margin-bottom: 20rpx; font-size: 30rpx; background: #fff; width: auto; }
-.btn { background: #e8590c; color: #fff; border-radius: 12rpx; font-size: 32rpx; padding: 22rpx 0; font-weight: 600; }
+.input { border: 1rpx solid #e3e8ef; border-radius: 12rpx; padding: 16rpx 22rpx; margin-bottom: 16rpx; font-size: 30rpx; background: #fff; width: auto; box-sizing: border-box; }
+.btn { background: #e8590c; color: #fff; border-radius: 12rpx; font-size: 32rpx; padding: 18rpx 0; font-weight: 600; margin-top: 4rpx; }
 .btn[disabled] { background: #f0b48a; }
-.agree { display: flex; flex-direction: row; align-items: center; flex-wrap: wrap; margin-top: 24rpx; font-size: 24rpx; color: #6b7280; }
+.agree { display: flex; flex-direction: row; align-items: center; flex-wrap: wrap; margin-top: 20rpx; font-size: 24rpx; color: #6b7280; line-height: 1.6; }
 .checkbox { width: 32rpx; height: 32rpx; border: 2rpx solid #c8cdd4; border-radius: 6rpx; margin-right: 10rpx; }
 .checkbox.on { background: #e8590c; border-color: #e8590c; }
 .agree-text { color: #6b7280; }
 .agree-link { color: #e8590c; }
-.tip { font-size: 24rpx; color: #8a8f99; text-align: center; margin-top: 28rpx; }
+.tip { font-size: 24rpx; color: #8a8f99; text-align: center; margin-top: 20rpx; line-height: 1.6; }
 </style>

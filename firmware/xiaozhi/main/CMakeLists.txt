@@ -918,10 +918,11 @@ endif()
 set(ELDER_DIR "${PROJECT_DIR}/components/elder")
 target_sources(${COMPONENT_LIB} PRIVATE
     "${ELDER_DIR}/src/elder_bridge.cc"
+    "${ELDER_DIR}/src/elder_bind_guide.cc"
 )
 target_include_directories(${COMPONENT_LIB} PRIVATE "${ELDER_DIR}/include")
 # 链接 elder 组件：同时传递它的 REQUIRES（driver / json / esp_http_client 等）
 target_link_libraries(${COMPONENT_LIB} PRIVATE idf::elder)
 
-# ---- 在 app_main() 启动 xiaozhi 之后拉起 elder ----
+# ---- 在 app_main() 启动 xiaozhi **之前**拉起未绑定设备的绑定引导 ----
 # <<< END elder-companion overlay <<<

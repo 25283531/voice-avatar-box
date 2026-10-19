@@ -1210,11 +1210,11 @@
         </div>
         <div v-if="mailTestResult" class="card" style="margin:12px 0 0;background:#f8fafc">
           <div>
-            <span class="tag" :class="mailTestResult.ok?'ok':'bad'">{{testResult.ok?'发送成功':'发送失败'}}</span>
+            <span class="tag" :class="mailTestResult.ok?'ok':'bad'">{{mailTestResult.ok?'发送成功':'发送失败'}}</span>
             <span v-if="mailTestResult.fake" class="tag warn" style="margin-left:6px">伪装发信（未真正投递）</span>
           </div>
           <div style="margin-top:6px;font-size:13px">{{mailTestResult.message}}</div>
-          <div v-if="testResult.to" class="muted" style="font-size:12px;margin-top:4px">收件人：{{mailTestResult.to}}</div>
+          <div v-if="mailTestResult.to" class="muted" style="font-size:12px;margin-top:4px">收件人：{{mailTestResult.to}}</div>
           <div v-if="mailTestResult.error" class="muted" style="font-size:12px;margin-top:4px;word-break:break-all">
             失败原因：{{mailTestResult.error}}
           </div>

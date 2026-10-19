@@ -601,12 +601,67 @@ def stop_server(proc) -> None:
             proc.kill()
         except Exception:
             pass
+    # ⚠️ Windows 上 terminate 返回 ≠ 端口已释放。
+    #
+    # 本脚本每个场景都要「停服务 → 换环境变量 → 重启同一个端口」。而
+    # uvicorn 退出后，它的**本地侧 socket 会留在 TIME_WAIT 约 2 分钟**
+    # （Windows 默认 TcpTimedWaitDelay），此时 bind 同一个端口会失败，
+    # 新进程起不来。而 `detect_addr_in_use()` 读到的是 uvicorn 自己打的
+    # bind 失败日志 ⇒ 报「端口被占用 / 结果不可信」。
+    #
+    # ⚠️ 症状极具误导性：这条报错说的是**端口冲突**，但没有任何外部进程占端口
+    # ——占用它的是脚本自己上一轮留下的 TIME_WAIT。换个端口重跑也没用
+    # （每个新端口跑完同样会撞自己的 TIME_WAIT），实测过一次。
+    #
+    # ⇒ 停完必须**轮询等待端口真正可 bind**，而不是 sleep 一个拍脑袋的秒数。
+    # Linux(CI) 上 TIME_WAIT 极短，这个循环一次就过，不引入额外耗时。
+    if not _wait_port_released(int(PORT), timeout=90.0):
+        # 等不出来就**明说原因**。不吭声地往下走，新进程 bind 失败，
+        # `detect_addr_in_use()` 会读到 uvicorn 的 bind 失败日志，
+        # 报成「端口被占用 / 结果不可信」——把「我自己没放下端口」
+        # 误报成「有别人占我的端口」，排障方向直接跑偏。
+        print(f"[boot] ⚠️ 停止服务后端口 :{PORT} 仍无法 bind"
+              f"（多半是本脚本上一轮留下的 TIME_WAIT，约需 2 分钟自然消退）。"
+              f"本次结果不可信，建议等待或换端口重跑。")
     log_fp = getattr(proc, "_log_fp", None)
     if log_fp is not None:
         try:
             log_fp.close()
         except OSError:
             pass
+
+
+def _wait_port_released(port: int, timeout: float = 90.0) -> bool:
+    """轮询等待端口可以重新 bind。返回 True=已释放。
+
+    判据用「能不能真的 bind 上」而不是「netstat 里有没有这个名字」：
+    TIME_WAIT 条目在 netstat 里看不见，但它确实会让 bind 失败 ——
+    只有实际 bind 一次才是真判据。
+
+    ⚠️ 必须设 SO_REUSEADDR：这正是 uvicorn 自己在 listen 前做的事。
+       不设它，Windows 会因为**本机自己留下的** TIME_WAIT 拒绝 bind，
+       于是这个探测永远超时 —— 把「等它自然消退」变成「永远等不到」。
+    ⚠️ 超时给到 90s：Windows TcpTimedWaitDelay 默认 120s，但同端口反复
+       场景切换时实际消耗通常 < 20s；90s 是「能等到就等、等不到也别卡死」
+       的折中，Linux(CI) 上一次就过、零额外耗时。
+    """
+    import socket
+
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            s.bind(("127.0.0.1", port))
+            return True
+        except OSError:
+            time.sleep(0.25)
+        finally:
+            try:
+                s.close()
+            except OSError:
+                pass
+    return False
 
 
 def register(username: str, password: str = "test123456"):

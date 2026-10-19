@@ -34,7 +34,8 @@
 #include "elder_rgb.h"
 #include "elder_input.h"
 #include "elder_reminder.h"
-#include "elder_activation.h"
+// elder_activation.h 已移除：激活码改为向服务端要（真码才有效），逻辑搬到
+// src/elder_bind_guide.cc（且必须在 app.Start() 之前起任务，见该文件头注释）。
 #include "elder_ui.h"
 #include "elder_cmd.h"     /* 离线命令词词表（启动自检时遍历，见 elder_bridge_start 第 9 步） */
 #include "elder_mn.h"      /* MultiNet 识别结果 → 分发器的异步通道 */
@@ -321,29 +322,6 @@ void OnCommandRecognized(const char *phrase)
     }
 }
 
-// 后端尚未提供「设备自助换取 device_token」的接口（见交付报告的遗留问题），
-// 这里保留本地生成 + 屏显的完整流程，一旦后端补上 /api/device/hello
-// 只需在下面填入 token 即可自动进入同步。
-void ShowActivationCode()
-{
-    char code[ELDER_ACT_CODE_LEN + 1] = {0};
-    if (elder_activation_generate(code, sizeof(code)) != ESP_OK) return;
-
-    char disp[ELDER_ACT_DISPLAY_LEN] = {0};
-    elder_activation_format(code, disp, sizeof(disp));
-
-    ESP_LOGI(TAG, "激活码: %s（本地校验 %s）", disp,
-             elder_activation_verify(code) ? "OK" : "FAIL");
-
-    auto display = Board::GetInstance().GetDisplay();
-    if (display) {
-        char msg[64];
-        snprintf(msg, sizeof(msg), "激活码 %s", disp);
-        display->ShowNotification(msg, 600000);   // 10 分钟，与有效期一致
-    }
-    elder_ui_set_state(ELDER_UI_ACTIVATING, 0);
-}
-
 }  // namespace
 
 /* ---------------------------------------------------------------- 离线命令词入口 */
@@ -446,10 +424,17 @@ extern "C" void elder_bridge_start(void)
     }
 #endif
 
-    // 8) 未绑定时屏显激活码
-    if (!elder_net_has_token()) {
-        ShowActivationCode();
-    }
+    // 8) 未绑定设备的引导**不在这里做**。
+    //
+    // 原先这里调 ShowActivationCode()（本地随机生成激活码），已删除，原因三条：
+    //  1. elder_bridge_start() 跑在 app.Start() 之后，而未绑定设备上
+    //     app.Start() 在 CheckNewVersion() 的 while(true) 里永久阻塞，
+    //     根本不会返回 ⇒ 这段代码永远执行不到；
+    //  2. 本地生成的码服务端**不认**（只有 server/app/voice 的
+    //     _ensure_activation_code 落库并按 MAC 复用的码才算数），
+    //     屏显一个输进去会失败的码比不屏显更糟；
+    //  3. 现在由 elder_bind_guide.cc 负责：它在 app.Start() **之前**起任务，
+    //     向服务端要真码并周期播报「请使用手机APP或者登录网站进行设备绑定」。
 
     ESP_LOGI(TAG, "elder 组件接入完成；离线提醒可用=%s",
              elder_time_synced() ? "已校时" : "未校时（依赖本地 RTC）");

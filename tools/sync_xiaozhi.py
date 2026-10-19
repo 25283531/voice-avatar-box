@@ -3,6 +3,29 @@
 """
 sync_xiaozhi.py —— 把 xiaozhi-esp32 上游源码「瘦身」同步进本项目仓库。
 
+⚠️⚠️ 2026-10-19 起：**默认冻结，不做上游同步**（用户拍板）
+---------------------------------------------------------------
+本项目在 `firmware/xiaozhi/` 上做了**直接改上游文件**的定制（不是全部走
+overlay 注入），例如：
+
+  * `main/display/lcd_display.cc` —— 对话界面 70/30 布局（6 处几何改造）
+  * `main/main.cc` —— elder_boot / 绑定引导任务
+  * `main/boards/{bread-compact-esp32,bread-compact-esp32-lcd,esp32-cgc-144,esp32-cgc}/*.cc`
+                     —— 唤醒词改宏引用
+  * `main/boards/common/wifi_board.cc` —— 唤醒词模型注释
+  * `sdkconfig.defaults` —— 唤醒词段落去重
+
+一次 `sync --force` / `sync --prune` 就会把上面全部**静默覆盖**（内容比对
+只认「与上游一致」，不认识「本地已定制」）。而这些覆盖**不会报错**，只会
+表现为「布局悄悄回退 / 唤醒词又变回你好小智」，排查成本极高。
+
+所以本脚本的默认行为现在是**拒绝同步**并打印版本锁。要同步必须显式
+`--unlock`（且需同时给出目标 commit），每次都会打印告警。
+
+**这不代表放弃上游**：将来真要升级，流程见本文档「解冻流程」——
+先 `--unlock`，同步后重跑 `merge_to_xiaozhi.py`，再按 README
+「上游定制补丁」节把直接改的文件重新贴回去（`merge --check` 会红着提醒）。
+
 设计目标
 --------
 上游整仓 567MB（含 .git 与 509MB 的 managed_components），直接搬进自己的
@@ -11,14 +34,17 @@ Git 仓库既不现实也没必要。本脚本只搬运**编译所需源码**，
 
 用法
 ----
+    # 0) 默认：一跑就拒绝同步，只报当前版本锁状态
+    python tools/sync_xiaozhi.py
+
     # 1) 预览：统计文件数/体积、列出被排除的超大文件 Top20（不写盘）
     python tools/sync_xiaozhi.py --dry-run
 
-    # 2) 正式同步（幂等：内容相同则跳过拷贝，可反复执行）
-    python tools/sync_xiaozhi.py
+    # 2) 正式同步（**需先 --unlock**）：幂等，内容相同则跳过拷贝
+    python tools/sync_xiaozhi.py --unlock
 
     # 3) 强制覆盖（忽略内容比对，全部重写）
-    python tools/sync_xiaozhi.py --force
+    python tools/sync_xiaozhi.py --unlock --force
 
     # 指定源/目标
     python tools/sync_xiaozhi.py --src D:/espdev/src/xiaozhi-esp32 --dst firmware/xiaozhi
@@ -39,6 +65,20 @@ DEFAULT_SRC = Path(r"D:\espdev\src\xiaozhi-esp32")
 DEFAULT_DST = Path(r"G:\workbuddy\语音助手\firmware\xiaozhi")
 
 UPSTREAM_URL = "https://github.com/78/xiaozhi-esp32"
+
+# ---------------------------------------------------------------- 版本锁
+#: 冻结的上游版本（2026-10-19 用户拍板）。
+#:
+#: 改成别的值**不会**自动解冻 —— 解冻必须走 ``--unlock``，避免有人为了
+#: 「让 CI 过」随手改常量，等于把保护机制自己拆了。
+PINNED_TAG = "v2.0.5"
+PINNED_COMMIT = "860d12a12c7df9e933ff710b6f9061bf58d61ab2"
+PINNED_ON = "2026-10-19"
+PINNED_BY = "用户拍板（老人陪伴助手：直接改上游文件的定制不可再被覆盖）"
+
+#: 解冻时必须显式确认的短语。看到这行就说明脚本在要求人明确表态，
+#: 而不是让一个手滑的 ``--force`` 悄悄覆盖掉一周的定制工作。
+UNLOCK_PHRASE = "I-ACCEPT-OVERWRITE-CUSTOM-PATCHES"
 
 # 整目录排除：这些目录不需要进仓库
 #   .git               上游版本库（567MB 的绝大部分）
@@ -105,6 +145,95 @@ ROOT_DIRS = {
     "partitions",
     "scripts",
 }
+
+
+# ---------------------------------------------------------------- 版本锁
+def frozen_banner(src: Path) -> None:
+    """打印当前冻结状态 + 被保护的自定义清单。"""
+    print("=" * 70)
+    print(f"⛔ 上游同步已冻结（{PINNED_ON} 由{PINNED_BY}）")
+    print("=" * 70)
+    print(f"  固定版本 : {PINNED_TAG}  commit={PINNED_COMMIT[:12]}")
+    print(f"  本地源   : {src}")
+    try:
+        import subprocess
+
+        out = subprocess.run(
+            ["git", "describe", "--tags", "--always"],
+            cwd=str(src), capture_output=True, text=True, timeout=20,
+        ).stdout.strip()
+        sha = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=str(src), capture_output=True, text=True, timeout=20,
+        ).stdout.strip()
+        if out:
+            same = "一致" if sha.startswith(PINNED_COMMIT[:12]) else "⚠️ 与锁定版本不一致"
+            print(f"  上游仓库 : {out}  {sha[:12]}  （{same}）")
+            if not same.startswith("一致"):
+                print("            ⚠️ 即使解锁，同步的也是**另一个版本**，"
+                      "务必先 git checkout 到锁定 tag 再同步。")
+    except Exception:
+        pass
+
+    print("\n  受保护的自定义改动（直接改上游文件，sync 会静默覆盖）：")
+    for f in CUSTOM_PATCH_FILES:
+        print(f"    - {f}")
+    print("\n  要同步必须显式解锁：")
+    print(f"    python tools/sync_xiaozhi.py --unlock --confirm '{UNLOCK_PHRASE}'")
+    print("=" * 70)
+
+
+#: 直接改上游文件的清单（与 README「上游定制补丁」节、决策记录 D24 对齐）。
+#: sync 会覆盖它们，所以冻结保护的就是这一组。
+CUSTOM_PATCH_FILES = (
+    "main/display/lcd_display.cc            （70/30 对话布局，标记 elder-layout-70-30）",
+    "main/main.cc                            （elder_boot + 绑定引导任务）",
+    "main/boards/bread-compact-esp32/esp32_bread_board.cc",
+    "main/boards/bread-compact-esp32-lcd/esp32_bread_board_lcd.cc",
+    "main/boards/esp32-cgc-144/esp32_cgc_144_board.cc",
+    "main/boards/esp32-cgc/esp32_cgc_board.cc",
+    "main/boards/common/wifi_board.cc",
+    "sdkconfig.defaults                      （唤醒词段去重）",
+)
+
+
+def require_unlock(args: argparse.Namespace, src: Path) -> bool:
+    """同步前的冻结门禁。返回 True 表示可以继续同步。
+
+    三道门，缺一不可：
+      1. ``--unlock`` 开关存在；
+      2. ``--confirm`` 短语逐字匹配（防止 ``--unlock`` 被 CI 模板顺手带上）；
+      3. 二次确认（交互式），非交互环境（CI/管道）直接拒绝。
+    """
+    if not getattr(args, "unlock", False):
+        frozen_banner(src)
+        print("\n[sync] 已拒绝：加 --unlock 才会真正写盘。")
+        return False
+
+    if args.confirm != UNLOCK_PHRASE:
+        print(f"[sync] --unlock 需要配 --confirm '{UNLOCK_PHRASE}'（逐字匹配）。",
+              file=sys.stderr)
+        return False
+
+    if not sys.stdin.isatty():
+        print("[sync] 非交互环境不做二次确认：解冻必须由人在终端里亲手敲。",
+              file=sys.stderr)
+        return False
+
+    print("\n⚠️⚠️ 即将用上游源码覆盖 firmware/xiaozhi/ 下的自定义改动。")
+    print("   下列文件会被重写，随后必须按 README「上游定制补丁」节重贴：")
+    for f in CUSTOM_PATCH_FILES:
+        print(f"     - {f}")
+    print("\n   输入 sync-xiaozhi 确认（其它任何输入都取消）：", end="", flush=True)
+    try:
+        answer = input().strip()
+    except EOFError:
+        answer = ""
+    if answer != "sync-xiaozhi":
+        print("\n[sync] 已取消。")
+        return False
+    print("[sync] 已确认解锁，继续同步。\n")
+    return True
 
 
 # ---------------------------------------------------------------- 扫描
@@ -324,12 +453,16 @@ cd G:/workbuddy/语音助手 && python tools/sync_xiaozhi.py
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description="同步 xiaozhi-esp32 源码到本项目")
+    ap = argparse.ArgumentParser(
+        description="同步 xiaozhi-esp32 源码到本项目（⚠️ 默认冻结，需 --unlock）")
     ap.add_argument("--src", type=Path, default=DEFAULT_SRC)
     ap.add_argument("--dst", type=Path, default=DEFAULT_DST)
     ap.add_argument("--dry-run", action="store_true", help="只统计，不写盘")
     ap.add_argument("--force", action="store_true", help="忽略内容比对强制覆盖")
     ap.add_argument("--prune", action="store_true", help="删除目标中已不在清单的文件")
+    ap.add_argument("--unlock", action="store_true",
+                    help=f"解除版本冻结（还需 --confirm '{UNLOCK_PHRASE}' 与交互确认）")
+    ap.add_argument("--confirm", default="", help="解冻确认短语（逐字匹配）")
     args = ap.parse_args()
 
     src, dst = args.src, args.dst
@@ -340,6 +473,10 @@ def main() -> int:
     print(f"[sync] 源 : {src}")
     print(f"[sync] 目标: {dst}")
     sys.stdout.flush()
+
+    # ---- 冻结门禁：--dry-run 只读，放行；任何写盘动作都要先解锁 ----
+    if not args.dry_run and not require_unlock(args, src):
+        return 3
 
     keep, drop = scan(src)
 

@@ -534,20 +534,40 @@ ES7210（ADC）、FT5x06（触摸）、**GC0308（摄像头，DVP）**。
 `SpiLcdDisplay`），不是 `esp_emote_gfx` 自绘——开 emote 路径时它根本不创建
 LVGL display，真机表现为全黑屏 + `font context is NULL`。
 
+**对话界面 70/30 布局**（2026-10-19 用户拍板）：屏幕上下分割——字幕区占屏幕
+**高度 70%**（全宽、紧贴顶部状态栏，文字在区内居中），**右下角 30%×30%** 是
+图片区（表情图标 `emoji_box_` 与服务端预览图 `preview_image_` 共用同一块区域，
+两者互斥显示），顶部状态栏（WiFi/静音/电量）原样保留。低电量弹窗移到左下角
+65% 宽，避免压图。图片缩放用 LVGL 原生 `LV_IMAGE_ALIGN_CONTAIN`（等比缩放进区），
+不再手算 scale。
+
+⚠️ 该布局是**直接改上游 `main/display/lcd_display.cc` 默认风格分支**
+（`CONFIG_USE_WECHAT_MESSAGE_STYLE` 气泡分支未启用、未动）。上游
+`sync_xiaozhi.py --force` 会冲掉它 ⇒ 文件内有 `elder-layout-70-30` 标记，
+`tools/merge_to_xiaozhi.py --check`（CI 每次构建都跑）会校验该标记，
+缺失即构建失败。重贴步骤：对照 git 历史里 `lcd_display.cc` 的默认分支
+（`#else` 与 `#endif` 之间）恢复 6 处几何改动——`emoji_box_`/`preview_image_`
+改 `LV_ALIGN_BOTTOM_RIGHT` + `lv_pct(30)` + CONTAIN、`bottom_bar_` 改
+`lv_obj_align_to(top_bar_, LV_ALIGN_OUT_BOTTOM_LEFT)` + 高度 70% 减状态栏、
+`low_battery_popup_` 改左下角 65%。
+
 **摄像头驱动已真正编进固件**，初始化改为「探到硬件才起来」：先用 SCCB 探地址，
 探不到就打一条 WARNING 跳过，既不占 DVP 的 11 个 IO 也不刷 ERROR；接上排线重启
 即自动启用。
 
 ### 唤醒词与离线命令词
 
-**唤醒词是「你好小智」**（拼音 `ni hao xiao zhi`），在设备端**离线识别**，
+**唤醒词是「你好，小暖」**（拼音 `ni hao xiao nuan`），在设备端**离线识别**，
 不联网也能响应。识别引擎是乐鑫 esp-sr 的 **MultiNet** 中文命令词模型
 （不是上游默认的 WakeNet 专用唤醒模型），识别阈值 20%（越小越灵敏）。
-配置的真源是 `sdkconfig.defaults` 与 `tools/merge_to_xiaozhi.py` 的
-`SDKCONFIG_OVERLAY`，**改词必须两处同步**，否则本地构建与 CI 产物不一致。
+配置的真源是 `tools/merge_to_xiaozhi.py` 的 `SDKCONFIG_OVERLAY`（由它生成
+`sdkconfig.defaults` 的 overlay 段，手动段只留注释——**两处都写以后定义覆盖先定义，
+手动段即成死配置**），改词只需改 merge 脚本后重跑 merge。
 
-⚠️ **刻意保留「你好小智」没换成「小暖」之类**：从 WakeNet 换到 MultiNet 只是
-识别引擎的更替，词本身没换——老人已经习惯的叫法，不能因为底层换实现而失效。
+📌 2026-10-18 用户拍板把唤醒词从「你好小智」改为「你好，小暖」（带逗号）。
+⚠️ **拼音↔汉字必须同步改**：MultiNet 的注册键是拼音串，`DISPLAY` 只影响屏显，
+改了拼音忘改汉字会出现「喊 A 显示 B」的割裂。另注意 `main/boards/` 下 4 块
+演示板的 ASR 按钮直接引用 `CONFIG_CUSTOM_WAKE_WORD_DISPLAY` 宏，自动跟随。
 
 除唤醒词外还有 **6 条离线命令词，无需先说唤醒词，直接说即生效**：
 
@@ -633,7 +653,7 @@ HA 的自动化（门磁触发、夜间场景联动等）。
 | [xinnan-tech/xiaozhi-esp32](https://github.com/xinnan-tech/xiaozhi-esp32) | 固件源码树与设备侧协议 | `firmware/xiaozhi/` 即在其源码树上合入本项目 `components/elder` 组件（`tools/merge_to_xiaozhi.py`） |
 | [xinnan-tech/xiaozhi-esp32-server](https://github.com/xinnan-tech/xiaozhi-esp32-server) | 协议与固件设计参考 | **不部署、不调用**（早期跑过它的容器，已删除）；本项目语音链路为自研实现 |
 | [78/esp-wifi-connect](https://github.com/78/esp-wifi-connect) | 浏览器配网 | `managed_components/78__esp-wifi-connect`，配网热点 `http://192.168.4.1` |
-| [espressif/esp-sr](https://github.com/espressif/esp-sr) | 离线命令词识别 | MultiNet 中文模型：唤醒词「你好小智」+ 6 条服药命令词 |
+| [espressif/esp-sr](https://github.com/espressif/esp-sr) | 离线命令词识别 | MultiNet 中文模型：唤醒词「你好，小暖」+ 6 条服药命令词 |
 | [78/xiaozhi-assets-generator](https://github.com/78/xiaozhi-assets-generator) | 自定义资产生成 | 唤醒词 / 字体 / 表情的在线编辑与打包 |
 
 ### 致谢

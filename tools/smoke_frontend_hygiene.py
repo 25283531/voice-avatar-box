@@ -20,8 +20,17 @@ L2. **模板里没有孤儿引用**：``@click="xxx"`` / ``v-model="xxx"`` /
     其实没了"的静默失效，正是最难发现的那类。
 L3. **data() 里没有重复键**：同一行里写两遍同名键，后者静默覆盖前者，
     而两处往往隔得很远（多人改同一文件时高发）。
+L4. **卡片里的变量属于自己那张卡**：扫描 ``<template>`` 中每个 ``v-if="x"``
+    守卫所辖的区域，断言区域内不出现**别的卡片的同名语义变量**。
+    2026-10-19 线上事故就是这么来的：邮件测试卡片复用了 AI 配置弹窗的
+    ``testResult``（而不是自己的 ``mailTestResult``），点「发送测试邮件」
+    后 ``testResult`` 仍是 ``null`` ⇒ ``null.ok`` ⇒ Vue 渲染抛异常 ⇒
+    **整个 SPA 白屏**，而控制台只有一行 ``TypeError``。
+    L1/L2/L3 全部抓不到它：``testResult`` 在 data() 里有定义（不孤儿），
+    也不是重复键，插值带三元表达式（不是裸方法名）。它属于「用错了但合法」
+    ——**只有按区域归属比对才能发现**。
 
-为什么不起服务：这三类缺陷全是**静态可判**的，起服务只会让 CI 多等几十秒，
+为什么不起服务：这几类缺陷全是**静态可判**的，起服务只会让 CI 多等几十秒，
 却一条断言都多不了。端口表（tools/smoke_ports.py）因此不收本脚本。
 
 ⚠️ 扫描器的三个坑（第一版全踩过，改法写在这里免得再踩）：
@@ -241,6 +250,79 @@ def root_identifiers(expr: str) -> list[str]:
     return out
 
 
+#: L4 卡片归属表：``守卫变量 -> 该卡片区域内允许出现的同前缀变量``。
+#: **只列已知的、真实踩过的坑**，不是"要求每个文件都有这张卡"。
+#:
+#: 形态是「同一语义域的变量名共享一个词根」。邮件测试这张卡的守卫是
+#: ``mailTestResult``，区域内只准出现 ``mail*`` / ``smtp*`` / ``test*Busy`` /
+#: ``testTo`` 这些同域名字；一旦出现裸 ``testResult``（AI 配置弹窗的键，
+#: 见 index.html:1354 的注释：同名会静默覆盖），就是 2026-10-19 那个白屏。
+#:
+#: 为什么只钉这一张卡而不是自动推断归属：自动推断要理解「语义」，
+#: 静态脚本做不到；写死白名单虽然不通用，但**明确、可 review、零误报**，
+#: 而这类事故的代价是整站白屏。宁可漏检，不可误报。
+#:
+#: 某文件里**找不到**这张卡时直接跳过（user.html 就没有邮件配置功能）——
+#: 断言必须约束"已存在的东西"，而不是"必须新增东西"，否则每个新页面
+#: 都会被这条与它无关的红灯拦住。
+CARD_OWNERS = {
+    "mailTestResult": {"mailTestResult", "testTo", "testBusy",
+                       "smtpForm", "smtpErr", "smtpMsg"},
+}
+
+
+def card_region(tpl: str, guard: str) -> tuple[str, int] | None:
+    """截取 ``v-if="<guard>"`` 所在元素闭合范围内的模板片段。
+
+    用**标签深度**而不是行数：``<div v-if="x">`` 到同缩进层级的 ``</div>``
+    之间的全部内容，就是这张卡管辖的区域。找不到闭合标签时返回 None
+    （宁可漏检，不报错——静态脚本不该因模板写法变化而崩）。
+    """
+    m = re.search(r'<(\w+)[^>]*\bv-if="' + re.escape(guard) + r'"[^>]*>', tpl)
+    if not m:
+        return None
+    tag = m.group(1)
+    start = m.end()
+    # 从开标签之后开始数同名标签的出现次数，见到配平的闭合标签即止。
+    depth = 1
+    for t in re.finditer(r'<(/?)' + tag + r'[\s>]', tpl[start:]):
+        depth += -1 if t.group(1) else 1
+        if depth == 0:
+            line = tpl.count("\n", 0, start + t.start()) + 1
+            return tpl[start:start + t.start()], line
+    return None
+
+
+def check_card_ownership(tpl: str) -> None:
+    for guard, allowed in CARD_OWNERS.items():
+        got = card_region(tpl, guard)
+        if got is None:
+            print(f"  [SKIP] L4 卡片 [{guard}]：本文件没有这张卡，不检查")
+            continue
+        region, line = got
+        # 区域内出现的所有根标识符，减去合法白名单，剩下的都是「外来变量」
+        used: set[str] = set()
+        for expr in re.findall(r"\{\{(.*?)\}\}", region):
+            used |= set(root_identifiers(expr))
+        for expr in re.findall(
+                r'(?:v-if|v-else-if|v-show|v-for|:[\w-]+|v-bind:[\w-]+)="([^"]+)"', region):
+            used |= set(root_identifiers(expr))
+        for attr in re.findall(r'@[\w.]+="([^"]+)"', region):
+            used |= set(root_identifiers(attr))
+        for vm in re.findall(r'v-model(?::[\w.]+)?="([^"]+)"', region):
+            used |= set(root_identifiers(vm))
+        foreign = sorted(n for n in used
+                         if n not in allowed and n not in BUILTINS
+                         and n not in LOCAL_VARS and n not in vfor_aliases(region))
+        check(
+            f"L4 卡片 [{guard}] 的区域归属（用错别人的变量会白屏）",
+            not foreign,
+            f"第 {line} 行起的 [{guard}] 卡片内出现了不属于它的变量: {foreign}。"
+            f"允许的: {sorted(allowed)}。这些名字在 data() 也有定义，"
+            f"L1/L2/L3 抓不到——它们只会在这里变成 null.xxx 而让整页白屏。"
+        )
+
+
 def strip_comments(html: str) -> str:
     """剥掉 HTML 注释（里面有示例代码，不剥会造出假孤儿）。"""
     return re.sub(r"<!--.*?-->", "", html, flags=re.S)
@@ -303,6 +385,9 @@ def scan_file(path: Path) -> None:
             seen[name] = ln
     check("L3 data() 无重复键（后者会静默覆盖前者，且两处往往隔得很远）",
           not dupes, f"重复: {dupes}")
+
+    # ---------------------------------------------------------- L4 卡片归属
+    check_card_ownership(tpl)
 
 
 def main() -> int:

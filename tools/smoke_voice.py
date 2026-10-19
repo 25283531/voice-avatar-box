@@ -106,6 +106,46 @@ WS_URL = f"ws://127.0.0.1:{PORT}/api/voice/v1/ws"
 MAC_BOUND = "AA:BB:CC:DD:EE:01"        # 播种时置 owner，用来拿 ws 通道
 MAC_UNBOUND = "AA:BB:CC:DD:EE:02"      # 从未出现过，用来拿激活码
 
+# ---------------------------------------------------------------- WS 兼容层
+#
+# 为什么需要这一层（本文件有 12 处连 WS，全部要带认证头）：
+#   1. `websockets.connect` 的**请求头参数名在新版改名**了：
+#      旧名 `extra_headers` → 新名 `additional_headers`。
+#   2. 更隐蔽的一层：即便用对了新名，底层 `loop.create_connection()`
+#      在 **Python 3.13 被移除了 extra_headers**。于是本地（elder venv =
+#      Python 3.13 + websockets 17.x）会炸：
+#          TypeError: create_connection() got an unexpected keyword
+#                     argument 'extra_headers'
+#      而 CI 是 Python 3.11 + 旧 websockets，一切正常。
+#      ⇒ 症状是「本地永远红、CI 永远绿」，且错误信息完全指不到本文件。
+#
+# ⚠️ 判据必须用**签名探测**而不是版本号比较：实测 websockets 17.2 仍然
+#    会把头传成 `extra_headers` 给已移除该参数的 asyncio ⇒ 「>=14 就用新名」
+#    这条规则被证伪过一次。
+#
+# ⚠️ 探测必须**惰性**（函数内 import）且每次调用都重探：模块级 `websockets`
+#    是下面若干处按需 import 的，模块顶部并没有它 ⇒ 在模块作用域探测会
+#    NameError。顺带也不缓存：探测一次几微秒，换来「换库版本后无需重启」的
+#    健壮性。
+#
+# 用法：把 `websockets.connect(..., extra_headers=h)` 换成
+#      `ws_connect(..., headers=h)`，其余参数原样透传。
+def ws_connect(url: str, headers: dict[str, str] | None = None, **kwargs):
+    """`websockets.connect` 的薄包装：按运行时签名挑请求头参数名。
+
+    刻意**不吞异常** —— 参数名选错的症状（TypeError）必须在调用处原样暴露，
+    不做二次包装，否则会把「参数名对不上」伪装成「服务端拒连」。
+    """
+    import inspect
+
+    import websockets
+
+    params = inspect.signature(websockets.connect).parameters
+    kw = "additional_headers" if "additional_headers" in params else "extra_headers"
+    if headers is not None:
+        kwargs[kw] = headers
+    return websockets.connect(url, **kwargs)
+
 FAKE_ASR_TEXT = "小暖小暖，明天早上八点提醒我吃药"
 FAKE_REPLY = "好的，明天早上八点我提醒您吃药。您也要记得多喝水。我陪您聊聊。"
 FAKE_TOTAL_TOKENS = 155
@@ -894,7 +934,7 @@ async def t_ws_auth(ids: dict) -> None:
 
     # 无 token
     try:
-        async with websockets.connect(WS_URL, open_timeout=10) as ws:
+        async with ws_connect(WS_URL, open_timeout=10) as ws:
             await ws.recv()
         code = None
     except Exception as exc:  # noqa: BLE001
@@ -903,11 +943,11 @@ async def t_ws_auth(ids: dict) -> None:
     check("无 token 连接被关闭（拿不到 server hello）", code is not None,
           f"close_code={code}")
 
-    # 垃圾 token
+    # 垃圾 token（请求头参数名的版本差异由 ws_connect 统一处理，见其 docstring）
     try:
-        async with websockets.connect(
+        async with ws_connect(
                 WS_URL, open_timeout=10,
-                extra_headers={"Authorization": "Bearer garbage"}) as ws:
+                headers={"Authorization": "Bearer garbage"}) as ws:
             await ws.recv()
         code = None
     except Exception as exc:  # noqa: BLE001
@@ -917,9 +957,9 @@ async def t_ws_auth(ids: dict) -> None:
 
     # 有效 token 但 Device-Id 不符
     try:
-        async with websockets.connect(
+        async with ws_connect(
                 WS_URL, open_timeout=10,
-                extra_headers={
+                headers={
                     "Authorization": f"Bearer {ids['token']}",
                     "Device-Id": "FF:FF:FF:FF:FF:FF",
                     "Protocol-Version": "1"}) as ws:
@@ -982,8 +1022,8 @@ async def _connect(ids: dict, version: int = 1):
                "Device-Id": MAC_BOUND,
                "Protocol-Version": str(version),
                "Client-Id": "smoke-client"}
-    ws = await websockets.connect(WS_URL, open_timeout=10,
-                                  extra_headers=headers)
+    ws = await ws_connect(WS_URL, open_timeout=10,
+                                  headers=headers)
     hello = await _handshake(ws, ids, version)
     await _drain(ws)
     return ws, str(hello.get("session_id", ""))
@@ -1034,8 +1074,8 @@ async def t_handshake_and_turn(ids: dict, libopus) -> None:
     headers = {"Authorization": f"Bearer {ids['token']}",
                "Device-Id": MAC_BOUND, "Protocol-Version": "1",
                "Client-Id": "smoke-client"}
-    async with websockets.connect(WS_URL, open_timeout=10,
-                                  extra_headers=headers) as ws:
+    async with ws_connect(WS_URL, open_timeout=10,
+                                  headers=headers) as ws:
         hello = await _handshake(ws, ids, 1)
         check("握手：收到服务端 hello", hello.get("type") == "hello",
               str(hello)[:120])
@@ -1154,8 +1194,8 @@ async def t_interrupt(ids: dict) -> None:
     headers = {"Authorization": f"Bearer {ids['token']}",
                "Device-Id": MAC_BOUND, "Protocol-Version": "1"}
     try:
-        async with websockets.connect(WS_URL, open_timeout=10,
-                                      extra_headers=headers) as ws:
+        async with ws_connect(WS_URL, open_timeout=10,
+                                      headers=headers) as ws:
             await _handshake(ws, ids, 1)
             await _drain(ws)
             sid = ""
@@ -1240,8 +1280,8 @@ async def t_degraded_tts(ids: dict) -> None:
     headers = {"Authorization": f"Bearer {ids['token']}",
                "Device-Id": MAC_BOUND, "Protocol-Version": "1"}
     try:
-        async with websockets.connect(WS_URL, open_timeout=10,
-                                      extra_headers=headers) as ws:
+        async with ws_connect(WS_URL, open_timeout=10,
+                                      headers=headers) as ws:
             await _handshake(ws, ids, 1)
             await _drain(ws)
             await ws.send(json.dumps({"type": "listen", "state": "start",
@@ -1292,8 +1332,8 @@ async def t_degraded_llm(ids: dict) -> None:
     headers = {"Authorization": f"Bearer {ids['token']}",
                "Device-Id": MAC_BOUND, "Protocol-Version": "1"}
     try:
-        async with websockets.connect(WS_URL, open_timeout=10,
-                                      extra_headers=headers) as ws:
+        async with ws_connect(WS_URL, open_timeout=10,
+                                      headers=headers) as ws:
             await _handshake(ws, ids, 1)
             await _drain(ws)
             await ws.send(json.dumps({"type": "listen", "state": "start",
@@ -1353,8 +1393,8 @@ async def t_empty_asr(ids: dict) -> None:
     headers = {"Authorization": f"Bearer {ids['token']}",
                "Device-Id": MAC_BOUND, "Protocol-Version": "1"}
     try:
-        async with websockets.connect(WS_URL, open_timeout=10,
-                                      extra_headers=headers) as ws:
+        async with ws_connect(WS_URL, open_timeout=10,
+                                      headers=headers) as ws:
             await _handshake(ws, ids, 1)
             await _drain(ws)
             await ws.send(json.dumps({"type": "listen", "state": "start",
@@ -1410,8 +1450,8 @@ async def t_quota(ids: dict) -> None:
     headers = {"Authorization": f"Bearer {ids['token']}",
                "Device-Id": MAC_BOUND, "Protocol-Version": "1"}
     try:
-        async with websockets.connect(WS_URL, open_timeout=10,
-                                      extra_headers=headers) as ws:
+        async with ws_connect(WS_URL, open_timeout=10,
+                                      headers=headers) as ws:
             await _handshake(ws, ids, 1)
             await _drain(ws)
             await ws.send(json.dumps({"type": "listen", "state": "start",
@@ -2192,8 +2232,8 @@ async def t_binary_framing(ids: dict) -> None:
             headers = {"Authorization": f"Bearer {ids['token']}",
                        "Device-Id": MAC_BOUND,
                        "Protocol-Version": str(version)}
-            async with websockets.connect(WS_URL, open_timeout=10,
-                                          extra_headers=headers) as ws:
+            async with ws_connect(WS_URL, open_timeout=10,
+                                          headers=headers) as ws:
                 hello = await _handshake(ws, ids, version)
                 await _drain(ws)
                 sid = hello.get("session_id", "")
@@ -2243,8 +2283,8 @@ async def t_binary_framing(ids: dict) -> None:
 
         headers = {"Authorization": f"Bearer {ids['token']}",
                    "Device-Id": MAC_BOUND, "Protocol-Version": "1"}
-        async with websockets.connect(WS_URL, open_timeout=10,
-                                      extra_headers=headers) as ws:
+        async with ws_connect(WS_URL, open_timeout=10,
+                                      headers=headers) as ws:
             hello = await _handshake(ws, ids, 1)
             await _drain(ws)
             sid = hello.get("session_id", "")
@@ -2350,8 +2390,8 @@ async def t_malformed_frame(ids: dict) -> None:
 
     headers = {"Authorization": f"Bearer {ids['token']}",
                "Device-Id": MAC_BOUND, "Protocol-Version": "2"}
-    async with websockets.connect(WS_URL, open_timeout=10,
-                                  extra_headers=headers) as ws:
+    async with ws_connect(WS_URL, open_timeout=10,
+                                  headers=headers) as ws:
         hello = await _handshake(ws, ids, 2)
         await _drain(ws)
         sid = hello.get("session_id", "")

@@ -786,6 +786,24 @@ void LcdDisplay::SetPreviewImage(std::unique_ptr<LvglImage> image) {
     lv_obj_scroll_to_view_recursive(img_bubble, LV_ANIM_ON);
 }
 #else
+// >>> BEGIN elder-layout-70-30 (2026-10-19 布局改造，勿手改；被上游 sync 冲掉时
+// merge_to_xiaozhi.py --check 会红，按 README「上游定制补丁」节重贴) >>>
+// 简洁风格布局（本板启用，320x240 物理 / swap_xy 后 LVGL 逻辑 240x320 竖屏）：
+//
+//    ┌──────────────────────────┐
+//    │ 状态栏 WiFi/静音/电量（不变）│  ← top_bar_ / status_bar_
+//    ├──────────────────────────┤
+//    │                          │
+//    │      字幕区（约 70%）      │  ← bottom_bar_（全宽，紧贴状态栏下方）
+//    │                          │
+//    ├──────────────┬───────────┤
+//    │  （空）        │ 图片区 30% │  ← emoji_box_ / preview_image_（右下角）
+//    └──────────────┴───────────┘
+//
+// 2026-10-19 用户拍板：对话界面上下 70/30 分割，右下角 30% 显示图标/表情，
+// 字幕占 70%，顶部状态栏保留。改动只涉及默认风格分支；WECHAT 气泡风格
+// （CONFIG_USE_WECHAT_MESSAGE_STYLE，本板未启用）不动。
+// <<< END elder-layout-70-30 >>>
 void LcdDisplay::SetupUI() {
     DisplayLockGuard lock(this);
     LvglTheme* lvgl_theme = static_cast<LvglTheme*>(current_theme_);
@@ -807,27 +825,36 @@ void LcdDisplay::SetupUI() {
     lv_obj_set_style_bg_color(container_, lvgl_theme->background_color(), 0);
     lv_obj_set_style_border_color(container_, lvgl_theme->border_color(), 0);
 
-    /* Bottom layer: emoji_box_ - centered display */
+    /* Bottom-right layer: emoji_box_ - 右下角图片区（30% x 30%，2026-10-19 布局） */
     emoji_box_ = lv_obj_create(screen);
-    lv_obj_set_size(emoji_box_, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
+    lv_obj_set_size(emoji_box_, lv_pct(30), lv_pct(30));
     lv_obj_set_style_bg_opa(emoji_box_, LV_OPA_TRANSP, 0);
     lv_obj_set_style_pad_all(emoji_box_, 0, 0);
     lv_obj_set_style_border_width(emoji_box_, 0, 0);
-    lv_obj_align(emoji_box_, LV_ALIGN_CENTER, 0, 0);
+    // 4px 内边距不贴屏幕边缘；偏移量与 preview_image_ 必须一致（两者是同一区域）
+    lv_obj_align(emoji_box_, LV_ALIGN_BOTTOM_RIGHT, -lvgl_theme->spacing(2), -lvgl_theme->spacing(2));
 
     emoji_label_ = lv_label_create(emoji_box_);
     lv_obj_set_style_text_font(emoji_label_, large_icon_font, 0);
     lv_obj_set_style_text_color(emoji_label_, lvgl_theme->text_color(), 0);
     lv_label_set_text(emoji_label_, FONT_AWESOME_MICROCHIP_AI);
+    // 盒子改为固定尺寸后必须显式居中（原来是 LV_SIZE_CONTENT 自适应）
+    lv_obj_center(emoji_label_);
 
     emoji_image_ = lv_img_create(emoji_box_);
-    lv_obj_center(emoji_image_);
+    // 表情图（twemoji_64 等）尺寸随主题而定：铺满图片区 + CONTAIN 等比缩放，
+    // 再大的原图也只会缩小不会溢出（lv_image 的 SIZE_CHANGED 会自动重算）
+    lv_obj_set_size(emoji_image_, lv_pct(100), lv_pct(100));
+    lv_image_set_inner_align(emoji_image_, LV_IMAGE_ALIGN_CONTAIN);
     lv_obj_add_flag(emoji_image_, LV_OBJ_FLAG_HIDDEN);
 
-    /* Middle layer: preview_image_ - centered display */
+    /* Middle layer: preview_image_ - 与 emoji_box_ 同一块右下角图片区 */
     preview_image_ = lv_image_create(screen);
-    lv_obj_set_size(preview_image_, width_ / 2, height_ / 2);
-    lv_obj_align(preview_image_, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_set_size(preview_image_, lv_pct(30), lv_pct(30));
+    // CONTAIN：LVGL 自动按图片区等比缩放（替代原先手算 128*width_/w 的公式，
+    // 那个公式按半屏宽算，在 30% 图片区下会把图放出界）
+    lv_image_set_inner_align(preview_image_, LV_IMAGE_ALIGN_CONTAIN);
+    lv_obj_align(preview_image_, LV_ALIGN_BOTTOM_RIGHT, -lvgl_theme->spacing(2), -lvgl_theme->spacing(2));
     lv_obj_add_flag(preview_image_, LV_OBJ_FLAG_HIDDEN);
 
     /* Layer 1: Top bar - for status icons */
@@ -902,10 +929,17 @@ void LcdDisplay::SetupUI() {
     lv_label_set_text(status_label_, Lang::Strings::INITIALIZING);
     lv_obj_align(status_label_, LV_ALIGN_CENTER, 0, 0);
 
-    /* Top layer: Bottom bar - fixed at bottom, minimum height 48, height can be adaptive */
+    /* Top layer: Bottom bar - 字幕区（2026-10-19 布局：屏幕高度 70%，全宽） */
     bottom_bar_ = lv_obj_create(screen);
     lv_obj_set_width(bottom_bar_, LV_HOR_RES);
-    lv_obj_set_height(bottom_bar_, LV_SIZE_CONTENT);
+    // 高度 = 屏幕 70% 减顶部状态栏实际高度；状态栏是内容高度（图标+padding），
+    // 先更新布局再读。下限 48 保底（小屏/异常分辨率时不塌陷）。
+    lv_obj_update_layout(top_bar_);
+    int subtitle_height = LV_VER_RES * 70 / 100 - lv_obj_get_height(top_bar_);
+    if (subtitle_height < 48) {
+        subtitle_height = 48;
+    }
+    lv_obj_set_height(bottom_bar_, subtitle_height);
     lv_obj_set_style_min_height(bottom_bar_, 48, 0); // Set minimum height 48
     lv_obj_set_style_radius(bottom_bar_, 0, 0);
     lv_obj_set_style_bg_color(bottom_bar_, lvgl_theme->background_color(), 0);
@@ -915,7 +949,8 @@ void LcdDisplay::SetupUI() {
     lv_obj_set_style_pad_left(bottom_bar_, lvgl_theme->spacing(4), 0);
     lv_obj_set_style_pad_right(bottom_bar_, lvgl_theme->spacing(4), 0);
     lv_obj_set_style_border_width(bottom_bar_, 0, 0);
-    lv_obj_align(bottom_bar_, LV_ALIGN_BOTTOM_MID, 0, 0);
+    // 紧贴顶部状态栏下方（原来贴屏幕底，会被右下角图片区挤占）
+    lv_obj_align_to(bottom_bar_, top_bar_, LV_ALIGN_OUT_BOTTOM_LEFT, 0, 0);
 
     /* chat_message_label_ placed in bottom_bar_ and vertically centered */
     chat_message_label_ = lv_label_create(bottom_bar_);
@@ -928,8 +963,9 @@ void LcdDisplay::SetupUI() {
 
     low_battery_popup_ = lv_obj_create(screen);
     lv_obj_set_scrollbar_mode(low_battery_popup_, LV_SCROLLBAR_MODE_OFF);
-    lv_obj_set_size(low_battery_popup_, LV_HOR_RES * 0.9, text_font->line_height * 2);
-    lv_obj_align(low_battery_popup_, LV_ALIGN_BOTTOM_MID, 0, -lvgl_theme->spacing(4));
+    // 左下角 65% 宽：避开右下角 30% 图片区（2026-10-19 布局，原来 90% 居中会压图）
+    lv_obj_set_size(low_battery_popup_, LV_HOR_RES * 0.65, text_font->line_height * 2);
+    lv_obj_align(low_battery_popup_, LV_ALIGN_BOTTOM_LEFT, lvgl_theme->spacing(4), -lvgl_theme->spacing(4));
     lv_obj_set_style_bg_color(low_battery_popup_, lvgl_theme->low_battery_color(), 0);
     lv_obj_set_style_radius(low_battery_popup_, lvgl_theme->spacing(4), 0);
     
@@ -961,10 +997,9 @@ void LcdDisplay::SetPreviewImage(std::unique_ptr<LvglImage> image) {
     preview_image_cached_ = std::move(image);
     auto img_dsc = preview_image_cached_->image_dsc();
     lv_image_set_src(preview_image_, img_dsc);
-    if (img_dsc->header.w > 0 && img_dsc->header.h > 0) {
-        // zoom factor 0.5
-        lv_image_set_scale(preview_image_, 128 * width_ / img_dsc->header.w);
-    }
+    // 缩放由 lv_image 的 LV_IMAGE_ALIGN_CONTAIN 自动完成（set_src 内部
+    // update_align 按图片区 30%x30% 重算，等比缩放、永不溢出）——
+    // 删掉了原先手算的 128*width_/w（那是在整屏居中的旧布局下按半屏宽算的）
 
     // Hide emoji_box_
     if (gif_controller_) {

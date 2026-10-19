@@ -89,14 +89,14 @@ CONFIG_USE_DEVICE_AEC=y
 #   build_default_assets.py 也只在 USE_CUSTOM_WAKE_WORD 时才把 multinet
 #   模型打进 assets。只开模型不开这个开关，模型根本不会被打包。
 #
-# 为什么 CUSTOM_WAKE_WORD 要写成「你好小智」的拼音：
-#   切到 CustomWakeWord 后唤醒词由 MultiNet 识别，不再是专用 WakeNet。
-#   短语本身必须保持不变 —— 老人和子女的肌肉记忆是产品资产，
-#   不能因为换了识别引擎就换词。Kconfig 要求中文写拼音、空格分隔。
-CONFIG_USE_CUSTOM_WAKE_WORD=y
-CONFIG_CUSTOM_WAKE_WORD="ni hao xiao zhi"
-CONFIG_CUSTOM_WAKE_WORD_DISPLAY="你好小智"
-CONFIG_CUSTOM_WAKE_WORD_THRESHOLD=20
+# ⚠️ 生效值不在本段：CONFIG_USE_CUSTOM_WAKE_WORD / CONFIG_CUSTOM_WAKE_WORD /
+#    CONFIG_CUSTOM_WAKE_WORD_DISPLAY / CONFIG_CUSTOM_WAKE_WORD_THRESHOLD
+#    由下方「elder-companion overlay」段注入（merge_to_xiaozhi.py 生成，勿手改），
+#    后定义覆盖先定义 ⇒ 本段若再写一遍只是死配置，改了两处还会互相漂移。
+#    改唤醒词 = 改 tools/merge_to_xiaozhi.py 的 SDKCONFIG_OVERLAY 后重跑 merge。
+#
+# 当前唤醒词「你好，小暖」（2026-10-18 用户拍板，原「你好小智」）。
+# 拼音↔汉字必须同步改：MultiNet 注册键是拼音串，DISPLAY 只影响屏显。
 # mn7_cn：官方推荐版本（S3/P4），比 mn6_cn 小约 1MB。
 # 模型字节数 = mn7_data 2659972 + mn7_index 4656 + vocab 6601 = 2671229，
 # 连同 fst 共 2680877 字节打进 assets 分区（8MB，当前余量充足）。
@@ -177,16 +177,19 @@ CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions/v2/16m.csv"
 # 离线语音命令词（esp-sr MultiNet）。切到 USE_CUSTOM_WAKE_WORD 是必须的：
 # build_default_assets.py 只在这个开关打开时才把 multinet 模型打进 assets，
 # 且 audio_service.cc SetModelsList() 见到 mn* 模型就改用 CustomWakeWord。
-# 唤醒词保持「你好小智」的拼音不变 —— 换了识别引擎不能换词，
-# 老人和子女的肌肉记忆是产品资产。Kconfig 要求中文写拼音、空格分隔。
+# 唤醒词 2026-10-18 用户拍板改为「你好，小暖」（原「你好小智」）。
+# ⚠️ 拼音↔汉字必须同步改：MultiNet 的注册键是拼音串，DISPLAY 只影响屏显；
+#    改了拼音忘改汉字（或反之）会出现「喊 A 显示 B」的割裂。
+# Kconfig 要求中文写拼音、空格分隔。
 CONFIG_USE_CUSTOM_WAKE_WORD=y
-CONFIG_CUSTOM_WAKE_WORD="ni hao xiao zhi"
-CONFIG_CUSTOM_WAKE_WORD_DISPLAY="你好小智"
+CONFIG_CUSTOM_WAKE_WORD="ni hao xiao nuan"
+CONFIG_CUSTOM_WAKE_WORD_DISPLAY="你好，小暖"
 CONFIG_CUSTOM_WAKE_WORD_THRESHOLD=20
 # mn7_cn：官方推荐（S3/P4），比 mn6_cn 小约 1MB。
 # 模型 2671229 字节 + fst 9648 字节 = 2680877 字节，进 assets 分区。
 CONFIG_SR_MN_CN_MULTINET7_QUANT=y
-# 业务后端地址（2026-10-18 起 IP 直连，也可 idf.py menuconfig 调整）
+# 业务后端地址（2026-10-18 起 IP 直连：域名未备案被厂商按 SNI 阻断，
+# 连 IP 不带 SNI 可绕过；服务端配 IP 证书后可开证书校验，见 Kconfig 帮助）
 CONFIG_ELDER_SERVER_URL="https://152.136.230.132"
 CONFIG_ELDER_SERVER_TOKEN=""
 CONFIG_ELDER_SYNC_INTERVAL_SEC=300

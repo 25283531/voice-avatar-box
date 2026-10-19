@@ -104,6 +104,13 @@
       }
     },
     {
+      "path": "pages/login/forgot-password",
+      "type": "page",
+      "style": {
+        "navigationBarTitleText": "找回密码"
+      }
+    },
+    {
       "path": "pages/login/index",
       "type": "page",
       "style": {

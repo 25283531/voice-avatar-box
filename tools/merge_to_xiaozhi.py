@@ -36,6 +36,7 @@ firmware/xiaozhi/ 是上游 xiaozhi-esp32 的只读镜像（由 sync_xiaozhi.py 
 from __future__ import annotations
 
 import argparse
+import re
 import shutil
 import sys
 from pathlib import Path
@@ -72,18 +73,28 @@ CMAKE_OVERLAY = f"""{BEGIN}
 set(ELDER_DIR "${{PROJECT_DIR}}/components/elder")
 target_sources(${{COMPONENT_LIB}} PRIVATE
     "${{ELDER_DIR}}/src/elder_bridge.cc"
+    "${{ELDER_DIR}}/src/elder_bind_guide.cc"
 )
 target_include_directories(${{COMPONENT_LIB}} PRIVATE "${{ELDER_DIR}}/include")
 # 链接 elder 组件：同时传递它的 REQUIRES（driver / json / esp_http_client 等）
 target_link_libraries(${{COMPONENT_LIB}} PRIVATE idf::elder)
 
-# ---- 在 app_main() 启动 xiaozhi 之后拉起 elder ----
+# ---- 在 app_main() 启动 xiaozhi **之前**拉起未绑定设备的绑定引导 ----
 {END}
 """
 
 # 追加到 main/main.cc 的内容：在 app.Start() 之后调用 elder_bridge_start()。
-# app.Start() 内部会创建主事件循环任务并立刻返回，因此这里延时 2s 再启动 elder，
-# 等 Board/Display 初始化完成，避免拿到空指针。
+#
+# ⚠️ 关键事实（2026-10-19 实测代码核实，推翻了早期的错误注释）：
+#   app.Start() **不是**「创建主事件循环任务并立刻返回」。它在
+#   CheckNewVersion(ota) 之后还有 protocol_ 初始化，而未绑定设备的
+#   CheckNewVersion() 是 `while (true)` 永不返回：
+#       ShowActivationCode(ota.GetActivationCode(), …)  // 念码播报
+#       for (int i = 0; i < 10; ++i) { ota.Activate(); } // v1 无 challenge，必败
+#       → 回到循环顶部再来一轮
+#   因此 **elder_boot 这个放在 app.Start() 之后的任务，在未绑定设备上
+#   永远不会被创建**（这正是原第 8 步「未绑定时屏显激活码」形同虚设的
+#   根因，见 D24）。绑定引导因此必须放在 app.Start() 之前（MAIN_CC_CALL_PRE）。
 #
 # ⚠️ 踩过的坑（C++ 语言规则，不是风格问题）：
 #   `extern "C"` **只能出现在命名空间作用域**，写在函数体里是语法错误：
@@ -99,7 +110,25 @@ MAIN_CC_DECL = """
 // 老人陪伴 & 提醒助手：等 xiaozhi 的 Board / Display / AudioService 就绪后拉起
 // 声明必须在**文件作用域**：extern "C" 写在函数体里是语法错误。
 extern "C" void elder_bridge_start(void);
+// 未绑定设备的绑定引导（必须在 app.Start() 之前启动，见 MAIN_CC_CALL_PRE 注释）
+extern "C" esp_err_t elder_bind_guide_start(void);
 // <<< END elder-companion overlay <<<
+"""
+
+# 插在 app.Start() **之前**的调用块。
+#
+# 为什么必须在这里：未绑定设备上 app.Start() 永不返回（CheckNewVersion 的
+# while(true)），任何放在它之后的代码都执行不到 —— 包括原来的 elder_boot 任务。
+# 引导任务只依赖 Board::GetInstance().GetDisplay()，Board 在 app.Start() 的
+# 第一行就构造完，所以「提前起任务」不会拿到未初始化的 Display。
+MAIN_CC_CALL_PRE = """
+    // >>> BEGIN elder-companion overlay (由 tools/merge_to_xiaozhi.py 注入，勿手改) >>>
+    // 未绑定设备的「请去 APP 绑定」引导。必须在 app.Start() **之前**起：
+    // 未绑定设备上 app.Start() 会永久阻塞在 CheckNewVersion 的 while(true)，
+    // 放在它之后的任何初始化都不会执行。详见 tools/merge_to_xiaozhi.py 的
+    // MAIN_CC_CALL_PRE 注释与 docs/决策记录.md D24。
+    elder_bind_guide_start();
+    // <<< END elder-companion overlay <<<
 """
 
 MAIN_CC_CALL = """
@@ -188,11 +217,13 @@ CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions/v2/16m.csv"
 # 离线语音命令词（esp-sr MultiNet）。切到 USE_CUSTOM_WAKE_WORD 是必须的：
 # build_default_assets.py 只在这个开关打开时才把 multinet 模型打进 assets，
 # 且 audio_service.cc SetModelsList() 见到 mn* 模型就改用 CustomWakeWord。
-# 唤醒词保持「你好小智」的拼音不变 —— 换了识别引擎不能换词，
-# 老人和子女的肌肉记忆是产品资产。Kconfig 要求中文写拼音、空格分隔。
+# 唤醒词 2026-10-18 用户拍板改为「你好，小暖」（原「你好小智」）。
+# ⚠️ 拼音↔汉字必须同步改：MultiNet 的注册键是拼音串，DISPLAY 只影响屏显；
+#    改了拼音忘改汉字（或反之）会出现「喊 A 显示 B」的割裂。
+# Kconfig 要求中文写拼音、空格分隔。
 CONFIG_USE_CUSTOM_WAKE_WORD=y
-CONFIG_CUSTOM_WAKE_WORD="ni hao xiao zhi"
-CONFIG_CUSTOM_WAKE_WORD_DISPLAY="你好小智"
+CONFIG_CUSTOM_WAKE_WORD="ni hao xiao nuan"
+CONFIG_CUSTOM_WAKE_WORD_DISPLAY="你好，小暖"
 CONFIG_CUSTOM_WAKE_WORD_THRESHOLD=20
 # mn7_cn：官方推荐（S3/P4），比 mn6_cn 小约 1MB。
 # 模型 2671229 字节 + fst 9648 字节 = 2680877 字节，进 assets 分区。
@@ -350,14 +381,18 @@ def merge() -> int:
         )
         # 也剥掉可能残留在文件作用域的裸声明（MAIN_CC_DECL 的形态）
         stripped = stripped.replace(
-            'extern "C" void elder_bridge_start(void);\n', ""
-        )
+            'extern "C" void elder_bridge_start(void);\n', "")
+        stripped = stripped.replace(
+            'extern "C" esp_err_t elder_bind_guide_start(void);\n', "")
 
         marker = "    app.Start();\n"
         if marker not in stripped:
             print("[merge] 警告：main.cc 中未找到 `app.Start();`，需手动接入",
                   file=sys.stderr)
         else:
+            # ⚠️ 顺序要紧：先插 app.Start() **之前**的引导块，再插之后的
+            #    elder_boot。两段都靠同一对 BEGIN/END 标记整段剥离，幂等。
+            stripped = stripped.replace(marker, MAIN_CC_CALL_PRE + marker, 1)
             stripped = stripped.replace(
                 marker, marker + MAIN_CC_CALL, 1)
             # 前置声明插在 app_main() 定义之前（文件作用域）
@@ -369,6 +404,12 @@ def merge() -> int:
                 print("[merge] 警告：main.cc 中未找到 app_main() 定义，"
                       "elder_bridge_start 的声明需手动补到文件作用域",
                       file=sys.stderr)
+
+            # 空白规范化：strip_overlay 只删 BEGIN/END 两行，overlay 两侧的空行
+            # 会残留；而 MAIN_CC_DECL / MAIN_CC_CALL 自带前导空行 ⇒ 每跑一次
+            # merge 就多几行空行（HEAD 上曾累积到连续 6 行）。把 2 个及以上
+            # 连续空行压成 1 个，保证反复 merge 后 main.cc 字节稳定。
+            stripped = re.sub(r"\n{3,}", "\n\n", stripped)
 
             changed = stripped != text
             if changed:
@@ -401,7 +442,6 @@ def clean() -> int:
     for p in (MAIN_CMAKE, SDK_DEFAULTS):
         if remove_overlay(p):
             print(f"[merge] 已还原: {p}")
-    import re
     cpp_block = re.compile(
         r"\n *// >>> BEGIN elder-companion overlay.*?// <<< END elder-companion overlay <<<\n",
         flags=re.S)
@@ -427,12 +467,18 @@ def check() -> int:
     ok &= SDK_DEFAULTS.is_file() and BEGIN in SDK_DEFAULTS.read_text(encoding="utf-8")
     lcd_ok = LCD_DISPLAY_CC.is_file() and "elder-companion overlay" in LCD_DISPLAY_CC.read_text(encoding="utf-8")
     ok &= lcd_ok
+    # 70/30 对话布局是**直接改上游 lcd_display.cc** 的定制（不是 overlay 注入），
+    # 上游 sync_xiaozhi.py --force 会把它冲掉 ⇒ 这里守住标记，CI 的 merge --check
+    # 会红，避免「布局悄悄回退」还照样出包。重贴步骤见 README「上游定制补丁」节。
+    layout_ok = LCD_DISPLAY_CC.is_file() and "elder-layout-70-30" in LCD_DISPLAY_CC.read_text(encoding="utf-8")
+    ok &= layout_ok
     print("[merge] 合并状态:", "已合并" if ok else "未合并/不完整")
     print(f"  components/elder : {'OK' if ELDER_DST.is_dir() else 'MISSING'}")
     print(f"  main/CMakeLists  : {'OK' if MAIN_CMAKE.is_file() and BEGIN in MAIN_CMAKE.read_text(encoding='utf-8') else 'MISSING'}")
     print(f"  main/main.cc     : {'OK' if MAIN_CC.is_file() and 'elder_bridge_start' in MAIN_CC.read_text(encoding='utf-8') else 'MISSING'}")
     print(f"  sdkconfig.defaults: {'OK' if SDK_DEFAULTS.is_file() and BEGIN in SDK_DEFAULTS.read_text(encoding='utf-8') else 'MISSING'}")
     print(f"  display/lcd_display.cc: {'OK' if lcd_ok else 'MISSING'}")
+    print(f"  lcd_display.cc 70/30 布局: {'OK' if layout_ok else 'MISSING（被上游同步冲掉？按 README「上游定制补丁」节重贴）'}")
     return 0 if ok else 2
 
 

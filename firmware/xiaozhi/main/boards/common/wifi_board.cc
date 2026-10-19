@@ -49,8 +49,11 @@ void WifiBoard::EnterWifiConfigMode() {
     //     —— ESP 事件基与事件 ID（device_state_event.h），协议标识；
     //   * xiaozhi-fonts / 78/xiaozhi-fonts —— 组件名与依赖坐标；
     //   * "Xiaozhi Assistant" —— menuconfig 菜单名（上游文档里大量引用）；
-    //   * wn9_nihaoxiaozhi_tts / ni hao xiao zhi —— 唤醒词模型与唤醒词本身
-    //     （后者是老人的肌肉记忆，产品资产，绝不能动）；
+    //   * wn9_nihaoxiaozhi_tts —— 上游 assets 里的 WakeNet9 模型文件名
+    //     （本项目已改用 MultiNet mn7_cn，该模型不参与构建，但文件名是
+    //     上游资产标识，不能动）；
+    //   * 唤醒词本身 2026-10-18 用户拍板改为「你好，小暖」
+    //     （CONFIG_CUSTOM_WAKE_WORD，见 merge_to_xiaozhi.py）；
     //   * XiaozhiStatus（atk-dnesp32s3-box0，另一块板的状态枚举变量名）。
     //
     // 长度核对：GetSsid() 用 char ssid[32] 拼 "%s-%02X%02X"，
