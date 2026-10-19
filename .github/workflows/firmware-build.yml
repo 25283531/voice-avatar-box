@@ -280,7 +280,11 @@ jobs:
       #   所以这里不做串检索，做**按 flasher_args.json 声明的偏移逐字节比对**。
       #   跟着 flasher_args.json 走、不硬编码 0x20000：merge-bin 本身就是读这个
       #   文件拼的，用同一个源判定，才不至于「断言和拼装各说一套」。
-      - name: 合并镜像自检（app 段与 build/xiaozhi.bin 逐字节一致）
+      #
+      #   ⚠️ 校验**全部** flash_files 段，不止 app：assets（语音资源）段换回旧版
+      #   是最难查的一类 —— 固件逻辑全对、代码全对，但语音资源是旧的，表现为
+      #   「行为怪但一切看起来都对」。只比 app 段会放过它。
+      - name: 合并镜像自检（各段与 build/ 源文件逐字节一致）
         shell: bash
         run: |
           set -e
@@ -289,18 +293,24 @@ jobs:
           import json, pathlib, sys
           b = pathlib.Path('build')
           args = json.loads((b / 'flasher_args.json').read_text())
-          app_name = args['app']['file']
-          off = int(args['app']['offset'], 16)
-          app = (b / app_name).read_bytes()
           merged = (b / 'merged-flash.bin').read_bytes()
-          if len(merged) < off + len(app):
-              sys.exit(f'合并镜像太短：{len(merged)} < app 偏移 {off:#x} + {len(app)}')
-          if merged[off:off + len(app)] != app:
-              sys.exit(
-                  f'合并镜像 {off:#x} 处的 app 段与 {app_name} 不一致 '
-                  f'⇒ 偏移错位，或 merge-bin 读到了旧文件')
-          print(f'OK：app {app_name} {len(app)} 字节落在 {off:#x}，与合并镜像逐字节一致')
-          print(f'    合并镜像总长 {len(merged)} 字节')
+          bad, checked = [], 0
+          for off_s, fname in args['flash_files'].items():
+              off = int(off_s, 16)
+              f = b / fname
+              if not f.exists():
+                  bad.append(f'{fname}: 源文件不存在'); continue
+              want = f.read_bytes()
+              if len(merged) < off + len(want):
+                  bad.append(f'{fname}: 合并镜像太短（{len(merged)} < {off:#x}+{len(want)}）'); continue
+              if merged[off:off + len(want)] != want:
+                  bad.append(f'{fname}: {off:#x} 处与源文件不一致'); continue
+              checked += 1
+              print(f'  OK {fname:28s} {len(want):>9d} 字节 @ {off:#x}')
+          if bad:
+              sys.exit('合并镜像与源文件不一致 ⇒ 偏移错位 / merge-bin 读到旧文件：\n  '
+                       + '\n  '.join(bad))
+          print(f'全部 {checked} 段逐字节一致，合并镜像总长 {len(merged)} 字节')
           PY
 
       - name: 整理产物
