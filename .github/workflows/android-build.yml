@@ -156,12 +156,35 @@ jobs:
           ANDROID_STORE_PASSWORD: ${{ secrets.ANDROID_STORE_PASSWORD }}
           ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
           ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+          # ⚠️ 这里**刻意不给默认值**。
+          #   版本号的唯一真源是 android/app/build.gradle.kts 的 `?: 110 / "1.1.0"`。
+          #   曾经这里写的是 `inputs.version_name || '1.0.0'` / `|| '100'`，
+          #   于是 push 构建（inputs 为空）恒定传 -PVERSION_CODE=100，
+          #   **把 gradle 里的新版本号盖回旧值** —— 文件名写着 1.1.0、
+          #   装到手机上版本号却是 100，安卓侧判为低版本、拒绝覆盖安装，
+          #   且构建全程不报错。这类「两份真源各自漂移」比没有版本号更危险。
+          #   现在只在 dispatch 显式传参时才覆盖，否则交给 gradle 的默认值。
           # 走环境变量而不是直接内插进 shell，避免 dispatch 输入被当成命令执行
-          VNAME: ${{ inputs.version_name || '1.0.0' }}
-          VCODE: ${{ inputs.version_code || '100' }}
+          VNAME: ${{ inputs.version_name }}
+          VCODE: ${{ inputs.version_code }}
         run: |
           set -e
           chmod +x gradlew
+          # 从 gradle 读回**实际生效**的版本号（唯一真源在 build.gradle.kts）。
+          # 文件名也用它，避免「文件名与包内版本不一致」这种查不出来的错。
+          # 注意这里是**额外一次 gradle 调用**，只跑 printElderVersion 这个空任务，
+          # 不触发编译；换来的是「产物名 = 包内版本」这个可断言的契约。
+          OUT="$(./gradlew --no-daemon -q printElderVersion \
+                  -PVERSION_NAME="$VNAME" -PVERSION_CODE="$VCODE" 2>/dev/null \
+                 | grep -o 'ELDER_VERSION .*' | tail -1 || true)"
+          VNAME="$(echo "$OUT" | awk '{print $2}')"
+          VCODE="$(echo "$OUT" | awk '{print $3}')"
+          # 读不到就**报错**，不猜：宁可构建失败，也不要发一个版本号不明的包。
+          if [ -z "$VNAME" ] || [ -z "$VCODE" ]; then
+            echo "::error::未能从 gradle 读回生效版本号（printElderVersion 无输出），中止发版"
+            exit 1
+          fi
+          echo "本次打包版本：name=$VNAME code=$VCODE"
           ./gradlew --no-daemon --stacktrace assembleRelease \
             -PVERSION_NAME="$VNAME" -PVERSION_CODE="$VCODE"
           ls -lh app/build/outputs/apk/release/
@@ -170,6 +193,12 @@ jobs:
             mv "$f" "app/build/outputs/apk/release/elder-companion-${VNAME}-${VCODE}.apk"
           done
           ls -lh app/build/outputs/apk/release/
+          # ⚠️ 版本号必须**高于上次发布的 100**。老人换机/升级走的是这里，
+          # 版本号不涨 ⇒ 安卓判为低版本、拒绝覆盖安装 ⇒ 表现为「发了新版但装不上」。
+          if [ "$VCODE" -le 100 ]; then
+            echo "::error::versionCode=$VCODE 未高于上次发布的 100，发版前必须递增"
+            exit 1
+          fi
 
       - uses: actions/upload-artifact@v4
         with:

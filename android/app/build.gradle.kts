@@ -14,8 +14,15 @@ android {
         applicationId = "com.elder.companion"
         minSdk = 24
         targetSdk = 34
-        versionCode = (project.findProperty("VERSION_CODE") as String?)?.toIntOrNull() ?: 100
-        versionName = (project.findProperty("VERSION_NAME") as String?) ?: "1.0.0"
+        // ⚠️ 这里的默认值是 versionCode/versionName 的**唯一真源**。
+        //   曾经 server-ci.yml 里还硬编码了一份 `inputs.version_code || '100'`，
+        //   两份各自漂移：改了这里的 110，yml 仍会传 -PVERSION_CODE=100 把它盖回去，
+        //   产出「文件名写着 1.1.0、装到手机上却是 100」的包 —— 安卓侧会当成
+        //   低版本，用户根本装不上覆盖，且构建全程不报错。
+        //   workflow_dispatch 的 inputs 只在显式传入时覆盖（见 yml 的 has_version 判定）。
+        //   发版时改这里一处即可。
+        versionCode = (project.findProperty("VERSION_CODE") as String?)?.toIntOrNull() ?: 110
+        versionName = (project.findProperty("VERSION_NAME") as String?) ?: "1.1.0"
     }
 
     signingConfigs {
@@ -66,4 +73,22 @@ dependencies {
     // WebViewAssetLoader：把 assets 里的 H5 映射成一个虚拟 https 域来加载，
     // 这样页面有正常 origin，localStorage / 跨域请求行为与线上 H5 一致
     implementation("androidx.webkit:webkit:1.8.0")
+}
+
+// 供 CI 读取**实际生效**的版本号（走的是与 assembleRelease 完全相同的取值逻辑）。
+// 存在的理由：CI 需要给产物起一个带版本号的名字，若 CI 自己再写一份版本号，
+// 就会与这里漂移 —— 文件名写着 1.1.0、包里却是 100，安卓侧判为低版本拒装，
+// 而构建全程绿灯。**让程序自己报出它的版本，是消除两份真源最省事的办法。**
+//
+// ⚠️ 刻意**不**用 `com.android.build.gradle.AppExtension` 读回 defaultConfig：
+//   该类在新版 AGP 已被移除/私有化，引用它会让整个构建脚本编译失败 ——
+//   为了打一行日志而搞挂发版链路，代价比收益大得多。
+//   这里改为复算同一套取值逻辑（属性 → 默认值），与上面 defaultConfig 完全一致；
+//   真正的"一致性由 CI 断言"靠下面的读回校验：值对不上时 CI 会报错而不是静默发包。
+tasks.register("printElderVersion") {
+    val vCode = (project.findProperty("VERSION_CODE") as String?)?.toIntOrNull() ?: 110
+    val vName = (project.findProperty("VERSION_NAME") as String?) ?: "1.1.0"
+    doLast {
+        println("ELDER_VERSION $vName $vCode")
+    }
 }

@@ -24,8 +24,11 @@ export default defineManifestConfig({
   'name': VITE_APP_TITLE,
   'appid': VITE_UNI_APPID,
   'description': '老人陪伴与服药提醒助手（家属端）',
-  'versionName': '1.0.0',
-  'versionCode': '100',
+  // ⚠️ versionCode 必须**严格递增**，否则安卓侧无法把它识别成新版（老人装不上）。
+  // 2026-10-19 发布 1.1.0：本版含忘记密码四步流程（用户名→绑定邮箱→验证码→新密码
+  // 发邮箱）与角色创建页六处交互修复（下拉选择、音色试听、返回键只关弹窗等）。
+  'versionName': '1.1.0',
+  'versionCode': '110',
   'transformPx': false,
   'locale': VITE_FALLBACK_LOCALE, // 'zh-Hans'
   'h5': {
