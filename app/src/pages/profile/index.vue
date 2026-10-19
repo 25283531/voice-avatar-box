@@ -5,7 +5,7 @@
 </route>
 
 <script setup lang="ts">
-import { onBackPress, onShow } from '@dcloudio/uni-app'
+import { onBackPress, onLoad, onShow } from '@dcloudio/uni-app'
 import { computed, ref } from 'vue'
 import {
   changeEmail,
@@ -98,10 +98,29 @@ const sourceOptions = computed(() => [
   })),
 ])
 
-/** picker 选中项 → roleParent（0 表示原创） */
+/**
+ * picker 选中项 → roleParent（**null 表示原创**）。
+ *
+ * ⚠️ 这里必须把原创项的 id=0 归一成 null —— 2026-10-19 用户报
+ * 「点创建方式下拉框，无条件跳到基于平台角色创建的界面」。
+ *
+ * 原实现是 `sourceOptions[i]?.id ?? null`，而原创项的 id 就是 0：
+ * `0 ?? null` 得 **0** 而不是 null（`??` 只在 null/undefined 时兜底，
+ * 0 是合法值）。于是 roleParent 变成 0，而下游两处判据对「0」的解释
+ * **正好相反**：
+ *   · 模板 `v-if="roleParent === null"` —— 0 不是 null ⇒ 走进**派生**分支；
+ *   · 提交 `if (roleParent.value)` —— 0 是假值 ⇒ 走**原创**创建。
+ * 叠加结果：界面显示「基于平台角色创建」的文案和橙色按钮，点下去却建出
+ * 一个原创角色。而且**选「完全原创」也照样跳**，因为原创项自己的 id 就是 0
+ * —— 用户看到的就是「无条件跳转，跟选了什么无关」。
+ *
+ * 修法：让 roleParent 只保留两种取值 —— null（原创）或真实数据库 id（≥1），
+ * 从源头消掉「0」这个既不是 null、又不是真 id 的第三态。
+ */
 function onPickSource(e: any) {
   sourceIndex.value = Number(e.detail.value) || 0
-  roleParent.value = sourceOptions.value[sourceIndex.value]?.id ?? null
+  const picked = sourceOptions.value[sourceIndex.value]
+  roleParent.value = picked && picked.id ? picked.id : null
 }
 
 /** 当前选中的创建方式（用于弹窗顶部回显） */
@@ -207,6 +226,16 @@ function playPreview(voiceId: string) {
 }
 
 async function onOpenRole() {
+  // ⚠️ 先把弹窗打开，**再**去拉母版与音色清单。
+  // 原实现把 showRole=true 放在两个 await 之后：网络慢的那几百毫秒里
+  // 弹窗还没出现，而返回键已经在按 showRole 判事了 ⇒ 那段时间里按返回键
+  // 会直接走默认行为退出应用。用户描述成「点了没反应，再按返回键软件就没了」。
+  // 先置位，让「弹窗已开」这个状态与用户的点击同时发生。
+  roleParent.value = null
+  sourceIndex.value = 0
+  roleForm.value = { name: '', description: '', system_prompt: '', tts_voice: '' }
+  showRole.value = true
+
   // 派生需要母版列表，所以打开弹窗时才去拉（首页不必为它多打一次请求）
   if (!presetRoles.value.length) {
     presetRoles.value = await listPresetRoles().catch(() => [])
@@ -214,11 +243,10 @@ async function onOpenRole() {
   if (!voices.value.length) {
     await loadVoices()
   }
-  roleParent.value = null
-  sourceIndex.value = 0
-  roleForm.value = { name: '', description: '', system_prompt: '', tts_voice: '' }
-  if (voices.value.length) roleForm.value.tts_voice = voices.value[voiceIndex.value]?.id || ''
-  showRole.value = true
+  // 兜底：voices 已缓存（本次没走 loadVoices）时 tts_voice 仍是空串
+  if (voices.value.length && !roleForm.value.tts_voice) {
+    roleForm.value.tts_voice = voices.value[voiceIndex.value]?.id || ''
+  }
 }
 
 /* ---------------- 安卓返回键 ---------------- */
@@ -226,14 +254,27 @@ async function onOpenRole() {
  * 拦截返回键：弹窗开着时**只关弹窗**，不退出页面、更不退出应用。
  *
  * ⚠️ 需求（2026-10-19 用户报「点返回键直接退出软件」）。
- * 根因：这三个弹窗是自己用 `v-if` + `.mask` 实现的，不是原生页面/组件，
- * 所以 uni 框架**不知道有东西需要关闭**，返回键直接走默认行为 = 退出应用。
+ * 第一层根因：这些弹窗是自己用 `v-if` + `.mask` 实现的，不是原生页面/组件，
+ * uni 框架不知道有东西需要关闭。
  *
- * 用 onBackPress 而不是模板内联 —— 同页 goAvatar 上方写过原因：
- * 模板表达式不会被 uni 插件改写。而 onBackPress 必须由 @dcloudio/uni-app
- * 的生命周期钩子接管，所以放在 script 里是唯一正确形态。
+ * ⚠️⚠️ 但**只加 onBackPress 是不够的** —— 第二层根因（上一轮漏掉的）：
+ * uni-app 运行时的返回处理里，`onBackPress` 的唯一调用入口是
+ * `navigateBack` API，而 navbar 返回路径有一条分支：
+ *
+ *     getCurrentPages().length === 1 ? reLaunch('/') : navigateBack({from:'backbutton'})
+ *
+ * 且 `getCurrentPages()` 对 tabBar 页**只统计当前活动的那一个**
+ * ⇒ 「我的」这个 tab 切过去之后，栈里恒为只有它自己，length 恒为 1
+ * ⇒ 物理返回键**永远走不到 onBackPress**，直接退出应用。
+ *
+ * 所以这里接两条路，判据只有一份（closeTopOverlay），任一条拦住即可：
+ *   1. onBackPress —— 页面级钩子，栈里有多页时由框架调用；
+ *   2. plus.key 'backbutton' —— Activity 级物理键监听，**与页面栈长度无关**，
+ *      专门兜上一行那种 length===1 的场景。
+ * 两条都做成幂等（关一个已关的弹窗是 no-op），不会出现「关两次」的可见副作用。
  */
-onBackPress((opts) => {
+/** 关掉最上层的那个弹窗；没有弹窗可关时返回 false（交回默认行为） */
+function closeTopOverlay(): boolean {
   if (showCache.value) {
     showCache.value = false
     return true
@@ -250,9 +291,35 @@ onBackPress((opts) => {
     showEmail.value = false
     return true
   }
-  // 没有任何弹窗 ⇒ 交回默认行为（允许退出应用）
   return false
-})
+}
+
+onBackPress(() => closeTopOverlay())
+
+/** plus.key 监听器只注册一次（tab 页长驻，重复注册会叠多个回调） */
+let nativeBackBound = false
+
+function bindNativeBack() {
+  if (nativeBackBound) return
+  // plus 只在 APP 端存在；H5/小程序上没有这个对象，静默跳过即可
+  const p = (globalThis as any).plus
+  if (!p || !p.key || typeof p.key.addEventListener !== 'function') return
+  p.key.addEventListener('backbutton', (ev: any) => {
+    // 没弹窗 ⇒ 不碰默认行为（该退首页退首页、该退出退出）
+    if (!closeTopOverlay()) return
+    // 有弹窗 ⇒ 必须阻止默认行为，否则 uni-app 仍会继续走
+    // 「退出应用 / reLaunch('/')」那一套
+    try {
+      ev && ev.preventDefault && ev.preventDefault()
+    }
+    catch { /* 阻止失败也不能让异常冒到监听器外 */ }
+  })
+  nativeBackBound = true
+}
+
+// onLoad 时 plus 可能还没就绪，onShow 再兜一次（nativeBackBound 保证幂等）
+onLoad(bindNativeBack)
+onShow(bindNativeBack)
 
 /** 关闭弹窗时必须停掉试听，否则弹窗没了声音还在放，很吵 */
 function stopPreview() {

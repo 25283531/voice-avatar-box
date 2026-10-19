@@ -408,7 +408,13 @@
       <div class="card">
         <div class="row" style="justify-content:space-between">
           <h2>平台人格预设</h2>
-          <span class="muted" style="font-size:12px">红线版本 {{presetMeta.guardrail_version||'—'}}</span>
+          <span class="row" style="gap:12px;align-items:center">
+            <span class="muted" style="font-size:12px">红线版本 {{presetMeta.guardrail_version||'—'}}</span>
+            <!-- 2026-10-19 用户报「只有一个人格，无法新增多个人格预设」：
+                 此前这里只有「红线版本」一个只读角标，整页没有任何创建入口，
+                 运营想加第二种说话风格时只能改数据库。 -->
+            <button class="primary" @click="openNewPreset">＋ 新增预设</button>
+          </span>
         </div>
         <p class="muted" style="font-size:12px;margin:0 0 10px">
           调整的是<b>全平台共享</b>的这一行。设备不缓存人格，保存即对所有
@@ -446,9 +452,16 @@
       <div v-if="pEditBox" class="mask" @click.self="closePreset">
         <div class="modal" style="max-width:860px">
           <button class="close" @click="closePreset">&times;</button>
-          <h2>编辑平台预设：{{pEdit.name}}</h2>
+          <h2>{{ pEdit.isNew ? '新建平台预设' : '编辑平台预设：' + pEdit.name }}</h2>
 
-          <div v-if="pEdit.bound_device_count>0" class="err"
+          <!-- 新建态不显示「影响 N 台设备」：此刻还没有任何设备绑它。
+               但要把「稍后仍可改」说清楚，否则运营会以为建完就定型了。 -->
+          <div v-if="pEdit.isNew" class="hint" style="margin:6px 0 0">
+            新预设默认与出厂「小暖」完全一致（提示词 / 音色 / 性格 10 维），
+            保存后立即可被家属选择；之后随时可以回来改。
+            安全底线由平台统一注入，不随本页调整变化。
+          </div>
+          <div v-else-if="pEdit.bound_device_count>0" class="err"
                style="background:#fdf3e3;color:var(--warn)">
             ⚠️ 保存后立即对 <b>{{pEdit.bound_device_count}}</b> 台设备生效（系统不缓存人格）。
             已派生出去的 {{pEdit.derived_role_count}} 个角色是独立副本，<b>不会</b>跟着变。
@@ -540,8 +553,16 @@
 
           <div class="row" style="margin-top:16px;justify-content:flex-end">
             <button @click="closePreset">取消</button>
-            <button @click="previewPreset">预览编译产物</button>
-            <button class="primary" :disabled="presetBusy" @click="savePreset">保存并立即生效</button>
+            <!-- 新建态禁用预览：编译要拿一行**已存在**的库内数据做基底
+                 （/preview 是按 id 取行的），没有 id 就无从编起。
+                 与其给一个必然 404 的按钮，不如直接禁掉并说清原因。 -->
+            <button @click="previewPreset" :disabled="!!pEdit.isNew"
+                    :title="pEdit.isNew
+                      ? '新建态还没有可编译的库内数据，请先保存，之后就能预览'
+                      : '查看保存后机器人真正收到的那一整段文字'">预览编译产物</button>
+            <button class="primary" :disabled="presetBusy" @click="savePreset">
+              {{ pEdit.isNew ? '创建预设' : '保存并立即生效' }}
+            </button>
           </div>
         </div>
       </div>
@@ -2102,6 +2123,29 @@ createApp({
       Object.assign(this.pEdit, this.splitVoice(this.pEdit.tts_voice));
       this.pEditBox = true;
     },
+    // 新建预设（2026-10-19 用户报「只有一个人格，无法新增」）。
+    // 缺省值全部取 meta 下发的 defaults（= 服务端 catalog 出厂值），
+    // 不从零填 10 个性格档位 —— 从零填的结果通常是半途而废。
+    // ⚠️ id 置 null + isNew 标记：savePreset 据此走 POST 而不是 PATCH，
+    // previewPreset 据此禁用（编译需要一行已存在的库内数据做基底）。
+    openNewPreset(){
+      const d = (this.presetMeta && this.presetMeta.defaults) || {};
+      this.pEdit = {
+        id: null,
+        isNew: true,
+        name: '',
+        description: '',
+        system_prompt: d.system_prompt || '',
+        tts_voice: d.tts_voice || '',
+        traits: Object.assign({}, d.traits || {}),
+        guardrails_soft: [],
+        guardrails_hard: [],
+        bound_device_count: 0,
+        derived_role_count: 0,
+      };
+      Object.assign(this.pEdit, this.splitVoice(this.pEdit.tts_voice));
+      this.pEditBox = true;
+    },
     closePreset(){ this.pEditBox = false; this.pEdit = null; },
     toggleSoft(id, on){
       const list = this.pEdit.guardrails_soft;
@@ -2127,6 +2171,8 @@ createApp({
       }
     },
     async previewPreset(){
+      // 新建态没有 id，/preview 是按 id 取行编译的 —— 按钮已禁用，这里是兜底
+      if (!this.pEdit || this.pEdit.isNew || !this.pEdit.id) return;
       try{
         const r = await this.api('/api/admin/presets/'+this.pEdit.id+'/preview', {
           method:'POST',
@@ -2138,6 +2184,7 @@ createApp({
       }catch(e){ this.err = e.message; }
     },
     async savePreset(){
+      const isNew = !!this.pEdit.isNew;
       const n = this.pEdit.bound_device_count || 0;
       // 保存是"影响他人但可秒回滚"→ 只在N>0 时确认（N=0 时确认框是纯噪音，
       // 而噪音确认框会训练运营闭眼点确定，那才是真风险）。
@@ -2148,15 +2195,42 @@ createApp({
         this.err = '音色选了「其他」但没填音色名。请填写，或改选一个预置音色。';
         return;
       }
+      if (!(this.pEdit.name||'').trim()){
+        this.err = '请填写预设名称 —— 它是家属在 APP 里看到的那一行。';
+        return;
+      }
       const voice = this.resolveVoice(this.pEdit.tts_voice, this.pEdit.tts_voice_custom);
       this.presetBusy = true; this.err = '';
       try{
-        await this.api('/api/admin/presets/'+this.pEdit.id, {
-          method:'PATCH',
-          body: JSON.stringify({name:this.pEdit.name, description:this.pEdit.description,
-                                system_prompt:this.pEdit.system_prompt,
-                                tts_voice:voice, traits:this.pEdit.traits})
-        });
+        if (isNew){
+          // 新建（2026-10-19 用户报「无法新增多个人格预设」）。
+          // ⚠️ 只提交这 5 个字段：归属类字段（record_type/owner_id/parent_id/kind）
+          // 服务端 schema 用 extra="forbid" 一律拒（422），前端**连传的入口都不给** ——
+          // 创建入口不该有能力决定"这行归谁"，那是 P0 安全边界。
+          const r = await this.api('/api/admin/presets', {
+            method:'POST',
+            body: JSON.stringify({
+              name: this.pEdit.name.trim(),
+              description: this.pEdit.description || '',
+              system_prompt: this.pEdit.system_prompt || '',
+              tts_voice: voice,
+              traits: this.pEdit.traits || {}
+            })
+          });
+          // api() 在 401 时返回 null（已被登出），此时什么都不该继续做
+          if(!r) return;
+          // 关键：把新 id 写回 pEdit，下面的 persistSoft 才能对着它逐项勾软约束
+          this.pEdit.id = r.id;
+          this.pEdit.isNew = false;
+        }
+        else {
+          await this.api('/api/admin/presets/'+this.pEdit.id, {
+            method:'PATCH',
+            body: JSON.stringify({name:this.pEdit.name, description:this.pEdit.description,
+                                  system_prompt:this.pEdit.system_prompt,
+                                  tts_voice:voice, traits:this.pEdit.traits})
+          });
+        }
         await this.persistSoft();
         this.pEditBox = false; this.pEdit = null;
         await this.loadPresets();

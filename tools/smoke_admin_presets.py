@@ -21,7 +21,7 @@
 4. **红线与 tokens 绝不出库**：展示只走 ``guardrails.card_items``（T09/T10）。
    ``regenerate_locked`` 多返回一个 ``tokens``，那是 ``assert_present()``
    做 fail-closed 自检的判定基准 —— 泄漏它等于把"门禁怎么判"交出去。
-5. **审计与业务写同事务**：4 个写入点逐一验证（T18/T20/T24/T25）。
+5. **审计与业务写同事务**：5 个写入点逐一验证（T18/T20/T24/T25 与 create_preset）。
    审计丢一次就永远丢了 —— 那等于没有审计。T32 补上**结果断言抓不到的
    那一半**：用 AST 静态守住"不许拆成两次 commit"（业务先提交、再补审计）。
 6. **启动期净改动 = 0**：运营改的值必须活过重启（T14），下架的预设不能
@@ -82,6 +82,11 @@ if DB_PATH.exists():
 PORT = resolve_port("smoke_admin_presets")
 BASE = f"http://127.0.0.1:{PORT}"
 SERVER_LOG = DB_PATH.with_name(DB_PATH.stem + "_server.log")
+
+# 本脚本自用的种子管理员口令。admin/admin123 这套硬编码弱口令已从代码移除
+# （bb5ca98），改为在起服务时通过 ELDER_SEED_ADMIN_PASSWORD 显式指定。
+# 与 smoke_auth.py / smoke_mail.py 的 LEGACY_PW 同名同义，改一处记得同步。
+LEGACY_PW = "admin123"
 
 results: list[tuple[str, bool, str]] = []
 
@@ -216,6 +221,11 @@ def _boot_env(db_url: str) -> dict:
     env["ELDER_JWT_SECRET"] = "smoke-presets-secret"
     env["ELDER_SCHEDULER_INTERVAL"] = "3600"
     env["PYTHONIOENCODING"] = "utf-8"
+    # ⚠️ 必须显式指定种子管理员口令：``admin/admin123`` 这套硬编码弱口令已从
+    # 代码移除（bb5ca98），空库部署时服务端用 ``secrets.token_urlsafe(16)``
+    # 生成随机口令 ⇒ 不指定的话下面那句登录必 401，整片红。
+    # 约定与其他冒烟脚本一致（见 smoke_auth.py / smoke_mail.py 的 LEGACY_PW）。
+    env["ELDER_SEED_ADMIN_PASSWORD"] = LEGACY_PW
     return env
 
 
@@ -454,7 +464,7 @@ def main() -> int:
     try:
         # ==================================================== 准备
         code, tk = req("POST", "/api/auth/login",
-                       {"username": "admin", "password": "admin123"})
+                       {"username": "admin", "password": LEGACY_PW})
         admin = tk.get("access_token", "") if isinstance(tk, dict) else ""
         check("登录默认管理员", code == 200 and bool(admin), str(code))
 
@@ -652,12 +662,15 @@ def main() -> int:
               else f"{n_pairs} 个写入口均合规")
         # 反向自检：这条断言必须**有匹配对象**才算数。匹配到 0 个函数
         # 意味着路径写错或匹配条件失效 —— 那时"没有违规"是恒绿。
-        # 数量钉死为 4：新增带审计的写入口必须显式改这里并 review 其
+        # 数量钉死：新增带审计的写入口必须显式改这里并 review 其
         # 事务结构（与 T28"恰好 10 个 trait 维度"同一条纪律）。
-        check("T32 反向自检：AST 匹配到 4 个 record+commit 写入口"
+        # 2026-10-19 由 4 改 5：新增 create_preset（POST /api/admin/presets）。
+        # 已 review：record() 内无 commit；失败路径先 db.rollback() 再 raise，
+        # 不留半行；record 行号早于唯一的 db.commit()。
+        check("T32 反向自检：AST 匹配到 5 个 record+commit 写入口"
               "（匹配不到 = 断言在对着空气开炮；数量变了说明新增了带审计的"
               "端点，请 review 其事务结构后显式改期望值）",
-              n_pairs == 4, f"{n_pairs} 个")
+              n_pairs == 5, f"{n_pairs} 个")
 
         # ==================================================== T21-T22 preview
         print("── T21-T22 preview 不落库且 fail-closed ──")
@@ -1064,6 +1077,76 @@ def main() -> int:
                   "库里会堆积重复的「小暖」）",
                   n_preset_after == n_preset_before,
                   f"{n_preset_before} -> {n_preset_after}")
+
+        # ==================================================== T32-T36 新建预设
+        # 2026-10-19 用户报「平台人格预设中只有一个人格，无法新增多个人格预设」。
+        # 这一节钉的是创建入口的**契约**，不只是"能建"：缺省值、用户端可见性、
+        # 审计、以及归属/红线/非法值这三类必须被挡在门外的请求。
+        print("── T32-T36 新建平台人格预设 ──")
+        code, plist0 = req("GET", "/api/admin/presets", token=admin)
+        n_before = len((plist0 or {}).get("presets", []))
+        NEW_NAME = "小太阳（冒烟测试）"
+
+        # 只给 name：其余必须走 catalog 出厂值。运营不该为了建一个"和小暖
+        # 差不多"的角色而从零填 10 个性格档位 —— 从零填的结果通常是半途而废。
+        code, created = req("POST", "/api/admin/presets", {"name": NEW_NAME}, admin)
+        check("T32 admin POST 只给 name -> 201（缺省走出厂值）",
+              code == 201 and isinstance(created, dict), f"code={code}")
+        new_pk = created.get("id") if isinstance(created, dict) else None
+        if new_pk:
+            code, got = req("GET", f"/api/admin/presets/{new_pk}", token=admin)
+            check("T32b 新建行与出厂默认逐字段一致（prompt/音色/10 维）",
+                  code == 200 and got.get("name") == NEW_NAME
+                  and got.get("tts_voice") == dflt_voice
+                  and got.get("system_prompt") == dflt_prompt
+                  and got.get("traits") == dflt_traits,
+                  f"code={code} name={got.get('name')!r}")
+            check("T32c 新建行带 5 条硬红线（card_items 只读口径）",
+                  len((got or {}).get("guardrails_hard") or []) == 5,
+                  str(len((got or {}).get("guardrails_hard") or [])))
+            # 用户端看不到 ⇒ 建了也白建（家属选不到）
+            code, uview = req("GET", "/api/roles/presets", token=u1)
+            unames = ([r.get("name") for r in uview]
+                      if isinstance(uview, list) else [])
+            check("T32d 新建预设出现在**用户端**可选列表（/api/roles/presets）",
+                  NEW_NAME in unames, str(unames))
+            code, auds = req("GET", f"/api/admin/presets/{new_pk}/audits", token=admin)
+            check("T33 新建写了一条 create 审计（与业务写同事务）",
+                  isinstance(auds, list) and len(auds) == 1
+                  and auds[0].get("action") == "create"
+                  and "name" in (auds[0].get("changed_fields") or []),
+                  str(auds[:1] if isinstance(auds, list) else auds))
+            code, patched = req("PATCH", f"/api/admin/presets/{new_pk}",
+                                {"description": "活泼型，语速偏快"}, admin)
+            check("T34 新建的预设可继续 PATCH（先建再调，不是一次性死行）",
+                  code == 200 and patched.get("description") == "活泼型，语速偏快",
+                  f"code={code}")
+
+        code, _ = req("POST", "/api/admin/presets", {"name": "x"}, u1)
+        check("T35 非 admin POST -> 403（创建入口同样是管理端边界）",
+              code == 403, f"code={code}")
+        code, _ = req("POST", "/api/admin/presets", {"name": "x"})
+        check("T35b 未登录 POST -> 401", code == 401, f"code={code}")
+        # 归属字段：创建入口不该有能力决定"这行归谁"（P0 边界的形状）
+        code, _ = req("POST", "/api/admin/presets",
+                      {"name": "x", "record_type": "role"}, admin)
+        check("T36 POST 带 record_type -> 422（归属不是请求方能决定的）",
+              code == 422, f"code={code}")
+        code, _ = req("POST", "/api/admin/presets",
+                      {"name": "x", "guardrails": {"hard": []}}, admin)
+        check("T36b POST 带 guardrails -> 422（红线只能由代码常量注入）",
+              code == 422, f"code={code}")
+        code, _ = req("POST", "/api/admin/presets", {"traits": {"humor": 1}}, admin)
+        check("T36c 缺 name -> 422（name 是创建的唯一必填项）",
+              code == 422, f"code={code}")
+        code, _ = req("POST", "/api/admin/presets",
+                      {"name": "x", "traits": {"humor": "很好笑"}}, admin)
+        check("T36d 非法 trait 值 -> 400（编译/值域校验先于落库）",
+              code == 400, f"code={code}")
+        code, plist1 = req("GET", "/api/admin/presets", token=admin)
+        n_after = len((plist1 or {}).get("presets", []))
+        check("T36e ★ 失败的那几次创建没有留下任何行（fail-closed）",
+              n_after == n_before + 1, f"{n_before} -> {n_after}")
 
         # ==================================================== T29-T30 契约
         print("── T29-T30 分页与响应契约 ──")

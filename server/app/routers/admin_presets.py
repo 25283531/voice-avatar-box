@@ -8,8 +8,10 @@ owner 或管理员。而本模块是**管理端**：非管理员403（先鉴权�
 迟早会出现"这个端点该按哪套来"的争议。管理端惯例见 ``routers/support.py``
 （prefix ``/api/admin/<模块>`` + router 级 ``get_current_admin`` + 不包 envelope）。
 
-**本模块只处理「调整现有平台预设」**，不支持新建（设计 §2：产品问题未答案
-+ ``_seed()`` 的母版判据目前是隐含不变量，多预设要先把它显式化）。
+**本模块处理「调整现有平台预设」与「新建平台预设」**。新建入口
+（``POST /api/admin/presets``）是 2026-10-19 用户报「只有一个人格、无法新增」
+后补的：此前 ``_seed()`` 只写一个「小暖」，运营想加第二种说话风格时
+只能改数据库，而预设又是全平台共享行，手工改既无校验也无审计。
 
 ================================ 五条不可越界的边界 =================================
 1. **可改字段只有 5 个**（``PresetPatchIn``）：``name`` / ``description`` /
@@ -38,6 +40,7 @@ from ..persona import admin_audit, catalog, guardrails
 from ..persona.compiler import PromptCompiler
 from ..schemas import (
     PresetAuditOut,
+    PresetCreateIn,
     PresetListOut,
     PresetMetaOut,
     PresetOut,
@@ -166,7 +169,14 @@ def _dirty_fields(row: models.AIProvider, traits: dict[str, Any]) -> list[str]:
 
 
 # ================================================================ 读
-@router.get("/", response_model=PresetListOut)
+# ⚠️ 集合端点用 ``""`` 而不是 ``"/"``（与 roles.py 的 ``@router.get("")`` 一致）。
+# 写成 ``"/"`` 时 FastAPI 注册到 ``/api/admin/presets/``（带斜杠），
+# 而不带斜杠的请求只能靠 Starlette 的 redirect_slashes 307 跳转 ——
+# 一旦同路径上再注册一个不带斜杠的方法（如本文件的 POST 创建），
+# 那条 307 就被精确匹配顶掉，GET 直接变 **405 Method Not Allowed**。
+# 实测踩过（2026-10-19）：加了 POST 创建端点后，原本全绿的
+# 「管理员可列平台预设」断言瞬间变红，而库里数据完全正常。
+@router.get("", response_model=PresetListOut)
 def list_presets(
     limit: int = Query(50, ge=1, le=200),
     db: Session = Depends(get_db),
@@ -179,6 +189,67 @@ def list_presets(
         .order_by(models.AIProvider.id.desc())
         .limit(limit)).all())
     return PresetListOut(presets=[_preset_out(db, r) for r in rows])
+
+
+@router.post("", response_model=PresetOut, status_code=status.HTTP_201_CREATED)
+def create_preset(payload: PresetCreateIn, db: Session = Depends(get_db),
+                  admin: models.User = Depends(get_current_admin)):
+    """新建平台人格预设。
+
+    ⚠️ 为什么补这个端点（2026-10-19 用户报「平台人格预设中只有一个人格，
+    无法新增多个人格预设」）：此前 ``_seed()`` 只写一个「小暖」，管理端又只有
+    PATCH / preview / reset / archive —— **没有任何创建入口** ⇒ 运营想加第二种
+    说话风格（例如更活泼的"小太阳"给不同老人）时无路可走，只能改数据库。
+
+    与 :func:`update_preset` 共用同一条 fail-closed 路径：先装配 + 编译校验
+    （红线齐全）再落库。编译不过就 ``rollback``，**不留半行** ——
+    一个编译不过的 preset 会让所有派生它的设备拿到不完整的提示词。
+
+    归属字段（``record_type='preset'`` / ``kind=''`` / ``owner_id=None`` /
+    ``parent_id=None``）按常量写死，不来自请求体：创建入口不该有能力决定
+    "这行归谁"，那是 P0 安全边界（"用户角色被刷成 preset"那次事故的形状）。
+    """
+    name = payload.name.strip()
+    if not name:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "名称不能全是空白")
+
+    row = models.AIProvider(
+        name=name,
+        description=(payload.description or "").strip(),
+        kind="",
+        record_type=models.RECORD_TYPE_PRESET,
+        owner_id=None,
+        parent_id=None,
+        # 缺省即出厂值，与 _seed() 建的默认预设逐字段一致
+        system_prompt=(payload.system_prompt
+                       if payload.system_prompt is not None
+                       else catalog.DEFAULT_PRESET_PROMPT),
+        tts_voice=(payload.tts_voice
+                   if payload.tts_voice is not None
+                   else catalog.DEFAULT_PRESET_TTS_VOICE),
+        traits=(dict(payload.traits) if payload.traits is not None
+                else dict(catalog.DEFAULT_TRAITS)),
+        # 硬红线按当前 GUARDRAIL_VERSION 注入，不接受外部传入
+        guardrails=guardrails.merge_stored(None),
+        enabled=True,
+    )
+    db.add(row)
+    db.flush()  # 先拿 id：build_spec_for_preset 与审计都要用
+
+    try:
+        candidate_spec = build_spec_for_preset(row)
+        PromptCompiler().compile(candidate_spec, {}, "", "")
+    except Exception:
+        # 编译不过 ⇒ 整个事务作废，不留一行"建了一半"的 preset
+        db.rollback()
+        raise
+
+    after = admin_audit.snapshot(row)
+    admin_audit.record(db, admin, row, "create", None, after)
+    db.commit()
+    db.refresh(row)
+    log.info("管理员 id=%s 新建平台预设 id=%s「%s」", admin.id, row.id, row.name)
+    return _preset_out(db, row)
 
 
 @router.get("/meta", response_model=PresetMetaOut)

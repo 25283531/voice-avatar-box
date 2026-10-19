@@ -531,6 +531,36 @@ class PresetPatchIn(ORMBase):
     model_config = ConfigDict(from_attributes=True, extra="forbid")
 
 
+class PresetCreateIn(ORMBase):
+    """新建平台人格预设（2026-10-19 用户报「只有一个人格，无法新增」）。
+
+    与 :class:`PresetPatchIn` 同源同构：``extra="forbid"`` 是白名单式锁的
+    前提（Pydantic v2 默认 ``extra="ignore"`` 会把未知字段**静默丢掉**，
+    那等于没有锁）；归属类字段（``record_type`` / ``owner_id`` /
+    ``parent_id`` / ``kind``）一律不收，由端点按常量写死 ——
+    创建入口不该有能力决定"这行归谁、是不是别人的角色"。
+
+    与 PATCH 的差别只在 ``name`` **必填**（PATCH 里可选，因为"改名"不是
+    新建的语义），其余全部缺省走 catalog 出厂值，与 ``_seed()`` 建的
+    默认预设逐字段一致：运营可以"先建一个和小暖一样的，再慢慢调"，
+    不必从零填 10 个性格档位 —— 从零填的结果通常是半途而废。
+
+    ⚠️ 不含 ``guardrails``：硬红线是代码常量，由 ``merge_stored(None)``
+    在创建时按当前 ``GUARDRAIL_VERSION`` 注入，不接受外部传入。
+    """
+
+    name: str = Field(min_length=1, max_length=64)
+    description: str | None = None
+    # 人格提示词（软性）。红线由代码常量注入，不在这里。
+    system_prompt: str | None = None
+    tts_voice: str | None = None
+    # 整体覆写；缺省 = 出厂 10 维。写入前逐项 is_valid 校验，非法值 400 且不落库。
+    traits: dict[str, Any] | None = None
+
+    # 见类注释：extra="forbid" 是「白名单式 schema 锁」成立的前提
+    model_config = ConfigDict(from_attributes=True, extra="forbid")
+
+
 class PresetResetIn(ORMBase):
     """恢复出厂默认。``fields`` 缺省 = 全部可重置字段。
 
