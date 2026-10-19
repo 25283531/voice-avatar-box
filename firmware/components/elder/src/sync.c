@@ -7,6 +7,7 @@
 #include <sys/time.h>
 
 #include "cJSON.h"
+#include "esp_chip_info.h"
 #include "esp_heap_caps.h"
 #include "nvs.h"
 #include "nvs_flash.h"
@@ -56,6 +57,7 @@ static struct {
     uint32_t          interval_sec;
     time_t            last_server_time;
     char              fw_version[32];
+    char              hw_model[24];
     bool              time_synced;
 } g;
 
@@ -602,6 +604,36 @@ static bool upload_local_reminders(void)
 
 /* ---------------------------------------------------------------- 拉取 */
 
+/* 芯片型号展示名（服务端设备表的「硬件型号」列用它）。
+ *
+ * esp_chip_info() 在 esp_hw_support 组件里（见 CMakeLists 的 REQUIRES）。
+ * switch 只列本项目可能用到的型号；default 兜底 CONFIG_IDF_TARGET
+ * （sdkconfig.h 必有该宏，形如 "esp32s3"），再兜底 "unknown"。
+ * 三重兜底都不返回 NULL —— URL 拼串的 %s 吃到 NULL 是未定义行为，
+ * 而「unknown」至少能让服务端与 UI 显示出一个诚实的占位。 */
+static const char *chip_model_name(void)
+{
+    esp_chip_info_t info;
+    esp_chip_info(&info);
+    switch (info.model) {
+        case CHIP_ESP32:   return "ESP32";
+        case CHIP_ESP32S2: return "ESP32-S2";
+        case CHIP_ESP32S3: return "ESP32-S3";
+        case CHIP_ESP32C3: return "ESP32-C3";
+        case CHIP_ESP32C2: return "ESP32-C2";
+        case CHIP_ESP32C6: return "ESP32-C6";
+        case CHIP_ESP32H2: return "ESP32-H2";
+        case CHIP_ESP32P4: return "ESP32-P4";
+        case CHIP_ESP32C5: return "ESP32-C5";
+        default:
+#if defined(CONFIG_IDF_TARGET)
+            return CONFIG_IDF_TARGET;
+#else
+            return "unknown";
+#endif
+    }
+}
+
 static esp_err_t do_sync(void)
 {
     static char *resp = NULL;
@@ -610,8 +642,12 @@ static esp_err_t do_sync(void)
         if (!resp) return ESP_ERR_NO_MEM;
     }
 
-    char path[96];
-    snprintf(path, sizeof(path), "/api/device/sync?fw_version=%s", g.fw_version);
+    /* 192 字节的最坏占用：固定段 37 + fw_version 31 + hw_model 23 + NUL 1
+     * = 92，留一倍余量给将来再加 query 参数（如固件 build id）。
+     * hw_model 为空串时退化为旧 URL 形态，老服务端照常解析。 */
+    char path[192];
+    snprintf(path, sizeof(path), "/api/device/sync?fw_version=%s&hw_model=%s",
+             g.fw_version, g.hw_model);
 
     size_t len = ELDER_NET_RESP_MAX;
     int status = 0;
@@ -718,6 +754,10 @@ esp_err_t elder_sync_init(const elder_sync_cfg_t *cfg)
 
     snprintf(g.fw_version, sizeof(g.fw_version), "%s",
              (cfg && cfg->fw_version) ? cfg->fw_version : "elder-1.0.0");
+    /* 硬件型号：cfg 显式给了就用（上层Override 场景），否则自动探测。
+     * 与 fw_version 同一形态：cfg 优先、默认值兜底。 */
+    snprintf(g.hw_model, sizeof(g.hw_model), "%s",
+             (cfg && cfg->hw_model) ? cfg->hw_model : chip_model_name());
     g.interval_sec = (cfg && cfg->interval_sec) ? cfg->interval_sec
                                                 : CONFIG_ELDER_SYNC_INTERVAL_SEC;
 

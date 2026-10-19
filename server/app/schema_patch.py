@@ -295,6 +295,13 @@ NEW_COLUMNS: Final[list[tuple[str, str, str, str]]] = [
     ("avatars", "deleted_at", "DATETIME", "DATETIME NULL"),
     # ---- agent_persona_profiles：哨兵列，修 L1 全局画像唯一性（架构 §1.5）----
     ("agent_persona_profiles", "agent_key", "INTEGER DEFAULT 0", "INT NOT NULL DEFAULT 0"),
+    # ---- devices：硬件型号 + 绑定时间（设备列表缺口，2026-10-19）----
+    # hardware_model 带 DEFAULT ''：老库补列后既有行读出空串（UI 兜底「未知」），
+    #   且新固件下次心跳自动补全，不需要回填脚本。
+    # bound_at 可空故不带默认：NULL = 存量未记录（与 ai_providers.deleted_at
+    #   同例），两个归属写入点（devices.create_device / bind_device）负责写值。
+    ("devices", "hardware_model", "VARCHAR(64) DEFAULT ''", "VARCHAR(64) DEFAULT ''"),
+    ("devices", "bound_at", "DATETIME", "DATETIME NULL"),
 ]
 
 # 本轮新增的索引。create_all 只为**新**库建索引，老库升级上来不会有，

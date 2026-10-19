@@ -55,6 +55,10 @@ if DB_PATH.exists():
 PORT = resolve_port("smoke_server")
 BASE = f"http://127.0.0.1:{PORT}"
 
+# 与 smoke_auth.py / smoke_mail.py / smoke_admin_presets.py 的 LEGACY_PW
+# 同名同义（四处保持一致，改一处记得同步）。
+LEGACY_PW = "admin123"
+
 # ⚠️ 子进程输出**绝不能**用 `subprocess.PIPE` +「只在启动失败时读一次」——
 # 日志量超过管道缓冲区（Windows 匿名管道 4096 字节）后，
 # **服务端会被永久阻塞**，而客户端只看到「读超时」。
@@ -90,6 +94,22 @@ def req(method: str, path: str, body: dict | None = None, token: str | None = No
             return e.code, json.loads(raw)
         except Exception:
             return e.code, raw
+
+
+def req_text(method: str, path: str) -> tuple[int, str]:
+    """GET 页面原文（入口路由断言用）。
+
+    为什么不能复用 :func:`req`：它对响应体**无条件** ``json.loads``，
+    而 HTML 页面会抛 ``JSONDecodeError`` —— 且该异常不在 req 的
+    ``except HTTPError`` 捕获范围内，会直接把脚本炸掉（页面路由
+    从来没被断言过，这个坑一直没人踩到）。
+    """
+    r = urllib.request.Request(BASE + path, method=method)
+    try:
+        with _LOCAL_OPENER.open(r, timeout=20) as resp:
+            return resp.status, resp.read().decode("utf-8", "replace")
+    except urllib.error.HTTPError as e:
+        return e.code, e.read().decode("utf-8", "replace")
 
 
 def wait_ready(timeout: float = 120.0) -> bool:
@@ -135,6 +155,13 @@ def main() -> int:
     env["ELDER_JWT_SECRET"] = "smoke-test-secret"
     env["ELDER_SCHEDULER_INTERVAL"] = "3600"   # 测试期间不跑后台调度，避免干扰
     env["PYTHONIOENCODING"] = "utf-8"
+    # 种子管理员口令 bb5ca98 起不再硬编码在代码里：空库未配
+    # ELDER_SEED_ADMIN_PASSWORD 时会生成**随机**口令打进日志。
+    # 本脚本自己起服务，却用 admin/admin123 登录 —— 下面不显式注入，
+    # 这个夹具就只在不带环境跑不起来（CI 靠 job 级 env 兜住，本地裸跑 401）。
+    # 约定与其他冒烟脚本一致（见 smoke_auth.py / smoke_mail.py /
+    # smoke_admin_presets.py 的 LEGACY_PW，四处同名同义，改一处记得同步）。
+    env["ELDER_SEED_ADMIN_PASSWORD"] = LEGACY_PW
 
     print(f"[boot] starting server on :{PORT} (db: {db_url.split('@')[-1]})")
     # ---- 三段式端口守卫（QA 第 4 轮「假绿」修复）----
@@ -201,8 +228,22 @@ def main() -> int:
         code, body = req("GET", "/api/health")
         check("健康检查", code == 200 and body.get("ok") is True, str(body))
 
+        # ---------------------------------------------------- 1b. 双入口路由
+        # 2026-10-19 用户端入口重构（决策记录 D41）：/ = 用户端（未登录即
+        # 登录/注册页），/admin = 管理后台，/user 已删除（项目未公开，
+        # 不重定向、不兼容渲染）。标记串取两个页面 h1 的实有文案。
+        code, home_html = req_text("GET", "/")
+        check("GET / 是用户端页面（含「用户端」标记）",
+              code == 200 and "用户端" in home_html, f"code={code}")
+        code, admin_html = req_text("GET", "/admin")
+        check("GET /admin 是管理后台页面（含「管理后台」标记）",
+              code == 200 and "管理后台" in admin_html, f"code={code}")
+        code, _user_html = req_text("GET", "/user")
+        check("GET /user 已删除（404，不做重定向/兼容渲染）",
+              code == 404, f"code={code}")
+
         # ---------------------------------------------------- 2. 登录（种子管理员）
-        code, tk = req("POST", "/api/auth/login", {"username": "admin", "password": "admin123"})
+        code, tk = req("POST", "/api/auth/login", {"username": "admin", "password": LEGACY_PW})
         check("登录默认管理员", code == 200 and bool(tk.get("access_token")), str(code))
         token = tk.get("access_token", "")
 
@@ -211,6 +252,13 @@ def main() -> int:
                         {"device_id": "aabbccddeeff", "name": "客厅陪伴助手"}, token)
         check("登记设备", code == 201 and dev.get("device_id") == "aabbccddeeff", str(code))
         dev_pk = dev.get("id", 0)
+        # bound_at 的**建档即归属**路径：create_device 直接写 owner_id，bound_at
+        # 必须同时落库（两个归属写入点之一，另一个是 /bind）。放在 bind 之前断言
+        # 是刻意的——bind 之后 bound_at 必然非 None（那条路径也写），放在那里
+        # 对本条路径没有鉴别力，删掉 create_device 的写入也不会红。
+        # 变异实证：删掉 routers/devices.py create_device 的 bound_at 写入，这条必须红。
+        check("登记设备时 bound_at 已写（建档即归属）",
+              bool(dev.get("bound_at")), str(dev.get("bound_at")))
 
         # ---------------------------------------------------- 4. 激活码
         code, cd = req("POST", f"/api/devices/{dev_pk}/code", {}, token)
@@ -247,6 +295,22 @@ def main() -> int:
         check("激活码绑定设备", code == 200 and bool(bind.get("device_token")), str(code))
         dev_token = bind.get("device_token", "")
 
+        # ---------------------------------------------------- 6b. 设备列表新字段
+        # 设备列表缺口（2026-10-19）：hardware_model / bound_at / fw_version
+        # 三列（OTA 相关的「升级入口」已随 OTA 后台化暂缓，见决策记录 D40）。
+        # 三个字段都带默认值，老客户端不读它们也无感。
+        code, devs = req("GET", "/api/devices", token=token)
+        me = {}
+        if code == 200 and isinstance(devs, list):
+            me = next((d for d in devs if d.get("id") == dev_pk), {})
+        check("DeviceOut 带 hardware_model / bound_at / fw_version 三个字段",
+              all(k in me for k in ("hardware_model", "bound_at", "fw_version")),
+              f"keys={sorted(me.keys())}")
+        # bound_at 由绑定写入点落库（routers/devices.py bind_device）。
+        # 变异实证：删掉那行写入，这条必须红。
+        check("绑定后 bound_at 非 None（当前归属的起始时刻）",
+              bool(me.get("bound_at")), str(me.get("bound_at")))
+
         # ---------------------------------------------------- 7. 提醒规则（复杂）
         rule = {
             "title": "降压药", "speak_text": "该吃降压药了，一片", "rtype": 0,
@@ -275,12 +339,25 @@ def main() -> int:
         rm_id = up[0]["reminder_id"] if isinstance(up, list) and up else rm_pk
 
         # ---------------------------------------------------- 9. 设备同步
-        code, sync = req("POST", "/api/device/sync?fw_version=0.1.0", {}, dev_token)
+        # hw_model：固件探测到的芯片型号（esp_chip_info），与 fw_version 同
+        # 形态的 query param。服务端非空即写入设备行。
+        code, sync = req("POST", "/api/device/sync?fw_version=0.1.0&hw_model=ESP32-S3",
+                         {}, dev_token)
         ok_sync = (code == 200 and len(sync.get("reminders", [])) >= 1
                    and len(sync.get("upcoming", [])) >= 1
                    and bool(sync.get("server_time")))
         check("设备心跳同步（规则+排期+形象+AI配置）", ok_sync,
               f"reminders={len(sync.get('reminders', []))} upcoming={len(sync.get('upcoming', []))}")
+
+        # 硬件型号回显：心跳上报后设备行应显示芯片型号（存量/老固件为「未知」，
+        # 新固件下次心跳自动补全 —— 这条钉住「补全」那一半）。
+        # 变异实证：删掉 device_api.sync 里的 hw_model 写入，这条必须红。
+        code, devs2 = req("GET", "/api/devices", token=token)
+        me2 = {}
+        if code == 200 and isinstance(devs2, list):
+            me2 = next((d for d in devs2 if d.get("id") == dev_pk), {})
+        check("心跳上报 hw_model 后设备行显示芯片型号",
+              me2.get("hardware_model") == "ESP32-S3", str(me2.get("hardware_model")))
 
         # 上面那条 upcoming>=1 只能顺带发现「排期恒空」，且**依赖运行当天的星期几**：
         # 本用例的规则是「每周一三五」，只有当天下一次触发落在 36h 窗口外时才红

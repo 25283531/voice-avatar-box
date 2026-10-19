@@ -161,7 +161,7 @@
         <div class="kpi"><div class="n">{{avatars.length}}</div><div class="l">形象数量</div></div>
       </div>
       <!-- 快速上手：这份清单只讲**管理员自己**能做的事。
-           为什么不写「怎么加设备」：设备登记与激活码绑定都在用户级 /user 页
+           为什么不写「怎么加设备」：设备登记与激活码绑定都在用户端 / 页
            （家属用自己的账号操作，见 user.html:155-187）。这里曾写着
            「在设备页登记设备、点生成激活码」，而那两个入口已经不存在 ——
            管理员照着做只会白跑一趟，而且与设备页空态那段
@@ -170,7 +170,7 @@
         <h2>快速上手</h2>
         <p class="muted" style="font-size:12px;margin:0 0 8px">
           这个后台是<b>平台管理员</b>用的，只负责「配置平台」和「查看运行情况」。
-          <b>设备登记、绑定、添加提醒都由家属在 <code>/user</code> 页自己完成</b>，
+          <b>设备登记、绑定、添加提醒都由家属在 <code>/</code> 页自己完成</b>，
           管理员在这里看不到也代不了操作。
         </p>
         <ol class="muted" style="margin:0;padding-left:20px;line-height:1.9">
@@ -179,21 +179,43 @@
               不用管理员登记。</li>
           <li><b>提醒规则不用你建。</b>「提醒」页能看所有用户设的规则和它们的回执
               （响没响、确认没确认），也能在提醒误报时临时暂停某一条。
-              新增和修改请让家属在 <code>/user</code> 操作，他们能在手机上看到自己刚改了什么。</li>
+              新增和修改请让家属在 <code>/</code> 操作，他们能在手机上看到自己刚改了什么。</li>
           <li><b>平台级配置在这里做：</b>「AI 接入」页配 ASR / LLM / TTS，
               「形象」页配屏幕动画与灯效资源包，「人格预设」页调全平台说话风格。
               这三项都是<b>所有用户共用</b>的，改动会影响全部设备。</li>
-          <li><b>角色绑定也在 <code>/user</code>：</b>哪台设备用哪个人格，
+          <li><b>角色绑定也在 <code>/</code>：</b>哪台设备用哪个人格，
               由家属在自己的页面选，管理员端不提供这个操作。</li>
         </ol>
       </div>
     </section>
 
     <!-- ---------------------- 设备（只读） ---------------------- -->
-    <!-- 管理员端只做「看」：谁接了、什么时候接的、系统版本、花了多少 token。
-         新增设备在用户级 /user 页面（那边能拿到设备的 eFuse MAC 与激活码），
+    <!-- 管理员端只做「看」：谁接了、什么时候接的、硬件型号、系统版本、花了多少
+         token。新增设备在用户端 / 页面（那边能拿到设备的 eFuse MAC 与激活码），
          管理员在这里既拿不到 MAC 也代不了用户绑定，给一个入口只会让人空跑一趟。 -->
     <section v-if="tab==='devices'">
+      <!-- 设备固件 OTA 分发 · **待开发功能**（2026-10-19 用户拍板暂缓，
+           决策记录 D40）。纯静态占位卡片：无表单、无按钮、不引任何 Vue 键
+           —— 放输入能力会让人以为现在就能配，实际保存无效，比没有入口更坏。
+           暂缓原因：后期设备型号会很多，同芯片的设备外围元件可能不同，
+           OTA 策略需按设备类型设计，排期待定。恢复接续点见 D40。 -->
+      <div class="card">
+        <h2>设备固件 OTA 分发 · 待开发功能</h2>
+        <p class="muted" style="font-size:12px;margin:0 0 10px;line-height:1.8">
+          功能规划：在管理后台配置<b>固件版本号</b>与<b>公网 HTTPS 下载地址</b>，
+          保存即生效，无需重启容器；设备下次开机检查更新时获取，
+          版本比较由固件自己做。
+        </p>
+        <p class="muted" style="font-size:12px;margin:0 0 10px;line-height:1.8">
+          当前状态：<b>待开发</b>。暂缓原因：后期设备型号会很多，
+          同芯片的设备外围元件可能不同，OTA 升级策略需按设备类型设计，排期待定。
+        </p>
+        <p class="muted" style="font-size:12px;margin:0;line-height:1.8">
+          说明：该功能上线前，设备开机 OTA 检查的响应不会携带固件更新信息。
+          将来地址必须指向<b>单 app 镜像</b>（xiaozhi.bin，不是 merged-flash.bin），
+          二进制由部署方自行托管。
+        </p>
+      </div>
       <div class="card">
         <div class="row" style="justify-content:space-between">
           <h2>已接入设备</h2>
@@ -204,7 +226,7 @@
         </div>
         <table v-if="shownDevices.length">
           <thead><tr>
-            <th>名称</th><th>设备标识</th><th>类型</th><th>拥有者</th>
+            <th>名称</th><th>设备标识</th><th>硬件型号</th><th>类型</th><th>拥有者</th>
             <th>接入时间</th><th>系统版本</th><th>状态</th>
             <th class="num">token 用量</th><th>操作</th>
           </tr></thead>
@@ -212,6 +234,10 @@
             <tr v-for="d in shownDevices" :key="d.id">
               <td>{{d.name}}</td>
               <td><code>{{d.device_id}}</code></td>
+              <!-- 硬件型号：固件心跳上报的芯片型号（esp_chip_info 探测）。
+                   老固件/存量设备为空串 → 「未知」，下次心跳自动补全。
+                   管理员排障时同样需要（工单里问「这是什么板子」）。 -->
+              <td class="muted">{{d.hardware_model||'未知'}}</td>
               <td class="muted">{{devType(d)}}</td>
               <td>{{ownerName(d)}}</td>
               <td class="muted">{{fmt(d.created_at)}}</td>
@@ -247,7 +273,7 @@
 
     <!-- ---------------------- 提醒（只读为主） ---------------------- -->
     <!-- 管理员在这里是「排障视角」：某台设备该响没响、家属到底确认了没有。
-         新增/编辑提醒是家属在 /user 自己做的事，管理员代设反而会让家属
+         新增/编辑提醒是家属在 / 自己做的事，管理员代设反而会让家属
          在自己手机上看到一个自己没建过的提醒。 -->
     <section v-if="tab==='reminders'">
       <div class="card">
@@ -1246,7 +1272,7 @@
     <!-- ---------------------- 修改密码弹窗 ---------------------- -->
     <!-- POST /api/auth/password：原密码错->400「原密码不正确」（刻意不用 401，
          否则会被统一请求层当成登录态失效踢回登录页），新密码不足 6 位->422。
-         校验规则与 /user 端完全一致，避免两个入口给出不同的报错。 -->
+         校验规则与 / 端完全一致，避免两个入口给出不同的报错。 -->
     <div v-if="pwBox" class="mask" @click.self="pwBox=false">
       <div class="modal" style="max-width:520px">
         <button class="close" @click="pwBox=false">&times;</button>
@@ -1275,7 +1301,7 @@
   </template>
 
   <!-- ============================ 非管理员提示 ============================ -->
-  <!-- 已登录但不是管理员：醒目横幅 + 跳转 /user，不渲染任何管理 tab。
+  <!-- 已登录但不是管理员：醒目横幅 + 跳转 /，不渲染任何管理 tab。
        旧行为是把 tab 外壳渲染出来、点哪个都弹 403 错误条——既吓到人，
        也等于告诉每个用户「管理功能有哪些」。 -->
   <template v-else>
@@ -1296,12 +1322,12 @@
         设备登记授权、人格预设运营、AI 接入等管理功能仅对平台管理员开放。
       </p>
       <p style="font-size:14px;line-height:1.9;margin:0 0 16px">
-        您的个人界面在 <code>/user</code>：可以在那里添加设备、设置提醒、
+        您的个人界面在 <code>/</code>：可以在那里添加设备、设置提醒、
         管理记忆与人格、查看用量统计。
       </p>
       <div class="row">
-        <a href="/user" class="primary" style="background:var(--brand);border-color:var(--brand);color:#fff;
-           border-radius:6px;padding:6px 14px;font-size:13px;text-decoration:none">前往我的界面 /user</a>
+        <a href="/" class="primary" style="background:var(--brand);border-color:var(--brand);color:#fff;
+           border-radius:6px;padding:6px 14px;font-size:13px;text-decoration:none">前往我的界面 /</a>
       </div>
     </div>
   </template>
@@ -1381,7 +1407,7 @@ createApp({
       return '例：cosyvoice-zh-female、GPT_SoVITS 角色名…';
     },
     // 是否管理员。user 来自 localStorage 的 elder_user（登录时由 doLogin 写入）。
-    // 两个入口（/ 与 /user）共用这套登录态：普通用户在 /user 登录后打开 /，
+    // 两个入口（/ 与 /admin）共用这套登录态：普通用户在 / 登录后打开 /admin，
     // 这里就是 false —— 看到横幅、看不到任何管理 tab，而不是又弹一次登录框。
     isAdmin(){ return !!(this.user && this.user.is_admin); },
     // 设备页列表：按搜索框过滤。**纯前端**过滤，不重新打接口 ——
@@ -1933,7 +1959,7 @@ createApp({
 
     // -------- 账号安全（修改密码）--------
     // 后端端点已存在（routers/auth.py change_password），这里只补管理后台入口：
-    // /user 端有一处，但没有入口的管理员根本不会想到去那边找。
+    // / 用户端有一处，但没有入口的管理员根本不会想到去那边找。
     openPassword(){
       this.pwBox = true; this.pwErr = ''; this.pwMsg = '';
       this.pwForm = {old_password:'', new_password:'', new_password2:''};
@@ -2340,7 +2366,7 @@ createApp({
       }catch(e){ this.err = e.message; }
     }
     // 非管理员不拉任何管理数据（loadProviders 等会 403，红条只会吓到人）；
-    // 他们的界面在 /user，这里只显示横幅。
+    // 他们的界面在 /，这里只显示横幅。
     if (this.isAdmin) this.loadAll().catch(e => { this.err = e.message; });
   }
 }).mount('#app');

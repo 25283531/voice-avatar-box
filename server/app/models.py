@@ -107,6 +107,19 @@ class Device(Base):
     online: Mapped[bool] = mapped_column(Boolean, default=False)
     last_seen_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     fw_version: Mapped[str] = mapped_column(String(32), default="")
+    # 硬件型号（芯片展示名，如 "ESP32-S3"）：由固件心跳 /api/device/sync?hw_model=
+    # 上报（固件侧 esp_chip_info() 探测，见 firmware/components/elder/src/sync.c）。
+    # 老固件 / 存量设备 = 空串，UI 兜底显示「未知」，下次心跳自动补全。
+    # 带 server_default：老库 ALTER 补列后既有行读出空串而不是 NULL
+    # （NULL 会炸 Pydantic 序列化，见 schema_patch.NEW_COLUMNS 的登记说明）。
+    hardware_model: Mapped[str] = mapped_column(
+        String(64), default="", server_default="")
+    # 当前绑定的起始时间（重新绑定会更新）。与 created_at（设备首次登记时间）
+    # 语义不同：家属关心的是「这台设备什么时候到我名下的」，解绑再绑定应反映
+    # 最新归属。存量 NULL → UI 显示「—」，**不回落 created_at**（两个时间语义
+    # 不同，混显会造成「绑定时间」的误读）。
+    bound_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True)
     ip: Mapped[str] = mapped_column(String(64), default="")
 
     # 端侧个性化配置（音量、亮度、灯效开关、离线提示音开关等）

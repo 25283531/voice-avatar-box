@@ -545,24 +545,31 @@ def health_scheduler():
     return scheduler_health()
 
 
-# ---------------------------------------------------------------- 管理页面
+# ---------------------------------------------------------------- 双入口页面
 if STATIC_DIR.is_dir():
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
+    # 入口（2026-10-19 用户端入口重构，docs/决策记录.md D41）：
+    #   /      → 用户端（未登录即登录/注册页）—— 老人与家属是主要使用者，
+    #            以使用方便为准则，最短路径给最常用的界面；
+    #   /admin → 管理后台（低频功能，tab 按 is_admin 过滤）。
+    # /user 已**直接删除**：不 301、不做同内容兼容渲染 —— 项目未对外公开，
+    # 没有存量书签/外链，多留一条路径只是多一份要维护的东西（冒烟
+    # smoke_server.py 钉住 GET /user → 404，改回渲染会让它红）。
+    # 用户端与管理后台是**两个入口、两套信息架构**，不是同一页面按角色
+    # 隐藏几个 tab：管理端管平台（全部用户的设备/AI/形象），用户端管自己
+    # （我家的设备/提醒/记忆）。
+    # ⚠️ 用户端这里曾列着「会员」tab —— 它随会员制取消（e264200）一起删除了：
+    # /api/membership 与 /api/admin/membership 两组端点已下线，会员相关的
+    # 五张表也由 schema_patch 在启动时清掉（见 DROPPED_TABLES）。
     @app.get("/")
-    def console():
-        return FileResponse(str(STATIC_DIR / "index.html"))
-
-    # 用户端界面：面向普通用户（设备 / 提醒 / 记忆 / 形象 / 角色 / 用量）。
-    # ⚠️ 这里曾列着「会员」—— 它随会员制取消（e264200）一起删除了：
-    # /api/membership 与 /api/admin/membership 两组端点已下线，
-    # 会员相关的五张表也由 schema_patch 在启动时清掉（见 DROPPED_TABLES）。
-    # 与管理后台（/）是**两个入口**，不是同一页面按角色隐藏几个 tab ——
-    # 两者的信息架构本来就不一致（管理端管平台，用户端管自己）。
-    @app.get("/user")
     def user_console():
         return FileResponse(str(STATIC_DIR / "user.html"))
+
+    @app.get("/admin")
+    def console():
+        return FileResponse(str(STATIC_DIR / "index.html"))
 else:  # pragma: no cover
     @app.get("/")
     def console_placeholder():
-        return {"message": "静态管理页面未打包，请访问 /docs 查看接口"}
+        return {"message": "静态页面未打包，请访问 /docs 查看接口"}

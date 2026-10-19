@@ -1,0 +1,74 @@
+classDiagram
+    direction LR
+    class FirmwareConfig {
+        <<ORM · firmware_config（单行 id=1）>>
+        +int id
+        +str version
+        +str url
+        +str updated_by
+        +datetime updated_at
+    }
+    class FirmwareConfigAudit {
+        <<ORM · firmware_config_audits>>
+        +int id
+        +int admin_id
+        +str admin_username
+        +str action
+        +list changed_fields
+        +dict diff
+        +datetime created_at
+    }
+    class Device {
+        <<ORM · devices（既有 +2 列）>>
+        +int id
+        +str device_id
+        +str hardware_model
+        +datetime|None bound_at
+        +str fw_version
+    }
+    class User {
+        <<ORM · users（既有）>>
+        +int id
+        +str username
+        +bool is_admin
+    }
+    class FirmwareEffective {
+        <<dataclass · firmware_config.py>>
+        +str version
+        +str url
+        +str source
+    }
+    class firmware_config {
+        <<module · DB/env 裁决唯一入口>>
+        +get_effective(db) FirmwareEffective
+        +get_row(db) FirmwareConfig|None
+        +save(db, version, url, admin) FirmwareConfig
+        +clear(db, admin) None
+        +validate(version, url) tuple
+        -_record_audit(db, admin, action, before, after)
+    }
+    class AdminFirmwareRouter {
+        <<router · /api/admin/firmware>>
+        +get_firmware(db) FirmwareConfigOut
+        +patch_firmware(payload, db, admin) FirmwareConfigOut
+        +delete_firmware(db, admin) FirmwareConfigOut
+        +list_firmware_audits(limit, db, admin) list
+    }
+    class DeviceOut {
+        <<schema（既有 +3 字段）>>
+        +str hardware_model
+        +datetime|None bound_at
+        +str|None latest_fw_version
+    }
+    class ota_check {
+        <<voice/__init__.py（既有改造）>>
+        +_firmware_section(db) dict|None
+    }
+    User "1" <-- "0..*" FirmwareConfigAudit : admin_id
+    firmware_config ..> FirmwareConfig : 读/写 id=1
+    firmware_config ..> FirmwareConfigAudit : 同事务 add
+    firmware_config ..> FirmwareEffective : 产出
+    AdminFirmwareRouter ..> firmware_config : save/clear/get_effective
+    AdminFirmwareRouter ..> User : get_current_admin
+    ota_check ..> firmware_config : get_effective(db)
+    DeviceOut ..> Device : model_validate

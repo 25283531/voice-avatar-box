@@ -40,7 +40,11 @@ def create_device(payload: DeviceCreate, db: Session = Depends(get_db),
     exists = db.scalar(select(models.Device).where(models.Device.device_id == payload.device_id))
     if exists:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "该设备已登记")
-    dev = models.Device(device_id=payload.device_id, name=payload.name, owner_id=user.id)
+    dev = models.Device(device_id=payload.device_id, name=payload.name, owner_id=user.id,
+                        bound_at=models.utcnow())
+    # 建档即归属（owner_id 直接写死为当前用户）⇒ bound_at 必须同时写。
+    # 漏写的后果：这条路径建出的设备「已归属但绑定时间显示 —」，与 bind 流程
+    # 两种口径，家属看到同一平台两台设备一个有时间一个没有。
     db.add(dev)
     db.commit()
     db.refresh(dev)
@@ -175,6 +179,10 @@ def bind_device(payload: BindIn, db: Session = Depends(get_db),
         db.flush()
 
     dev.owner_id = user.id
+    # 绑定时间 = 当前归属的起始时刻。放在这里而不是上面「现场建档」分支里：
+    # 通用码场景设备可能刚 flush 出来，重绑定（解绑再绑）也要更新时间，
+    # 一个写入点覆盖两条路径。存量设备此列为 NULL，UI 显示「—」。
+    dev.bound_at = models.utcnow()
     if payload.alias:
         dev.name = payload.alias
     row.used = True

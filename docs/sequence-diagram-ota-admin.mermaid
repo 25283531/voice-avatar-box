@@ -1,0 +1,46 @@
+sequenceDiagram
+    participant A as 管理端 index.html
+    participant R as AdminFirmwareRouter
+    participant F as firmware_config
+    participant DB as SQLite
+    participant D as 设备固件
+    participant O as ota_check(voice)
+
+    A->>R: PATCH /api/admin/firmware {version,url}
+    R->>R: get_current_admin（非管理员 403）
+    R->>F: validate()（半配/超长/非 http(s) → 400）
+    F->>DB: SELECT firmware_config WHERE id=1
+    alt 无行
+        F->>DB: INSERT id=1（并发双写：IntegrityError → 重取后更新）
+    else 有行
+        F->>DB: UPDATE version/url/updated_by
+    end
+    F->>DB: INSERT firmware_config_audits（同一事务）
+    F->>DB: COMMIT（业务+审计一次提交）
+    R-->>A: 200 {source:"database", ...}
+    Note over A,R: 保存即生效：无缓存，下次读取现查 DB
+
+    D->>O: POST /api/voice/ota（Device-Id=MAC）
+    O->>F: _firmware_section(db) → get_effective(db)
+    F->>DB: SELECT firmware_config WHERE id=1
+    F-->>O: FirmwareEffective(source=database)
+    O-->>D: {server_time, websocket, firmware:{version,url}}
+
+sequenceDiagram
+    participant FW as 设备固件 sync.c
+    participant S as device_api.sync
+    participant DB as SQLite
+    participant U as 用户端 user.html
+    participant L as devices.list_devices
+    participant F as firmware_config
+
+    FW->>S: POST /api/device/sync?fw_version=…&hw_model=ESP32-S3
+    S->>DB: UPDATE devices SET fw_version, hardware_model
+    S-->>FW: DeviceSyncOut（device 段含 hardware_model）
+
+    U->>L: GET /api/devices
+    L->>DB: SELECT devices WHERE owner_id=…
+    L->>F: get_effective(db)（每次请求一次）
+    F->>DB: SELECT firmware_config WHERE id=1
+    F-->>L: FirmwareEffective
+    L-->>U: [DeviceOut{…, hardware_model, bound_at, latest_fw_version}]

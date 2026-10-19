@@ -95,13 +95,24 @@ def _voice_endpoints(request: Request) -> tuple[str, str]:
 
 
 @router.post("/sync", response_model=DeviceSyncOut)
-def sync(request: Request, fw_version: str = "", db: Session = Depends(get_db),
+def sync(request: Request, fw_version: str = "", hw_model: str = "",
+         db: Session = Depends(get_db),
          dev: models.Device = Depends(get_current_device)):
-    """心跳 + 拉全量配置。"""
+    """心跳 + 拉全量配置。
+
+    ``hw_model``：固件探测到的芯片型号（如 ``ESP32-S3``，见固件
+    ``sync.c`` 的 ``chip_model_name()``），与 ``fw_version`` 同为 query
+    param、同形态上报。非空即写入设备行（用户端/管理端设备表的「硬件型号」
+    列读它）；空 = 老固件未升级，保留原值不清空 —— 心跳是周期动作，
+    一次异常请求不该把已采到的型号抹掉。
+    """
     dev.online = True
     dev.last_seen_at = utcnow()
     if fw_version:
         dev.fw_version = fw_version
+    hw = (hw_model or "").strip()
+    if hw:
+        dev.hardware_model = hw[:64]     # 与 Device.hardware_model 列宽对齐
     db.commit()
 
     # 为该设备排期（幂等）

@@ -15,6 +15,7 @@ idf_component_register(
         driver
         esp_timer
         nvs_flash
+        esp_hw_support
         esp_driver_rmt
         esp_driver_gpio
         esp_http_client

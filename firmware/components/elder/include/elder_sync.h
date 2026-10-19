@@ -17,7 +17,8 @@ extern "C" {
  * 与业务后端（FastAPI, server/）的提醒同步。
  *
  * 对齐的接口（见 server/app/routers/device_api.py）：
- *   POST /api/device/sync?fw_version=<ver>   Bearer <device_token>
+ *   POST /api/device/sync?fw_version=<ver>&hw_model=<chip>
+ *        Bearer <device_token>
  *        → { server_time, device{...}, avatar{...},
  *            reminders:[ReminderOut], upcoming:[EventOut],
  *            providers:[...], ws_url, ota_url, sync_interval_sec }
@@ -68,6 +69,9 @@ typedef struct {
     const char *base_url;      /* 形如 http://192.168.1.10:8000 */
     const char *token;         /* device JWT；NULL 表示尚未激活 */
     const char *fw_version;
+    const char *hw_model;      /* 硬件型号（如 "ESP32-S3"），上报给服务端设备表的
+                                  「硬件型号」列；NULL = 自动探测（esp_chip_info，
+                                  见 sync.c 的 chip_model_name） */
     uint32_t    interval_sec;  /* 心跳周期；服务端下发后以服务端为准 */
 } elder_sync_cfg_t;
 

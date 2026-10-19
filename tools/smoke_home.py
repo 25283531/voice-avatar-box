@@ -57,6 +57,10 @@ DB_FILE = DB_PATH if DB_PATH.is_absolute() else (SERVER / DB_PATH)
 PORT = resolve_port("smoke_home")
 BASE = f"http://127.0.0.1:{PORT}"
 
+# 与 smoke_auth.py / smoke_mail.py / smoke_admin_presets.py / smoke_server.py
+# 的 LEGACY_PW 同名同义（五处保持一致，改一处记得同步）。
+LEGACY_PW = "admin123"
+
 # ⚠️ 子进程输出**绝不能**用 `subprocess.PIPE` +「只在启动失败时读一次」——
 # 日志量超过管道缓冲区（Windows 匿名管道 4096 字节）后，
 # **服务端会被永久阻塞**，而客户端只看到「读超时」。
@@ -135,6 +139,12 @@ def main() -> int:
     env["ELDER_JWT_SECRET"] = "smoke-home-secret"
     env["ELDER_SCHEDULER_INTERVAL"] = "3600"   # 不跑后台调度，避免超时升级干扰计数
     env["PYTHONIOENCODING"] = "utf-8"
+    # 种子管理员口令 bb5ca98 起不再硬编码：空库不配 ELDER_SEED_ADMIN_PASSWORD
+    # 会生成随机口令。本脚本自己起服务却用 admin/admin123 登录 —— 不在这里
+    # 显式注入，本地裸跑就是 401（CI 靠 job 级 env 兜住，掩盖了这个不自足）。
+    # 约定同 smoke_auth.py / smoke_mail.py / smoke_admin_presets.py /
+    # smoke_server.py 的 LEGACY_PW（五处同名同义，改一处记得同步）。
+    env["ELDER_SEED_ADMIN_PASSWORD"] = LEGACY_PW
 
     if DB_FILE.exists():
         DB_FILE.unlink()
@@ -196,7 +206,7 @@ def main() -> int:
         print("[boot] ready\n")
 
         # ==================================================== 准备账号
-        code, tk = req("POST", "/api/auth/login", {"username": "admin", "password": "admin123"})
+        code, tk = req("POST", "/api/auth/login", {"username": "admin", "password": LEGACY_PW})
         check("登录默认管理员", code == 200 and bool(tk.get("access_token")), str(code))
         # 平台 AI 配置现在是**仅管理员**可写（原先任何登录用户都能建/改/删，
         # 那正是 P0-1 事故链路的源头），所以建配置要用管理员 token。

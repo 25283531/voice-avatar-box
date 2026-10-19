@@ -105,6 +105,12 @@ class DeviceOut(ORMBase):
     online: bool
     last_seen_at: datetime | None
     fw_version: str
+    # 硬件型号（"ESP32-S3" 等）。**带默认值**：老固件不上报时为空串，
+    # 老客户端（不读该键）无感；UI 兜底「未知」。
+    hardware_model: str = ""
+    # 绑定时间（当前归属的起始时刻）。**带默认值 None**：存量设备为 NULL，
+    # UI 显示「—」；重新绑定会更新（与 created_at 语义区分，见 Device.bound_at）。
+    bound_at: datetime | None = None
     ip: str
     settings: dict[str, Any]
     created_at: datetime

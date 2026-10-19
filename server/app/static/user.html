@@ -122,7 +122,7 @@
 
     <p class="muted" style="margin-top:12px;font-size:12px">
       不装手机 APP 也能在浏览器里完成全部操作：绑定设备、设置提醒、提交工单。
-      平台管理员请访问 <a href="/">管理后台</a>。
+      平台管理员请访问 <a href="/admin">管理后台</a>。
     </p>
   </div>
 
@@ -134,7 +134,7 @@
         <div class="muted" style="font-size:12px">管理您家的设备、提醒、记忆与人格</div>
       </div>
       <div class="row">
-        <a v-if="user.is_admin" href="/" style="font-size:12px">管理后台</a>
+        <a v-if="user.is_admin" href="/admin" style="font-size:12px">管理后台</a>
         <span class="muted" style="font-size:12px">{{user.username}}</span>
         <!-- 账户设置（改密码 / 换邮箱）放弹窗而不是新增 tab：tab 已经 9 个，
              再多一行就看不过来了，而这两项都属于低频的「顺手改一下」操作。 -->
@@ -213,12 +213,20 @@
       <div class="card">
         <h2>我的设备</h2>
         <table v-if="devices.length">
-          <thead><tr><th>名称</th><th>标识</th><th>状态</th><th>形象</th><th>人格角色</th><th>操作</th></tr></thead>
+          <thead><tr><th>名称</th><th>标识</th><th>状态</th><th>硬件型号</th><th>固件版本</th><th>绑定时间</th><th>形象</th><th>人格角色</th><th>操作</th></tr></thead>
           <tbody>
             <tr v-for="d in devices" :key="d.id">
               <td>{{d.name}}</td>
               <td><code>{{d.device_id}}</code></td>
               <td><span class="tag" :class="d.online?'ok':''">{{d.online?'在线':'离线'}}</span></td>
+              <!-- 硬件型号：固件心跳上报（esp_chip_info 探测）。老固件/存量设备
+                   为空串 → 「未知」，下次心跳自动补全，不需要家属做任何事。
+                   固件版本：设备自报；未上报过 → 「未上报」。
+                   绑定时间：当前归属的起始时刻（重新绑定会更新）；存量 NULL
+                   → fmt() 返「—」，**不回落 created_at**（语义不同）。 -->
+              <td class="muted">{{d.hardware_model||'未知'}}</td>
+              <td class="muted">{{d.fw_version||'未上报'}}</td>
+              <td class="muted">{{fmt(d.bound_at)}}</td>
               <td>
                 <select :value="d.avatar_id||''" @change="applyAvatar(d,$event)">
                   <option value="">未设置</option>
@@ -885,7 +893,7 @@ createApp({
   data(){
     return {
       // token 与 user 的存储 key 与管理后台（index.html）**刻意保持一致**：
-      // 两个入口共用一套登录态。普通用户在 /user 登录后打开 /，管理后台能直接
+      // 两个入口共用一套登录态。普通用户在 / 登录后打开 /admin，管理后台能直接
       // 识别出「已登录但非管理员」并显示横幅 + 隐藏管理 tab，而不是又弹一次登录框。
       token: localStorage.getItem('elder_token') || '',
       user: JSON.parse(localStorage.getItem('elder_user') || '{}'),
