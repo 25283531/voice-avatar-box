@@ -170,23 +170,33 @@ jobs:
         run: |
           set -e
           chmod +x gradlew
-          # 从 gradle 读回**实际生效**的版本号（唯一真源在 build.gradle.kts）。
-          # 文件名也用它，避免「文件名与包内版本不一致」这种查不出来的错。
-          # 注意这里是**额外一次 gradle 调用**，只跑 printElderVersion 这个空任务，
-          # 不触发编译；换来的是「产物名 = 包内版本」这个可断言的契约。
-          OUT="$(./gradlew --no-daemon -q printElderVersion \
-                  -PVERSION_NAME="$VNAME" -PVERSION_CODE="$VCODE" 2>/dev/null \
+          # ⚠️⚠️ inputs 为空时**必须完全不传 -P**，不能传空串。
+          #   `-PVERSION_NAME=""` 会让 gradle 真的存在一个「值为空串」的属性，
+          #   而 build.gradle.kts 里的 `(findProperty(...) as String?) ?: "1.1.0"`
+          #   只在 **null** 时兜底 —— 空串不是 null ⇒ 兜底失效 ⇒
+          #   versionName 变成空串、printElderVersion 打出 "ELDER_VERSION  110"，
+          #   awk 切出 $2=110/$3=空 ⇒ 被下面的守卫拦下，整个发版链路红。
+          #   这个坑真实发生过一次（2026-10-19 push 触发的构建全红，
+          #   而 dispatch 显式传参的那次是绿的 —— 两条路径行为不一致）。
+          #   所以这里用数组**按需**追加参数，而不是无条件传空值。
+          GRADLE_V_ARGS=()
+          [ -n "$VNAME" ] && GRADLE_V_ARGS+=("-PVERSION_NAME=$VNAME")
+          [ -n "$VCODE" ] && GRADLE_V_ARGS+=("-PVERSION_CODE=$VCODE")
+          echo "传入的版本覆盖参数：${GRADLE_V_ARGS[*]:-（无，用 gradle 里的真源）}"
+
+          # 从 gradle 读回**实际生效**的版本号，让「产物名 == 包内版本」可断言。
+          # 只跑 printElderVersion 这个空任务，不触发编译。
+          OUT="$(./gradlew --no-daemon -q printElderVersion "${GRADLE_V_ARGS[@]}" 2>/dev/null \
                  | grep -o 'ELDER_VERSION .*' | tail -1 || true)"
           VNAME="$(echo "$OUT" | awk '{print $2}')"
           VCODE="$(echo "$OUT" | awk '{print $3}')"
           # 读不到就**报错**，不猜：宁可构建失败，也不要发一个版本号不明的包。
           if [ -z "$VNAME" ] || [ -z "$VCODE" ]; then
-            echo "::error::未能从 gradle 读回生效版本号（printElderVersion 无输出），中止发版"
+            echo "::error::未能从 gradle 读回生效版本号（printElderVersion 输出='$OUT'），中止发版"
             exit 1
           fi
           echo "本次打包版本：name=$VNAME code=$VCODE"
-          ./gradlew --no-daemon --stacktrace assembleRelease \
-            -PVERSION_NAME="$VNAME" -PVERSION_CODE="$VCODE"
+          ./gradlew --no-daemon --stacktrace assembleRelease "${GRADLE_V_ARGS[@]}"
           ls -lh app/build/outputs/apk/release/
           # 统一文件名，方便下载
           for f in app/build/outputs/apk/release/*.apk; do

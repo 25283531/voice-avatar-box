@@ -14,15 +14,20 @@ android {
         applicationId = "com.elder.companion"
         minSdk = 24
         targetSdk = 34
-        // ⚠️ 这里的默认值是 versionCode/versionName 的**唯一真源**。
-        //   曾经 server-ci.yml 里还硬编码了一份 `inputs.version_code || '100'`，
-        //   两份各自漂移：改了这里的 110，yml 仍会传 -PVERSION_CODE=100 把它盖回去，
-        //   产出「文件名写着 1.1.0、装到手机上却是 100」的包 —— 安卓侧会当成
-        //   低版本，用户根本装不上覆盖，且构建全程不报错。
-        //   workflow_dispatch 的 inputs 只在显式传入时覆盖（见 yml 的 has_version 判定）。
-        //   发版时改这里一处即可。
-        versionCode = (project.findProperty("VERSION_CODE") as String?)?.toIntOrNull() ?: 110
-        versionName = (project.findProperty("VERSION_NAME") as String?) ?: "1.1.0"
+        // ⚠️ 这里默认值为**唯一真源**，workflow_dispatch 的 inputs 只在显式传入时覆盖。
+        //   发版时改这里一处即可（yml 不再兜默认值 —— 两份真源会互相覆盖，见 D39）。
+        //
+        // ⚠️⚠️ 刻意用 `takeIf { it.isNotBlank() }` 而不是直接 `?:`：
+        //   `?:` 只在 **null** 时兜底，而 CI 若传 `-PVERSION_NAME=""`
+        //   （push 触发时 inputs 为空，很容易顺手传个空串），
+        //   gradle 里就**真的存在一个值为空串的属性** ⇒ 兜底失效
+        //   ⇒ versionName 变成空串、产物名变成 `elder-companion--110.apk`，
+        //   而构建照样绿灯。2026-10-19 真实踩过一次。
+        //   空串与 null 同义，是这里必须显式写出来的一句。
+        versionCode = (project.findProperty("VERSION_CODE") as String?)
+            ?.takeIf { it.isNotBlank() }?.toIntOrNull() ?: 110
+        versionName = (project.findProperty("VERSION_NAME") as String?)
+            ?.takeIf { it.isNotBlank() } ?: "1.1.0"
     }
 
     signingConfigs {
@@ -86,8 +91,10 @@ dependencies {
 //   这里改为复算同一套取值逻辑（属性 → 默认值），与上面 defaultConfig 完全一致；
 //   真正的"一致性由 CI 断言"靠下面的读回校验：值对不上时 CI 会报错而不是静默发包。
 tasks.register("printElderVersion") {
-    val vCode = (project.findProperty("VERSION_CODE") as String?)?.toIntOrNull() ?: 110
-    val vName = (project.findProperty("VERSION_NAME") as String?) ?: "1.1.0"
+    val vCode = (project.findProperty("VERSION_CODE") as String?)
+        ?.takeIf { it.isNotBlank() }?.toIntOrNull() ?: 110
+    val vName = (project.findProperty("VERSION_NAME") as String?)
+        ?.takeIf { it.isNotBlank() } ?: "1.1.0"
     doLast {
         println("ELDER_VERSION $vName $vCode")
     }
