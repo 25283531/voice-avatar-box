@@ -48,6 +48,9 @@ firmware/xiaozhi/components/elder/
 # 规避方式是先 Move-Item 移到这里暂存（可逆、不改阈值），构建后可直接删
 firmware/xiaozhi/.mc_stash/
 
+# CI 冒烟脚本的落盘日志（tools/run_smoke.py 写，红灯时随 artifact 上传）
+logs/
+
 # ---------------------------------------------------------- 杂项
 # QA 补丁前备份 / 临时探针：一次性产物，历史已踩过「临时脚本混进 commit 后
 # 自删、留下无法解释的历史」，一律不入库

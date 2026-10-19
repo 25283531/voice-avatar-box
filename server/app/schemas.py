@@ -1074,6 +1074,99 @@ class PasswordResetVerifyOut(ORMBase):
     username: str = ""
 
 
+# ================================================ 「用户名 + 邮箱」找回密码（2026-10-19）
+#
+# 为什么要在既有「邮箱 → 验证码」之外另开一条链路：
+# 老人常常只记得**自己注册时用的用户名**，邮箱在哪张卡片上、拼对没有都说不清。
+# 让他先填邮箱，等于要求他必须先知道邮箱才能找回密码 —— 对目标用户不成立。
+# 新链路把「用户名」放到最前面，邮箱降级为**第二道确认**，与需求的四步一致。
+
+class PasswordLookupIn(ORMBase):
+    """第 1 步：只提交用户名。
+
+    ⚠️ 这一步**只**用来确认「能不能继续」，绝不能回显用户名是否存在。
+    但用户又要看到明确的推进反馈，所以这里的取舍是：
+      * 用户名不存在 → 走与「存在但未绑邮箱」**不同的分支**是必要的
+        （前者不可能有邮箱，后者要去联系管理员），但两者的措辞必须
+        都**不确认账号存在**，只能靠「能否继续」反推 —— 这在原理上
+        无法完全避免，是本设计已知的取舍，见 request_account_probe 注释。
+    """
+
+    username: str = Field(min_length=1, max_length=64)
+
+
+class PasswordLookupOut(ORMBase):
+    """第 1 步响应。
+
+    ⚠️ ``email_bound`` 必须**对「未绑邮箱」和「用户名不存在」返回相同值**
+    （都是 false），否则就成了用户名枚举接口。区别只在 ``message`` 的措辞
+    —— 而措辞差异本身也是侧信道，所以下面的 message 被刻意写得语义模糊，
+    真正区分二者的是 ``next_step``（用户接下来该做什么），那是功能需要，
+    不是信息泄露。
+    """
+
+    ok: bool = True
+    #: 该账号是否绑定了可用邮箱。前端据此决定是否提示「请联系管理员」。
+    email_bound: bool = False
+    #: 未绑邮箱时给管理员邮箱（前端原样展示，避免把地址硬编码在前端）
+    admin_email: str = ""
+    message: str = ""
+
+
+class PasswordIssueIn(ORMBase):
+    """第 2 步：用户名 + 邮箱，发起验证码。
+
+    ⚠️ 用户名与邮箱**不匹配**时不能返回「不匹配」以外的任何信息
+    （尤其不能提示正确的邮箱），否则就是「给定用户名 → 探测邮箱」的接口。
+    这里用 ``matched`` 布尔让前端提示"请重新填写"，但不给出正确值。
+    """
+
+    username: str = Field(min_length=1, max_length=64)
+    email: str = Field(min_length=3, max_length=128)
+
+    @field_validator("email")
+    @classmethod
+    def _check(cls, v: str) -> str:
+        return _check_email_str(v)
+
+
+class PasswordIssueOut(ORMBase):
+    ok: bool = True
+    #: 用户名与邮箱是否对得上。**只用于决定前端下一步文案**，
+    #: 不能携带「正确的邮箱是什么」—— 那才是真正的泄露。
+    matched: bool = False
+    #: 匹配成功时给出验证码有效期/冷却秒数；不匹配时为 0。
+    expires_in_sec: int = 0
+    cooldown_sec: int = 0
+    message: str = ""
+
+
+class PasswordSendIn(ORMBase):
+    """第 3 步：提交验证码 → 服务端**直接把新密码**发到该邮箱。
+
+    ⚠️ 这条链路与既有的 verify（用户自己设新密码）并存，差别在于：
+    这里把新密码放进邮件，所以**本端点只做校验，不改密码**——
+    真正的改密码发生在下一步 ``/send``，避免「验证码正确就立刻改密码」
+    与「密码要单独发一封邮件」两件事缠在一起。
+    """
+
+    username: str = Field(min_length=1, max_length=64)
+    email: str = Field(min_length=3, max_length=128)
+    code: str = Field(min_length=6, max_length=6)
+
+    @field_validator("email")
+    @classmethod
+    def _check(cls, v: str) -> str:
+        return _check_email_str(v)
+
+
+class PasswordSendOut(ORMBase):
+    ok: bool = True
+    message: str = ""
+    #: 剩余可尝试次数，前端用来显示"你还可以试 N 次"
+    attempts_left: int = 0
+
+
 class TicketCreateIn(ORMBase):
     """提交问题（工单）。匿名可提交，但必须留邮箱，否则管理员没法回复。"""
 

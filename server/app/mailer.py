@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import logging
 import os
+import secrets
 import smtplib
 import socket
 from dataclasses import dataclass, field
@@ -61,6 +62,13 @@ RESET_CODE_MAX_ATTEMPTS = int(os.getenv("ELDER_RESET_CODE_MAX_ATTEMPTS", "5"))
 RESET_RESEND_COOLDOWN_SEC = int(os.getenv("ELDER_RESET_RESEND_COOLDOWN", "60"))
 # 过期验证码的清理缓冲（秒）：purge_expired_reset_codes() 只删「过期超过这个缓冲」的行
 RESET_CODE_PURGE_BUFFER_SEC = int(os.getenv("ELDER_RESET_PURGE_BUFFER", "3600"))
+# 管理员邮箱：APP 在「该账号没绑邮箱」时要把它显示给用户（用户要求里的
+# 「请联系管理员…zxh@250886.xyz」）。放服务端而不写死在前端，是为了
+# 换地址时只改一处，也避免前端改版漏掉。
+RESET_ADMIN_EMAIL = os.getenv("ELDER_ADMIN_EMAIL", "zxh@250886.xyz")
+# 直接寄新密码时生成的随机口令长度。12 位含大小写与数字，
+# 熵足够（约 71 bit），同时老人能在电话里念出来、抄到纸上。
+RESET_GENERATED_PWD_LEN = 12
 # 单次 SMTP 会话超时（秒）。宁可早点失败也别让请求挂住：
 # 这个发送是同步阻塞在请求线程里的，超时太长会把工作线程拖死
 # （FastAPI 的同步 def 端点跑在固定大小的线程池里，挂住几个请求
@@ -367,6 +375,55 @@ def send_mail(
 
 
 # ---------------------------------------------------------------- 邮件正文
+def generate_password(length: int = RESET_GENERATED_PWD_LEN) -> str:
+    """生成随机口令（用于「直接寄新密码」那条链路）。
+
+    ⚠️字符集刻意**不含** 0/O、1/l/I 等易混字符：老人要把它抄到纸上，
+    抄错一位就登不进来，而他们往往不会去看邮件里的原文。
+    大小写与数字保留（熵约 71 bit / 12 位），只排除 6 个易混字符。
+    """
+    # 去掉了 0/O/1/l/I；字母表大小写都保留但排除了 o/O（易与 0 混）
+    letters = "abcdefghijkmnpqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ"
+    digits = "23456789"
+    alphabet = letters + digits
+    return "".join(secrets.choice(alphabet) for _ in range(max(8, length)))
+
+
+def build_new_password_mail(username: str, new_password: str) -> tuple[str, str]:
+    """把**新密码本身**发到用户邮箱的邮件（2026-10-19 用户要求的那条链路）。
+
+    与 build_reset_mail（发验证码、用户自己设密码）的分工：
+      * 验证码版：明文口令从不出现在邮件里，邮箱被窃听也拿不到密码；
+      * 本版：老人不用自己想密码，服务端生成一串足够强的随机口令直接寄过去。
+
+    ⚠️ 正文里必须写清「这是新口令、请尽快登录后修改」——
+    口令会留在收件箱里（转发、备份、代理服务器都可能留存），
+    不提示用户去改就等于长期暴露。
+    """
+    subject = "【老人陪伴提醒助手】你的新密码"
+    body = (
+        f"你好{f'，{username}' if username else ''}：\n"
+        "\n"
+        "你刚刚申请了重置登录密码。**新的密码是：**\n"
+        "\n"
+        f"    {new_password}\n"
+        "\n"
+        "请用它登录。登录后请尽快在「我的 → 修改密码」里改成只有你知道的密码。\n"
+        "\n"
+        f"如果这不是你本人的操作，请忽略本邮件（密码不会被自动使用），"
+        f"或联系管理员（{RESET_ADMIN_EMAIL}）核实账号安全。\n"
+    )
+    return subject, body
+
+
+def find_user_by_username(db: Session, username: str) -> models.User | None:
+    """按用户名找用户（大小写不敏感）。与 find_user_by_email 同理用 func.lower。"""
+    target = username.strip()
+    return db.scalar(
+        select(models.User).where(func.lower(models.User.username) == target.lower())
+    )
+
+
 def build_reset_mail(username: str, code: str, ttl_min: int) -> tuple[str, str]:
     """找回密码邮件的 (主题, 正文)。有效期按 config.TZ 展示，用户才对得上时间。"""
     expire_text = (now_utc().astimezone(TZ).replace(microsecond=0)

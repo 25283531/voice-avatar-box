@@ -97,8 +97,8 @@ jobs:
       # 虽然它们跑在不同 runner 上不会真撞车，但保持全表唯一才能在本地
       # 「并行跑全部冒烟」时也确定不冲突。
       - name: 运行业务闭环冒烟测试
-        run: python tools/smoke_server.py 8100
-
+        # 经 run_smoke 落盘：红灯时日志进 artifact（见末尾「失败诊断」步骤）
+        run: python tools/run_smoke.py logs/smoke_smoke_server.log python tools/smoke_server.py 8100
       # 注册 / 鉴权安全边界冒烟（65 条断言）：
       #   - 匿名注册开关 + "第一个注册者=管理员" 的老规则不再复活；
       #   - **种子管理员不再是可猜测口令**：空库未配 ELDER_SEED_ADMIN_PASSWORD 时
@@ -113,15 +113,15 @@ jobs:
       # 不挂的话整套断言就是"只在本机能跑"。
       # 端口 8121 已在 tools/smoke_ports.py 登记。
       - name: 注册 / 鉴权 / 种子口令冒烟（含 P0 默认口令断言）
-        run: python tools/smoke_auth.py 8121
-
+        # 经 run_smoke 落盘：红灯时日志进 artifact（见末尾「失败诊断」步骤）
+        run: python tools/run_smoke.py logs/smoke_smoke_auth.log python tools/smoke_auth.py 8121
       # 角色域冒烟：/api/roles 全闭环 + 四条 P0 越权断言。
       # 之所以单列一步而不是塞进 smoke_server：这四类缺陷（P0-1~4）曾经
       # **全部是活的**，而它们的特点是「接口照常返回 200，只是返回了别人的
       # 数据 / 真的删了别人的配置」，业务闭环冒烟**发现不了**。
       - name: 角色与权限冒烟（含 P0 安全断言）
-        run: python tools/smoke_roles.py 8101
-
+        # 经 run_smoke 落盘：红灯时日志进 artifact（见末尾「失败诊断」步骤）
+        run: python tools/run_smoke.py logs/smoke_smoke_roles.log python tools/smoke_roles.py 8101
       # 人格预设运营后台（/api/admin/presets，105 条断言）。
       # 之所以必须挂在 SQLite job 而不是 mysql-smoke job：它**直连 sqlite3
       # 改库**注入脏数据（T08「把 guardrails.hard 清空后红线是否仍齐全」——
@@ -131,23 +131,23 @@ jobs:
       #
       # 端口 8118 已在 tools/smoke_ports.py 登记（唯一真源），与 8110-8117 错开。
       - name: 人格预设运营后台冒烟（红线不出库 + 审计同事务 + 重启不变式）
-        run: python tools/smoke_admin_presets.py 8118
-
+        # 经 run_smoke 落盘：红灯时日志进 artifact（见末尾「失败诊断」步骤）
+        run: python tools/run_smoke.py logs/smoke_smoke_admin_presets.log python tools/smoke_admin_presets.py 8118
       # 陪聊计量 + 「取消会员制」核心不变量（端口 8106，已在 smoke_ports.py 登记）。
       # 它守着本次产品决策：把 free_daily_seconds 压到 0，已绑定设备仍 unlimited。
       # ⚠️ 少了这一步，「有人把按用量拦人的逻辑加回来」不会被任何测试发现 ——
       # 因为除了它，其余冒烟都不把上限压到 0。
       - name: 陪聊计量冒烟（授权设备无限量 + 会员端点已下线）
-        run: python tools/smoke_quota.py 8106
-
+        # 经 run_smoke 落盘：红灯时日志进 artifact（见末尾「失败诊断」步骤）
+        run: python tools/run_smoke.py logs/smoke_smoke_quota.log python tools/smoke_quota.py 8106
       # token 用量：网关提取真实 usage + 双端接口（/api/usage 与 /api/admin/usage）
       # + 越权隔离。进程内起服务（usage 路由在 main.py 已接线，冒烟另走进程内
       # attach 覆盖同一份路由对象），端口 8120 已在 smoke_ports.py 登记。
       # 挂 SQLite job 而不进 mysql-smoke：它验的是 token 归一化口径与权限边界，
       # 与跑什么库无关；MySQL 侧由 smoke_server/smoke_roles 的真实往返覆盖。
       - name: token 用量冒烟（网关提取 + 双端接口 + 越权隔离）
-        run: python tools/smoke_usage.py 8120
-
+        # 经 run_smoke 落盘：红灯时日志进 artifact（见末尾「失败诊断」步骤）
+        run: python tools/run_smoke.py logs/smoke_smoke_usage.log python tools/smoke_usage.py 8120
       # 音色目录 + 服务就绪度面板（端口 8124，已在 smoke_ports.py 登记）。
       #
       # ⚠️ 少这一步会漏掉两类回归，别的冒烟都抓不到：
@@ -156,8 +156,8 @@ jobs:
       # ② 前端又把音色清单硬编码回 index.html —— 于是「下拉框里有的音色，
       #    恢复出厂默认后却是另一个」，第二份真源复活。
       - name: 音色目录与就绪度冒烟（零配置如实反映 + 音色单一真源）
-        run: python tools/smoke_voice_catalog.py 8124
-
+        # 经 run_smoke 落盘：红灯时日志进 artifact（见末尾「失败诊断」步骤）
+        run: python tools/run_smoke.py logs/smoke_smoke_voice_catalog.log python tools/smoke_voice_catalog.py 8124
       # 可信反代 + 307 scheme（端口 8125，已在 smoke_ports.py 登记）。
       # 守的是 2026-10-18 线上事故：管理后台在 HTTPS 页面里请求
       # /api/admin/presets 被浏览器 Mixed Content 拦掉（Failed to fetch），
@@ -169,8 +169,8 @@ jobs:
       # D 组还静态核对 Dockerfile CMD：--proxy-headers 必须在、
       # 默认值不能写死 *（写成 * 会当场转红）。
       - name: 可信反代与 307 scheme 冒烟（Mixed Content 事故回归）
-        run: python tools/smoke_proxy_headers.py 8125
-
+        # 经 run_smoke 落盘：红灯时日志进 artifact（见末尾「失败诊断」步骤）
+        run: python tools/run_smoke.py logs/smoke_smoke_proxy_headers.log python tools/smoke_proxy_headers.py 8125
       # 前端模板卫生（静态扫描，不起服务、不占端口）。
       # 守的是 2026-10-18 线上事故：AI 配置弹窗的 API Key 标签渲染成
       # 「function () { [native code] }」—— 标签用的标识符被放进了
@@ -180,8 +180,8 @@ jobs:
       # 这三个缺陷在浏览器里都不报错（一个显示乱码、一个渲染成空、
       # 一个互相串数据），只有静态扫描能在合并前抓住。
       - name: 前端模板卫生冒烟（方法插值 / 孤儿引用 / 重复键）
-        run: python tools/smoke_frontend_hygiene.py
-
+        # 经 run_smoke 落盘：红灯时日志进 artifact（见末尾「失败诊断」步骤）
+        run: python tools/run_smoke.py logs/smoke_smoke_frontend_hygiene.log python tools/smoke_frontend_hygiene.py
       # 语音链路冒烟（WS 协议逐字段对固件 + Opus 编解码 + OTA 签发口径）。
       # 挂在 SQLite job：它直连 sqlite 造激活码/设备，且进程内起 uvicorn。
       #
@@ -219,14 +219,14 @@ jobs:
       # smoke_ports.py 登记；也不进 mysql-smoke job —— 它 monkeypatch 的
       # 是进程内模块，与跑什么库无关，SQLite 上验的就是回滚语义本身。
       - name: 审计同事务故障注入（record 抛异常 -> 业务写回滚）
-        run: python tools/qa_audit_rollback.py
-
+        # 经 run_smoke 落盘：红灯时日志进 artifact（见末尾「失败诊断」步骤）
+        run: python tools/run_smoke.py logs/smoke_qa_audit_rollback.log python tools/qa_audit_rollback.py
       # 人格 eval 门禁：**必须挂在 smoke job 里**（而不是另开一个）——
       # 这样复用已装好的依赖，且与 SQLite 冒烟同环境。
       # 分级：医疗安全类失败 -> 本步红；长度/用词类只打印⚠️ -> 本步绿。
       - name: 人格 eval 门禁（医疗安全类硬失败）
-        run: python tools/eval_persona.py
-
+        # 经 run_smoke 落盘：红灯时日志进 artifact（见末尾「失败诊断」步骤）
+        run: python tools/run_smoke.py logs/smoke_eval_persona.log python tools/eval_persona.py
       # ---- 以下三步守的是「只有老库 / 只有重启才暴露」的缺陷 ----
       # 它们曾经**全部是活的**，而当时 CI 是绿的 —— 因为门禁里没有它们。
       # 每一份对应一个真实事故，不是「保险性冗余」：
@@ -248,20 +248,68 @@ jobs:
       # qa3_device_binding=8114（qa3_migration 不起服务），
       # 均由 tools/smoke_ports.py 统一登记，与冒烟的 8100-8106 无冲突。
       - name: 重启不变式（回填不改角色归属）
-        run: python tools/qa3_r2_restart.py
-
+        # 经 run_smoke 落盘：红灯时日志进 artifact（见末尾「失败诊断」步骤）
+        run: python tools/run_smoke.py logs/smoke_qa3_r2_restart.log python tools/qa3_r2_restart.py
       - name: 迁移完整性（ORM 列与 NEW_COLUMNS 对账）
-        run: python tools/qa3_migration.py
-
+        # 经 run_smoke 落盘：红灯时日志进 artifact（见末尾「失败诊断」步骤）
+        run: python tools/run_smoke.py logs/smoke_qa3_migration.log python tools/qa3_migration.py
       - name: 设备绑定归属（重启不被绑上平台预设）
-        run: python tools/qa3_device_binding.py
-
+        # 经 run_smoke 落盘：红灯时日志进 artifact（见末尾「失败诊断」步骤）
+        run: python tools/run_smoke.py logs/smoke_qa3_device_binding.log python tools/qa3_device_binding.py
       # 会员制遗留五张表必须**真的**被删掉。
       # 这条门禁是补 875b38c 留下的洞：当时删表函数整个被掏空，全仓 CI 依然全绿
       # （qa3_migration 的老库 DDL 根本不建这五张表，删表分支恒为空操作）。
       # 本脚本自己先按历史结构建出这五张表，再用「表还在不在」而不是函数返回值作判据。
       - name: 会员遗留表真删（掏空实现必变红）
-        run: python tools/qa3_drop_tables.py
+        # 经 run_smoke 落盘：红灯时日志进 artifact（见末尾「失败诊断」步骤）
+        run: python tools/run_smoke.py logs/smoke_qa3_drop_tables.log python tools/qa3_drop_tables.py
+      # 失败诊断：把每个冒烟脚本的结论搬进 job summary。
+      #
+      # 为什么加这个（2026-10-19 实际踩到的）：
+      # server-ci 红了，但 GitHub 网页上的日志正文是**异步加载的**，
+      # 没有 token 时 API / web /日志下载端点三条路全都拿不到正文——
+      # 于是只能靠猜「哪个 step 红了」，而本地和干净 clone 都绿，
+      # 猜了半天才发现不是代码问题。
+      # 结论：**「构建/测试红了但看不到为什么」本身就是缺陷**，
+      # 排查成本高到下次干脆不看了。
+      #
+      # 这里做的事：每个脚本把输出写进 logs/，失败时把**结论行**
+      # （FAIL 断言 + 汇总行）摘出来贴到 summary。
+      # 只摘结论不贴全文——全文动辄上万行，summary 会撑爆且没人看。
+      - name: 失败诊断（把结论贴进 job summary）
+        if: failure()
+        shell: bash
+        run: |
+          {
+            echo "### 后端冒烟失败诊断"
+            echo
+            if [ -d logs ]; then
+              for f in logs/*.log; do
+                [ -f "$f" ] || continue
+                echo "#### \`$(basename "$f" .log)\`"
+                echo
+                echo '```'
+                # 只留 FAIL/汇总/异常三类行：这是排查需要的信息，其余是噪音
+                grep -E "FAIL|共 [0-9]+ 条|passed|Traceback|Error:|AssertionError|未就绪" "$f" \
+                  | head -25 || echo "(无匹配行——脚本可能在起服务阶段就崩了，看上面步骤)"
+                echo '```'
+                echo
+              done
+            else
+              echo "没有 logs/ 目录：失败发生在**跑脚本之前**（装依赖 / 环境准备阶段）。"
+            fi
+            echo "排查顺序建议：① 看上面哪条 FAIL 最刺眼 ② 本地跑同名脚本 ③ 若本地绿、CI 红，"
+            echo "差异多半在 Linux/Windows 环境或并发残留进程，别改业务代码。"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: 保留完整日志（供下载排查）
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: server-ci-logs
+          path: logs/
+          retention-days: 7
+          if-no-files-found: ignore
 
   # elder 组件的宿主单元测试：断网提醒链路的「离线可用」证据。
   #
@@ -435,8 +483,8 @@ jobs:
       - name: 跑业务闭环（mysql+pymysql）
         env:
           ELDER_DB: mysql+pymysql://root:smoke-pass@127.0.0.1:3306/elder_companion?charset=utf8mb4
-        run: python tools/smoke_server.py 8100
-
+        # 经 run_smoke 落盘：红灯时日志进 artifact（见末尾「失败诊断」步骤）
+        run: python tools/run_smoke.py logs/mysql-smoke_smoke_server.log python tools/smoke_server.py 8100
       # MySQL 变体必须重跑角色域冒烟与 eval：
       # SQLite 覆盖不到 JSON 列与 ALTER TABLE 的方言差异，而本轮新增的
       # traits / guardrails / agent_key 全都是 JSON / 补列相关 ——
@@ -444,13 +492,13 @@ jobs:
       - name: 角色与权限冒烟（mysql+pymysql）
         env:
           ELDER_DB: mysql+pymysql://root:smoke-pass@127.0.0.1:3306/elder_companion?charset=utf8mb4
-        run: python tools/smoke_roles.py 8101
-
+        # 经 run_smoke 落盘：红灯时日志进 artifact（见末尾「失败诊断」步骤）
+        run: python tools/run_smoke.py logs/mysql-smoke_smoke_roles.log python tools/smoke_roles.py 8101
       - name: 人格 eval 门禁（mysql+pymysql）
         env:
           ELDER_DB: mysql+pymysql://root:smoke-pass@127.0.0.1:3306/elder_companion?charset=utf8mb4
-        run: python tools/eval_persona.py
-
+        # 经 run_smoke 落盘：红灯时日志进 artifact（见末尾「失败诊断」步骤）
+        run: python tools/run_smoke.py logs/mysql-smoke_eval_persona.log python tools/eval_persona.py
       # ★ 这一条是**下面那段注释唯一的例外**，而且是有意的例外。
       #
       # 上面的注释说「故意不放 qa3_*，因为它们跑不到 MySQL」—— 这条仍然成立，
@@ -466,8 +514,8 @@ jobs:
       - name: 会员遗留表真删（mysql+pymysql 真发 DROP）
         env:
           ELDER_DB: mysql+pymysql://root:smoke-pass@127.0.0.1:3306/elder_companion?charset=utf8mb4
-        run: python tools/qa3_drop_tables.py
-
+        # 经 run_smoke 落盘：红灯时日志进 artifact（见末尾「失败诊断」步骤）
+        run: python tools/run_smoke.py logs/mysql-smoke_qa3_drop_tables.log python tools/qa3_drop_tables.py
       # ⚠️ 这里**故意不**放 qa3_r2_restart / qa3_migration / qa3_device_binding。
       # 理由不是「MySQL 不重要」，而是那三份脚本**跑不到 MySQL**：
       #   * 它们直连 `sqlite3`（构造老库 DDL、改列、读行做指纹比对）；

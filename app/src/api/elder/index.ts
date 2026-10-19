@@ -433,6 +433,61 @@ export function isResetFail(res: ElderRawResult<any>): res is ElderRawResult<Pas
   return res.statusCode >= 400 && !!res.data && typeof (res.data as PasswordResetFail).message === 'string'
 }
 
+/* ================================================
+ * 「用户名 → 邮箱 → 验证码 → 寄新密码」四步（2026-10-19 用户要求）
+ *
+ * 与上面那套（邮箱 → 验证码）并存而不替换：
+ * 老人常常只记得**用户名**，邮箱在哪张卡片上都说不清，
+ * 让他先填邮箱等于要求他必须先知道邮箱才能找回密码。
+ *
+ * ⚠️ 三个字段语义必须照抄服务端，不能在前端「优化」掉：
+ *   email_bound —— 对「未绑邮箱」和「用户名不存在」都返回 false，
+ *                  前端若把它当成「用户不存在」就会露出枚举接口；
+ *   matched     —— 只表示"用户名与邮箱是否对得上"，**不携带正确邮箱**。
+ *                  前端绝不能自己再写"正确邮箱是xxx"（拿不到，也不该猜）。
+ * ============================================== */
+
+/** 第1 步响应 */
+export interface PasswordLookupOut {
+  ok: boolean
+  email_bound: boolean
+  admin_email: string
+  message: string
+}
+
+/** 第2 步响应 */
+export interface PasswordIssueOut {
+  ok: boolean
+  matched: boolean
+  expires_in_sec: number
+  cooldown_sec: number
+  message: string
+}
+
+/** 第1 步：查用户名能否自助重置 */
+export function lookupAccount(username: string) {
+  return elderRequestRaw<PasswordLookupOut>(
+    '/api/auth/password/reset/lookup',
+    { method: 'POST', data: { username }, auth: false, toast: false },
+  )
+}
+
+/** 第2 步：用户名 + 邮箱 -> 发验证码 */
+export function issueResetCode(username: string, email: string) {
+  return elderRequestRaw<PasswordIssueOut>(
+    '/api/auth/password/reset/issue',
+    { method: 'POST', data: { username, email }, auth: false, toast: false },
+  )
+}
+
+/** 第3 步：验证码 -> 服务端把新密码寄到该邮箱 */
+export function sendNewPassword(username: string, email: string, code: string) {
+  return elderRequestRaw<{ ok: boolean, message: string, attempts_left: number }>(
+    '/api/auth/password/reset/send-password',
+    { method: 'POST', data: { username, email, code }, auth: false, toast: false },
+  )
+}
+
 // ============================================================ 帮助与反馈（工单）
 
 /** 工单分类：与后端 TicketCategory 保持一致，未知值后端按"其它"处理。

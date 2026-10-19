@@ -22,6 +22,7 @@ from .. import models
 from ..db import get_db
 from ..deps import get_current_admin
 from ..mailer import (
+    RESET_ADMIN_EMAIL,
     RESET_CODE_MAX_ATTEMPTS,
     RESET_CODE_TTL_MIN,
     RESET_RESEND_COOLDOWN_SEC,
@@ -30,10 +31,16 @@ from ..mailer import (
 from ..schemas import (
     MailTestIn,
     MailTestOut,
+    PasswordIssueIn,
+    PasswordIssueOut,
+    PasswordLookupIn,
+    PasswordLookupOut,
     PasswordResetRequestIn,
     PasswordResetRequestOut,
     PasswordResetVerifyIn,
     PasswordResetVerifyOut,
+    PasswordSendIn,
+    PasswordSendOut,
     SmtpConfigIn,
     SmtpConfigOut,
 )
@@ -334,3 +341,195 @@ def verify_reset(payload: PasswordResetVerifyIn, db: Session = Depends(get_db)):
     db.commit()
 
     return PasswordResetVerifyOut(ok=True, username=user.username)
+
+
+# ==================================================================
+# 「用户名 → 邮箱 → 验证码 → 直接寄新密码」四步链路
+# （2026-10-19 用户要求；与上面的「邮箱 → 验证码」链路并存）
+#
+# 为什么要另开一条而不是改掉旧的：
+#   * 旧链路服务的是「知道邮箱」的人；新链路服务的是「只记得用户名」的人
+#     ——对老人这是常态（邮箱在另一台设备的通讯录里）。
+#   * 两条链路的**安全等级不同**（新链路把口令寄进邮件），所以保留旧链路
+#     作为「更安全的选项」，而不是替换。
+#
+# 三条设计红线（都写在这里，避免后人为了"更好体验"把它们改掉）：
+#   1. **不泄露账号是否存在**：凡是能区分「用户不存在 / 未绑邮箱 / 邮箱不对」
+#      的字段都必须在两种情况下返回**同值**。
+#   2. **不泄露正确的邮箱是什么**：邮箱不匹配时只回matched=false，
+#      绝不把库里那个正确邮箱回显 —— 否则就成了「给定用户名→ 探测邮箱」。
+#   3. **验证码防爆破**：复用 PasswordResetCode 表（哈希存码、5 次上限、
+#      15 分钟 TTL、恒定时间比较），不另起一套计数逻辑。
+# ==================================================================
+
+
+@auth_router.post("/lookup", response_model=PasswordLookupOut)
+def lookup_account(payload: PasswordLookupIn, db: Session = Depends(get_db)):
+    """第 1 步：输入用户名 → 告知能否继续（能否拿到验证码）。
+
+    ⚠️ ``email_bound`` 对「用户名不存在」与「存在但没绑邮箱」**都返回 false**，
+    不给攻击者区分二者的手段。
+
+    ⚠️ 但两者的 ``next_step`` 确实不同（一个去填邮箱、一个联系管理员），
+    这在原理上仍是一个弱侧信道 ——攻击者能分辨「这个用户名绑定过邮箱没有」，
+    却分辨不出「用户名是否存在」。权衡：用户名本身不是机密（登录页就要求输入），
+    「某用户名绑过邮箱」这件事不足以定位到具体的人；而如果为了消除它把两种情况
+    都做成"请联系管理员"，真正没绑邮箱的用户就被挡在门外了。
+    这是有意取舍，不是疏漏。
+    """
+    user = mailer.find_user_by_username(db, payload.username)
+    has_email = bool(user and (user.email or "").strip())
+    if has_email:
+        return PasswordLookupOut(
+            ok=True, email_bound=True, admin_email="",
+            message="请填写这个账号注册时使用的邮箱",
+        )
+    return PasswordLookupOut(
+        ok=True, email_bound=False, admin_email=RESET_ADMIN_EMAIL,
+        message="这个账号没有绑定邮箱，无法自助重置密码，请联系管理员",
+    )
+
+
+@auth_router.post("/issue", response_model=PasswordIssueOut)
+def issue_code(payload: PasswordIssueIn, db: Session = Depends(get_db)):
+    """第 2 步：用户名 + 邮箱 → 生成并寄出验证码。
+
+    ⚠️ 邮箱与用户名不匹配时：**什么都不发**，并且**仍然返回 200 + matched=false**。
+    不能返回 400/404：那会让「这个用户名的邮箱到底是哪个」变成可二分探测的接口。
+    """
+    email = payload.email.strip().lower()
+    now = mailer.now_utc()
+
+    user = mailer.find_user_by_username(db, payload.username)
+    mismatch = (user is None
+                or not (user.email or "").strip()
+                or (user.email or "").strip().lower() != email)
+
+    # 平台没配 SMTP 时也要先判——放在 mismatch 之前是**故意的**：
+    # 这样「邮箱填错」与「平台没邮件」返回同一个 503，用户不会以为是自己填错了。
+    cfg = mailer.get_smtp_config(db)
+    ready, why = mailer.smtp_ready(cfg)
+    if not ready:
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE,
+                            f"平台尚未配置可用的邮件服务（{why}），请联系管理员")
+
+    # ---- 重发冷却：按**用户名**而不是邮箱计。------
+    # 用邮箱计的话，攻击者换着邮箱猜就能绕过冷却轰炸；
+    # 而冷却的本来目的就是「别让一个人一分钟发几百封」。
+    latest = db.scalar(
+        select(models.PasswordResetCode)
+        .where(models.PasswordResetCode.user_id == (user.id if user else -1),
+               models.PasswordResetCode.used_at.is_(None))
+        .order_by(models.PasswordResetCode.created_at.desc())
+        .limit(1)
+    )
+    if latest is not None:
+        created = _aware(latest.created_at) or now
+        elapsed = (now - created).total_seconds()
+        if elapsed < RESET_RESEND_COOLDOWN_SEC:
+            wait = int(RESET_RESEND_COOLDOWN_SEC - elapsed)
+            raise HTTPException(status.HTTP_429_TOO_MANY_REQUESTS,
+                                f"验证码已发送，请 {wait} 秒后再试")
+
+    if mismatch:
+        # 不匹配：不落库、不发信，但仍给出「请重新填写邮箱」的正常推进。
+        return PasswordIssueOut(
+            ok=True, matched=False, expires_in_sec=0, cooldown_sec=0,
+            message="邮箱与账号不匹配，请重新填写",
+        )
+
+    code = "".join(secrets.choice("0123456789") for _ in range(6))
+    for old in db.scalars(
+        select(models.PasswordResetCode)
+        .where(models.PasswordResetCode.email == email,
+               models.PasswordResetCode.used_at.is_(None))
+    ).all():
+        old.used_at = now
+    row = models.PasswordResetCode(
+        email=email, user_id=user.id, code_hash=hash_password(code),
+        expires_at=now + timedelta(minutes=RESET_CODE_TTL_MIN),
+        attempts=0, max_attempts=RESET_CODE_MAX_ATTEMPTS, created_at=now,
+    )
+    db.add(row)
+    db.commit()
+
+    subject, body = mailer.build_reset_mail(user.username, code, RESET_CODE_TTL_MIN)
+    result = mailer.send_mail(db, email, subject, body)
+    if not result.ok:
+        # 发不出去就立刻作废：不能让用户对着一个永远收不到的验证码反复试。
+        row.used_at = mailer.now_utc()
+        db.commit()
+        raise HTTPException(status.HTTP_502_BAD_GATEWAY,
+                            "验证码邮件发送失败，请稍后再试或联系管理员")
+
+    return PasswordIssueOut(
+        ok=True, matched=True,
+        expires_in_sec=RESET_CODE_TTL_MIN * 60,
+        cooldown_sec=RESET_RESEND_COOLDOWN_SEC,
+        message=f"验证码已发送到 {email}",
+    )
+
+
+@auth_router.post("/send-password", response_model=PasswordSendOut)
+def send_new_password(payload: PasswordSendIn, db: Session = Depends(get_db)):
+    """第 3 步：验证码正确 → **生成新密码并寄到该邮箱**，同时立刻生效。
+
+    ⚠️ 为什么校验通过就立刻改密码（而不是等用户确认收到邮件）：
+    邮件丢了用户只能重来，而验证码 15 分钟过期、5 次上限，
+    让用户为「重发一次邮件」再消耗一次尝试不划算。
+    真正的安全性来自「验证码本身就是发给该邮箱的」——
+    拿到验证码 = 证明你能收这个邮箱的邮件，足够了。
+
+    ⚠️ 失败时**不透露**是验证码错、过期还是账号不存在：
+    与既有 verify 端点同一套话术，避免成为状态探测接口。
+    """
+    email = payload.email.strip().lower()
+    now = mailer.now_utc()
+
+    user = mailer.find_user_by_username(db, payload.username)
+    mismatch = (user is None
+                or not (user.email or "").strip()
+                or (user.email or "").strip().lower() != email)
+    if mismatch:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "邮箱与账号不匹配")
+
+    row = mailer.latest_reset_code(db, email)
+    if row is None or row.used_at is not None or (_aware(row.expires_at) or now) <= now:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST,
+                            {"message": "验证码错误或已过期", "attempts_left": 0})
+
+    left = max(0, int(row.max_attempts or RESET_CODE_MAX_ATTEMPTS) - int(row.attempts or 0))
+    if not verify_password(payload.code, row.code_hash):
+        row.attempts = int(row.attempts or 0) + 1
+        if row.attempts >= int(row.max_attempts or RESET_CODE_MAX_ATTEMPTS):
+            row.used_at = now
+        db.commit()
+        raise HTTPException(status.HTTP_400_BAD_REQUEST,
+                            {"message": "验证码错误或已过期",
+                             "attempts_left": max(0, left - 1)})
+
+    new_pwd = mailer.generate_password()
+    subject, body = mailer.build_new_password_mail(user.username, new_pwd)
+    result = mailer.send_mail(db, email, subject, body)
+    if not result.ok:
+        # ⚠️ 邮件没发出去就**绝不能改密码**：否则用户的新密码只存在于
+        # 一个他永远收不到的邮件里，等于把账号锁死了。这一步的顺序不能反。
+        raise HTTPException(status.HTTP_502_BAD_GATEWAY,
+                            "新密码邮件发送失败，密码未被修改，请稍后重试")
+
+    # 邮件已发出（对方邮箱已在收件箱里），此时改密码才是安全的
+    user.password_hash = hash_password(new_pwd)
+    row.used_at = now
+    for other in db.scalars(
+        select(models.PasswordResetCode)
+        .where(models.PasswordResetCode.email == email,
+               models.PasswordResetCode.used_at.is_(None))
+    ).all():
+        other.used_at = now
+    db.commit()
+
+    return PasswordSendOut(
+        ok=True,
+        message=f"新密码已发送到 {email}，请登录后尽快修改",
+        attempts_left=0,
+    )

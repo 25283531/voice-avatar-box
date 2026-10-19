@@ -73,6 +73,11 @@ async function onSubmit() {
 function openDoc(url: string) {
   uni.navigateTo({ url })
 }
+
+/** 去「找回密码」页（2026-10-19 用户要求：提示必须可点，而不是一段死路说明） */
+function goForgotPassword() {
+  uni.navigateTo({ url: '/pages/login/forgot-password' })
+}
 </script>
 
 <template>
@@ -95,12 +100,12 @@ function openDoc(url: string) {
 
       <!-- placeholder-class 必填：APP 端原生 input 的占位符不继承 .input 的颜色，
            不指定就用系统默认灰。要求老人也能看清提示文字。 -->
-      <input v-model="form.username" class="input" placeholder-class="input-placeholder" placeholder="账号" maxlength="32" />
-      <input v-model="form.password" class="input" password placeholder-class="input-placeholder" placeholder="密码" maxlength="32" />
+      <input v-model="form.username" class="input" placeholder-class="input-placeholder" placeholder="账号" :maxlength="32" />
+      <input v-model="form.password" class="input" password placeholder-class="input-placeholder" placeholder="密码" :maxlength="32" />
       <template v-if="mode === 'register'">
-        <input v-model="form.again" class="input" password placeholder-class="input-placeholder" placeholder="确认密码" maxlength="32" />
-        <input v-model="form.nickname" class="input" placeholder-class="input-placeholder" placeholder="称呼（可选）" maxlength="32" />
-        <input v-model="form.email" class="input" placeholder-class="input-placeholder" placeholder="邮箱（可选，用于找回密码）" maxlength="64" />
+        <input v-model="form.again" class="input" password placeholder-class="input-placeholder" placeholder="确认密码" :maxlength="32" />
+        <input v-model="form.nickname" class="input" placeholder-class="input-placeholder" placeholder="称呼（可选）" :maxlength="32" />
+        <input v-model="form.email" class="input" placeholder-class="input-placeholder" placeholder="邮箱（可选，用于找回密码）" :maxlength="64" />
       </template>
 
       <button class="btn" :disabled="busy" @click="onSubmit">
@@ -116,7 +121,14 @@ function openDoc(url: string) {
       </view>
 
       <view v-if="mode === 'login'" class="tip">
-        忘记密码可在「我的 → 修改密码」处理，或联系管理员重置
+        <text class="tip-text">忘记了密码？</text>
+        <!-- ⚠️ 必须是**可点**的入口而不是一段说明文字。
+             2026-10-19 用户报「这里应该是一个忘记密码的可点击字」——
+             原来的「忘记密码可在「我的 → 修改密码」处理」把用户推去
+             一个**需要先登录才能进**的页面，而用户正是因为登不进来才找它，
+             是个死循环式的建议。跳转同样放在 script 里：
+             模板内联的 uni.* 不被插件改写，会静默失效（见 profile 页说明）。 -->
+        <text class="tip-link" @click="goForgotPassword">点这里找回密码</text>
       </view>
     </view>
   </view>
@@ -195,4 +207,12 @@ function openDoc(url: string) {
 .agree-text { color: #6b7280; }
 .agree-link { color: #e8590c; }
 .tip { font-size: 26rpx; color: #8a8f99; text-align: center; margin-top: 24rpx; line-height: 1.6; }
+/* 可点的找回密码入口：老人目标用户，必须够大够显眼且有下划线提示可点 */
+.tip-link {
+  color: #e8590c;
+  font-weight: 600;
+  text-decoration: underline;
+  /* <text> 的点击热区在 APP 端只包住字形，行高留足避免误触不到 */
+  padding: 8rpx 12rpx;
+}
 </style>

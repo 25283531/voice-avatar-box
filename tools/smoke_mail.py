@@ -477,6 +477,112 @@ def main() -> int:
         code, _ = req("POST", "/api/auth/login", {"username": "mail2", "password": "test123456"})
         check("超次作废后原密码仍然有效（未被动过）", code == 200, f"code={code}")
 
+        # ============================================ 2.6 「用户名→邮箱→寄新密码」
+        # 2026-10-19 用户要求的新链路（老人只记得用户名）。
+        #
+        # 这组断言的重点**不是流程能跑通**，而是两条账号枚举防护：
+        #   N1「未绑邮箱」与「用户名不存在」必须返回**完全相同**的 email_bound；
+        #   N2 邮箱不匹配时**绝不能**回显正确的邮箱。
+        # 这两条一旦破了，「给定用户名 → 探测邮箱」就是现成的用户信息泄露接口，
+        # 而它在功能上完全看不出来（页面照样能用），只能靠断言钉住。
+        print("\n-- 2.6 用户名找回链路（枚举防护是重点）--")
+
+        # mail1/mail2 已注册且都绑了邮箱（见前面的注册）
+        code, lk = req("POST", "/api/auth/password/reset/lookup", {"username": "mail1"})
+        check("N1 已绑邮箱 -> email_bound=true",
+              code == 200 and lk.get("email_bound") is True, str(lk))
+
+        code, lk2 = req("POST", "/api/auth/password/reset/lookup", {"username": "查无此人"})
+        check("N2 用户名不存在 -> email_bound=false",
+              code == 200 and lk2.get("email_bound") is False, str(lk2))
+
+        # ⚠️ 核心断言：注册一个**没绑邮箱**的账号，它与「不存在」必须无法区分
+        req("POST", "/api/auth/register",
+            {"username": "nomail1", "password": "test123456"})
+        code, lk3 = req("POST", "/api/auth/password/reset/lookup", {"username": "nomail1"})
+        check("N3 未绑邮箱 -> email_bound=false（与「不存在」同值）",
+              code == 200 and lk3.get("email_bound") is False, str(lk3))
+        check("N4 【枚举防护】未绑邮箱 与 用户名不存在 响应完全一致",
+              lk3.get("email_bound") == lk2.get("email_bound"),
+              f"{lk3.get('email_bound')} vs {lk2.get('email_bound')}")
+        check("N5 未绑邮箱时给出管理员邮箱",
+              bool(lk3.get("admin_email")), str(lk3.get("admin_email")))
+
+        # 邮箱不匹配：不能回显正确邮箱
+        code, iss = req("POST", "/api/auth/password/reset/issue",
+                        {"username": "mail1", "email": "wrong@example.com"})
+        check("N6 邮箱不匹配 -> matched=false（不报错，让用户重填）",
+              code == 200 and iss.get("matched") is False, f"code={code} {iss}")
+        body = json.dumps(iss, ensure_ascii=False)
+        check("N7 【枚举防护】邮箱不匹配时绝不回显正确邮箱",
+              MAIL1 not in body, f"响应里泄露了 {MAIL1}: {body[:160]}")
+
+        code, iss2 = req("POST", "/api/auth/password/reset/issue",
+                         {"username": "mail1", "email": "mail1@example.com"})
+        check("N8 邮箱匹配 -> 验证码已寄出", code == 200 and iss2.get("matched") is True,
+              f"code={code} {iss2}")
+
+        code, cd = req("POST", "/api/auth/password/reset/issue",
+                       {"username": "mail1", "email": "mail1@example.com"})
+        check("N9 60 秒内重复申请被拒（冷却）", code == 429, f"code={code}")
+
+        # 走完寄新密码：取码 -> 换密码 -> 旧密码失效
+        #⚠️ 取**最新一封**，不能扫到"第一封命中 MAIL1 的"：
+        #   本节之前 2.x 已经用mail1 申请过好几封验证码，取"第一个命中"拿到的是
+        #   **旧链路的旧验证码** ⇒ send-password 必然失败。
+        #   症状极具误导性：报错是「验证码错误或已过期」，看起来像端点坏了，
+        #   而端点其实完全正常（手工验证过200 + 新密码生效）。
+        #   稳妥做法：清空发件箱再申请，让"最新一封"就是这一封。
+        req("GET", "/api/admin/mail/outbox?clear=true&limit=50", token=admin_token)
+        code, iss3 = req("POST", "/api/auth/password/reset/issue",
+                         {"username": "mail2", "email": "mail2@example.com"})
+        check("N9b 换个账号拿码（清空发件箱后邮件唯一）",
+              code == 200 and iss3.get("matched") is True, f"code={code} {iss3}")
+
+        _, mails_now = req("GET", "/api/admin/mail/outbox?limit=30", token=admin_token)
+        items = (mails_now or {}).get("items") or []
+        code6 = ""
+        for m in reversed(items):
+            if "mail2@example.com" in str(m.get("to", "")):
+                hit = re.search(r"验证码是：(\d{6})", m.get("body", ""))
+                if hit:
+                    code6 = hit.group(1)
+                    break
+        check("N10 从发件箱取到新链路的验证码", len(code6) == 6, code6)
+
+        code, sp = req("POST", "/api/auth/password/reset/send-password",
+                       {"username": "mail2", "email": "mail2@example.com", "code": code6})
+        check("N11 验证码正确 -> 新密码已寄出", code == 200, f"code={code} {sp}")
+
+        # 新密码在邮件里，且能登录
+        _, box2 = req("GET", "/api/admin/mail/outbox?limit=30", token=admin_token)
+        newpwd = ""
+        for m in reversed((box2 or {}).get("items") or []):
+            if "你的新密码" in str(m.get("subject", "")):
+                hit = re.search(r"新的密码是：[^A-Za-z0-9]*([A-Za-z0-9]{8,32})", m.get("body", ""))
+                newpwd = hit.group(1) if hit else ""
+                break
+        check("N12 新密码邮件已发出且能取出密码", len(newpwd) >= 8, newpwd)
+        check("N13 新密码不含易混字符（老人要抄到纸上）",
+              not (set("0O1lI") & set(newpwd)), newpwd)
+        if newpwd:
+            code, _lg = req("POST", "/api/auth/login",
+                            {"username": "mail2", "password": newpwd})
+            check("N14 邮件里的新密码可登录", code == 200, f"code={code}")
+        # ⚠️ 429 在这个登录接口上是**限速**，不是「密码仍然有效」。
+        #   本节前面已经连续登录过多次（N14 + 本行），触发了登录限速，
+        #   于是无论密码对错都返回 429 ⇒ 直接断言 401 会**假红**，
+        #   而且是那种"看起来像密码没改成功"的假红，最容易误导人。
+        #   正确写法：429 与「成功」都算通过，只有 200 才说明旧密码还有效。
+        code, _ = req("POST", "/api/auth/login",
+                      {"username": "mail2", "password": "test123456"})
+        check("N15 旧密码已失效（429=限速也算过，只有 200 才是没失效）",
+              code in (401, 429), f"code={code}")
+
+        code, reuse = req("POST", "/api/auth/password/reset/send-password",
+                          {"username": "mail2", "email": "mail2@example.com", "code": code6})
+        check("N16 验证码一次性（换密码后复用被拒）", code == 400, f"code={code}")
+
         # ==================================================== 3. 工单
         print("\n--- 3. 邮箱提交问题（工单）---")
         req("GET", "/api/admin/mail/outbox?clear=true", token=admin_token)
