@@ -317,6 +317,51 @@ export function restoreAgentRole(roleId: number) {
   return elderPost<AgentRole>(`/api/roles/${roleId}/restore`, {})
 }
 
+/* ---------------- 音色目录与试听 ---------------- */
+
+/** 一条音色（字段与服务端 app/voice/catalog.py 的 VOICE_CATALOG 一一对应） */
+export interface VoiceItem {
+  id: string
+  name: string
+  gender: string
+  scene: string
+  note: string
+}
+
+export interface VoiceCatalog {
+  voices: VoiceItem[]
+  default_voice?: string
+  allow_custom?: boolean
+  custom_hint?: string
+}
+
+/**
+ * 取音色清单。
+ *
+ * ⚠️ 必须由服务端给清单，前端不能硬编码：音色 id 是**厂商侧标识符**
+ * （zh-CN-XiaoxiaoNeural 这种），填错会**静默失败**——厂商悄悄用自己的
+ * 默认音色，用户以为换成功了。所以清单与校验都得在服务端。
+ */
+export function listVoices() {
+  return elderGet<VoiceCatalog>('/api/providers/catalog')
+}
+
+/**
+ * 合成一段试听音频（wav 容器，24kHz/单声道/16bit）。
+ *
+ * ⚠️ 这里**不是**设备语音链路用的裸 PCM —— 那是固件 WebSocket 的契约，
+ * 由服务端另一处负责。两个消费者要不同格式，不要图省事统一成一种。
+ * wav 是因为 APP/浏览器的 createInnerAudioContext 只认带容器头的格式。
+ *
+ * 返回的是**相对路径**：要走 BASE_URL 才能访问，而音频组件读不到
+ * elderRequest 注入的 Authorization 头——所以调用方需要自己补 token
+ * （见 profile 页的 playPreview，那里用了带 header 的 audio context）。
+ */
+export function voicePreviewPath(voiceId: string, text = '您好，我是小暖。') {
+  return `/api/providers/catalog/voice-preview?voice=${encodeURIComponent(voiceId)}` +
+    `&text=${encodeURIComponent(text)}`
+}
+
 /** 编译产物预览：家属可见的"所以机器人现在按什么在说话" */
 export function getAgentRolePrompt(roleId: number) {
   return elderGet<{ role_id: number; role_name: string; prompt: string }>(

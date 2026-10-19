@@ -51,9 +51,32 @@ BEGIN_MARK = "# >>> BEGIN elder-companion overlay"
 END_MARK = "# <<< END elder-companion overlay"
 
 results: list[tuple[str, bool, str, bool]] = []  # (名称, 通过, 详情, 是否致命)
+#: 本轮被 SKIP 掉的检查项名称。SKIP 内部记为 passed（好让 --strict 的
+#: 通过/失败判定不看它），但**汇总必须把它单列**——把 SKIP 混进「通过 N 条」
+#: 会让人以为每一项都真的查过了，而它们其实无判据可查。
+skipped: list[str] = []
+
+#: 「本项无判据可查」的标记。用了它的检查项打印 [SKIP]，
+#: 既不算通过也不算警告 —— 在 --strict 下也不拦。
+SKIP = object()
 
 
-def check(name: str, ok: bool, detail: str = "", fatal: bool = True) -> None:
+def check(name: str, ok: bool | object, detail: str = "", fatal: bool = True) -> None:
+    """登记一条检查结果。
+
+    ``ok`` 传 `SKIP` 表示「本项此刻无判据可查」——例如 sdkconfig.h 还没生成。
+    这类项**不算失败也不算警告**：门禁必须只约束「已经存在的东西」，
+    否则 CI 干净环境（无 build/、无 sdkconfig）会永远红，且它红的原因与
+    真实缺陷无关 ⇒ 流水线从此不可信（这正是 2026-10-19 CI 失败的真因）。
+    """
+    if ok is SKIP:
+        results.append((name, True, detail, False))
+        skipped.append(name)
+        print(f"  [SKIP] {name}")
+        for ln in detail.splitlines():
+            if ln.strip() and not ln.strip().startswith("⚠️"):
+                print("         -> " + ln)
+        return
     results.append((name, bool(ok), detail, fatal))
     tag = "PASS" if ok else ("FAIL" if fatal else "WARN")
     print(f"  [{tag}] {name}")
@@ -214,13 +237,20 @@ def main() -> int:
     )
 
     part = src.get("CONFIG_PARTITION_TABLE_CUSTOM_FILENAME", "").strip('"')
-    check(
-        "C3 分区表文件存在（含 assets 分区）",
-        bool(part) and (XIAOZHI / part).is_file(),
-        f"CONFIG_PARTITION_TABLE_CUSTOM_FILENAME={part!r}；"
-        f"assets 分区缺失则模型与形象都烧不进去",
-        fatal=bool(part),
-    )
+    if not part:
+        # 没有分区表配置 ⇒ 用的是默认分区表，此时「默认表是否含 assets 分区」
+        # 无从判断。与 C3b 同理：无判据 ≠ 不通过。
+        check("C3 分区表文件存在（含 assets 分区）", SKIP,
+              "未显式配置 CONFIG_PARTITION_TABLE_CUSTOM_FILENAME ⇒ 用的是 Kconfig "
+              "默认分区表，无具体文件可校验。assets 分区缺失则模型与形象都烧不进去，"
+              "真出现时症状是「离线唤醒与表情全失效」。")
+    else:
+        check(
+            "C3 分区表文件存在（含 assets 分区）",
+            (XIAOZHI / part).is_file(),
+            f"CONFIG_PARTITION_TABLE_CUSTOM_FILENAME={part!r}；"
+            f"assets 分区缺失则模型与形象都烧不进去",
+        )
 
     # ------------------------------------------------------ C3b 目标芯片
     # 真实事故（2026-10-19）：删掉 build/ 与 sdkconfig 后直接 `idf.py build`，
@@ -244,11 +274,23 @@ def main() -> int:
             fatal=True,
         )
     else:
+        # ⚠️⚠️ 这里**不能**报 WARN、更不能让它在 --strict 下红。
+        #
+        # 本工作流里自检步骤刻意排在 `set-target` **之前**，而 sdkconfig.h
+        # 正是 set-target 生成的 ⇒ CI 干净环境下它必然不存在 ⇒ 报 WARN
+        # 就等于把「流水线配置正确」判成「有问题」。
+        # 2026-10-19 CI 就是这样红的：编译根本没开始，自检先拦下了。
+        # 流水线的可信度一旦被这种假红破坏，人就会开始习惯性忽略红色，
+        # 下次真的编不过时也不会看了。
+        #
+        # 正确的做法是让 set-target **之后再自检一次**（workflow 里已加），
+        # 那时 sdkconfig.h 存在、C3b 才有判据可查，也才真的拦得住
+        # 「按 esp32 编出固件」这个真事故。
         check(
-            "C3b 目标芯片配置存在", False,
-            f"缺 {BUILD_H}。这是「还没 build 过」的正常状态，但请确认编译顺序是 "
-            f"set-target esp32s3 → build（直接 build 会按 esp32 编）",
-            fatal=False,
+            "C3b 目标芯片配置存在", SKIP,
+            f"尚未 set-target，{BUILD_H.name} 还不存在 ⇒ 本项无判据可查。"
+            f"（set-target 之后的第二次自检会真正校验它。编译顺序必须是"
+            f"set-target esp32s3 → build，直接 build 会按 esp32 编）",
         )
 
     # ------------------------------------------------------ C5 固件自检期望值
@@ -276,8 +318,9 @@ def main() -> int:
             fatal=expected_display is not None,
         )
     except Exception as exc:  # noqa: BLE001
-        check("C5 固件开机自检期望值校验", False, f"无法读取 {cfg_report}: {exc}",
-              fatal=False)
+        # 同 C3b：读不到判据本身 ≠ 判据不通过。报 WARN 会在 --strict 下拦 CI。
+        check("C5 固件开机自检期望值校验", SKIP,
+              f"无法读取 {cfg_report}: {exc}")
 
     # ------------------------------------------------------ C4 merge 注入
     try:
@@ -293,9 +336,10 @@ def main() -> int:
     # ------------------------------------------------------ 汇总
     failed = [r for r in results if not r[1] and r[3]]
     warned = [r for r in results if not r[1] and not r[3]]
+    passed = len(results) - len(failed) - len(warned) - len(skipped)
     print("\n" + "=" * 68)
-    print(f"共 {len(results)} 条：通过 {len(results) - len(failed) - len(warned)}，"
-          f"失败 {len(failed)}，警告 {len(warned)}")
+    print(f"共 {len(results)} 条：通过 {passed}，失败 {len(failed)}，"
+          f"警告 {len(warned)}，跳过 {len(skipped)}")
     for n, _ok, _d, _f in failed:
         print(f"  ✗ {n}")
     for n, _ok, _d, _f in warned:

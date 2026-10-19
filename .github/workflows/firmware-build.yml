@@ -130,6 +130,23 @@ jobs:
           idf.py set-target "$IDF_TARGET"
           grep -E 'CONFIG_BOARD_TYPE|CONFIG_ELDER_SERVER_URL|CONFIG_USE_EMOTE|CONFIG_SPIRAM' sdkconfig | head -12 || true
 
+      # ⚠️ 第二次自检，位置在 set-target **之后**。
+      #
+      # 2026-10-19 CI 失败的真因：第一次自检排在 set-target 之前，
+      # 而 `build/config/sdkconfig.h` 正是 set-target 才生成的 ⇒ CI 干净环境下
+      # 该文件必然不存在 ⇒ C3b 判「缺文件」⇒ --strict 把它当失败 ⇒
+      # **编译根本没开始就被自检拦下**。
+      #
+      # 这次复检有真实判据可查：
+      #   * C1 现在能查 sdkconfig 残留冲突（第一次自检时 sdkconfig 还不存在）
+      #   * C3b 能确认 CONFIG_IDF_TARGET 真是 esp32s3，而不是默认的 esp32
+      #     ——后者曾导致 esp_video 的 rule 把摄像头组件判成无用、编出烧上去
+      #       不能用的固件，而且全程不报错
+      - name: 编译前配置自检（set-target 后复检）
+        run: |
+          set -e
+          python3 tools/prebuild_check.py --strict
+
       - name: 编译
         shell: bash
         env:

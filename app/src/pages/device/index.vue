@@ -146,6 +146,15 @@ function currentDevice() {
   return devices.value.find(d => d.id === panel.value?.devicePk) || null
 }
 
+// ⚠️ 跳转必须写在 script 里，不能写成 `@click="uni.navigateTo(...)"`。
+// 模板内联写法不会被 @dcloudio/uni-app 插件改写，产物里是
+// `i.uni.navigateTo(...)`——那个 `uni` 不是 API 对象，调用抛 TypeError
+// 又被 Vue 的事件处理器静默吞掉 ⇒「点不动」且构建不报错。
+// 详见 pages/profile/index.vue 里 goAvatar 上方的完整说明。
+function goDeviceConfig() {
+  uni.navigateTo({ url: '/pages/device-config/index' })
+}
+
 onShow(() => { refresh() })
 </script>
 
@@ -227,7 +236,7 @@ onShow(() => { refresh() })
           <view class="tip left">
             配网需要让设备进入配对模式：长按设备按键 5 秒，听到提示音后点下面按钮。
           </view>
-          <button class="btn" @click="uni.navigateTo({ url: '/pages/device-config/index' })">
+          <button class="btn" @click="goDeviceConfig">
             开始配网
           </button>
         </template>

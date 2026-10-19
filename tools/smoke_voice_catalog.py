@@ -41,6 +41,8 @@ OpenAI 兼容路径 —— 表现为「配置都填对了却报接口格式不�
 """
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import os
 import subprocess
@@ -48,7 +50,9 @@ import sys
 import tempfile
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
+import wave
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -106,6 +110,18 @@ def req(method: str, path: str, body: dict | None = None, token: str | None = No
             return e.code, json.loads(raw)
         except Exception:
             return e.code, raw
+
+
+def req_bin(method: str, path: str, token: str | None = None):
+    """拿二进制的请求（试听音频是 wav，不能走 req() 的 JSON 解码）。"""
+    r = urllib.request.Request(BASE + path, method=method)
+    if token:
+        r.add_header("Authorization", "Bearer " + token)
+    try:
+        with _LOCAL_OPENER.open(r, timeout=60) as resp:
+            return resp.status, resp.read(), dict(resp.headers)
+    except urllib.error.HTTPError as e:
+        return e.code, e.read(), dict(e.headers)
 
 
 def wait_ready(timeout: float = 120.0) -> bool:
@@ -184,7 +200,64 @@ def main() -> int:
         check("A6 附带了自定义填写说明（前端要展示给管理员）",
               bool((cat or {}).get("custom_hint")), "")
 
-        # ================================================== B. 单一真源一致性
+        # ================================================== C. 试听端点
+        # 2026-10-19 用户报「音色（可选）里没有任何音色供选择」。
+        # 根因：APP 侧那个框是**自由输入**，从没调过 /api/providers/catalog。
+        # 试听是这个缺口的另一半——光有名字没法挑，老人必须能先听。
+        print("\n── C. 音色试听（/api/providers/catalog/voice-preview）──")
+        edge_on = (cat or {}).get("edge_available") is True
+
+        # C1 未登录必须被拒：试听会消耗 TTS 配额，不能匿名白用。
+        code, _b, _h = req_bin("GET", "/api/providers/catalog/voice-preview?voice=x")
+        check("C1 试听需要登录（匿名被拒）", code in (401, 403), f"code={code}")
+
+        if not edge_on:
+            # 没配 TTS 时必须给 503 而不是 500：
+            # 客户端据此提示「服务未启用语音合成」是可行动的，
+            # 「服务器内部错误」用户只能干瞪眼。
+            code, _b, _h = req_bin(
+                "GET", "/api/providers/catalog/voice-preview?voice=zh-CN-XiaoxiaoNeural",
+                token=token)
+            check("C2 未启用 TTS 时返回 503（不是 500）",
+                  code == 503, f"code={code} edge_available={edge_on}")
+        else:
+            code, wav, hdrs = req_bin(
+                "GET", "/api/providers/catalog/voice-preview?voice=zh-CN-XiaoxiaoNeural",
+                token=token)
+            check("C2 试听端点 200", code == 200, f"code={code} len={len(wav)}")
+            check("C3 Content-Type 是 audio/wav",
+                  "audio/wav" in (hdrs.get("Content-Type") or ""),
+                  f"got={hdrs.get('Content-Type')!r}")
+            # C4 必须校验 wav 头的三个参数：与 synth_pcm 的输出严格一致。
+            # 「能播但速度不对」（采样率写错）比不播更难排查。
+            ok_hdr = len(wav) > 44 and wav[:4] == b"RIFF" and wav[8:12] == b"WAVE"
+            check("C4 是合法 wav 容器（RIFF/WAVE 魔数）", ok_hdr,
+                  f"magic={wav[:4]!r}/{wav[8:12]!r}")
+            if ok_hdr:
+                with contextlib.closing(io.BytesIO(wav)) as b:
+                    with wave.open(b) as w:
+                        ch, sw, fr, nf = (w.getnchannels(), w.getsampwidth(),
+                                          w.getframerate(), w.getnframes())
+                check("C5 格式 = 1ch/16bit/24kHz（与 synth_pcm 契约一致）",
+                      (ch, sw, fr) == (1, 2, 24000), f"{ch}ch/{sw*8}bit/{fr}Hz")
+                check("C6 确实有音频数据（不是空壳）",
+                      nf > 2400, f"frames={nf} ≈ {nf/24000:.2f}s")
+
+        # C7 text 限长：这 endpoint 会消耗 TTS 配额，不限长等于开放免费 TTS。
+        #⚠️ query 必须 urlencode：直接把中文塞进 URL 会让 http.client
+        # 在 encode('ascii') 处炸（UnicodeEncodeError），
+        # 症状是「测试脚本崩了」而不是「端点有问题」，极易误判方向。
+        if edge_on:
+            long_text = urllib.parse.quote("long preview text " * 40)
+            code, wav2, _h = req_bin(
+                "GET", "/api/providers/catalog/voice-preview?voice=zh-CN-XiaoxiaoNeural"
+                       f"&text={long_text}", token=token)
+            # 只在真的合成成功时才有字节可比；否则 wav2 是错误 JSON。
+            check("C7 超长试听文本被截断（不是原样合成）",
+                  code != 200 or len(wav2) < 60 * 24000 * 2,
+                  f"code={code} len={len(wav2)}")
+
+        # ================================================== D. 单一真源一致性
         print("\n── B. 出厂默认音色的单一真源 ──")
         default_voice = (cat or {}).get("default_voice") or ""
         check("B1 目录给出了出厂默认音色", bool(default_voice), default_voice)

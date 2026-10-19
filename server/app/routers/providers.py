@@ -19,9 +19,11 @@ llm_light）；usage 是**调用方的意图**（"我要聊天"、"我要抽意�
 """
 from __future__ import annotations
 
+import io
 import time
+import wave
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Response, status
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -203,6 +205,64 @@ def _edge_available() -> bool:
     except Exception:  # noqa: BLE001  模块本身出问题也按不可用处理
         return False
     return edge_available()
+
+
+@router.get("/catalog/voice-preview")
+def voice_preview(voice: str, text: str = "您好，我是小暖。",
+                  user: models.User = Depends(get_current_user)):
+    """合成一段**试听音频**，让用户挑音色时能先听再选。
+
+    为什么必须有这个（2026-10-19 用户报「音色没有任何音色供选择」）
+    ------------------------------------------------------------------
+    音色是厂商侧标识符（``zh-CN-XiaoxiaoNeural`` 这种），**纯文字无法判断**：
+    「晓晓」和「晓伊」在列表里都是「女声· 温柔/活泼」，光看名字和说明分不出
+    差别，而老人听力衰减使他们的偏好与年轻人明显不同。挑音色必须听。
+
+    为什么这里返回 wav，而设备语音链路用裸 PCM
+    -------------------------------------------
+    两者是**不同消费者**，别被「统一契约」四个字误导：
+      * 固件走 WebSocket 语音链路，吃 24kHz/mono/S16LE **裸 PCM**
+        （全项目 TTS 契约，见 app/voice/tts_edge.py）；
+      * APP 试听交给系统播放器（createInnerAudioContext），
+        它只认 wav/mp3 这类带容器头的格式。
+    给试听端点返回裸 PCM 会让前端必须自己拼 44 字节头，
+    而各端（尤其小程序端）拿 ArrayBuffer 写文件的差异比容器本身还麻烦。
+    容器头在服务端用标准库 wave 包一下，30 行换两端都省事。
+
+    错误处理：TTS 不可用抛 **503** 而不是 500 ——「服务没配 TTS」是部署状态问题，
+    客户端据此提示「服务未配置」比「服务器内部错误」可行动得多。
+    """
+    from ..voice import tts_edge
+
+    if not tts_edge.edge_available():
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="试听不可用：本部署未启用 TTS 合成",
+        )
+    # 限长：这是「试听」，不是「把 TTS 当免费下载器」。
+    # 不限的话任何登录用户都能拿它做免费 TTS 服务。
+    snippet = (text or "").strip()[:60] or "您好，我是小暖。"
+    try:
+        pcm = tts_edge.synth_pcm(snippet, voice)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"试听合成失败：{exc}",
+        ) from exc
+
+    buf = io.BytesIO()
+    # 1 声道 / 16 位 / 24kHz —— 与 synth_pcm 的输出严格一致，三个参数不能错，
+    # 否则是「能播但速度不对」的声音（比不播更难排查）。
+    with wave.open(buf, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(24000)
+        w.writeframes(pcm)
+    return Response(
+        content=buf.getvalue(),
+        media_type="audio/wav",
+        headers={"Cache-Control": "no-store"},
+    )
 
 
 @router.get("/readiness")

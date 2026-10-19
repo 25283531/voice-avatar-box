@@ -390,9 +390,56 @@ def scan_file(path: Path) -> None:
     check_card_ownership(tpl)
 
 
+APP_SRC = SERVER.parent / "app" / "src"
+
+
+def scan_app_templates() -> None:
+    """扫描 uni-app (.vue) 模板：**禁止把 uni.* 写在模板表达式里**。
+
+    2026-10-19 实锤的坑（用户报「系统形象库 / 隐私政策 / 用户协议点不动」，
+    三个症状一个根因）：
+
+        @click="uni.navigateTo({ url: '/x' })"     ← 坏：不生效、不报错
+
+    ``uni.*`` 是 @dcloudio/uni-app 插件在**构建期**注入的，插件改写的是
+    JS 源码里的调用点；写在模板表达式里它不参与改写，产物里原样变成
+    ``o.uni.navigateTo(...)`` —— ``o`` 是 setup 上下文的解构对象，
+    它身上的 ``uni`` 不是那个 API 对象 ⇒ 调用抛 TypeError。
+    而异常发生在 Vue 的事件处理器里、没有全局 errorHandler ⇒ **被静默吞掉**；
+    模板表达式语法又完全合法 ⇒ **构建也不报错**。
+    症状于是是「构建成功 + 点击毫无反应」，是能查到吐的假绿。
+
+    为什么值得单独一条门禁：上面这两条（不报错、不构建失败）都让它躲过了
+    现有全部检查。而正确写法（把跳转放进 script里的具名函数）一眼就能认出来，
+    用正则把坏形态钉死，比指望人记住便宜得多。
+    """
+    files = sorted(APP_SRC.rglob("*.vue"))
+    if not files:
+        check("APP 模板扫描（.vue 至少有一个）", False,
+              f"{APP_SRC} 下没有 .vue，确认路径")
+        return
+
+    bad: list[str] = []
+    for p in files:
+        text = p.read_text(encoding="utf-8")
+        tpl = re.sub(r"<script.*?</script>", "", text, flags=re.S)
+        tpl = strip_comments(tpl)
+        for m in re.finditer(r'(:|v-bind:|@)?[\w.:-]*="([^"]*\buni\.[A-Za-z_]+[^"]*)"',
+                             tpl):
+            attr_line = tpl[:m.start()].count("\n") + 1
+            bad.append(f"{p.relative_to(SERVER.parent)}:{attr_line}  {m.group(2).strip()[:60]}")
+
+    check("APP 模板里没有内联的 uni.* 调用（必须放进 script 的具名函数）",
+          not bad,
+          "这些位置把 uni.* 写在模板表达式里，构建期不会被插件改写 ⇒ "
+          "点击时抛 TypeError 且被静默吞掉（构建却成功）：\n         "
+          + "\n         ".join(bad[:10])
+          + ("\n         …共 %d 处" % len(bad) if len(bad) > 10 else ""))
+
+
 def main() -> int:
     print("=" * 64)
-    print("前端模板卫生（静态扫描：方法插值 / 孤儿引用 / 重复键）")
+    print("前端模板卫生（静态扫描：方法插值 / 孤儿引用 / 重复键 / uni 内联）")
     print("=" * 64)
     missing = [p for p in (INDEX, USER) if not p.exists()]
     if missing:
@@ -400,6 +447,7 @@ def main() -> int:
         return 1
     for path in (INDEX, USER):
         scan_file(path)
+    scan_app_templates()
 
     passed = sum(1 for _n, ok, _d in results if ok)
     failed = [n for n, ok, _d in results if not ok]
