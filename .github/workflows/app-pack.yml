@@ -38,13 +38,17 @@ on:
         options: [cloud, public, self]
         default: cloud
       version_name:
-        description: 版本名
+        # ⚠️ 刻意不给 default（与 android-build.yml 同一个理由，见该文件与 D39）：
+        #   input 的 default 会成为版本号的第二份真源，并在 dispatch 时
+        #   无人察觉地盖掉 app/src/manifest.json 里的真值。
+        #   留空 = 沿用 manifest.json 里的值。
+        description: 版本名（留空则用 src/manifest.json 里的值）
         type: string
-        default: 1.0.0
+        required: false
       version_code:
-        description: 版本号（整数，需递增）
+        description: 版本号（留空则用 src/manifest.json 里的值；仅在确实要覆盖时填）
         type: string
-        default: '100'
+        required: false
   release:
     types: [published]
 
@@ -84,8 +88,10 @@ jobs:
         working-directory: app
         env:
           UNI_APPID: ${{ inputs.uni_appid || secrets.UNI_APPID }}
-          VERSION_NAME: ${{ inputs.version_name || '1.0.0' }}
-          VERSION_CODE: ${{ inputs.version_code || '100' }}
+          # ⚠️ 同样不给兜底：inputs 有值才覆盖 manifest.json 里的值。
+          #   传空串会让下面的正则把 versionCode 写成 ""，产出无法安装的包。
+          VERSION_NAME: ${{ inputs.version_name }}
+          VERSION_CODE: ${{ inputs.version_code }}
         run: |
           python -c "
           import json, os, re
@@ -94,10 +100,17 @@ jobs:
           appid = os.environ.get('UNI_APPID', '').strip()
           if appid:
               s = re.sub(r'\"appid\"\s*:\s*\"[^\"]*\"', '\"appid\": \"%s\"' % appid, s, count=1)
-          s = re.sub(r'\"versionName\"\s*:\s*\"[^\"]*\"', '\"versionName\": \"%s\"' % os.environ['VERSION_NAME'], s, count=1)
-          s = re.sub(r'\"versionCode\"\s*:\s*\"[^\"]*\"', '\"versionCode\": \"%s\"' % os.environ['VERSION_CODE'], s, count=1)
+          # 只在**显式非空**时改写：空串会把版本号写成 \"\"，
+          # 而 manifest.json 里的原值恰恰是唯一真源（D39）。
+          for key, env in (('versionName', 'VERSION_NAME'), ('versionCode', 'VERSION_CODE')):
+              val = os.environ.get(env, '').strip()
+              if val:
+                  s = re.sub(r'\"%s\"\s*:\s*\"[^\"]*\"' % key, '\"%s\": \"%s\"' % (key, val), s, count=1)
           open(p, 'w', encoding='utf-8').write(s)
-          print('appid ->', json.loads(s).get('appid'))
+          d = json.loads(s)
+          print('appid ->', d.get('appid'), '| version ->', d.get('versionName'), d.get('versionCode'))
+          # 写空版本号会产出一个装不上的包，且云打包照样成功 —— 当场拦下。
+          assert d.get('versionCode'), 'versionCode 为空，拒绝出包'
           "
 
       - name: 缓存 HBuilderX CLI

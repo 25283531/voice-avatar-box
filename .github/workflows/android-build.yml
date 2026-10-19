@@ -33,13 +33,21 @@ on:
   workflow_dispatch:
     inputs:
       version_name:
-        description: 版本名
+        # ⚠️ **刻意不给 default**。
+        #   workflow_dispatch 的 input 一旦带 default，dispatch 时即使人不填也会
+        #   拿到那个值 —— 于是 `inputs.default` 本身就是**版本号的第二份真源**，
+        #   且会在无人察觉的情况下把 gradle 里的真值盖掉。
+        #   2026-10-19 真实踩过：清掉了 env 里的 `|| '1.0.0'` 兜底，
+        #   却漏了这里的 default，于是手动 dispatch 出来的包版本号退回 100，
+        #   被「必须递增」门禁拦下（门禁是对的，配置是错的）。
+        #   留空 = 沿用 android/app/build.gradle.kts 里的唯一真源。
+        description: 版本名（留空则用 build.gradle.kts 里的值：1.1.0）
         type: string
-        default: 1.0.0
+        required: false
       version_code:
-        description: 版本号（整数，需递增）
+        description: 版本号（留空则用 build.gradle.kts 里的值：110；仅在确实要覆盖时填）
         type: string
-        default: '100'
+        required: false
       sign:
         description: '签名：self=仓库 secrets 里的 keystore（缺省）/ debug=调试签名'
         type: choice

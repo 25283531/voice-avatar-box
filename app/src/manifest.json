@@ -2,8 +2,8 @@
   "name": "老人陪伴助手",
   "appid": "__UNI__26FECA2",
   "description": "老人陪伴与服药提醒助手（家属端）",
-  "versionName": "1.0.0",
-  "versionCode": "100",
+  "versionName": "1.1.0",
+  "versionCode": "110",
   "transformPx": false,
   "app-plus": {
     "usingComponents": true,
