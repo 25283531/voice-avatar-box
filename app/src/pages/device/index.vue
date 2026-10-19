@@ -6,7 +6,7 @@
 
 <script setup lang="ts">
 import { onShow } from '@dcloudio/uni-app'
-import { ref } from 'vue'
+import { computed, ref } from 'vue'
 import {
   applyAvatar,
   bindAgentRole,
@@ -31,6 +31,17 @@ const loading = ref(false)
 
 const showBind = ref(false)
 const bindForm = ref({ code: '', alias: '' })
+
+// 激活码契约：1 位字母 + 12 位数字 = 13 位。
+// 与服务端 generate_activation_code()（server/app/security.py）逐位一致，
+// **校验逻辑本身不改** —— 用户输不上是因为语音漏播首字母只听到 12 位，
+// 修法是固件把码显示在屏幕上（大字分组），不是放宽长度。
+const CODE_LEN = 13
+
+// 已输入的有效位数：过滤短横线等分隔符后按字符数算。
+// 屏幕上的码是 A-3829-4471-0056 分组形态，用户照抄会带 -，
+// 按输入框原长度算会虚高，必须按「将要提交的形态」计。
+const codeLen = computed(() => bindForm.value.code.replace(/[^0-9a-zA-Z]/g, '').length)
 
 /** 正在配置哪台设备：null=关闭 / 'net'=配网 / 'agent'=绑角色 */
 const panel = ref<null | { devicePk: number, mode: 'net' | 'agent' }>(null)
@@ -59,8 +70,13 @@ async function refresh() {
 
 async function doBind() {
   const code = bindForm.value.code.replace(/[^0-9a-zA-Z]/g, '').toUpperCase()
-  if (code.length !== 13) {
-    uni.showToast({ title: '激活码应为 13 位（1 字母 + 12 数字）', icon: 'none' })
+  if (code.length !== CODE_LEN) {
+    // 带上实际位数：用户最常见的失误是只听清语音、漏了首字母只输入 12 位，
+    // 「还差 1 位 + 首位是字母」比一句笼统的「格式不正确」可操作得多。
+    uni.showToast({
+      title: `激活码应为 13 位（1 字母 + 12 数字），当前 ${code.length} 位`,
+      icon: 'none',
+    })
     return
   }
   try {
@@ -219,6 +235,15 @@ onShow(() => { refresh() })
           在设备屏幕上可以看到形如 A-3829-4471-0056 的激活码，10 分钟内有效
         </view>
         <input v-model="bindForm.code" class="input big" placeholder="A-3829-4471-0056" />
+        <view class="code-count">
+          已输入 {{ codeLen }}/{{ CODE_LEN }} 位
+        </view>
+        <view v-if="codeLen < CODE_LEN" class="code-tip">
+          还差 {{ CODE_LEN - codeLen }} 位：首位是字母，后面 12 位是数字
+        </view>
+        <view v-else-if="codeLen > CODE_LEN" class="code-tip">
+          超出 {{ codeLen - CODE_LEN }} 位：激活码共 13 位（1 字母 + 12 数字），请核对屏幕
+        </view>
         <input v-model="bindForm.alias" class="input" placeholder="给设备起个名字（可选）" />
         <button class="btn" @click="doBind">
           绑定设备
@@ -308,6 +333,8 @@ onShow(() => { refresh() })
 .title { font-size: 32rpx; font-weight: 600; margin-bottom: 8rpx; }
 .input { border: 1rpx solid #e3e8ef; border-radius: 10rpx; padding: 18rpx; margin-bottom: 16rpx; font-size: 28rpx; background: #fff; }
 .input.big { font-size: 36rpx; letter-spacing: 2rpx; text-align: center; }
+.code-count { font-size: 24rpx; color: #8a8f99; text-align: center; margin: -8rpx 0 12rpx; }
+.code-tip { font-size: 24rpx; color: #e8590c; text-align: center; margin: -8rpx 0 12rpx; }
 .group-label { font-size: 26rpx; color: #8a8f99; margin: 20rpx 0 8rpx; }
 .pick { border: 1rpx solid #e3e8ef; border-radius: 12rpx; padding: 20rpx; margin-bottom: 12rpx; }
 .pick-name { font-size: 28rpx; font-weight: 600; display: block; }

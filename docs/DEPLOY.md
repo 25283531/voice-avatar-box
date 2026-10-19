@@ -204,6 +204,42 @@ uvicorn app.main:app --reload --port 8080
 
 不设 `ELDER_DB` 时，代码会自动挑一个可写目录：`/data` 存在且可写就用 `/data/elder.db`（容器里的命名卷），否则退回当前工作目录下的 `./elder.db`（本机裸跑）。持久化目录可用 `ELDER_DATA_DIR` 覆盖。
 
+### 1.10 设备 OTA 固件分发（可选，**默认不启用**）
+
+设备开机 OTA 检查（`/api/voice/ota`）时，服务端可以顺带告诉设备「有新版固件」。
+**默认不返回 `firmware` 段**（= 设备永远不 OTA，与配置该特性之前逐字一致）；
+只有下面两个变量**都配置**时才在响应里带上（已绑定 / 未绑定两条路径都会带）：
+
+| 变量 | 说明 |
+| --- | --- |
+| `ELDER_FIRMWARE_VERSION` | 最新可用固件版本号，如 `2.0.5`。**真源是 `firmware/xiaozhi/CMakeLists.txt` 的 `PROJECT_VER`**，两边必须一致 |
+| `ELDER_FIRMWARE_URL` | 固件下载地址（完整 URL），如 `https://152.136.230.132/firmware/xiaozhi-2.0.5.bin` |
+
+配置示例（`server/.env` 或 compose 的 `environment`，二选一即可，改完重启服务）：
+
+```bash
+ELDER_FIRMWARE_VERSION=2.0.5
+ELDER_FIRMWARE_URL=https://152.136.230.132/firmware/xiaozhi-2.0.5.bin
+```
+
+行为约定（配之前必须知道）：
+
+1. **版本比较由固件自己做**（`firmware/xiaozhi/main/ota.cc` 的
+   `IsNewVersionAvailable`），服务端只负责「报告最新可用版本」，不判断设备
+   当前版本、不决定要不要升。配成旧版本号 = 设备认为无需升级，无副作用。
+2. **URL 指向的必须是单 app 镜像（CI 产物 `xiaozhi.bin`），不是
+   `merged-flash.bin`**。设备的 OTA 升级走 `Ota::Upgrade()` →
+   `esp_ota_begin` / `esp_ota_write` 写 **OTA 分区**，只吃单 app 镜像；
+   merged-flash 是整片 Flash 镜像（含 bootloader / 分区表），OTA 写不进去。
+3. **二进制不放在本服务托管**。本服务只在 OTA 响应里返回一个 URL，文件放哪
+   由部署方决定（Nginx 静态目录 / OSS / CDN 均可）。注意地址必须是**设备
+   可达**的（内网设备给内网地址），建议 https。
+4. **CI artifact 会过期**。GitHub Actions 产物有保留期限，生产环境要把
+   artifact 下载后传到自己的稳定静态托管，**别把 CI 的临时 URL 配到这里** ——
+   过期后设备每次开机都会尝试下载一个 404。
+5. **两个变量只配一个 = 不返回 `firmware` 段**（配置不完整时宁可不返回，
+   让设备保持现状，也不下一个缺字段的段让固件白做比较）。
+
 ---
 
 ## 2. 接入 MySQL（完整步骤）
@@ -1095,6 +1131,8 @@ WS 地址由它自动换 scheme 推导成 `wss://voice.example.com/api/voice/v1/
 | `ELDER_USER_TOKEN_DAYS` | `30` | 用户登录令牌有效期（天） |
 | `ELDER_DEVICE_TOKEN_DAYS` | `365` | 设备令牌有效期（天） |
 | `ELDER_ACT_TTL_MIN` | `10` | 激活码有效期（分钟），与固件 `elder_activation.c` 的格式约定配套 |
+| `ELDER_FIRMWARE_VERSION` | 空（不返回 firmware 段） | **设备 OTA 报告的最新固件版本号**。与 `ELDER_FIRMWARE_URL` **同时配置**才在 OTA 响应里下发 `firmware` 段；版本真源是 `firmware/xiaozhi/CMakeLists.txt` 的 `PROJECT_VER`，版本比较由固件自己做。见 §1.10 |
+| `ELDER_FIRMWARE_URL` | 空（不返回 firmware 段） | **固件下载 URL**，**必须是单 app 镜像（`xiaozhi.bin`）不是 merged-flash.bin**（OTA 走 `esp_ota_write` 写 OTA 分区）；二进制由部署方托管，CI artifact 会过期别直接用。见 §1.10 |
 | `ELDER_LIBOPUS_PATH` | 空（自动探测） | **Opus 编解码库文件的绝对路径**。**Docker 部署不需要设** —— 镜像已 `apt-get install libopus0`。只在**本机裸跑**（§1.9）且自动探测失败时才需要，见 §6.12 |
 | `ELDER_DB_ECHO` | `0` | 设为 `1` 打印所有 SQL，排查问题时开，平时关 |
 | `ELDER_ALLOW_PUBLIC_REGISTER` | `1`（开启） | **是否开放匿名自助注册**。设为 `0`/`false`/`no`/`off`/空串即关闭，关闭时 `POST /api/auth/register` 返回 `403` + 「当前未开放自助注册，请联系管理员开通账号」。详见 §5.1 |

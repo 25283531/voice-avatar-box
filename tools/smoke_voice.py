@@ -5,6 +5,8 @@
 ------------------------------
 1. **OTA 分流**：未绑定 MAC 只拿激活码、**不带 websocket 段**；绑定后才拿
    ws url + token（且 token 本地 decode 校验 typ/sub）；
+   **firmware 段**：未配 ``ELDER_FIRMWARE_*`` 时两条路径都不返回（默认行为
+   不变），配齐后两条路径都返回且值正确（版本比较由固件自己做）；
 2. **WS 鉴权**：无 token / 垃圾 token → 被关（4401）；token 有效但
    Device-Id 不符 → 4001；
 3. **握手**：服务端 hello 的 transport / session_id / sample_rate=24000；
@@ -599,6 +601,11 @@ def start_app_server() -> object:
     os.environ.pop("https_proxy", None)
     os.environ.pop("HTTP_PROXY", None)
     os.environ.pop("HTTPS_PROXY", None)
+    # 固件分发默认不启用：显式清掉，保证 t_ota_firmware 的「未配置」断言
+    # 测的是**默认行为**而不是开发机 ambient env 里残留的变量（那种残留会让
+    # 默认断言诡异地红，且查不到本文件头上）。
+    os.environ.pop("ELDER_FIRMWARE_VERSION", None)
+    os.environ.pop("ELDER_FIRMWARE_URL", None)
 
     SERVER_LOG.parent.mkdir(parents=True, exist_ok=True)
     logging.basicConfig(
@@ -926,6 +933,93 @@ def t_activate_v2() -> None:
     check("激活 v2 -> 400", code == 400, f"code={code}")
     check("激活 v2 的 error 明确说 unsupported",
           body.get("error") == "activation-v2-unsupported", str(body.get("error")))
+
+
+def t_ota_firmware(ids: dict) -> None:
+    print("── 1d. OTA firmware 段：默认不返回，两个变量都配了才返回 ──")
+    import importlib
+
+    from app import config as _config
+
+    version = "2.0.5"
+    url = "https://152.136.230.132/firmware/xiaozhi-2.0.5.bin"
+    keys = ("ELDER_FIRMWARE_VERSION", "ELDER_FIRMWARE_URL")
+
+    def _reload_and_probe(env: dict[str, str]) -> tuple[int, dict, int, dict]:
+        """按 env 重载 config，返回 ``(未绑定码, 未绑定响应, 已绑定码, 已绑定响应)``。
+
+        先把两个 key 全部 pop 再按 env 设置 —— 每个场景的输入**只有 env
+        显式列出的那几项**，绝不让上一个场景的残留渗进来。reload 后同进程内
+        的服务立即换行为（ota_check 经 config 模块属性在调用时读值，
+        见 voice._firmware_section 的 docstring），DB / 种子 / 端口全部复用。
+        """
+        for key in keys:
+            os.environ.pop(key, None)
+        for key, value in env.items():
+            os.environ[key] = value
+        importlib.reload(_config)
+        code_unbound, unbound = _ota(MAC_UNBOUND)
+        code_bound, bound = _ota(MAC_BOUND)
+        return code_unbound, unbound, code_bound, bound
+
+    # ---- 默认（两个变量都未配）：两条路径都不带 firmware 段 ----
+    # 这是「默认行为不许变」的回归网：该特性上线前固件永远拿不到 firmware 段，
+    # 任何把默认改成"总返回"的改动都必须在这里红。
+    code, unbound, _code, bound = _reload_and_probe({})
+    check("1d · 未配置时未绑定响应无 firmware 段（默认行为不变）",
+          code == 200 and "firmware" not in unbound,
+          f"code={code} keys={list(unbound.keys())}")
+    check("1d · 未配置时已绑定响应无 firmware 段（默认行为不变）",
+          _code == 200 and "firmware" not in bound,
+          f"code={_code} keys={list(bound.keys())}")
+
+    # ---- 半配（只设一个）：两条路径都不得返回 firmware 段 ----
+    # QA 曾把 _firmware_section 的条件改成「任一非空」，全套冒烟仍 140 过 0 败
+    # ——「两个都非空才返回」当时只靠代码注释维持。这四条就是钉死该契约的
+    # 断言：只配 version 或只配 url 都是配置不完整，宁可不返回让设备保持
+    # 「不 OTA」的现状，也不下一个缺字段的段让固件白做比较。
+    code, unbound, _code, bound = _reload_and_probe(
+        {"ELDER_FIRMWARE_VERSION": version})
+    check("1d · 半配（只有 VERSION）时未绑定响应无 firmware 段",
+          code == 200 and "firmware" not in unbound,
+          f"code={code} keys={list(unbound.keys())}")
+    check("1d · 半配（只有 VERSION）时已绑定响应无 firmware 段",
+          _code == 200 and "firmware" not in bound,
+          f"code={_code} keys={list(bound.keys())}")
+    code, unbound, _code, bound = _reload_and_probe(
+        {"ELDER_FIRMWARE_URL": url})
+    check("1d · 半配（只有 URL）时未绑定响应无 firmware 段",
+          code == 200 and "firmware" not in unbound,
+          f"code={code} keys={list(unbound.keys())}")
+    check("1d · 半配（只有 URL）时已绑定响应无 firmware 段",
+          _code == 200 and "firmware" not in bound,
+          f"code={_code} keys={list(bound.keys())}")
+
+    # ---- 配齐（两个都设）：两条路径都返回，且值正确 ----
+    try:
+        code, unbound, code_bound, bound = _reload_and_probe(
+            {"ELDER_FIRMWARE_VERSION": version, "ELDER_FIRMWARE_URL": url})
+        fw = unbound.get("firmware") or {}
+        check("1d · 配齐后未绑定响应带 firmware 段",
+              code == 200 and bool(fw), str(list(unbound.keys())))
+        check("1d · 未绑定 firmware.version == ELDER_FIRMWARE_VERSION",
+              fw.get("version") == version, str(fw.get("version")))
+        check("1d · 未绑定 firmware.url == ELDER_FIRMWARE_URL",
+              fw.get("url") == url, str(fw.get("url")))
+        fw2 = bound.get("firmware") or {}
+        check("1d · 配齐后已绑定响应也带 firmware 段",
+              code_bound == 200 and bool(fw2), str(list(bound.keys())))
+        check("1d · 已绑定 firmware.version/url == 配置值",
+              fw2.get("version") == version and fw2.get("url") == url,
+              str(fw2))
+        # 新段不能挤掉既有段：已绑定路径的 websocket 是设备的命脉
+        check("1d · firmware 段不挤掉 websocket 段",
+              bool(bound.get("websocket")), str(list(bound.keys())))
+    finally:
+        # 还原默认环境并重载：不能把配置留给后续断言组
+        for key in keys:
+            os.environ.pop(key, None)
+        importlib.reload(_config)
 
 
 async def t_ws_auth(ids: dict) -> None:
@@ -2483,6 +2577,7 @@ def main() -> int:
         import asyncio
 
         t_ota(ids)
+        t_ota_firmware(ids)
         t_activate_v2()
         asyncio.run(_amain(ids, libopus))
         t_usage_rows(ids)

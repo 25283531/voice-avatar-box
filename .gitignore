@@ -79,3 +79,6 @@ Thumbs.db
 
 # 本地下载的构建产物
 out/
+# 仓库根的 dist/（从 Actions 下载的 APK/固件整包暂存，2026-10-19 QA 发现
+# 只有 app/dist/ 被规则命中而根 dist/ 漏网，48MB 二进制有误入库风险）
+dist/

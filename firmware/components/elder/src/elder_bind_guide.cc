@@ -18,12 +18,19 @@
 // 「Board 已构造完成」，也等价于「屏幕驱动就绪」。这里用 Display* 非空而
 // 不是 DisplayLockGuard，等价但更轻——不与上游刷屏争锁。
 //
-// ── 与上游 OTA 激活循环的显示争用（已评估：接受）──────────────────────
-// 未绑定时上游每轮 CheckVersion() 失败都会 Alert(ACTIVATION, …)，
-// 写 status_label_ 与 chat_message_label_；本模块用 ShowNotification
-// （notification_label_，同一顶区）约每 15s 刷新一次，实测可压过上游的
-// 逐位念码。刻意不去改上游 application.cc —— 那是冻结镜像（见 VENDOR.md），
-// 改动成本远大于收益。
+// ── 与上游 OTA 激活循环的显示争用（策略已变，2026-10-19 重写）──────────
+// 旧策略：激活码走 ShowNotification（notification_label_，顶部状态栏），
+//   与上游各写各的标签、互不覆盖。
+// 新策略：激活码改用 SetChatMessage 落到 chat_message_label_（屏幕下方
+//   70% 的大字字幕区）—— 用户 2026-10-19 实测反馈「激活码只语音播报一遍、
+//   首字母还没播、希望能显示在屏幕上照着输入」，而顶部状态栏字号小、
+//   13 位连写抄错率极高，只有字幕区扛得动「大字 + 分组」。
+// 争用真相：上游每轮激活循环会用 Alert() 把 chat_message_label_ 覆盖成
+//   服务端下发的 message 文案（application.cc ShowActivationCode → Alert，
+//   见 VENDOR.md 冻结镜像）。一轮激活循环 = 1 次 Alert + 10 次 Activate
+//   重试（每次间隔 3s/10s）⇒ 上游约 30~100s 才重写一次；本模块每 15s
+//   刷新一次，激活码在绝大多数时间里占据屏幕。刻意不去改上游
+//   application.cc —— 改动冻结镜像的成本远大于收益。
 
 #include <cstdio>
 #include <cstring>
@@ -47,6 +54,7 @@
 #include "ota.h"                  // Settings("wifi") 的 ota_url 与服务端契约
 
 #include "elder_bind_guide.h"
+#include "elder_activation.h"   // elder_activation_format：码分组 X-XXXX-XXXX-XXXX（C 接口，.cc 可直接调）
 #include "elder_net.h"
 #include "config_report.h"
 
@@ -226,13 +234,33 @@ bool fetch_activation_code(char *out, size_t out_len)
     return true;
 }
 
-/* ------------------------------------------------------------ 播报 */
+/* ------------------------------------------------------------ 屏显 */
 
 /**
- * 屏显引导文案 + 附带激活码（取到时）。
+ * 屏显引导文案 + 激活码（取到时），多行落在大字字幕区。
  *
- * 只用 ShowNotification，不碰 SetStatus/SetChatMessage —— 那两个是上游的
- * 状态位，抢过来会和 OTA 激活提示互相顶掉。
+ * 布局（走 SetChatMessage，落在屏幕下方 70%、全宽、LONG_WRAP 的
+ * chat_message_label_）：
+ *     激活码
+ *     A-3829-4471-0056
+ *     请使用手机APP或者登录网站进行设备绑定
+ *
+ * 为什么从 ShowNotification 改成 SetChatMessage（2026-10-19 用户实测）：
+ *   激活码原先只语音播报，而内置音效表（assets/lang_config.h）里**没有任何
+ *   字母音**，只有 OGG_0..OGG_9 + 固定短语 ⇒ 首字母（如 W）被跳过不播，
+ *   用户只听到 12 位数字、照输入必然被 APP 的 13 位校验拒掉。语音侧无解
+ *   （补字母音不可行、未绑定设备也没有 TTS 通道），主路径只能是屏显。
+ *   notification_label_ 在顶部状态栏、与网络/电池图标同区且字号小；
+ *   chat_message_label_ 是唯一的大字区，所以搬到这里。
+ *
+ * 为什么必须分组：服务端下发的是**原始 13 位码**（如 W298422335600，
+ * 无短横线 —— server/app/voice/__init__.py 的 activation.code 原样下发，
+ * format_code 只用于服务端日志），不过 elder_activation_format 就上屏
+ * 的话，12 位连写在 320x240 上抄错率极高（elder_activation.h 原话）。
+ *
+ * 与上游争用：每轮激活循环上游会用 Alert 把 chat_message_label_ 覆盖成
+ * message 文案；本函数由主循环每 15s 调一次，把激活码重新压回去
+ * （详见文件头「与上游 OTA 激活循环的显示争用」一节）。
  */
 void show_guide(const char *code)
 {
@@ -241,16 +269,25 @@ void show_guide(const char *code)
         return;
     }
 
-    char text[96];
+    // 缓冲区按 UTF-8 字节算：kGuideText 共 54 字节（17 个汉字 + "APP"），
+    // 加上标题/分组码/换行最坏 82 字节（已按字节实测），160 留足一倍余量。
+    char text[160];
     if (code && code[0]) {
-        // 服务端下发的已是 "A-3829-4471-0056" 形态（server/app/security.py
-        // 的 format_code），直接拼即可，不必再过 elder_activation_format。
-        snprintf(text, sizeof(text), "%s\n激活码 %s", kGuideText, code);
+        if (strlen(code) >= ELDER_ACT_CODE_LEN) {
+            // elder_activation_format 要求 out 至少 ELDER_ACT_DISPLAY_LEN
+            // （17 字节：16 字符 + '\0'），这里逐字对齐，不靠巧合。
+            char grouped[ELDER_ACT_DISPLAY_LEN];
+            elder_activation_format(code, grouped, sizeof(grouped));
+            snprintf(text, sizeof(text), "激活码\n%s\n%s", grouped, kGuideText);
+        } else {
+            // 码长不足 13 位（服务端异常）：原样显示也比空白有用，
+            // 且不会去读 code[12] 越界（format 只在前一个分支调）。
+            snprintf(text, sizeof(text), "激活码\n%s\n%s", code, kGuideText);
+        }
     } else {
         snprintf(text, sizeof(text), "%s\n请检查网络后重试", kGuideText);
     }
-    // 25s > 15s 轮询周期，保证两次之间不留空白窗口（老人看到空白会以为死机）。
-    display->ShowNotification(text, 25000);
+    display->SetChatMessage("system", text);
 }
 
 /* ------------------------------------------------------------ 主循环 */
@@ -272,7 +309,10 @@ void guide_task(void *arg)
         char code[40] = {0};
         bool got_code = fetch_activation_code(code, sizeof(code));
         if (got_code) {
-            // 码变了才刷屏，避免每 15s 用同样的内容闪一次（闪久了像坏了）。
+            // 码**变了**才更新并记日志（同一 MAC 服务端复用同一个码，正常情况下
+            // 每轮都一样，不刷日志）；但 show_guide 每轮都调 —— 上游激活循环
+            // 会周期性把 chat_message_label_ 覆盖成 message 文案，只有 15s
+            // 级的重刷才能把激活码持续压回屏幕（见文件头争用说明）。
             if (strcmp(code, s_last_code) != 0) {
                 snprintf(s_last_code, sizeof(s_last_code), "%s", code);
                 ESP_LOGI(TAG, "已取到激活码: %s", s_last_code);

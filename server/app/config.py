@@ -258,6 +258,28 @@ ACT_CODE_LEN = 13
 ACT_CODE_TTL_MINUTES = int(os.getenv("ELDER_ACT_TTL_MIN", "10"))
 LETTERS = "ABCDEFGHJKLMNPQRSTUVWXYZ"
 
+# ---------------------------------------------------------------- 设备 OTA 固件分发
+# 两个变量**都非空**时，OTA 响应（已绑定 / 未绑定两条路径）才带
+# ``"firmware": {"version": ..., "url": ...}``；任一为空 = 不返回该段
+# = 设备永远不 OTA（**默认行为逐字不变**，既有部署升级不受影响）。
+#
+# 为什么是「两个都非空」而不是「配了 url 就返回」：只配一半等于配置不完整，
+# 下一个缺字段的段会让固件白做一次版本比较，不如干脆不返回让设备保持现状。
+#
+# 取值口径：
+#   * ``version`` 的真源是 ``firmware/xiaozhi/CMakeLists.txt`` 的 ``PROJECT_VER``
+#     （固件侧 ``ota.cc`` 用自己的 current_version_ 与服务端下发的版本比较，
+#     服务端**不判断**设备当前版本，只报告最新可用版本）；
+#   * ``url`` 指向的必须是**单 app 镜像**（CI 产物 ``xiaozhi.bin``），
+#     **不是** ``merged-flash.bin`` —— ``Ota::Upgrade()`` 用 ``esp_ota_write``
+#     写 OTA 分区，只吃单 app 镜像；
+#   * 二进制**不由本服务托管**：地址由部署方提供（Nginx 静态目录 / OSS / CDN），
+#     且必须是设备可达的地址（内网设备给内网地址）。GitHub Actions artifact
+#     有保留期限，生产要放稳定位置。
+# 完整运维口径见 docs/DEPLOY.md §1.10。
+FIRMWARE_VERSION = os.getenv("ELDER_FIRMWARE_VERSION", "").strip()
+FIRMWARE_URL = os.getenv("ELDER_FIRMWARE_URL", "").strip()
+
 # ---------------------------------------------------------------- 自研语音链路
 # ⚠️ 这里**不再是** xiaozhi-esp32-server。
 #

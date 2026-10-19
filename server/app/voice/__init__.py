@@ -119,6 +119,26 @@ def _utcnow():
     return _dt.datetime.now(_dt.timezone.utc)
 
 
+def _firmware_section() -> dict[str, Any] | None:
+    """OTA 响应的 ``firmware`` 段；未配置（任一变量为空）时返回 None。
+
+    为什么在**调用时**读 ``config`` 模块属性而不是 import 期固化：
+    ``config`` 是 import 期读环境变量的模块，冒烟脚本用
+    ``importlib.reload(app.config)`` 切换场景，只有动态读才拿得到
+     reload 后的值（与 ``device_api._voice_endpoints`` 的读点同一形态）。
+
+    为什么两个都非空才返回：只配一半 = 配置不完整，下一个缺字段的段
+    只会让固件白做一次版本比较，不如不返回让设备保持「不 OTA」的现状。
+    版本比较由固件自己做（``ota.cc`` 的 ``IsNewVersionAvailable``），
+    服务端只报告最新可用版本，不判断设备当前版本。
+    """
+    version = (config.FIRMWARE_VERSION or "").strip()
+    url = (config.FIRMWARE_URL or "").strip()
+    if not version or not url:
+        return None
+    return {"version": version, "url": url}
+
+
 def _ensure_activation_code(db: Any, mac: str) -> ActivationCode:
     """给未绑定设备一个激活码：优先复用，没有再建。"""
     row = _reusable_activation_code(db, mac)
@@ -161,6 +181,12 @@ async def ota_check(
 
     ``include_in_schema=False``（见装饰器处注释）：消费者是固件而非前端。
 
+    固件段（可选）：``ELDER_FIRMWARE_VERSION`` 与 ``ELDER_FIRMWARE_URL``
+    **都配置了**才在两条路径的响应里带上 ``firmware`` 段（版本比较由固件
+    自己做，服务端只报告最新可用版本）；未配置时不返回该段，行为与
+    配置该特性之前逐字一致。见 :func:`_firmware_section` 与
+    docs/DEPLOY.md §1.10。
+
     为什么这个端点无鉴权却不能乱给东西
     ---------------------------------
     设备此时**还没有 token**（token 要从这个响应里拿），所以无法要求
@@ -194,6 +220,9 @@ async def ota_check(
                     "token": token,
                 },
             }
+            firmware = _firmware_section()
+            if firmware is not None:
+                payload["firmware"] = firmware
             log.info("OTA：设备 %s 已绑定（owner=%s），下发 WS 通道",
                      mac, dev.owner_id)
             return JSONResponse(content=payload)
@@ -207,6 +236,9 @@ async def ota_check(
                 "message": "请在手机 APP 输入激活码，把设备绑定到您的账户",
             },
         }
+        firmware = _firmware_section()
+        if firmware is not None:
+            payload["firmware"] = firmware
         log.info("OTA：设备 %s 未绑定，下发激活码 %s（无 websocket 段）",
                  mac, format_code(row.code))
         return JSONResponse(content=payload)
