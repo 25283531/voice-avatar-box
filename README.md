@@ -569,6 +569,31 @@ LVGL display，真机表现为全黑屏 + `font context is NULL`。
 改了拼音忘改汉字会出现「喊 A 显示 B」的割裂。另注意 `main/boards/` 下 4 块
 演示板的 ASR 按钮直接引用 `CONFIG_CUSTOM_WAKE_WORD_DISPLAY` 宏，自动跟随。
 
+🚨 **改了配置但固件没变？先查 `sdkconfig` 残留**
+2026-10-19 真实事故：唤醒词明明改对了，编译烧的固件**仍然只认「你好小智」**。
+原因是 ESP-IDF 里 `sdkconfig`（本地生成、不入库）的优先级**高于**
+`sdkconfig.defaults`，后者只在**首次生成**时参与，而 kconfig 对已存在的选项
+**默认不覆盖**——全程**不报错、不告警**，症状与「模型没烧进分区」完全一样。
+
+⇒ 改完配置按这个顺序走，别跳步：
+
+```bash
+# 1) 改 firmware/xiaozhi/sdkconfig.defaults（或改 merge 脚本后重跑 merge）
+# 2) 删 sdkconfig（不入库，会按 defaults 重新生成）——★ 最容易漏的一步
+rm -f firmware/xiaozhi/sdkconfig
+# 3) 删 build 并**先 set-target**（不 set-target 会按 esp32 编译，
+#    esp_video 等依赖的 rule 会把摄像头组件判成无用，见决策记录 D29）
+rm -rf firmware/xiaozhi/build
+python tools/idfwin.py set-target esp32s3
+# 4) 编译前的必过自检（把上面这些坑全变成会红的断言）
+python tools/prebuild_check.py
+# 5) 编译
+python tools/idfwin.py build
+```
+
+CI 里第 4 步已自动执行（`firmware-build.yml`），本地不会漏。
+自检项与判据见 `tools/prebuild_check.py` 模块 docstring 与决策记录 D28。
+
 除唤醒词外还有 **6 条离线命令词，无需先说唤醒词，直接说即生效**：
 
 | 命令词 | 拼音（MultiNet 注册用） | 作用 |

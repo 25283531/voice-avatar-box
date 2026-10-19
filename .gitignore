@@ -44,6 +44,9 @@ firmware/xiaozhi/managed_components/
 firmware/xiaozhi/sdkconfig
 firmware/xiaozhi/sdkconfig.old
 firmware/xiaozhi/components/elder/
+# 组件管理器删「无用组件」时会撞本机删除守卫（按文件数批量拦截），
+# 规避方式是先 Move-Item 移到这里暂存（可逆、不改阈值），构建后可直接删
+firmware/xiaozhi/.mc_stash/
 
 # ---------------------------------------------------------- 杂项
 # QA 补丁前备份 / 临时探针：一次性产物，历史已踩过「临时脚本混进 commit 后

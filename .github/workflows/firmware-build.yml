@@ -94,6 +94,18 @@ jobs:
           echo "--- sdkconfig.defaults 关键行 ---"
           grep -E 'BOARD_TYPE|ELDER_SERVER_URL|EMOTE|SPIRAM|FLASHSIZE|PARTITION' "$DEF" || true
 
+      # ⚠️ 放在「覆盖板卡与地址」**之后**：自检读的就是被覆盖完的最终值。
+      #
+      # 防的是 2026-10-19 那类事故：**改了 sdkconfig.defaults 但固件没变**。
+      # kconfig 以已存在的 sdkconfig 为准、defaults 只在首次生成时参与，
+      # 且**不报错不告警** ⇒ 症状是「唤醒词改成小暖了但设备只认小智」。
+      # CI 是干净环境（无 sdkconfig）所以这里本就会绿——真正的风险在本地，
+      # 但让**同一套判据**在两边跑，才能保证「本地过了 = CI 会过」。
+      - name: 编译前配置自检
+        run: |
+          set -e
+          python3 tools/prebuild_check.py --strict
+
       - name: 缓存 IDF 组件与 ccache
         uses: actions/cache@v4
         with:

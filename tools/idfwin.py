@@ -64,6 +64,12 @@ def build_env() -> dict:
     env["IDF_TOOLS_PATH"] = str(IDF_TOOLS_PATH)
     env["IDF_PATH"] = str(IDF_PATH)
     env["IDF_PYTHON_ENV_PATH"] = str((IDF_TOOLS_PATH / "python_env"))
+    # ⚠️ 禁用 ccache 的**环境层**（与 idf.py 层双保险）。
+    #    仓库路径含中文，ccache 转换路径时抛
+    #      "Cannot convert character sequence: Illegal byte sequence"
+    #    ⇒ 表现为若干编译单元 FAILED，而报错完全指不到中文路径。
+    #    两层都设的原因：export.ps1 会自行探测并启用 ccache，单设一处不可靠。
+    env["IDF_CCACHE_ENABLE"] = "0"
     # 让 pip/urllib 走系统代理失效时不再卡住
     env.setdefault("PYTHONIOENCODING", "utf-8")
     return env
@@ -84,11 +90,21 @@ def main() -> int:
     # 正式构建走官方 export.ps1，由它负责把 cmake / ninja / xtensa 工具链装进 PATH，
     # 避免我们在脚本里硬编码工具版本号。
     quoted = ", ".join(f"'{a}'" for a in args)
+    # ⚠️ 必须禁用 ccache：仓库路径含中文（`G:\workbuddy\语音助手\...`），
+    #    而 ccache 走自己的路径转换，遇到无法映射的字节序列就抛
+    #        what(): filesystem error: Cannot convert character sequence:
+    #                 Illegal byte sequence
+    #    表现为 12 个编译单元全部 FAILED，报错信息完全指不到「中文路径」。
+    #    ⚠️ 必须在 export.ps1 **之前**设：export.ps1 自己会去探测并启用 ccache，
+    #    之后再设就晚了（已验证：改前 12 FAILED / 改后全绿）。
+    #    CI（ubuntu）路径无中文，不需要这个开关，但同一份脚本两边都能跑。
     script = (
         "$ErrorActionPreference='Continue'\n"
         f"$env:IDF_TOOLS_PATH='{IDF_TOOLS_PATH}'\n"
         f"$env:IDF_PATH='{IDF_PATH}'\n"
+        "$env:IDF_CCACHE_ENABLE='0'\n"
         f"& '{IDF_PATH / 'export.ps1'}' | Out-Null\n"
+        "$env:IDF_CCACHE_ENABLE='0'\n"   # export 之后再说一次，防它自己又打开
         f"& python '{IDF_PATH / 'tools' / 'idf.py'}' @({quoted})\n"
         "exit $LASTEXITCODE\n"
     )

@@ -1,0 +1,289 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+prebuild_check.py —— 编译前的配置一致性自检（秒级，先于 idf.py build 跑）。
+
+为什么需要这个脚本
+------------------
+2026-10-19 的实测事故：**改了仓库里的配置，但编译出来的固件没变**。
+用户按 10-18 的要求把唤醒词改成了「你好，小暖」，`sdkconfig.defaults` 里
+确实改对了 —— 但真正参与编译的 `sdkconfig`（本地生成、**不入库**）里
+还是 10-17 的旧值「你好小智」，于是烧到设备上的固件喊「你好小暖」不应答。
+用户报上来的是「离线唤醒不能用」，与「模型没烧进去」症状**完全一样**。
+
+根因是 ESP-IDF 的标准行为，但**没有任何提示**：
+  * `sdkconfig` 一旦存在，kconfig 就以它为准；
+  * `sdkconfig.defaults` **只在首次生成时**参与；
+  * 而 kconfig 对「已存在的选项」默认不覆盖 ⇒ 改了 defaults 也白改。
+
+这类问题的特点是「不报错、不告警、改了仓库不生效」，属于最难查的一类。
+所以把它变成**编译前必过的门禁**：不查出来就不让编译。
+
+检查项
+------
+C1. ``sdkconfig`` 残留且与 ``sdkconfig.defaults`` 冲突（★ 本次事故的真凶）
+C2. 关键选项与「仓库里的期望值」不符（如显示风格/唤醒词/分区表）
+C3. 分区表文件存在（配置指向的文件别是空指针）
+C4. merge 注入完整（elder 组件 + 70/30 布局标记）
+
+用法：
+    python tools/prebuild_check.py           # 有问题退 1
+    python tools/prebuild_check.py --strict  # 警告也退 1（CI 用）
+"""
+from __future__ import annotations
+
+import argparse
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+XIAOZHI = ROOT / "firmware" / "xiaozhi"
+SDKCONFIG = XIAOZHI / "sdkconfig"
+SDK_DEFAULTS = XIAOZHI / "sdkconfig.defaults"
+BUILD_H = XIAOZHI / "build" / "config" / "sdkconfig.h"
+
+#: overlay 段标记。⚠️ 必须与 tools/merge_to_xiaozhi.py 的 BEGIN/END **逐字一致**，
+#: 改那边要改这边 —— 不一致的后果是 overlay_keys() 返回空集，
+#: 于是 C1 什么都不检查、静默放行（比报错更糟）。
+BEGIN_MARK = "# >>> BEGIN elder-companion overlay"
+END_MARK = "# <<< END elder-companion overlay"
+
+results: list[tuple[str, bool, str, bool]] = []  # (名称, 通过, 详情, 是否致命)
+
+
+def check(name: str, ok: bool, detail: str = "", fatal: bool = True) -> None:
+    results.append((name, bool(ok), detail, fatal))
+    tag = "PASS" if ok else ("FAIL" if fatal else "WARN")
+    print(f"  [{tag}] {name}")
+    # ⚠️ detail 里常写「⚠️ xxx」这样的告警文案（同一份文案在 FAIL 时是解释、
+    #    在 PASS 时就是噪音）。PASS 时把以 ⚠️ 开头的行去掉，避免
+    #    「[PASS] … -> ⚠️ 这些配置的改动不会生效」这种自相矛盾的输出
+    #    —— 那种输出会让人怀疑整个脚本是不是坏了。
+    if detail:
+        lines = [ln for ln in detail.splitlines() if not ln.strip().startswith("⚠️")]
+        if lines:
+            print("         -> " + "\n         ".join(lines))
+
+
+def read_kv(path: Path) -> dict[str, str]:
+    """读 kconfig 风格文件的 key=value（只看最后出现的，后定义覆盖先定义）。
+
+    同时支持两种形态：
+      * ``CONFIG_X=y``（sdkconfig / sdkconfig.defaults）
+      * ``#define CONFIG_X "v"``（build/config/sdkconfig.h，C 头文件）
+    ⚠️ 后者**必须能读**：C3b 要校验的目标芯片只存在于 .h 里，
+       拿 kconfig 解析器去读 .h 会一律返回空 ⇒ 永远判红（第一版就这毛病）。
+    """
+    out: dict[str, str] = {}
+    if not path.is_file():
+        return out
+    for raw in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        line = raw.strip()
+        # 形态二：C 头文件的 #define
+        m = re.match(r"#define\s+(CONFIG_\S+)\s+(.+)$", line)
+        if m:
+            out[m.group(1)] = m.group(2).strip().strip('"')
+            continue
+        if not line or line.startswith("#"):
+            # 「# CONFIG_X is not set」也算一种明确取值
+            m = re.match(r"#\s*(CONFIG_\S+)\s+is not set", line)
+            if m:
+                out[m.group(1)] = ""
+            continue
+        # 形态一：kconfig 的 key=value
+        m = re.match(r"(CONFIG_\S+?)[\s]*[=]", line)
+        if m:
+            key = m.group(1)
+            val = line.split("=", 1)[1].strip() if "=" in line else "y"
+            out[key] = val.strip('"')
+    return out
+
+
+def overlay_keys(defaults_path: Path) -> set[str]:
+    """取 sdkconfig.defaults 里**我们自己的 overlay 段**里的键。
+
+    段边界是 merge_to_xiaozhi.py 写下的 BEGIN/END 标记（同一份常量，
+    改动时两处必须同步——已在 docstring 里注明）。
+
+    为什么要单独取：
+      * 我们主动改的只有这一段，改它时「忘了删 sdkconfig」才是真事故；
+      * 其余行来自上游（板型默认值、Kconfig 默认），它们与 sdkconfig 不一致
+        是**正常**的，逐条比对只会产出永久性假红，把真信号淹掉。
+    """
+    if not defaults_path.is_file():
+        return set()
+    inside = False
+    keys: set[str] = set()
+    for raw in defaults_path.read_text(encoding="utf-8",
+                                       errors="replace").splitlines():
+        s = raw.strip()
+        if s.startswith(BEGIN_MARK):
+            inside = True
+            continue
+        if s.startswith(END_MARK):
+            inside = False
+            continue
+        if inside and s and not s.startswith("#") and "=" in s:
+            keys.add(s.split("=", 1)[0].strip())
+    return keys
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description="编译前配置一致性自检")
+    ap.add_argument("--strict", action="store_true", help="警告也视为失败（CI 用）")
+    args = ap.parse_args()
+
+    print("=" * 68)
+    print("编译前配置自检（2026-10-19「改了配置但固件没变」事故而加）")
+    print("=" * 68)
+
+    defaults = read_kv(SDK_DEFAULTS)
+
+    # ------------------------------------------------------ C1 sdkconfig 残留
+    if SDKCONFIG.is_file():
+        actual = read_kv(SDKCONFIG)
+        # ⚠️ 只比**我们自己 overlay 的那一段**。上游按板型切了多个
+        #    sdkconfig.defaults.esp32s3 等文件，它们的默认值（如 WiFi 缓冲区
+        #    3/6）与我们的 sdkconfig.defaults（6/8）本来就不一样，**不是冲突**。
+        #    第一版没排除它们 ⇒ set-target 之后永远报 C1 失败，而真正该拦的
+        #    「改了我们自己的配置却没生效」反而被淹没在噪音里。
+        #    做法：以 overlay 段标记为界，只取那段里的键。
+        ours = overlay_keys(SDK_DEFAULTS)
+        conflicts = []
+        for k in ours:
+            v = defaults.get(k, "")
+            if k not in actual:
+                continue
+            av = actual[k]
+            norm = {"y": "y", "": "n", "n": "n"}.get(av, av)
+            want = {"y": "y", "": "n", "n": "n"}.get(v, v)
+            if norm != want and not (want == "y" and norm == "y"):
+                conflicts.append(f"{k}: defaults={v!r} 但 sdkconfig={av!r}")
+        check(
+            "C1 sdkconfig 与我们的 overlay 段无冲突",
+            not conflicts,
+            "⚠️ **这些配置的改动不会生效**（kconfig 以已存在的 sdkconfig 为准）："
+            + "；".join(conflicts[:6])
+            + ("…" if len(conflicts) > 6 else "")
+            + f"\n         处置：删掉 {SDKCONFIG.name} 后重新编译（它不入库，"
+              f"会自动按 defaults 重新生成）",
+        )
+    else:
+        check("C1 无 sdkconfig 残留（将按 defaults 生成）", True)
+
+    # ------------------------------------------------------ C2 关键选项
+    # 用哪份为准：sdkconfig 在则以它为准（编译真正读的是它），否则用 defaults
+    src = read_kv(SDKCONFIG) if SDKCONFIG.is_file() else defaults
+    where = "sdkconfig" if SDKCONFIG.is_file() else "sdkconfig.defaults"
+
+    check(
+        "C2a 显示风格是标准 LVGL（不是 emote）",
+        src.get("CONFIG_USE_DEFAULT_MESSAGE_STYLE", "n") == "y",
+        f"{where} 里 CONFIG_USE_DEFAULT_MESSAGE_STYLE="
+        f"{src.get('CONFIG_USE_DEFAULT_MESSAGE_STYLE', '(未设置)')!r}。"
+        f"emote 那条路真机黑屏已实证（gfx_label: font context is NULL），"
+        f"详见 sdkconfig.defaults 的注释段",
+    )
+
+    wake = src.get("CONFIG_CUSTOM_WAKE_WORD", "")
+    display = src.get("CONFIG_CUSTOM_WAKE_WORD_DISPLAY", "")
+    # 判据只认**拼音词根**：汉字里没有「xiao nuan」这种拉丁串，
+    # 不能拿拉丁串去 display 里找（第一版就这么写的，必然假红：
+    # 「你好，小暖」里永远找不到 "xiao nuan"）。
+    # 正确做法是查两件事各自是否**正确**，而不是要求二者「互相包含」——
+    # 拼音↔汉字一致是 Kconfig/编码层面的事实，这里只能验「不是旧值」。
+    ok_pinyin = wake.replace(" ", "") == "nihaoxiaonuan"
+    ok_display = display.replace("，", "").replace(",", "").replace(" ", "") == "你好小暖"
+    check(
+        "C2b 唤醒词是「你好，小暖」（拼音与汉字都必须是新值）",
+        ok_pinyin and ok_display,
+        f"{where}: 拼音={wake!r} 屏显={display!r}"
+        + ("" if ok_pinyin and ok_display
+           else "。⚠️ 仍是旧唤醒词「你好小智」—— 改了 defaults 但 sdkconfig "
+                "残留时最常见（kconfig 以已存在的 sdkconfig 为准）"),
+    )
+
+    check(
+        "C2c 离线唤醒模型已选（mn7_cn）",
+        src.get("CONFIG_SR_MN_CN_MULTINET7_QUANT", "n") == "y",
+        f"{where} 里 CONFIG_SR_MN_CN_MULTINET7_QUANT="
+        f"{src.get('CONFIG_SR_MN_CN_MULTINET7_QUANT', '(未设置)')!r}；"
+        f"没开它则 srmodels.bin 不打包 ⇒ 离线唤醒与命令词双双失效",
+    )
+
+    part = src.get("CONFIG_PARTITION_TABLE_CUSTOM_FILENAME", "").strip('"')
+    check(
+        "C3 分区表文件存在（含 assets 分区）",
+        bool(part) and (XIAOZHI / part).is_file(),
+        f"CONFIG_PARTITION_TABLE_CUSTOM_FILENAME={part!r}；"
+        f"assets 分区缺失则模型与形象都烧不进去",
+        fatal=bool(part),
+    )
+
+    # ------------------------------------------------------ C3b 目标芯片
+    # 真实事故（2026-10-19）：删掉 build/ 与 sdkconfig 后直接 `idf.py build`，
+    # 此时 IDF 没有目标芯片的概念，**默认按 esp32 构建**。日志里那句
+    # `-- Building ESP-IDF components for target esp32` 就是它。
+    # 后果不是报错，而是连锁误判：
+    #   * esp_video 的 rule 是 `if: target not in [esp32]` ⇒ 在 esp32 下
+    #     它是「可选依赖」被跳过 ⇒ esp_cam_sensor 被判定无用 ⇒ 组件管理器
+    #     尝试删除 179 个文件 ⇒ 在本机触发安全删除守卫，编译直接失败；
+    #   * 即便侥幸编过，出来的也是**给 esp32 的固件**，烧到 S3 上不工作。
+    # ⇒ 删 build 后的正确顺序是 set-target → build，脚本头部已写明，这里守着。
+    if BUILD_H.is_file():
+        target = read_kv(BUILD_H).get("CONFIG_IDF_TARGET", "")
+        check(
+            "C3b 目标芯片是 esp32s3（删 build 后必须先 set-target）",
+            target == "esp32s3",
+            f"build/config/sdkconfig.h 里 CONFIG_IDF_TARGET={target!r}，"
+            f"期望 'esp32s3'。为空说明还没 set-target —— 直接 build 会按 "
+            f"esp32 编译（esp_video 等依赖的 rule 会把摄像头组件判成无用）。"
+            f"处置：python tools/idfwin.py set-target esp32s3",
+            fatal=True,
+        )
+    else:
+        check(
+            "C3b 目标芯片配置存在", False,
+            f"缺 {BUILD_H}。这是「还没 build 过」的正常状态，但请确认编译顺序是 "
+            f"set-target esp32s3 → build（直接 build 会按 esp32 编）",
+            fatal=False,
+        )
+
+    # ------------------------------------------------------ C4 merge 注入
+    try:
+        rc = subprocess.run(
+            [sys.executable, str(ROOT / "tools" / "merge_to_xiaozhi.py"), "--check"],
+            capture_output=True, text=True, timeout=120, cwd=str(ROOT),
+        ).returncode
+        check("C4 merge 注入完整（elder 组件 + 70/30 布局）", rc == 0,
+              "" if rc == 0 else "merge_to_xiaozhi.py --check 失败，先跑 merge")
+    except Exception as exc:  # noqa: BLE001
+        check("C4 merge 注入完整", False, f"无法执行 merge --check: {exc}")
+
+    # ------------------------------------------------------ 汇总
+    failed = [r for r in results if not r[1] and r[3]]
+    warned = [r for r in results if not r[1] and not r[3]]
+    print("\n" + "=" * 68)
+    print(f"共 {len(results)} 条：通过 {len(results) - len(failed) - len(warned)}，"
+          f"失败 {len(failed)}，警告 {len(warned)}")
+    for n, _ok, _d, _f in failed:
+        print(f"  ✗ {n}")
+    for n, _ok, _d, _f in warned:
+        print(f"  ! {n}")
+    print("=" * 68)
+
+    if failed:
+        print("\n**先修掉上面的失败项再编译** —— 带着过期配置编译出来的固件，"
+              "\n症状是「改了代码但设备行为没变」，比不编译更难排查。")
+        return 1
+    if warned and args.strict:
+        return 1
+    if warned:
+        print("\n有警告项，已放行（--strict 会拦）。")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
