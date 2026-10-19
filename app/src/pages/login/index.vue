@@ -93,12 +93,14 @@ function openDoc(url: string) {
         <text :class="['tab', mode === 'register' ? 'on' : '']" @click="switchMode">注册</text>
       </view>
 
-      <input v-model="form.username" class="input" placeholder="账号" maxlength="32" />
-      <input v-model="form.password" class="input" password placeholder="密码" maxlength="32" />
+      <!-- placeholder-class 必填：APP 端原生 input 的占位符不继承 .input 的颜色，
+           不指定就用系统默认灰。要求老人也能看清提示文字。 -->
+      <input v-model="form.username" class="input" placeholder-class="input-placeholder" placeholder="账号" maxlength="32" />
+      <input v-model="form.password" class="input" password placeholder-class="input-placeholder" placeholder="密码" maxlength="32" />
       <template v-if="mode === 'register'">
-        <input v-model="form.again" class="input" password placeholder="确认密码" maxlength="32" />
-        <input v-model="form.nickname" class="input" placeholder="称呼（可选）" maxlength="32" />
-        <input v-model="form.email" class="input" placeholder="邮箱（可选，用于找回密码）" maxlength="64" />
+        <input v-model="form.again" class="input" password placeholder-class="input-placeholder" placeholder="确认密码" maxlength="32" />
+        <input v-model="form.nickname" class="input" placeholder-class="input-placeholder" placeholder="称呼（可选）" maxlength="32" />
+        <input v-model="form.email" class="input" placeholder-class="input-placeholder" placeholder="邮箱（可选，用于找回密码）" maxlength="64" />
       </template>
 
       <button class="btn" :disabled="busy" @click="onSubmit">
@@ -121,46 +123,76 @@ function openDoc(url: string) {
 </template>
 
 <!--
-  一屏显示（2026-10-19 用户实测修复）
+  一屏显示 + 输入框可见（2026-10-19 两轮用户实测）
 
-  现象：安卓 APP 注册页装不下，底部「注册」按钮和协议勾选要滚动才看得到。
+  第一轮（只为一屏）：安卓 APP 注册页装不下，底部按钮和协议要滚动才看得到。
+  按 rpx 算原布局注册态总高 ≈ 1326rpx，而典型安卓视口可用高约 1200rpx
+  （16:9 扣掉状态栏/导航栏）。做法是压「非信息」的垂直开销：
+  brand 装饰、card/page 内边距、注册态隐藏登录态的「忘记密码」提示。
+  ⚠️ 当时**顺手把输入框上下内边距从 22 压到 16** —— 这一步是错的，
+  直接导致下面的输入框文字被裁。
 
-  原因（按 rpx 算的，750rpx = 屏幕宽）：
-    原布局注册态总高 ≈ 1326rpx，而典型安卓视口可用高只有 ~1200rpx
-    （16:9 屏扣掉状态栏/导航栏），必然溢出。逐项构成：
-      page padding 96 + brand 326（logo 150 + 名称 + 副标题 + 48 下边距）
-      + card padding 72 + tabs 138 + 5 个输入框 535 + 按钮 89
-      + 协议行 56 + 底部提示 62。
+  第二轮（用户截图反馈）：内容框被压成扁带、输入的文字只露上半截，
+  而占位符「邮箱（可选，用于找回密码」显示完整。
+  ⇒根因不是「整体压太扁」，而是**只用 padding 撑高度对APP 端原生<input>
+  无效**，其内容盒高度由原生样式决定；line-height 又没固定，
+  默认行高大于内容盒 ⇒ 文字上沿被裁。占位符由原生 hint 视图单独绘制，
+  所以不受影响——「占位符完整但输入内容被裁」就是这个根因的指纹。
 
-  做法：压「非信息」的垂直开销，信息本身不动。
-    · brand 是装饰，占了 326rpx 却零信息量 → logo 与间距各砍 ~40%
-    · 输入框上下内边距 22→16、间距 20→16（5 个框省 60rpx）
-    · card / page 内边距同步收窄
-    · 底部「忘记密码」提示**注册态隐藏**：它讲的是登录态的事，
-      注册的人此刻根本用不上（登录态仍保留）
-    · 协议行仍允许折行（宽屏一行、小屏两行都放得下）
-
-  结果：注册态 ≈ 1047rpx、登录态 ≈ 1140rpx，均在一屏内，且仍保留
-  页面滚动作为极小屏（< 5 吋）的兜底——不写 overflow:hidden，
-  免得万一装不下时用户连滚动都没得滚。
+  修正：输入框改成height/line-height 显式固定（见 .input），
+  上下padding 去掉只留左右；品牌区与内边距**适度回收**，
+  因为实测截图里卡片下方仍有大片空白，一屏并不紧张。
+  仍不写 overflow:hidden —— 万一极小屏装不下，用户连滚动都没得滚。
 -->
 <style scoped>
-.page { padding: 24rpx 32rpx; background: #f5f7fa; min-height: 100vh; box-sizing: border-box; }
-.brand { text-align: center; margin-bottom: 24rpx; }
-.logo { width: 112rpx; height: 112rpx; border-radius: 26rpx; }
-.brand-name { font-size: 40rpx; font-weight: 700; margin-top: 14rpx; }
-.brand-sub { font-size: 24rpx; color: #8a8f99; margin-top: 6rpx; }
+.page { padding: 28rpx 32rpx; background: #f5f7fa; min-height: 100vh; box-sizing: border-box; }
+.brand { text-align: center; margin-bottom: 28rpx; }
+.logo { width: 120rpx; height: 120rpx; border-radius: 28rpx; }
+.brand-name { font-size: 42rpx; font-weight: 700; margin-top: 14rpx; }
+.brand-sub { font-size: 26rpx; color: #8a8f99; margin-top: 8rpx; }
 .card { background: #fff; border-radius: 24rpx; padding: 28rpx; box-sizing: border-box; }
-.tabs { display: flex; margin-bottom: 18rpx; }
-.tab { flex: 1; text-align: center; padding: 14rpx 0; font-size: 30rpx; color: #6b7280; }
+.tabs { display: flex; margin-bottom: 20rpx; }
+.tab { flex: 1; text-align: center; padding: 16rpx 0; font-size: 32rpx; color: #6b7280; }
 .tab.on { color: #e8590c; font-weight: 700; border-bottom: 4rpx solid #e8590c; }
-.input { border: 1rpx solid #e3e8ef; border-radius: 12rpx; padding: 16rpx 22rpx; margin-bottom: 16rpx; font-size: 30rpx; background: #fff; width: auto; box-sizing: border-box; }
-.btn { background: #e8590c; color: #fff; border-radius: 12rpx; font-size: 32rpx; padding: 18rpx 0; font-weight: 600; margin-top: 4rpx; }
+/*
+  输入框必须显式给 height + line-height（2026-10-19 用户实测截图）
+
+  现象：内容框被压成扁带，输入的文字**只露出上半截**
+        （占位符「邮箱（可选，用于找回密码」却是完整的）。
+  根因：只用 padding 撑高度时，APP 端 `<input>` 是**原生控件**，
+        它的内容盒高度由原生样式决定、与 padding 无关；
+        而 line-height 未固定，默认行高算出来大于内容盒高度 ⇒ 文字上沿被裁。
+        占位符由原生 hint 视图单独绘制，所以它不受影响 ——
+        **「占位符完整但输入内容被裁」正是这个根因的指纹**，
+        遇到时直接怀疑 line-height/height，而不是「整体压太扁」。
+
+  修法：height 用 rpx 固定给足，line-height 与 height 相同让文字垂直居中，
+        padding 只保留左右（上下 padding 对原生控件的高度无效，还会挤内容）。
+
+  一屏显示仍要保证：靠brand 装饰压缩 + 注册态隐藏登录态提示，
+  不再靠压输入框 —— 上一轮正是压输入框导致这个 bug。
+*/
+.input {
+  border: 1rpx solid #e3e8ef;
+  border-radius: 12rpx;
+  /* 88rpx ≈ 44px：对老人字号（30rpx ≈ 15px）足够，且仍属紧凑 */
+  height: 88rpx;
+  line-height: 88rpx;
+  padding: 0 24rpx;
+  margin-bottom: 20rpx;
+  font-size: 30rpx;
+  background: #fff;
+  color: #1f2430;
+  width: auto;
+  box-sizing: border-box;
+}
+.input-placeholder { color: #a8aeb8; }
+.btn { background: #e8590c; color: #fff; border-radius: 12rpx; font-size: 34rpx; padding: 24rpx 0; font-weight: 600; margin-top: 8rpx; }
 .btn[disabled] { background: #f0b48a; }
-.agree { display: flex; flex-direction: row; align-items: center; flex-wrap: wrap; margin-top: 20rpx; font-size: 24rpx; color: #6b7280; line-height: 1.6; }
-.checkbox { width: 32rpx; height: 32rpx; border: 2rpx solid #c8cdd4; border-radius: 6rpx; margin-right: 10rpx; }
+.agree { display: flex; flex-direction: row; align-items: center; flex-wrap: wrap; margin-top: 24rpx; font-size: 26rpx; color: #6b7280; line-height: 1.6; }
+.checkbox { width: 34rpx; height: 34rpx; border: 2rpx solid #c8cdd4; border-radius: 6rpx; margin-right: 10rpx; }
 .checkbox.on { background: #e8590c; border-color: #e8590c; }
 .agree-text { color: #6b7280; }
 .agree-link { color: #e8590c; }
-.tip { font-size: 24rpx; color: #8a8f99; text-align: center; margin-top: 20rpx; line-height: 1.6; }
+.tip { font-size: 26rpx; color: #8a8f99; text-align: center; margin-top: 24rpx; line-height: 1.6; }
 </style>
