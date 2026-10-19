@@ -80,6 +80,23 @@ BASE = f"http://127.0.0.1:{PORT}"
 SERVER_LOG = DB_PATH.with_name(DB_PATH.stem + "_server.log")
 
 results: list[tuple[str, bool, str]] = []
+#: 跳过的断言（name, 原因）。**与失败严格分开**，汇总时单列。
+#:
+#: 为什么要第三态（2026-10-19 的教训，比「假绿」更隐蔽）
+#: ------------------------------------------------------
+#: 本脚本原先按 ``edge_available`` 二选一：有 Edge 依赖就**打真网络**验试听，
+#: 没有就只验 503。于是：
+#:   · CI 装了 edge-tts/av（requirements.txt 里就有）⇒ 真去连微软的
+#:     ``speech.platform.bing.com`` ⇒ **限流/网络抖动 ⇒ 整个后端 CI 变红**，
+#:     而红的原因与本仓库代码无关；
+#:   · 开发机没装 ⇒ 永远走 503 分支 ⇒ **试听成功路径一次都没被执行过**，
+#:     却因为「全绿」被当成验证过了。
+#: 也就是说：同一份脚本在两台机器上**验的不是同一段代码**，而两台都显示绿/红
+#: 各自自洽。这比假绿更坏 —— 假绿至少有个统一的绿可对照，这里是「按环境分裂」。
+#:
+#: 结论：**契约必须与环境无关地断言**，联网部分显式 opt-in 且默认 SKIP。
+#: SKIP 必须报出来，不能混进「通过」——否则「什么都没验」和「都验过了」同形。
+skipped: list[tuple[str, str]] = []
 
 
 def check(name: str, ok: bool, detail: str = "") -> None:
@@ -92,6 +109,15 @@ def check(name: str, ok: bool, detail: str = "") -> None:
     """
     results.append((name, ok, detail))
     print(f"  [{'PASS' if ok else 'FAIL'}] {name}" + (f"  -> {detail}" if detail and not ok else ""))
+
+
+def skip(name: str, reason: str) -> None:
+    """记录一条**被跳过**的断言，并打印出来。
+
+    跳过不是通过。汇总行里必须能看出「有多少条根本没验」。
+    """
+    skipped.append((name, reason))
+    print(f"  [SKIP] {name}  -> {reason}")
 
 
 def req(method: str, path: str, body: dict | None = None, token: str | None = None):
@@ -200,62 +226,141 @@ def main() -> int:
         check("A6 附带了自定义填写说明（前端要展示给管理员）",
               bool((cat or {}).get("custom_hint")), "")
 
-        # ================================================== C. 试听端点
+        # ================================================== C. 音色试听
         # 2026-10-19 用户报「音色（可选）里没有任何音色供选择」。
         # 根因：APP 侧那个框是**自由输入**，从没调过 /api/providers/catalog。
         # 试听是这个缺口的另一半——光有名字没法挑，老人必须能先听。
         print("\n── C. 音色试听（/api/providers/catalog/voice-preview）──")
-        edge_on = (cat or {}).get("edge_available") is True
 
         # C1 未登录必须被拒：试听会消耗 TTS 配额，不能匿名白用。
+        # 这一条与环境无关（鉴权在路由依赖层，早于任何合成），任何机器都必须真跑。
         code, _b, _h = req_bin("GET", "/api/providers/catalog/voice-preview?voice=x")
         check("C1 试听需要登录（匿名被拒）", code in (401, 403), f"code={code}")
 
-        if not edge_on:
-            # 没配 TTS 时必须给 503 而不是 500：
-            # 客户端据此提示「服务未启用语音合成」是可行动的，
-            # 「服务器内部错误」用户只能干瞪眼。
-            code, _b, _h = req_bin(
-                "GET", "/api/providers/catalog/voice-preview?voice=zh-CN-XiaoxiaoNeural",
-                token=token)
-            check("C2 未启用 TTS 时返回 503（不是 500）",
-                  code == 503, f"code={code} edge_available={edge_on}")
-        else:
-            code, wav, hdrs = req_bin(
-                "GET", "/api/providers/catalog/voice-preview?voice=zh-CN-XiaoxiaoNeural",
-                token=token)
-            check("C2 试听端点 200", code == 200, f"code={code} len={len(wav)}")
+        # ---- C2..C10：wav 契约，**打桩 PCM、进程内直调端点函数**，不依赖网络 ----
+        # 为什么要打桩 + 直调（这是本轮修掉的真 bug 的核心）：
+        #   端点真正的职责是「把上游返回的裸 PCM 包成 wav 容器」，而**不是**
+        #   「能不能连上微软」。前者是本仓库的契约，后者是外部依赖。
+        #   原脚本在有 edge-tts 时去打真网络，于是：
+        #     · CI（装了 edge-tts/av）→ 撞微软限流 → 整个后端 CI 红，
+        #       红的原因与本仓库代码无关；
+        #     · 开发机（没装）→ 只跑 503 分支，C3-C6 **从未执行**，
+        #       却因为「全绿」被当成验证过了。
+        #   两台机器验的不是同一段代码，而各自都自洽 —— 比假绿更隐蔽。
+        #
+        #   打桩后：同一段代码在任何机器、任何网络状况下都被验到，且
+        #   「限长」这类断言在真网络下根本没法稳定验（只能靠字节数猜）。
+        #
+        # ⚠️ 为什么是**进程内直调**而不是打桩后走 HTTP：
+        #   服务端是**子进程**（subprocess.Popen），测试进程里替换
+        #   ``tts_edge.synth_pcm`` 根本影响不到它 —— 那样写会得到一份
+        #   「看起来在打桩、其实桩没生效」的假绿，正是本项目反复吃亏的那类。
+        #   端点函数本身是纯逻辑（输入 text/voice，输出 wav 字节），
+        #   直接调用即可；鉴权那一层（C1）仍然走真 HTTP，因为那是路由依赖的事。
+        sys.path.insert(0, str(SERVER))
+        from fastapi import HTTPException  # noqa: E402
+
+        from app.routers import providers as _prov  # noqa: E402
+        from app.voice import tts_edge as _edge_mod  # noqa: E402
+
+        stub_pcm = bytes(range(256)) * 40        # 10240 字节 = 0.213s，确定性数据
+        _seen: list[tuple[str, str]] = []
+        _orig_synth = _edge_mod.synth_pcm
+        _orig_avail = _edge_mod.edge_available
+
+        def _fake_synth(text: str, voice: str, **_kw) -> bytes:
+            _seen.append((text or "", voice or ""))
+            return stub_pcm
+
+        def _boom(*_a, **_kw):
+            raise RuntimeError("上游炸了")
+
+        def _call_preview(text: str = "您好，我是小暖。",
+                          voice: str = "zh-CN-XiaoxiaoNeural"):
+            """直调端点函数，返回 (status, body, headers)；异常路径还原成状态码。
+
+            `user` 传 None：它只服务于 `Depends(get_current_user)`，
+            函数体内并未使用（鉴权由 C1 走真 HTTP 覆盖）。
+            """
+            try:
+                resp = _prov.voice_preview(voice=voice, text=text, user=None)
+                return resp.status_code, resp.body, dict(resp.headers)
+            except HTTPException as exc:
+                return exc.status_code, str(exc.detail).encode(), {}
+
+        try:
+            # C2 正常路径：打桩 PCM ⇒ 纯逻辑，完全离线。
+            _edge_mod.synth_pcm = _fake_synth
+            _edge_mod.edge_available = lambda: True
+            status, wav, hdrs = _call_preview()
+            check("C2 试听端点 200（打桩 PCM，不联网）", status == 200,
+                  f"status={status} body={wav[:120]!r}")
             check("C3 Content-Type 是 audio/wav",
-                  "audio/wav" in (hdrs.get("Content-Type") or ""),
-                  f"got={hdrs.get('Content-Type')!r}")
-            # C4 必须校验 wav 头的三个参数：与 synth_pcm 的输出严格一致。
-            # 「能播但速度不对」（采样率写错）比不播更难排查。
-            ok_hdr = len(wav) > 44 and wav[:4] == b"RIFF" and wav[8:12] == b"WAVE"
-            check("C4 是合法 wav 容器（RIFF/WAVE 魔数）", ok_hdr,
-                  f"magic={wav[:4]!r}/{wav[8:12]!r}")
+                  "audio/wav" in (hdrs.get("content-type") or ""),
+                  f"got={hdrs.get('content-type')!r}")
+
+            # C4 容器头：RIFF/WAVE 魔数 + 长度自洽（44 字节头 + 桩长度）。
+            # 「能播但速度不对」（采样率写错）比不播更难排查，
+            # 所以下面 C5 连位深与采样率一起钉死。
+            ok_hdr = (len(wav) > 44 and wav[:4] == b"RIFF" and wav[8:12] == b"WAVE"
+                      and len(wav) == 44 + len(stub_pcm))
+            check("C4 是合法 wav 容器（RIFF/WAVE 魔数 + 长度自洽）", ok_hdr,
+                  f"magic={wav[:4]!r}/{wav[8:12]!r} len={len(wav)} 期望={44 + len(stub_pcm)}")
             if ok_hdr:
                 with contextlib.closing(io.BytesIO(wav)) as b:
                     with wave.open(b) as w:
                         ch, sw, fr, nf = (w.getnchannels(), w.getsampwidth(),
                                           w.getframerate(), w.getnframes())
                 check("C5 格式 = 1ch/16bit/24kHz（与 synth_pcm 契约一致）",
-                      (ch, sw, fr) == (1, 2, 24000), f"{ch}ch/{sw*8}bit/{fr}Hz")
-                check("C6 确实有音频数据（不是空壳）",
-                      nf > 2400, f"frames={nf} ≈ {nf/24000:.2f}s")
+                      (ch, sw, fr) == (1, 2, 24000), f"{ch}ch/{sw * 8}bit/{fr}Hz")
+                check("C6 音频数据未被容器篡改（帧数与桩一致）",
+                      nf * ch * sw == len(stub_pcm), f"frames={nf} 期望={len(stub_pcm) // 2}")
 
-        # C7 text 限长：这 endpoint 会消耗 TTS 配额，不限长等于开放免费 TTS。
-        #⚠️ query 必须 urlencode：直接把中文塞进 URL 会让 http.client
-        # 在 encode('ascii') 处炸（UnicodeEncodeError），
-        # 症状是「测试脚本崩了」而不是「端点有问题」，极易误判方向。
-        if edge_on:
-            long_text = urllib.parse.quote("long preview text " * 40)
-            code, wav2, _h = req_bin(
-                "GET", "/api/providers/catalog/voice-preview?voice=zh-CN-XiaoxiaoNeural"
-                       f"&text={long_text}", token=token)
-            # 只在真的合成成功时才有字节可比；否则 wav2 是错误 JSON。
-            check("C7 超长试听文本被截断（不是原样合成）",
-                  code != 200 or len(wav2) < 60 * 24000 * 2,
-                  f"code={code} len={len(wav2)}")
+            # C7 text 限长（防「把 TTS 当免费下载器」）：打桩后**必然可断言**，
+            # 因为我们知道上游究竟拿到了什么。
+            _seen.clear()
+            long_text = "试听限长测试" * 40          # 240 字，远超 60 上限
+            status, _b, _h = _call_preview(text=long_text)
+            got_text = _seen[0][0] if _seen else ""
+            check("C7 超长试听文本被截断到 60 字（不是原样合成）",
+                  bool(got_text) and len(got_text) <= 60 and len(long_text) > 60,
+                  f"上游收到 {len(got_text)} 字 / 原 {len(long_text)} 字")
+            check("C8 音色名原样透传给上游（没被端点偷偷改掉）",
+                  bool(_seen) and _seen[0][1] == "zh-CN-XiaoxiaoNeural",
+                  f"上游收到音色 {_seen[0][1]!r}" if _seen else "上游根本没被调用")
+
+            # C9 合成失败必须映射成 502 而不是 500：500 对用户是「服务器坏了」，
+            # 而这明明是上游故障 —— 老人侧排查方向完全不同。
+            _edge_mod.synth_pcm = _boom
+            status, body, _h = _call_preview()
+            check("C9 合成异常映射为 502（不是 500，也不是 200 空音频）",
+                  status == 502, f"status={status} body={body[:160]!r}")
+
+            # C10 依赖缺失必须映射成 503（前端据此提示「服务未启用语音合成」）。
+            _edge_mod.synth_pcm = _fake_synth
+            _edge_mod.edge_available = lambda: False
+            status, body, _h = _call_preview()
+            check("C10 未启用 TTS 时返回 503（不是 500）", status == 503,
+                  f"status={status} body={body[:160]!r}")
+        finally:
+            _edge_mod.synth_pcm = _orig_synth
+            _edge_mod.edge_available = _orig_avail
+
+        # C11 真网络合成：**默认 SKIP**。
+        # 这是唯一必须连微软的一条，而它恰恰最不可靠（非公开协议 + 限流，
+        # 见 tts_edge 模块头的实测记录）。默认不跑、显式 opt-in，
+        # 才能保证「后端 CI 红」永远意味着「代码有问题」而不是「微软抽风」。
+        # ⚠️ 走真 HTTP（不是直调）：它要验的正是「真上游能不能通」。
+        if os.environ.get("ELDER_SMOKE_EDGE_LIVE") == "1":
+            code, wav, _h = req_bin(
+                "GET", "/api/providers/catalog/voice-preview?voice=zh-CN-XiaoxiaoNeural",
+                token=token)
+            check("C11 真网络 Edge 合成（opt-in，可能因限流失败）", code == 200,
+                  f"code={code} len={len(wav)}")
+        else:
+            skip("C11 真网络 Edge 合成",
+                 "需 ELDER_SMOKE_EDGE_LIVE=1；Edge 是非公开协议且限流，"
+                 "写进默认 CI 会让红灯与本仓库代码无关")
 
         # ================================================== D. 单一真源一致性
         print("\n── B. 出厂默认音色的单一真源 ──")
@@ -625,7 +730,14 @@ def main() -> int:
 
     passed = sum(1 for _, ok, _ in results if ok)
     total = len(results)
-    print(f"\n==== {passed}/{total} passed ====")
+    # ⚠️ 跳过**单列**，绝不混进「通过」：把「没验」显示成「验过了」，
+    # 是本项目在 libopus、Edge 依赖、SKIP 第三态上反复付过学费的错误。
+    summary = f"\n==== {passed}/{total} passed ===="
+    if skipped:
+        summary += f"（另有 {len(skipped)} 条跳过）"
+    print(summary)
+    for name, reason in skipped:
+        print(f"  SKIPPED: {name} —— {reason}")
     for name, ok, detail in results:
         if not ok:
             print(f"  FAILED: {name} {detail}")
