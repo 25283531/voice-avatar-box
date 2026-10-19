@@ -42,6 +42,7 @@
 #include "display.h"
 #include "settings.h"
 #include "system_info.h"
+#include "wifi_station.h"  // IsConnected()：lwIP 是否已就绪的唯一可靠判据
 #include "assets/lang_config.h"   // Lang::Sounds::OGG_POPUP（内置提示音，离线可用）
 #include "ota.h"                  // Settings("wifi") 的 ota_url 与服务端契约
 
@@ -54,9 +55,6 @@
 // 主循环周期：15s 一次足够跟上「用户在 APP 上完成绑定」这个慢动作，
 // 再密只是白耗电与白刷屏。
 #define GUIDE_POLL_MS        15000
-// 首次播报的等待：Display 就绪后还要等网络连上 + OTA 拿到激活码，
-// 12s 是「联网成功」的典型耗时。太早播报等于对着云断开图标说「去绑定」。
-#define GUIDE_FIRST_TONE_MS  12000
 // 两次提示音之间的最小间隔：老人需要时间去操作，3 分钟一次不扰人。
 #define GUIDE_TONE_GAP_MS    180000
 
@@ -86,6 +84,57 @@ bool device_is_bound()
     return !settings.GetString("token").empty();
 }
 
+/* ------------------------------------------------------------ 网络就绪门控 */
+
+// 网络没连上时是否已经提示过一次（避免 15s 一次地刷屏同一个警告）
+static bool s_warned_no_network = false;
+
+/**
+ * lwIP / 网络栈是否已经可以安全使用。
+ *
+ * ── 为什么必须有这个门 ──────────────────────────────────────────────────
+ * 本任务在 `app_main()` 里、`app.Start()` **之前**就被创建（未绑定设备上
+ * app.Start() 永不返回，只能建在这之前，见文件头注释）。而本任务的优先级 4
+ * 高于 app_main 的 1，`xTaskCreate` 返回后**立刻抢占** app_main ——
+ * 于是第一次循环跑在 `app.Start()` 内的 `board.StartNetwork()` **之前**。
+ *
+ * 全工程只有 `WifiStation::Start()` 里那一处 `esp_netif_init()`（它由
+ * board.StartNetwork() 调用）。在它之前就发 HTTP，esp_http_client 会去碰
+ * lwIP，此时 tcpip_mbox 仍是 SYS_MBOX_NULL，直接触发：
+ *
+ *   assert failed: tcpip_send_msg_wait_sem ... (Invalid mbox)
+ *
+ * 这不是"请求失败"，是 **abort** ⇒ 设备无限重启，且每次都崩在同一处。
+ * 实测现象正是：背光刚亮（背光是在 Board 构造里点的）就重启，崩溃点约 508ms，
+ * 远早于 WiFi 连上所需的 600~700ms。
+ *
+ * ⚠️ **与「用域名还是用 IP」无关**。换成 152.136.230.132 照样崩：崩的是
+ * 「lwIP 没初始化」，不是「DNS 解析不了」。IP 只是免了解析这一步而已。
+ *
+ * ── 为什么判据用 IsConnected() ─────────────────────────────────────────
+ * 它读的是 `WifiStation::Start()` 注册的 IP_EVENT_STA_GOT_IP 事件组位。
+ * 那个 handler 只可能在 `esp_netif_init()` 之后注册、只可能在拿到 IP 之后触发，
+ * 所以「已连接」蕴含「esp_netif_init 已执行」—— 是一个**充分**条件。
+ * 宁可多等几秒，不可早发一次请求换一个重启循环。
+ */
+static bool network_ready()
+{
+    bool ready = WifiStation::GetInstance().IsConnected();
+
+    if (!ready && !s_warned_no_network) {
+        // 只警告一次：WiFi 重连可能要十几秒，每轮都刷会把串口日志冲掉，
+        // 而这段日志恰恰是排查「为什么不取码」的唯一线索。
+        ESP_LOGW(TAG, "网络尚未就绪，跳过本轮取码（等 WiFi 拿到 IP 后自动继续）");
+        s_warned_no_network = true;
+    } else if (ready) {
+        if (s_warned_no_network) {
+            ESP_LOGI(TAG, "网络已就绪，恢复取码");
+            s_warned_no_network = false;
+        }
+    }
+    return ready;
+}
+
 /* ------------------------------------------------------------ 激活码 */
 
 /**
@@ -103,6 +152,13 @@ bool device_is_bound()
 bool fetch_activation_code(char *out, size_t out_len)
 {
     out[0] = '\0';
+
+    // ⚠️ 门控必须在最前面，且必须在任何 Board/网络访问之前。
+    // 原因见 network_ready() 的注释：esp_netif_init() 没跑就发 HTTP
+    // = lwIP assert = 无限重启。
+    if (!network_ready()) {
+        return false;
+    }
 
     auto &board = Board::GetInstance();
     auto network = board.GetNetwork();
@@ -214,7 +270,8 @@ void guide_task(void *arg)
         }
 
         char code[40] = {0};
-        if (fetch_activation_code(code, sizeof(code))) {
+        bool got_code = fetch_activation_code(code, sizeof(code));
+        if (got_code) {
             // 码变了才刷屏，避免每 15s 用同样的内容闪一次（闪久了像坏了）。
             if (strcmp(code, s_last_code) != 0) {
                 snprintf(s_last_code, sizeof(s_last_code), "%s", code);
@@ -222,21 +279,30 @@ void guide_task(void *arg)
             }
             show_guide(s_last_code);
         } else {
+            // 取不到码也照样显示引导文案：老人在等网的这十几秒里，
+            // 看到「请用 APP 绑定」比看到空白屏有用得多（后面那句
+            // 「请检查网络后重试」已经说明了当前状况）。
             show_guide(nullptr);
         }
 
-        // 提示音：首次等网络，第二次起每 3 分钟一次。
-        int64_t now = esp_timer_get_time();
-        if (!tone_done && now > (int64_t)GUIDE_FIRST_TONE_MS * 1000) {
-            auto &app = Application::GetInstance();
-            app.PlaySound(Lang::Sounds::OGG_POPUP);
-            ESP_LOGI(TAG, "播放绑定引导提示音");
-            tone_done = true;
-            s_last_tone_us = now;
-        } else if (tone_done &&
-                   now - s_last_tone_us > (int64_t)GUIDE_TONE_GAP_MS * 1000) {
-            Application::GetInstance().PlaySound(Lang::Sounds::OGG_POPUP);
-            s_last_tone_us = now;
+        // 提示音：**首次必须等网络真的连上**再播，否则就是对着
+        // 「云服务断开」图标喊「去绑定」，反而更让人困惑
+        // （这正是 GUIDE_FIRST_TONE_MS 注释里写的意图）。
+        // 之前用 esp_timer_get_time()（开机时间）近似，等于只靠"启动够久"
+        // 来赌网络已就绪；现在有了 network_ready() 这个真判据，直接用它。
+        // 第二声起仍是每 3 分钟一次，与网络无关。
+        if (got_code) {
+            int64_t now = esp_timer_get_time();
+            if (!tone_done) {
+                auto &app = Application::GetInstance();
+                app.PlaySound(Lang::Sounds::OGG_POPUP);
+                ESP_LOGI(TAG, "播放绑定引导提示音（网络已就绪）");
+                tone_done = true;
+                s_last_tone_us = now;
+            } else if (now - s_last_tone_us > (int64_t)GUIDE_TONE_GAP_MS * 1000) {
+                Application::GetInstance().PlaySound(Lang::Sounds::OGG_POPUP);
+                s_last_tone_us = now;
+            }
         }
 
         vTaskDelay(pdMS_TO_TICKS(GUIDE_POLL_MS));

@@ -93,6 +93,12 @@ SERVER_LOG = DB_PATH.with_name(DB_PATH.stem + "_server.log")
 SMTP_PASSWORD = "AbcDefGhIjK"
 MASKED = "Ab******jK"
 
+# 种子管理员口令。admin/admin123 这个弱口令组合已从代码移除，
+# 本脚本通过 ELDER_SEED_ADMIN_PASSWORD 在起服务时显式指定自己用的口令，
+# 这样「弱口令已下线」这条安全改动不会把冒烟测试一起带死。
+# 与 smoke_auth.py 的 LEGACY_PW 同名同义，改一处记得同步另一处。
+LEGACY_PW = "admin123"
+
 # 测试用 SMTP 主机：**必须是本地地址**。
 # 早先这里写的是公网域名 smtp.example.com，测试结果会随「外网 DNS 是否可用」
 # 漂移：解析失败是 gaierror，解析成功但连不上是 timeout，两者走不同的失败分支，
@@ -231,6 +237,12 @@ def main() -> int:
     env["ELDER_JWT_SECRET"] = "smoke-mail-secret"
     env["ELDER_SCHEDULER_INTERVAL"] = "3600"
     env["ELDER_MAIL_FAKE"] = "1"       # 伪装发信：邮件进内存 OUTBOX，不碰网络
+    # ⚠️ 必须显式指定种子口令：admin/admin123 这套硬编码弱口令已从代码移除
+    #（bb5ca98），空库部署时服务端会生成**随机**口令（只在启动日志里显示一次）。
+    # 不设这个变量的话，下面的管理员登录必然 401，而失败会以「邮件服务冒烟
+    # 一片红」的形式出现 —— 症状与真实故障点完全脱节，极难归因。
+    # 约定与其他冒烟脚本一致（见 smoke_auth.py 的 LEGACY_PW）。
+    env["ELDER_SEED_ADMIN_PASSWORD"] = LEGACY_PW
     env["PYTHONIOENCODING"] = "utf-8"
 
     print(f"[boot] starting server on :{PORT} (db: {DB_PATH}, ELDER_MAIL_FAKE=1)")
@@ -293,7 +305,7 @@ def main() -> int:
         print("[boot] ready\n")
 
         # ==================================================== 准备账号
-        code, tk = req("POST", "/api/auth/login", {"username": "admin", "password": "admin123"})
+        code, tk = req("POST", "/api/auth/login", {"username": "admin", "password": LEGACY_PW})
         check("登录默认管理员", code == 200 and bool(tk.get("access_token")), str(code))
         admin_token = tk.get("access_token", "")
 
@@ -310,6 +322,11 @@ def main() -> int:
         MAIL1 = "mail1@example.com"
         MAIL2 = "mail2@example.com"
         NOBODY = "nobody@example.com"
+        # 「用户名 + 邮箱」链路里用户**自己设定**的新密码。
+        # 取一个在邮件正文里绝不可能自然出现的串 —— N11 正是靠它证明
+        # 「口令没有被寄进邮件」。所以别把它换成 test123456 这种通用值，
+        # 那样断言会因为正文别处碰巧出现而失去意义。
+        PWD_NEW = "Nuan2026pwd"
 
         # ==================================================== 1. SMTP 配置（管理端）
         print("\n--- 1. 平台 SMTP 配置 ---")
@@ -526,12 +543,12 @@ def main() -> int:
                        {"username": "mail1", "email": "mail1@example.com"})
         check("N9 60 秒内重复申请被拒（冷却）", code == 429, f"code={code}")
 
-        # 走完寄新密码：取码 -> 换密码 -> 旧密码失效
+        # 走完「验证码 -> 自己设新密码」：取码 -> 设密码 -> 旧密码失效
         #⚠️ 取**最新一封**，不能扫到"第一封命中 MAIL1 的"：
         #   本节之前 2.x 已经用mail1 申请过好几封验证码，取"第一个命中"拿到的是
-        #   **旧链路的旧验证码** ⇒ send-password 必然失败。
+        #   **旧链路的旧验证码** ⇒ 提交必然失败。
         #   症状极具误导性：报错是「验证码错误或已过期」，看起来像端点坏了，
-        #   而端点其实完全正常（手工验证过200 + 新密码生效）。
+        #   而端点其实完全正常（手工验证过 200 + 新密码生效）。
         #   稳妥做法：清空发件箱再申请，让"最新一封"就是这一封。
         req("GET", "/api/admin/mail/outbox?clear=true&limit=50", token=admin_token)
         code, iss3 = req("POST", "/api/auth/password/reset/issue",
@@ -542,33 +559,71 @@ def main() -> int:
         _, mails_now = req("GET", "/api/admin/mail/outbox?limit=30", token=admin_token)
         items = (mails_now or {}).get("items") or []
         code6 = ""
+        reset_mail = {}
         for m in reversed(items):
             if "mail2@example.com" in str(m.get("to", "")):
+                reset_mail = m
                 hit = re.search(r"验证码是：(\d{6})", m.get("body", ""))
                 if hit:
                     code6 = hit.group(1)
                     break
         check("N10 从发件箱取到新链路的验证码", len(code6) == 6, code6)
 
-        code, sp = req("POST", "/api/auth/password/reset/send-password",
-                       {"username": "mail2", "email": "mail2@example.com", "code": code6})
-        check("N11 验证码正确 -> 新密码已寄出", code == 200, f"code={code} {sp}")
+        #⚠️ **口令绝不能出现在邮件里**（2026-06-19 语义变更的核心）。
+        #   旧实现是「服务端生成随机密码寄回邮箱」，正文里有明文口令。
+        #   改法：邮件只发验证码，新密码由用户在 APP 里自己设。
+        #
+        #   ⚠️ 这条断言要防的是「有人把寄密码的逻辑改回来」这种回归。
+        #   **不要**用「正文里不含 PWD_NEW」来防：那只能证明这一个口令没出现。
+        #   回归实现用的是服务端随机生成的口令，和 PWD_NEW 根本不相等 ⇒ 断言照绿。
+        #   （这是实测过的：用随机口令变异后，本条仍然 PASS，是假绿。）
+        #   正确判据是**语义级**的——重置密码这个动作前后，发件箱里**不应该
+        #   多出任何一封邮件**，因为口令压根不经邮件往返。这条对任何
+        #   密码来源都成立，是 N11 的真正防线。
+        #   ⚠️ check() 的第三参数是**无条件回显**的（PASS 时也打印），所以失败措辞
+        #   只能放在失败分支里算出来 —— 否则会输出
+        #   「[PASS] ... -> 主题像是口令邮件：…」这种自相矛盾的行。
+        #   下面几处 detail 都遵循这一条。
+        _subj = str(reset_mail.get("subject", ""))
+        _subj_ok = ("验证码" in _subj) and ("新密码" not in _subj)
+        check("N11 改密码用的邮件是验证码邮件，不是口令邮件", _subj_ok,
+              f"主题：{_subj}")
 
-        # 新密码在邮件里，且能登录
-        _, box2 = req("GET", "/api/admin/mail/outbox?limit=30", token=admin_token)
-        newpwd = ""
-        for m in reversed((box2 or {}).get("items") or []):
-            if "你的新密码" in str(m.get("subject", "")):
-                hit = re.search(r"新的密码是：[^A-Za-z0-9]*([A-Za-z0-9]{8,32})", m.get("body", ""))
-                newpwd = hit.group(1) if hit else ""
-                break
-        check("N12 新密码邮件已发出且能取出密码", len(newpwd) >= 8, newpwd)
-        check("N13 新密码不含易混字符（老人要抄到纸上）",
-              not (set("0O1lI") & set(newpwd)), newpwd)
-        if newpwd:
-            code, _lg = req("POST", "/api/auth/login",
-                            {"username": "mail2", "password": newpwd})
-            check("N14 邮件里的新密码可登录", code == 200, f"code={code}")
+        code, sp = req("POST", "/api/auth/password/reset/send-password",
+                       {"username": "mail2", "email": "mail2@example.com",
+                        "code": code6, "new_password": PWD_NEW})
+        check("N12 验证码正确 -> 新密码已生效", code == 200 and sp.get("ok") is True,
+              f"code={code} {sp}")
+        check("N12b 响应回显账号（此时已验证邮箱归属，无泄露风险）",
+              sp.get("username") == "mail2", str(sp.get("username")))
+
+        # 设置完密码后**不应该再发出任何邮件**——密码不经邮件往返。
+        #   ⚠️ 这条是本组最关键的防回归断言（N11/N11b 只能证伪"标题/正文形状"，
+        #   对「换个随机口令寄出去」的回归同样会绿——实测踩过）。
+        #   判据是数量：重置动作前后发件箱必须一模一样。口令怎么来、
+        #   标题怎么写，都逃不掉"多出一封信"这个事实。
+        _, box_after = req("GET", "/api/admin/mail/outbox?limit=30", token=admin_token)
+        after_items = (box_after or {}).get("items") or []
+        _extra = [m.get("subject") for m in after_items[len(items):]]
+        check("N13 【安全】改密码过程不产生任何邮件（口令不经邮件往返）",
+              len(after_items) == len(items),
+              f"改密码前 {len(items)} 封，改密码后 {len(after_items)} 封，多出：{_extra}")
+
+        # ⚠️ N11b **必须查改密码之后的全量快照**（after_items）。
+        #   早先它查的是改密码**之前**的 items —— 而「寄新密码」那封邮件
+        #   恰恰是在改密码时才产生的，根本不在那个快照里 ⇒ 断言恒绿，
+        #   是一处纯假绿（实测变异时确实没红）。凡是「不该出现 X」的断言，
+        #   都必须放在 X **可能出现之后**的那个观测点上。
+        _pwd_subjects = [str(m.get("subject", "")) for m in after_items
+                         if "你的新密码" in str(m.get("subject", ""))]
+        check("N11b 【安全】改密码后发件箱里也没有口令邮件",
+              not _pwd_subjects,
+              f"口令邮件标题：{_pwd_subjects}")
+
+        # 新密码可登录，旧密码失效
+        code, _lg = req("POST", "/api/auth/login",
+                        {"username": "mail2", "password": PWD_NEW})
+        check("N14 自己设的新密码可登录", code == 200, f"code={code}")
         # ⚠️ 429 在这个登录接口上是**限速**，不是「密码仍然有效」。
         #   本节前面已经连续登录过多次（N14 + 本行），触发了登录限速，
         #   于是无论密码对错都返回 429 ⇒ 直接断言 401 会**假红**，
@@ -580,8 +635,26 @@ def main() -> int:
               code in (401, 429), f"code={code}")
 
         code, reuse = req("POST", "/api/auth/password/reset/send-password",
-                          {"username": "mail2", "email": "mail2@example.com", "code": code6})
-        check("N16 验证码一次性（换密码后复用被拒）", code == 400, f"code={code}")
+                          {"username": "mail2", "email": "mail2@example.com",
+                           "code": code6, "new_password": "another12345"})
+        check("N16 验证码一次性（改密码后复用被拒）", code == 400, f"code={code}")
+
+        # 新密码太短要在 pydantic 层被挡（前端也挡了一道，这里验服务端不靠前端）
+        req("GET", "/api/admin/mail/outbox?clear=true", token=admin_token)
+        _, _iss4 = req("POST", "/api/auth/password/reset/issue",
+                       {"username": "mail2", "email": "mail2@example.com"})
+        _, box4 = req("GET", "/api/admin/mail/outbox?limit=30", token=admin_token)
+        code7 = ""
+        for m in reversed((box4 or {}).get("items") or []):
+            hit = re.search(r"验证码是：(\d{6})", m.get("body", ""))
+            if hit:
+                code7 = hit.group(1)
+                break
+        code, short = req("POST", "/api/auth/password/reset/send-password",
+                          {"username": "mail2", "email": "mail2@example.com",
+                           "code": code7, "new_password": "123"})
+        check("N17 新密码短于 6 位被拒（422，服务端独立校验）",
+              code == 422, f"code={code} {short}")
 
         # ==================================================== 3. 工单
         print("\n--- 3. 邮箱提交问题（工单）---")

@@ -480,11 +480,21 @@ export function issueResetCode(username: string, email: string) {
   )
 }
 
-/** 第3 步：验证码 -> 服务端把新密码寄到该邮箱 */
-export function sendNewPassword(username: string, email: string, code: string) {
-  return elderRequestRaw<{ ok: boolean, message: string, attempts_left: number }>(
+/** 第3 步：验证码 + **用户自己设定的新密码** -> 密码立即生效
+ *
+ *  ⚠️ 2026-06-19 起语义已变：原先这里是「服务端生成随机密码寄回邮箱」。
+ *     现在邮件只发验证码，新密码由用户在 APP 里自己设 ——
+ *     明文口令不该躺在收件箱里（转发/备份/邮件网关都会留存），
+ *     而且老人还得抄一遍才能登录，抄错一位就登不进来。 */
+export function resetPassword(
+  username: string,
+  email: string,
+  code: string,
+  newPassword: string,
+) {
+  return elderRequestRaw<{ ok: boolean, message: string, attempts_left: number, username: string }>(
     '/api/auth/password/reset/send-password',
-    { method: 'POST', data: { username, email, code }, auth: false, toast: false },
+    { method: 'POST', data: { username, email, code, new_password: newPassword }, auth: false, toast: false },
   )
 }
 

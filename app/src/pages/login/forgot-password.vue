@@ -6,7 +6,7 @@
 
 <script setup lang="ts">
 /**
- * 找回密码 —— 四步：用户名 → 绑定邮箱 → 验证码 → 服务端把新密码寄到该邮箱。
+ * 找回密码 —— 五步：用户名 → 绑定邮箱 → 验证码 → 自己设新密码 → 完成。
  *
  * 为什么是「用户名」而不是「邮箱」开头（2026-10-19 用户要求）
  * ----------------------------------------------------------
@@ -15,8 +15,14 @@
  * 而忘了密码的人恰恰最可能同时忘了邮箱。
  * 所以用户名放在最前面，邮箱降级为**第二道确认**。
  *
+ * ⚠️ 第 4 步的语义在 2026-06-19 改过：原先是「服务端把新密码寄到邮箱」，
+ * 现在改为「用户自己在 APP 里设新密码」，邮件只发验证码。
+ * 理由：明文口令躺在收件箱里（转发/备份/邮件网关都会留存），而且老人
+ * 还得把它抄到纸上才能登录，抄错一位就登不进来 —— 这套流程反人性。
+ * 改成自设后，**口令从不出现在邮件里**，也不再需要「抄」这个动作。
+ *
  * 与服务端那套「邮箱 → 验证码 → 自己设新密码」并存：
- * 那条对知道邮箱的人更安全（口令从不出现在邮件里），本页不替代它。
+ * 那条对知道邮箱的人更省事（少一步邮箱确认），本页多花一步但起点是用户名。
  *
  * ⚠️ 三条不能在前端"优化"的规则（都是账号枚举防护，见服务端同名注释）：
  *   1. email_bound=false **不能**翻译成「这个用户名不存在」——
@@ -28,17 +34,24 @@
  *   3. 验证码错误/过期/账号不存在，服务端返回**同一句话**，前端照原样显示。
  *
  * 所有请求都走 auth:false：用户此刻登不进来，这条链路必须完全匿名可用。
+ *
+ * ⚠️ 跳转一律用 script 里的具名函数，不在模板里写 uni.xxx：
+ *    模板表达式里的 `uni.*` 不会被插件改写，产物会变成 o.uni.xxx，
+ *    TypeError 被 Vue 事件处理器静默吞掉 —— 构建全绿但点击没反应。
  */
 import { computed, onUnmounted, ref } from 'vue'
-import { issueResetCode, lookupAccount, sendNewPassword } from '@/api/elder'
+import { issueResetCode, lookupAccount, resetPassword } from '@/api/elder'
 import type { ElderRawResult } from '@/http/elder'
 
-/** 1 用户名 | 2 邮箱确认 | 3 验证码 | 4 完成 */
-const step = ref<1 | 2 | 3 | 4>(1)
+/** 1 用户名 | 2 邮箱确认 | 3 验证码 | 4 新密码 | 5 完成 */
+const step = ref<1 | 2 | 3 | 4 | 5>(1)
 const username = ref('')
 const email = ref('')
 const code = ref('')
+const newPwd = ref('')
+const newPwd2 = ref('')
 
+/** 密码输入框是原生控件，类型选错会露出明文；这里统一在模板里绑定 password */
 const busy = ref(false)
 /** 页面上直接显示的错误话术—— 不用 toast：老人看不清也记不住一闪而过的字 */
 const err = ref('')
@@ -187,8 +200,8 @@ async function onIssue() {
   }
 }
 
-/* ------------------------------------------------------- 第3 步：验证码换密码 */
-async function onSendPassword() {
+/* --------------------------------------------------------- 第3 步：验证码 */
+function onCodeNext() {
   if (busy.value) return
   const c = code.value.trim()
   err.value = ''
@@ -196,15 +209,40 @@ async function onSendPassword() {
     err.value = '请照着邮件里的 6 位数字验证码填一遍'
     return
   }
+  // 只做本地格式校验就往下走：验证码的真伪由服务端在第 4 步提交时校验。
+  // 在这里就调接口会让用户为"填错一位"多消耗一次尝试次数
+  // （服务端是 5 次上限，用完就得重发验证码）。
+  newPwd.value = ''
+  newPwd2.value = ''
+  step.value = 4
+}
+
+/* ------------------------------------------------------- 第4 步：设置新密码 */
+async function onReset() {
+  if (busy.value) return
+  const c = code.value.trim()
+  const p1 = newPwd.value
+  const p2 = newPwd2.value
+  err.value = ''
+  // 下限 6 位，与服务端 PasswordSendIn.new_password 的 min_length 一致。
+  // 这里先挡一道是为了不让用户白等一次网络往返。
+  if (p1.length < 6) {
+    err.value = '新密码至少要 6 位，请再长一点'
+    return
+  }
+  if (p1 !== p2) {
+    err.value = '两次输入的密码不一样，请再核对一遍'
+    return
+  }
   busy.value = true
   try {
-    const res = await sendNewPassword(username.value.trim(), email.value.trim(), c)
+    const res = await resetPassword(username.value.trim(), email.value.trim(), c, p1)
     if (res.statusCode >= 200 && res.statusCode < 300) {
       stopCooldown()
       err.value = ''
-      step.value = 4
-      // 留 3 秒让用户看清「新密码已发到邮箱」，然后自动回登录页
-      setTimeout(() => uni.reLaunch({ url: '/pages/login/index' }), 3000)
+      step.value = 5
+      // 留 4 秒让用户看清「密码已重置」，然后自动回登录页
+      setTimeout(() => uni.reLaunch({ url: '/pages/login/index' }), 4000)
       return
     }
     const msg = messageOf(res)
@@ -213,15 +251,15 @@ async function onSendPassword() {
     const left = Number(detail?.attempts_left ?? 0)
     if (left > 0) {
       err.value = `验证码不对或已经过期，你还可以试 ${left} 次`
+      // 验证码可疑 ⇒ 退回第 3 步重输，别让他在第 4 步反复改密码
+      step.value = 3
+    }
+    else if (res.statusCode === 422) {
+      err.value = '新密码太短了，至少要 6 位'
     }
     else if (res.statusCode === 400) {
       err.value = msg || '验证码错误或已过期，请回到上一步重新发送'
-    }
-    else if (res.statusCode === 502) {
-      // ⚠️ 这一条最关键：邮件没发出去时服务端**不改密码**，
-      // 所以此时原来的密码仍然有效，必须明确告诉用户「密码没变」，否则
-      // 他会去用旧密码登录然后发现能登进去，困惑于「到底改没改」。
-      err.value = '新密码邮件发送失败，密码没有被修改，请稍后重试或联系管理员'
+      step.value = 3
     }
     else {
       err.value = msg || '操作失败，请稍后再试'
@@ -235,10 +273,21 @@ async function onSendPassword() {
   }
 }
 
+/** 第4 步的「返回上一步」：回验证码页重输，不清 code（省得再抄一遍） */
+function backToStep3() {
+  if (busy.value) return
+  newPwd.value = ''
+  newPwd2.value = ''
+  err.value = ''
+  step.value = 3
+}
+
 function backToStep1() {
   stopCooldown()
   code.value = ''
   email.value = ''
+  newPwd.value = ''
+  newPwd2.value = ''
   err.value = ''
   tip.value = ''
   step.value = 1
@@ -255,7 +304,7 @@ function backToStep1() {
         <text class="sep">›</text>
         <text class="step" :class="{ on: step === 3 }">3 验证码</text>
         <text class="sep">›</text>
-        <text class="step" :class="{ on: step === 4 }">4 完成</text>
+        <text class="step" :class="{ on: step === 4 || step === 5 }">4 新密码</text>
       </view>
 
       <!-- 第 1 步：填用户名 -->
@@ -310,21 +359,43 @@ function backToStep1() {
         <view v-if="err" class="err">
           {{ err }}
         </view>
-        <button class="btn" :disabled="busy" @click="onSendPassword">
-          {{ busy ? '正在提交…' : '下一步' }}
+        <button class="btn" :disabled="busy" @click="onCodeNext">
+          下一步（设置新密码）
         </button>
         <button class="btn ghost" :disabled="!canResend" @click="onIssue">
           {{ cooldown > 0 ? `重新发送（${cooldown} 秒后可以再发）` : '没收到？重新发送验证码' }}
         </button>
       </view>
 
-      <!-- 第 4 步：完成 -->
+      <!-- 第 4 步：自己设新密码（口令不再经过邮件） -->
+      <view v-else-if="step === 4" class="pane">
+        <view class="lead">
+          请自己想一个新的密码。它不会被发到任何邮箱，只存在这台手机上。
+        </view>
+        <view class="mail-row">
+          <text class="mail-label">账号</text>
+          <text class="mail">{{ username }}</text>
+        </view>
+        <input v-model="newPwd" class="input" password placeholder="新密码，至少 6 位" :maxlength="128" />
+        <input v-model="newPwd2" class="input" password placeholder="再输一遍新密码" :maxlength="128" />
+        <view v-if="err" class="err">
+          {{ err }}
+        </view>
+        <button class="btn" :disabled="busy" @click="onReset">
+          {{ busy ? '正在保存…' : '确定，修改密码' }}
+        </button>
+        <button class="btn ghost" :disabled="busy" @click="backToStep3">
+          返回上一步
+        </button>
+      </view>
+
+      <!-- 第 5 步：完成 -->
       <view v-else class="pane">
         <view class="done-title">
-          新密码已发送到你的邮箱
+          密码已重置
         </view>
         <view class="done-sub">
-          请打开邮箱查看新密码，用它登录。登录后请尽快在「我的 → 修改密码」里改成只有你知道的密码。
+          请用刚才设置的新密码登录。密码只存在这台手机上，没有发到任何邮箱。
         </view>
         <view class="done-tip">
           正在自动返回登录页…

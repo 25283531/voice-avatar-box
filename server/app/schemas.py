@@ -1142,17 +1142,24 @@ class PasswordIssueOut(ORMBase):
 
 
 class PasswordSendIn(ORMBase):
-    """第 3 步：提交验证码 → 服务端**直接把新密码**发到该邮箱。
+    """第 3 步：提交验证码 + **用户自己设定的新密码**。
 
-    ⚠️ 这条链路与既有的 verify（用户自己设新密码）并存，差别在于：
-    这里把新密码放进邮件，所以**本端点只做校验，不改密码**——
-    真正的改密码发生在下一步 ``/send``，避免「验证码正确就立刻改密码」
-    与「密码要单独发一封邮件」两件事缠在一起。
+    ⚠️ 2026-06-19 用户拍板改过一次语义：这一端点原本是「服务端生成随机
+    密码并寄到邮箱」，现已改成「用户自己在 APP 里设新密码」，邮件只发验证码。
+    理由是后者才正常：明文口令躺在收件箱里（转发、备份、代理都会留存），
+    老人还得抄一遍才能登录，抄错一位就登不进来。
+
+    所以本端点现在做的事，与既有 ``PasswordResetVerifyIn``（邮箱链路）
+    **完全一样**，只是入参多带一个 ``username``。
+    之所以不直接让前端复用 /verify：那条链路以邮箱为起点、只认邮箱；
+    本链路以用户名为起点（老人只记得用户名），服务端仍需校验
+    「用户名 + 邮箱 + 验证码」三者自洽。
     """
 
     username: str = Field(min_length=1, max_length=64)
     email: str = Field(min_length=3, max_length=128)
     code: str = Field(min_length=6, max_length=6)
+    new_password: str = Field(min_length=6, max_length=128)
 
     @field_validator("email")
     @classmethod
@@ -1165,6 +1172,8 @@ class PasswordSendOut(ORMBase):
     message: str = ""
     #: 剩余可尝试次数，前端用来显示"你还可以试 N 次"
     attempts_left: int = 0
+    #: 走到这里说明验证码校验通过，告诉用户是哪个账号无妨
+    username: str = ""
 
 
 class TicketCreateIn(ORMBase):

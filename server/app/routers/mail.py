@@ -472,15 +472,19 @@ def issue_code(payload: PasswordIssueIn, db: Session = Depends(get_db)):
 
 @auth_router.post("/send-password", response_model=PasswordSendOut)
 def send_new_password(payload: PasswordSendIn, db: Session = Depends(get_db)):
-    """第 3 步：验证码正确 → **生成新密码并寄到该邮箱**，同时立刻生效。
+    """第 3 步：验证码正确 → **用户自己设定的新密码**立即生效。
 
-    ⚠️ 为什么校验通过就立刻改密码（而不是等用户确认收到邮件）：
-    邮件丢了用户只能重来，而验证码 15 分钟过期、5 次上限，
-    让用户为「重发一次邮件」再消耗一次尝试不划算。
-    真正的安全性来自「验证码本身就是发给该邮箱的」——
-    拿到验证码 = 证明你能收这个邮箱的邮件，足够了。
+    ⚠️ 2026-06-19 用户拍板改过语义：这里原本是「服务端生成随机密码、
+    寄到该邮箱、同时改掉密码」，现已改成「用户自己在 APP 里设新密码」，
+    **邮件里只出现验证码，不出现口令**。理由：明文口令躺在收件箱里
+    （转发、备份、邮件网关都会留存），老人还要抄一遍才能登录，
+    抄错一位就登不进来 —— 这套流程对目标用户并不友好。
 
-    ⚠️ 失败时**不透露**是验证码错、过期还是账号不存在：
+    端点名 ``/send-password`` 保留未改，是为了不破坏已发布 APP 的调用；
+    但它现在**不发任何密码邮件**，名字已经名不副实。
+    要改名的前提是 APP 与服务端同步发版（见 forget-password.vue 的步骤 5）。
+
+    失败时**不透露**是验证码错、过期还是账号不存在：
     与既有 verify 端点同一套话术，避免成为状态探测接口。
     """
     email = payload.email.strip().lower()
@@ -508,17 +512,11 @@ def send_new_password(payload: PasswordSendIn, db: Session = Depends(get_db)):
                             {"message": "验证码错误或已过期",
                              "attempts_left": max(0, left - 1)})
 
-    new_pwd = mailer.generate_password()
-    subject, body = mailer.build_new_password_mail(user.username, new_pwd)
-    result = mailer.send_mail(db, email, subject, body)
-    if not result.ok:
-        # ⚠️ 邮件没发出去就**绝不能改密码**：否则用户的新密码只存在于
-        # 一个他永远收不到的邮件里，等于把账号锁死了。这一步的顺序不能反。
-        raise HTTPException(status.HTTP_502_BAD_GATEWAY,
-                            "新密码邮件发送失败，密码未被修改，请稍后重试")
-
-    # 邮件已发出（对方邮箱已在收件箱里），此时改密码才是安全的
-    user.password_hash = hash_password(new_pwd)
+    # 验证码校验通过 = 证明了能收这个邮箱的邮件，直接落新密码。
+    # 没有任何"邮件发不出去就回滚"的问题需要处理——这是改语义带来的
+    # 额外好处：过去校验通过后必须先确认邮件送达才敢改密码。
+    user.password_hash = hash_password(payload.new_password)
+    # 一次性：本邮箱所有未消费的验证码一起作废（含本次）
     row.used_at = now
     for other in db.scalars(
         select(models.PasswordResetCode)
@@ -530,6 +528,7 @@ def send_new_password(payload: PasswordSendIn, db: Session = Depends(get_db)):
 
     return PasswordSendOut(
         ok=True,
-        message=f"新密码已发送到 {email}，请登录后尽快修改",
+        message="密码已重置，请用新密码登录",
         attempts_left=0,
+        username=user.username,
     )
