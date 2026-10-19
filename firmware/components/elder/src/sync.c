@@ -712,13 +712,59 @@ static esp_err_t do_sync(void)
 
 /* ---------------------------------------------------------------- 任务 */
 
+/* OTA 绑定成功后 token 落在 xiaozhi 的 NVS 命名空间 websocket/token
+ * （main/ota.cc:167 用 Settings("websocket", true) 写入；服务端在
+ * voice/__init__.py:450-453 的 websocket 段里下发 {"url", "token"}），
+ * 而本模块只认 elder_sync/token（文件头的 NVS_NS / NVS_KEY_TOK 定义，
+ * 恢复路径在 elder_sync_init() 末尾那段，本函数不复制它）。
+ * 两处不交接 ⇒ elder_net_has_token() 恒 false ⇒ 心跳永不发出 ⇒ 服务端
+ * devices.online 恒 False、fw_version/hw_model 永远「未上报」，服药提醒
+ * 下发与服药回执上报一并全瘫（生产事故 2026-10-20：WS 握手成功、语音
+ * 会话已经在跑，管理后台却显示离线 + 硬件型号「未知」/系统版本「未上报」）。
+ * 这里直接裸读同一 NVS 命名空间，不必跨到 C++ 的 Settings。
+ * 只读不写：拿到就交给 elder_sync_set_token() 持久化到 elder_sync/token，
+ * 之后重启走原来那条恢复路径，不新增第二处真相。 */
+static void adopt_ws_token(void)
+{
+    nvs_handle_t h;
+    if (nvs_open("websocket", NVS_READONLY, &h) != ESP_OK) return;
+
+    char tok[ELDER_NET_TOKEN_MAX] = {0};
+    size_t n = sizeof(tok);
+    esp_err_t err = nvs_get_str(h, "token", tok, &n);
+    nvs_close(h);
+
+    /* 这一条不是防御性编程的摆设：设备 JWT 目前约 209 字节，紧贴 256 的
+     * 上限（payload 里含 sub/device_id/ep）。真超了 nvs_get_str 会返回
+     * INVALID_LENGTH，函数静默 return ⇒ 又变回「心跳永远不发」这个原始
+     * 故障，而且完全没有日志可查 —— 所以这里必须留一行日志。 */
+    if (err == ESP_ERR_NVS_INVALID_LENGTH) {
+        ESP_LOGE(TAG, "websocket/token 超过 %d 字节，无法接管；请同步放大 ELDER_NET_TOKEN_MAX",
+                 (int)ELDER_NET_TOKEN_MAX);
+        return;
+    }
+    if (err != ESP_OK || !tok[0]) return;
+
+    ESP_LOGI(TAG, "接管 websocket/token 作为设备令牌（绑定已完成）");
+    elder_sync_set_token(tok);   /* 同时持久化到 elder_sync/token，重启后走原恢复路径 */
+}
+
 static void sync_task(void *arg)
 {
     while (1) {
         uint32_t wait_ms = g.interval_sec * 1000;
 
+        /* token 是**运行期**才出现的：OTA 绑定成功那一刻才写进 websocket/token。
+         * 所以每轮都试一次接管，不能让「启动时没有 token」一直读到重启。 */
+        if (!elder_net_has_token()) {
+            adopt_ws_token();
+        }
+
         /* 无 token：只能走激活流程，不做无效重试 */
         if (!elder_net_has_token()) {
+            /* 未绑定：最多 15 秒再看一眼。绑定是运行时事件，不能按 300 秒
+             * 周期死等 —— 用户扫完码指望半分钟内看到「在线」。 */
+            if (wait_ms > 15000) wait_ms = 15000;
             ESP_LOGW(TAG, "尚未绑定（无 device_token），仅本地提醒可用；%u ms 后重试",
                      (unsigned)wait_ms);
         } else {
