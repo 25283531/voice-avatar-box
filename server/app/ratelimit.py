@@ -80,10 +80,14 @@ from .config import (
 )
 
 __all__ = [
+    "BIND_RATE_LIMIT_DETAIL_PREFIX",
     "RATE_LIMIT_DETAIL_PREFIX",
+    "bind_gate",
+    "clear_bind_failures",
     "clear_login_failures_for",
     "client_ip",
     "login_gate",
+    "record_bind_failure",
     "record_login_failure",
 ]
 
@@ -132,11 +136,20 @@ def _human_wait(sec: int) -> str:
 
 # ============================================================ 存储
 class _FailureStore:
-    """``主体 -> 失败时间戳队列``，带 LRU 上限与锁。"""
+    """``主体 -> 失败时间戳队列``，带 LRU 上限与锁。
 
-    def __init__(self, max_keys: int) -> None:
+    ``rules`` 默认取登录规则；激活码绑定用同一个类、另一份规则表
+    （:data:`_BIND_RULES`）—— **一份实现两种用途**，不是两份复制粘贴。
+    两份规则表各自持有自己的窗口上界（``_window``），否则用登录的 1 小时
+    窗口去裁激活码队列，会把本该保留的记录提前扔掉。
+    """
+
+    def __init__(self, max_keys: int,
+                 rules: tuple[tuple[float, int], ...] | None = None) -> None:
         self._lock = threading.Lock()
         self._max_keys = max(1, max_keys)
+        self._rules = rules if rules is not None else _ACTIVE_RULES
+        self._window = max((r[0] for r in self._rules), default=1.0)
         self._items: "OrderedDict[str, deque[float]]" = OrderedDict()
 
     def blocked_for(self, key: str, now: float) -> float:
@@ -154,7 +167,7 @@ class _FailureStore:
                 return 0.0
             self._items.move_to_end(key)
             wait = 0.0
-            for window, limit in _ACTIVE_RULES:
+            for window, limit in self._rules:
                 if len(q) < limit:
                     continue
                 # 队列升序；要等"第 (len-limit+1) 老"的那一笔滑出窗口
@@ -179,9 +192,8 @@ class _FailureStore:
         with self._lock:
             self._items.pop(key, None)
 
-    @staticmethod
-    def _prune(q: "deque[float]", now: float) -> None:
-        cut = now - _WINDOW_SEC
+    def _prune(self, q: "deque[float]", now: float) -> None:
+        cut = now - self._window
         while q and q[0] <= cut:
             q.popleft()
 
@@ -320,3 +332,77 @@ def clear_login_failures_for(username: str) -> None:
     if not LOGIN_RATE_LIMIT_ENABLED:
         return
     _STORE.clear(_user_key(username))
+
+
+# ============================================================ 激活码绑定闸门
+# 为什么激活码也需要限速（2026-10-20 激活码改 6+1 位全数字后新增）
+# ------------------------------------------------------------------------
+# 空间只有 10^6，且**校验位由前 6 位完全决定** ⇒ 攻击者只要随机猜，约 1/10
+# 的猜测能通过本地格式校验，进而在库里"撞"到一枚真实存在的码。若不限速，
+# 一个脚本每分钟几万次请求就能在小时级内撞中某位用户的待绑定设备，
+# 把它绑到自己账号上（= 拿到设备 token = 看得到老人的提醒与回执）。
+#
+# 三道闸门（与登录同一套实现，规则不同）：
+#   1. 每 IP 每分钟 5 次失败 —— 挡住单点爆破；
+#   2. 每 IP 每小时 40 次失败 —— 挡住"每分钟 5 次"被拉长到整天的慢速爆破；
+#   3. **每账号**每小时 20 次失败 —— 生产部署在 nginx 反代后面，uvicorn 只信任
+#      ELDER_TRUSTED_PROXY_IPS 里的代理；若该变量没配，`client_ip()` 取到的
+#      是**反代自己的地址**，全站用户共享同一个 IP 键 ⇒ 一个攻击者把键打满，
+#      所有人 1 小时都绑不了设备（限速器变成 DoS 武器，与登录那条同一个坑）。
+#      账号键让"针对某个账号的失败"跨 IP 也封顶，同时把误伤限制在本人身上。
+#   4. 单码 max_attempts=5（在 models.ActivationCode 上，见 bind_device）——
+#      即使攻击者换 IP 换账号，也不能对**同一枚码**无限试。
+#
+# ⚠️ 成功绑定**不过闸门、也不记账**（与登录同一条铁律）：
+# 家属在老人家里连续绑三台设备不该被限速器误伤。
+BIND_RATE_LIMIT_DETAIL_PREFIX = "激活码错误次数过多"
+_BIND_RULES: tuple[tuple[float, int], ...] = (
+    (60.0, 5),
+    (3600.0, 40),
+)
+#: 账号维度的规则单独一张表：IP 闸门放宽（40/小时），账号闸门收紧（20/小时），
+#: 两张表共用一个 store 实现、两套键前缀，互不覆盖。
+_BIND_USER_RULES: tuple[tuple[float, int], ...] = ((3600.0, 20),)
+_BIND_STORE = _FailureStore(LOGIN_RATE_LIMIT_MAX_KEYS, _BIND_RULES)
+_BIND_USER_STORE = _FailureStore(LOGIN_RATE_LIMIT_MAX_KEYS, _BIND_USER_RULES)
+
+
+def _bind_user_key(user_id: int) -> str:
+    return "bind_u:" + str(user_id)
+
+
+def bind_gate(request, user_id: int) -> Verdict | None:
+    """激活码绑定失败路径的闸门。**成功绑定不要调用它**。"""
+    if not LOGIN_RATE_LIMIT_ENABLED:
+        return None
+    now = time.monotonic()
+    wait = max(
+        _BIND_STORE.blocked_for(_ip_key(client_ip(request)), now),
+        _BIND_USER_STORE.blocked_for(_bind_user_key(user_id), now),
+    )
+    if wait <= 0:
+        return None
+    sec = max(1, int(wait + 0.999))
+    return Verdict(sec, f"{BIND_RATE_LIMIT_DETAIL_PREFIX}，请 {_human_wait(sec)} 后再试")
+
+
+def record_bind_failure(request, user_id: int) -> None:
+    """记一笔绑定失败（IP 与账号各一份）。只在**确实失败**时调用。"""
+    if not LOGIN_RATE_LIMIT_ENABLED:
+        return
+    now = time.monotonic()
+    _BIND_STORE.record(_ip_key(client_ip(request)), now)
+    _BIND_USER_STORE.record(_bind_user_key(user_id), now)
+
+
+def clear_bind_failures(request, user_id: int) -> None:
+    """绑定成功时清掉该 IP 与**该账号自己**的失败记录。
+
+    与 ``clear_login_failures_for`` 不同，这里清 IP 键是安全的：绑定成功
+    意味着手里已经有一枚合法激活码，攻击者不可能靠"撞中一次"来重置配额
+    （那已经是他得手的时刻）。而家属连续绑多台设备时，正需要这个清零。
+    """
+    if not LOGIN_RATE_LIMIT_ENABLED:
+        return
+    _BIND_STORE.clear(_ip_key(client_ip(request)))
+    _BIND_USER_STORE.clear(_bind_user_key(user_id))

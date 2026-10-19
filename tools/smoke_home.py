@@ -29,6 +29,7 @@ PY = sys.executable
 # 默认端口统一由 tools/smoke_ports.py 托管（唯一真源），各脚本不再各写一份 ——
 # 早先 smoke_home/smoke_roles/smoke_memory 都是 8097，并行跑必然撞车。
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+from smoke_common import unlink_retry
 from smoke_ports import (  # noqa: E402
     detect_addr_in_use,
     guard_or_die,
@@ -147,7 +148,7 @@ def main() -> int:
     env["ELDER_SEED_ADMIN_PASSWORD"] = LEGACY_PW
 
     if DB_FILE.exists():
-        DB_FILE.unlink()
+        unlink_retry(DB_FILE)
 
     print(f"[boot] starting server on :{PORT} (db: {DB_FILE})")
     # ---- 三段式端口守卫（QA 第 4 轮「假绿」修复）----
@@ -567,7 +568,7 @@ def main() -> int:
             print(f"\n[diag] ---- server log tail ({SERVER_LOG}) ----")
             print(_read_log_tail())
         if DB_FILE.exists():
-            DB_FILE.unlink()
+            unlink_retry(DB_FILE)
 
     passed = sum(1 for _, ok, _ in results if ok)
     total = len(results)

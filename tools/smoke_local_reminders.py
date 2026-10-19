@@ -138,7 +138,7 @@ def main() -> int:
         # 走真流程拿 device_token：申请激活码 -> 校验 -> 绑定
         code, cd = req("POST", f"/api/devices/{dev_pk}/code", {}, tok)
         full_code = (cd or {}).get("code", "")
-        check("申请激活码", code == 200 and len(full_code) == 13, f"HTTP {code}")
+        check("申请激活码", code == 200 and len(full_code) == 7, f"HTTP {code}")
         code, bind = req("POST", "/api/devices/bind", {"code": full_code}, tok)
         dev_token = (bind or {}).get("device_token", "")
         check("绑定拿到 device_token", code == 200 and bool(dev_token), f"HTTP {code}")

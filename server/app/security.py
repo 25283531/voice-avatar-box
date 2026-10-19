@@ -11,12 +11,12 @@ from datetime import datetime, timedelta, timezone
 import jwt
 
 from .config import (
+    ACT_CODE_BODY_LEN,
     ACT_CODE_LEN,
     ACT_CODE_TTL_MINUTES,
     DEVICE_TOKEN_TTL,
     JWT_ALG,
     JWT_SECRET,
-    LETTERS,
     USER_TOKEN_TTL,
 )
 
@@ -110,15 +110,22 @@ def decode_token(token: str) -> dict | None:
 
 
 # ============================================================ 激活码
-def luhn_check_digit(digits11: str) -> int:
-    """与固件 elder_activation.c 中 luhn_check_digit() 完全一致。
+# 7 位全数字 = 6 位随机数字 + 1 位 Luhn 校验位。与固件 activation.c 逐位一致。
+def luhn_check_digit(body: str) -> int:
+    """对 body 计算 Luhn 校验位（**完整码长 = len(body) + 1**）。
 
-    digits11: 11 位数字字符串（code[1..11]）
+    与固件 ``activation.c::luhn_check_digit()`` 完全一致：
+    自右往左数，偶数位加倍（>9 则减 9），校验位本身是第 1 位不加倍。
+
+    ⚠️ 校验位由 body **完全决定**，不增加任何密钥空间 —— 它的唯一作用是
+    把「抄错一位」这类手误在本地拦掉。**它不是安全机制**，别指望它防撞码。
     """
+    n = len(body)
     total = 0
-    for i in range(11):
-        d = int(digits11[i])
-        if (11 - i) % 2 == 0:      # index 1,3,5,7,9 加倍
+    for i, ch in enumerate(body):
+        d = int(ch)
+        # body 的 index i 在完整码里是自右往左第 (n + 1 - i) 位
+        if (n + 1 - i) % 2 == 0:
             d *= 2
             if d > 9:
                 d -= 9
@@ -126,41 +133,47 @@ def luhn_check_digit(digits11: str) -> int:
     return (10 - (total % 10)) % 10
 
 
-def generate_activation_code(prefix: str | None = None) -> str:
-    """生成 13 位激活码：1 位字母 + 11 位随机数字 + 1 位 Luhn 校验位。"""
-    letter = prefix if prefix else secrets.choice(LETTERS)
-    letter = letter.upper()
-    if letter in ("I", "O"):
-        letter = secrets.choice(LETTERS)
-    digits = "".join(secrets.choice("0123456789") for _ in range(11))
-    return letter + digits + str(luhn_check_digit(digits))
+def generate_activation_code() -> str:
+    """生成 7 位激活码：6 位随机数字 + 1 位 Luhn 校验位。
+
+    ⚠️ 空间只有 10^6（约 100 万），**调用方必须处理撞码**：
+    ``activation_codes.code`` 上有唯一索引，撞了会抛 IntegrityError。
+    ``devices.issue_code`` / ``device_api.request_activation_code`` /
+    ``voice._ensure_activation_code`` 三处都带重试，新增调用点请照抄。
+    """
+    body = "".join(secrets.choice("0123456789") for _ in range(ACT_CODE_BODY_LEN))
+    return body + str(luhn_check_digit(body))
 
 
 def verify_activation_code(code: str) -> bool:
     """校验激活码格式与 Luhn 校验位（不查库，纯算法）。"""
     if not code or len(code) != ACT_CODE_LEN:
         return False
-    c0 = code[0].upper()
-    if not c0.isalpha() or c0 in ("I", "O"):
+    # ⚠️ 必须 isascii + isdigit 两个都要：Python 的 str.isdigit() 对
+    # '²'（上标二）、全角 '１'、阿拉伯-印度数字 '١' 都返回 True，
+    # 而 int() 对 '²' 直接抛 ValueError —— 攻击者一个 '²' 就能把这里
+    # 变成未捕获异常（500）。固件侧只认 '0'..'9'，两边口径必须一致。
+    if not (code.isascii() and code.isdigit()):
         return False
-    body = code[1:]
-    if not body.isdigit():
-        return False
-    return int(body[11]) == luhn_check_digit(body[:11])
+    return int(code[-1]) == luhn_check_digit(code[:-1])
 
 
 def normalize_code(code: str) -> str:
-    """容错输入：去空格、去分隔符、首字母大写。"""
+    """容错输入：去空格、去分隔符。
+
+    保留 ``isalnum`` 而不是 ``isdigit``：用户把「1」打成「l」时，
+    这里不该把它悄悄变成别的数字，而应该让长度/纯数字校验在下一道关卡
+    明确拒绝（错误信息才说得清「激活码是 7 位数字」）。
+    """
     cleaned = "".join(ch for ch in code.strip() if ch.isalnum())
     return cleaned.upper() if cleaned else ""
 
 
 def format_code(code: str) -> str:
-    """显示为 A-3829-4471-0056，降低 320x240 小屏上的抄写错误率。"""
+    """显示为 123-4567，降低小屏上的抄写错误率。"""
     if len(code) != ACT_CODE_LEN:
         return code
-    d = code[1:]
-    return f"{code[0].upper()}-{d[0:4]}-{d[4:8]}-{d[8:12]}"
+    return f"{code[:3]}-{code[3:]}"
 
 
 def code_expires_at(now: datetime | None = None) -> datetime:

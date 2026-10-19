@@ -250,13 +250,26 @@ LOGIN_RATE_LIMIT_MAX_KEYS = _int_env("ELDER_LOGIN_RATE_LIMIT_MAX_KEYS", 10000)
 TRUSTED_PROXY_IPS = os.getenv("ELDER_TRUSTED_PROXY_IPS", "").strip()
 
 # ---------------------------------------------------------------- 激活码
-# 与固件 elder_activation.c 保持完全一致：
-#   [0]     1 位字母（剔除易混淆的 I / O）
-#   [1..11] 11 位随机数字
-#   [12]    1 位 Luhn 校验位（由 [1..11] 计算）
-ACT_CODE_LEN = 13
+# **7 位全数字**：6 位随机数字 + 1 位 Luhn 校验位。
+# 与固件 firmware/components/elder/src/activation.c 逐位一致 —— 改一处必须改两处，
+# 否则设备屏上的码在 APP 里永远校验不过（历史上就是这么坏过一次）。
+#
+# ⚠️ 为什么从「1 字母 + 12 数字」退成「7 位全数字」（用户 2026-10-20 拍板）
+#   设备内置音效表 assets/lang_config.h 只有 OGG_0..OGG_9，**没有字母音**；
+#   上游 Application::ShowActivationCode() 逐字符播报，遇到字母静默跳过
+#   ⇒ 老人只听到 12 位数字，照输必被 APP 的 13 位校验拒掉。语音侧无解。
+#   全数字后 7 位都能念完，且 7 位在 320x240 上可以一行大字显示。
+#
+# ⚠️ 代价必须写在这里，别让后人以为这是免费的：
+#   密钥空间从 26×10^11 ≈ 2.6e12 降到 10^6，**掉了 6 个数量级**，
+#   校验位由前 6 位完全决定，**不增加任何熵**（它只防手误，不防攻击）。
+#   ⇒ 必须配套绑定接口限速 + 单码失败上限，见 app/ratelimit.py 的 bind_gate()
+#     与 models.ActivationCode.attempts / max_attempts。
+#   ⇒ 激活码与 MAC 强绑定（server/app/voice/__init__.py 的 _ensure_activation_code
+#     按 MAC 建行），绑定时校验 device_id 一致，撞码不能跨设备使用。
+ACT_CODE_BODY_LEN = 6
+ACT_CODE_LEN = ACT_CODE_BODY_LEN + 1
 ACT_CODE_TTL_MINUTES = int(os.getenv("ELDER_ACT_TTL_MIN", "10"))
-LETTERS = "ABCDEFGHJKLMNPQRSTUVWXYZ"
 
 # ---------------------------------------------------------------- 设备 OTA 固件分发
 # 两个变量**都非空**时，OTA 响应（已绑定 / 未绑定两条路径）才带

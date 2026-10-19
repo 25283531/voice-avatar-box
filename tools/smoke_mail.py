@@ -46,6 +46,7 @@ PY = sys.executable
 # 默认端口统一由 tools/smoke_ports.py 托管（唯一真源），各脚本不再各写一份 ——
 # 早先 smoke_models/smoke_mail 都是 8096，并行跑必然撞车。
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+from smoke_common import unlink_retry
 from smoke_ports import (  # noqa: E402
     detect_addr_in_use,
     guard_or_die,
@@ -68,7 +69,7 @@ DB_DIR = Path(os.environ.get("SMOKE_DB_DIR", str(Path(tempfile.gettempdir()))))
 DB_PATH = Path(os.environ.get("SMOKE_MAIL_DB",
                               str(DB_DIR / f"elder_smoke_mail_{os.getpid()}.db")))
 if DB_PATH.exists():
-    DB_PATH.unlink()
+    unlink_retry(DB_PATH)
 
 PORT = resolve_port("smoke_mail")
 BASE = f"http://127.0.0.1:{PORT}"
@@ -957,7 +958,7 @@ def main() -> int:
             p = Path(str(DB_PATH) + suffix)
             if p.exists():
                 try:
-                    p.unlink()
+                    unlink_retry(p)
                 except OSError:
                     pass
 

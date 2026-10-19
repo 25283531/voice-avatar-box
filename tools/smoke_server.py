@@ -277,16 +277,17 @@ def main() -> int:
 
         # ---------------------------------------------------- 4. 激活码
         code, cd = req("POST", f"/api/devices/{dev_pk}/code", {}, token)
-        ok_code = code == 200 and len(cd.get("code", "")) == 13
-        check("生成 13 位激活码", ok_code, cd.get("display", ""))
+        ok_code = code == 200 and len(cd.get("code", "")) == 7
+        check("生成 7 位激活码（6 位随机 + 1 位校验）", ok_code, cd.get("display", ""))
         full = cd.get("code", "")
 
-        # 与固件同算法校验 Luhn
-        def luhn11(d: str) -> int:
+        # 与固件同算法校验 Luhn：完整码长 = 6 位 body + 1 位校验 = 7
+        def luhn6(d: str) -> int:
             s = 0
-            for i in range(11):
+            for i in range(6):
                 v = int(d[i])
-                if (11 - i) % 2 == 0:
+                # body 的 index i 在完整 7 位码里是自右往左第 (7 - i) 位
+                if (7 - i) % 2 == 0:
                     v *= 2
                     if v > 9:
                         v -= 9
@@ -294,10 +295,10 @@ def main() -> int:
             return (10 - s % 10) % 10
 
         check("Luhn 校验位一致（对齐固件 C 实现）",
-              len(full) == 13 and int(full[12]) == luhn11(full[1:12]),
-              f"expect={luhn11(full[1:12]) if len(full) == 13 else '?'} actual={full[12:]}")
-        check("显示格式分四段",
-              cd.get("display", "").count("-") == 3 and len(cd.get("display", "")) == 16,
+              len(full) == 7 and int(full[6]) == luhn6(full[:6]),
+              f"expect={luhn6(full[:6]) if len(full) == 7 else '?'} actual={full[6:]}")
+        check("显示格式为 123-4567",
+              cd.get("display", "").count("-") == 1 and len(cd.get("display", "")) == 8,
               cd.get("display", ""))
 
         # ---------------------------------------------------- 5. 错误码应当被拒

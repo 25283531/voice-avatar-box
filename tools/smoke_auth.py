@@ -151,6 +151,7 @@ SERVER = ROOT / "server"
 PY = sys.executable
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+from smoke_common import unlink_retry  # noqa: E402
 from smoke_ports import (  # noqa: E402
     detect_addr_in_use,
     guard_or_die,
@@ -168,7 +169,7 @@ DB_DIR = Path(os.environ.get("SMOKE_DB_DIR", str(Path(tempfile.gettempdir()))))
 DB_PATH = Path(os.environ.get("SMOKE_AUTH_DB",
                               str(DB_DIR / f"elder_smoke_auth_{os.getpid()}.db")))
 if DB_PATH.exists():
-    DB_PATH.unlink()
+    unlink_retry(DB_PATH)
 
 PORT = resolve_port("smoke_auth")
 BASE = f"http://127.0.0.1:{PORT}"
@@ -771,7 +772,7 @@ def main() -> int:
     # 后面那条「已有管理员不被降级」就失去了可打架的对象（管理员已经不存在了）。
     db_empty = DB_PATH.with_name(DB_PATH.stem + "_empty.db")
     if db_empty.exists():
-        db_empty.unlink()
+        unlink_retry(db_empty)
     proc = start_server({"ELDER_ALLOW_PUBLIC_REGISTER": "1",
                          "ELDER_SEED_ADMIN_PASSWORD": LEGACY_PW}, db_path=db_empty)
     if proc is None:
@@ -859,7 +860,7 @@ def main() -> int:
     group("场景 4：★ 新部署空库 + 未设 ELDER_SEED_ADMIN_PASSWORD -> 随机口令")
     db_rand = DB_PATH.with_name(DB_PATH.stem + "_rand.db")
     if db_rand.exists():
-        db_rand.unlink()
+        unlink_retry(db_rand)
     # ⚠️ 显式传 None = 从子进程 env 里**删掉**这个变量。CI 在 job 级设了它，
     #   不删就永远走不到随机分支（详见模块 docstring）。
     proc = start_server({"ELDER_SEED_ADMIN_PASSWORD": None}, db_path=db_rand)
@@ -902,7 +903,7 @@ def main() -> int:
     group("场景 5：设了 ELDER_SEED_ADMIN_PASSWORD -> 用它，admin123 失败")
     db_seedpw = DB_PATH.with_name(DB_PATH.stem + "_seedpw.db")
     if db_seedpw.exists():
-        db_seedpw.unlink()
+        unlink_retry(db_seedpw)
     proc = start_server({"ELDER_SEED_ADMIN_PASSWORD": SEED_PW}, db_path=db_seedpw)
     if proc is None:
         return 1
@@ -925,7 +926,7 @@ def main() -> int:
     group("场景 6：★ 存量库（admin 口令仍是 admin123）-> 启动打印告警")
     db_legacy = DB_PATH.with_name(DB_PATH.stem + "_legacy.db")
     if db_legacy.exists():
-        db_legacy.unlink()
+        unlink_retry(db_legacy)
     # ---- 6A：造存量库（顺带放一个「已改过口令的管理员」和一个普通用户做回归对象）
     proc = start_server({"ELDER_ALLOW_PUBLIC_REGISTER": "1",
                          "ELDER_SEED_ADMIN_PASSWORD": LEGACY_PW,

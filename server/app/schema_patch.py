@@ -302,6 +302,15 @@ NEW_COLUMNS: Final[list[tuple[str, str, str, str]]] = [
     #   同例），两个归属写入点（devices.create_device / bind_device）负责写值。
     ("devices", "hardware_model", "VARCHAR(64) DEFAULT ''", "VARCHAR(64) DEFAULT ''"),
     ("devices", "bound_at", "DATETIME", "DATETIME NULL"),
+    # ---- activation_codes：6+1 位改造（2026-10-20）----
+    # 激活码空间从 26e11 降到 1e6，这三列是把风险压回去的**结构性**前提：
+    #   attempts/max_attempts —— 单码失败上限（撞码者不能无限试校验位变体）；
+    #   used_at             —— 使用时间（审计 + 后续按时间清理的判据）。
+    # 三个都带 server_default/DEFAULT：老库补列后既有行读出 0 / 5 / NULL，
+    # 不会炸 Pydantic（NULL 只出现在 used_at，且模型里是 Optional）。
+    ("activation_codes", "attempts", "INTEGER DEFAULT 0", "INT NOT NULL DEFAULT 0"),
+    ("activation_codes", "max_attempts", "INTEGER DEFAULT 5", "INT NOT NULL DEFAULT 5"),
+    ("activation_codes", "used_at", "DATETIME", "DATETIME NULL"),
 ]
 
 # 本轮新增的索引。create_all 只为**新**库建索引，老库升级上来不会有，

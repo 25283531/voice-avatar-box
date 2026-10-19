@@ -48,6 +48,7 @@ PY = sys.executable
 # 默认端口统一由 tools/smoke_ports.py 托管（唯一真源）：smoke_usage=8120，
 # 与 smoke_voice(8119) 错开。各脚本不再各写一份，并行跑必然撞车。
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+from smoke_common import unlink_retry
 from smoke_ports import (  # 见 smoke_ports.py 模块 docstring
     detect_addr_in_use,
     guard_or_die,
@@ -69,7 +70,7 @@ DB_PATH = DB_DIR / f"elder_smoke_usage_{os.getpid()}.db"
 # 缓冲区把写日志的一端永久阻塞（本仓 smoke_mail 的真实事故）。
 SERVER_LOG = DB_PATH.with_name(DB_PATH.stem + "_server.log")
 if DB_PATH.exists():
-    DB_PATH.unlink()
+    unlink_retry(DB_PATH)
 
 PORT = resolve_port("smoke_usage")
 BASE = f"http://127.0.0.1:{PORT}"
@@ -498,7 +499,7 @@ def main() -> int:
         except Exception:  # noqa: BLE001, S110  收尾失败不影响判定，别掩盖真异常
             pass
         if DB_PATH.exists():
-            DB_PATH.unlink()
+            unlink_retry(DB_PATH)
 
 
 if __name__ == "__main__":

@@ -136,17 +136,31 @@ class Device(Base):
 
 # ================================================================ 激活码
 class ActivationCode(Base):
-    """设备绑定激活码：1 位字母 + 12 位数字（末位为 Luhn 校验位）。"""
+    """设备绑定激活码：6 位随机数字 + 1 位 Luhn 校验位 = 7 位全数字。
+
+    ⚠️ 空间只有 10^6，所以这张表的两条不变量是**安全前提**而不是优化：
+      1. ``device_id`` 必须非空（激活码与 MAC 强绑定，撞码也不能跨设备用）；
+      2. ``attempts`` 达到 ``max_attempts`` 后该码作废 —— 攻击者拿到一枚码
+         也只能试有限次，而不是无限撞校验位。
+    绑定接口另有 IP/账号级限速（app/ratelimit.py::bind_gate）。
+    """
 
     __tablename__ = "activation_codes"
     __table_args__ = (Index("ix_act_code", "code"),)
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    # 7 位码；留 16 宽是为了兼容历史 13 位行（老库不迁移，只按长度过滤掉）
     code: Mapped[str] = mapped_column(String(16), unique=True, index=True)
-    # 为空表示「通用码」，任意设备均可申领；否则绑定到指定 device_id
+    # 非空：激活码总是绑定到一台具体设备（MAC）。空值只可能来自历史数据，
+    # 绑定时会被显式拒绝（见 routers/devices.py::bind_device）。
     device_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     used_by: Mapped[int | None] = mapped_column(ForeignKey("users.id"), nullable=True)
     used: Mapped[bool] = mapped_column(Boolean, default=False)
+    used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # 绑定尝试计数：每次校验通过但没绑成功也算一次（撞码者校验位也会过）
+    attempts: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    # 单码失败上限。5 次足以覆盖老人手抖重输，又让撞码者无法穷举校验位变体
+    max_attempts: Mapped[int] = mapped_column(Integer, default=5, server_default="5")
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 

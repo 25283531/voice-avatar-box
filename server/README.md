@@ -131,9 +131,13 @@ OTA 只给**已绑定设备**签发 token；未绑定只返激活码。
 服务端同时预排 36 小时实例做对账，两边以 `(reminder_id, due_at)` 对齐。
 
 ### 4.2 激活码
-13 位 = 1 位字母（剔除易混淆的 I/O）+ 11 位随机数字 + 1 位 Luhn 校验位，
-与固件 `elder_activation.c` 逐位一致；显示为 `A-3829-4471-0056` 四段式，降低小屏抄写错误率。
-输入时允许带空格/短横线，字母不区分大小写；校验位错当场报错，不需要打服务端。
+7 位 = 6 位随机数字 + 1 位 Luhn 校验位（全数字），与固件 `activation.c` 逐位一致；
+显示为 `123-4567`，降低小屏抄写错误率。输入时允许带空格/短横线，校验位错当场报错。
+
+⚠️ 空间只有 10^6，安全靠三件事：绑定接口限速（`ratelimit.bind_gate`，
+每 IP 5 次/分钟、40 次/小时失败）、单码失败上限（`ActivationCode.attempts`
+默认 5 次）、码与 MAC 强绑定（`bind_device` 校验 `device_id`）。
+校验位只防手误、不提供抗猜测能力，详见决策记录 D42。
 
 ### 4.3 提醒规则
 支持：每天 / 每周指定几天 / 每月指定几号 / 每隔 N 天 / 指定日期一次，
@@ -151,7 +155,7 @@ OTA 只给**已绑定设备**签发 token；未绑定只返激活码。
 | POST | `/api/auth/register` `/api/auth/login` | 注册 / 登录 |
 | GET | `/api/devices` | 设备列表 |
 | POST | `/api/devices` | 登记设备 |
-| POST | `/api/devices/{id}/code` | 生成 13 位激活码 |
+| POST | `/api/devices/{id}/code` | 生成 7 位激活码 |
 | POST | `/api/devices/bind` | 激活码绑定，返回设备 token |
 | GET | `/api/devices/{id}/events` | 提醒回执 |
 | GET/POST/PATCH/DELETE | `/api/reminders` | 提醒规则 CRUD（`POST` 需 `?device_pk=`） |

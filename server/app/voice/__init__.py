@@ -28,6 +28,8 @@
 from __future__ import annotations
 
 import logging
+import time
+from datetime import timedelta
 from typing import Any, Final
 
 from fastapi import APIRouter, FastAPI, Header, Request, Response
@@ -53,10 +55,22 @@ from .session import (
 
 log = logging.getLogger(__name__)
 
-#: 单个 MAC 下最多保留多少个未过期激活码。**无鉴权端点的防刷措施**：
-# 设备反复重启会反复来要码，若每次都新建，activation_codes 表会被
-# 一台设备刷满，而真正要绑定的用户反而可能拿到已过期的码。
+#: 单个 MAC 下最多保留多少个**未使用**激活码。
+#:
+#: ⚠️ 2026-10-20 起这个上限**不再由「新建」路径消耗**：``_reusable_activation_code``
+#: 改成「一台设备一辈子一枚码」（复用任意未用尽的行并顺延有效期），所以正常
+#: 情况下每个 MAC 只会有 1 行。保留这个常量是为了给**历史数据**兜底：老库里
+#: 可能已经攒了一摞（旧逻辑每 10 分钟新建一行且从不清理），运维排查时用得上。
 _MAX_ACTIVE_CODES_PER_MAC: Final[int] = 10
+
+#: 一枚激活码的**寿命上限**（自 created_at 起算）。设备每 15s 轮询一次，
+#: 若每次都无条件顺延有效期，这枚码就永远不会过期 —— 一旦泄漏即永久凭据。
+#: 24 小时足够覆盖「老人今天没空绑、明天再绑」，又让泄漏有确定的止损点。
+_ACT_CODE_MAX_LIFETIME: Final = timedelta(hours=24)
+
+#: 上次清理僵尸激活码的时间（time.monotonic）。清理是幂等 DELETE，
+#: 挂在取码路径上按小时节流，不引入新的后台任务。
+_last_purge_at: float = 0.0
 
 
 def _ws_endpoint(request: Request) -> str:
@@ -89,31 +103,85 @@ def _server_time() -> dict[str, Any]:
 
 
 def _reusable_activation_code(db: Any, mac: str) -> ActivationCode | None:
-    """找该 MAC 未过期的可复用激活码；没有则 None。"""
+    """找该 MAC 可复用的激活码；没有则 None。
+
+    ⚠️ 四个判据，每个都对应一次真实的失败模式（2026-10-20 改 6+1 位时重写）：
+
+    1. **不看 ``expires_at``**：原先只复用「未过期」的行，于是设备每过 10 分钟
+       就新建一行，而 ``activation_codes`` **没有任何清理任务** —— 一台长期
+       未绑定的设备能在一周内攒出上千行。7 位码空间只有 10^6，这些僵尸行会
+       把可用空间直接吃掉。现在「一台设备长期一枚码」，复用时把有效期顺延。
+    2. **但有效期不能无限顺延**：设备每 15s 轮询一次，若每次都无条件续期，
+       这枚码永远不过期 ⇒ 一旦泄漏就是永久凭据。所以续期以
+       ``created_at + _ACT_CODE_MAX_LIFETIME`` 封顶，到顶即退役换新码。
+    3. **跳过已用尽的码**：``attempts >= max_attempts`` 的码已经被撞到作废，
+       不能再发给用户（他照着屏幕输只会一直失败）。
+    4. **按长度过滤**：老库里的 13 位行（1 字母 + 12 数字）不能发给新固件 ——
+       新固件按 7 位校验，收到 13 位会拒绝上屏。
+    """
+    from datetime import timedelta
+
     from sqlalchemy import func, select
 
-    now = _utcnow()
-    total = db.scalar(
-        select(func.count()).select_from(ActivationCode).where(
-            ActivationCode.device_id == mac,
-            ActivationCode.used.is_(False),
-            ActivationCode.expires_at > now,
-        )
-    ) or 0
-    if total >= _MAX_ACTIVE_CODES_PER_MAC:
-        # 已有一摞未过期的码：只复用最新的，绝不新建。
-        log.info("MAC %s 已有 %d 个未过期激活码，只复用不新建", mac, total)
     row = db.scalar(
         select(ActivationCode).where(
             ActivationCode.device_id == mac,
             ActivationCode.used.is_(False),
-            ActivationCode.expires_at > now,
+            ActivationCode.attempts < ActivationCode.max_attempts,
+            func.length(ActivationCode.code) == config.ACT_CODE_LEN,
         ).order_by(ActivationCode.id.desc())
     )
+    if row is None:
+        return None
+
+    now = _now()
+    created = row.created_at or now
+    if created.tzinfo is None:
+        created = created.replace(tzinfo=now.tzinfo)
+    cap = created + _ACT_CODE_MAX_LIFETIME
+    if cap <= now:
+        # 到寿命上限：退役这枚码（used=True 让它再也不会被复用），下一轮新建
+        row.used = True
+        db.commit()
+        log.info("MAC %s 的激活码到达寿命上限，退役换新", mac)
+        return None
+
+    # 顺延有效期（设备屏上正显示着这枚码，用户随时可能来绑），但不超过寿命上限
+    fresh = code_expires_at()
+    row.expires_at = fresh if fresh < cap else cap
+    db.commit()
+    db.refresh(row)
     return row
 
 
-def _utcnow():
+def _purge_stale_codes(db: Any) -> int:
+    """删掉早已过期且从未被使用的激活码行，返回删除条数。
+
+    ⚠️ 为什么必须有：``activation_codes`` 原先**没有任何清理**。改 7 位后空间
+    只有 10^6，而 OTA 端点无鉴权、按任意 ``Device-Id`` 都会建行 —— 攻击者
+    拿一批伪造 MAC 打几小时就能把表撑满，之后**所有真实设备都取不到码**
+    （唯一索引撞满 → 生成失败），这是不可逆的功能性瘫痪。
+
+    为什么「过期 1 天以上」而不是立刻删：设备刚过期就删，会让正在输入的用户
+    拿到 404；留一天足够覆盖「看完屏、回屋拿手机、慢慢输」的真实节奏。
+    幂等：DELETE 条件只依赖数据本身，重复执行结果相同（第 2 次删 0 行）。
+    """
+    from datetime import timedelta
+
+    from sqlalchemy import delete
+
+    cut = _now() - timedelta(days=1)
+    res = db.execute(
+        delete(ActivationCode).where(
+            ActivationCode.used.is_(False),
+            ActivationCode.expires_at < cut,
+        )
+    )
+    db.commit()
+    return int(res.rowcount or 0)
+
+
+def _now():
     import datetime as _dt
 
     return _dt.datetime.now(_dt.timezone.utc)
@@ -140,22 +208,56 @@ def _firmware_section() -> dict[str, Any] | None:
 
 
 def _ensure_activation_code(db: Any, mac: str) -> ActivationCode:
-    """给未绑定设备一个激活码：优先复用，没有再建。"""
+    """给未绑定设备一个激活码：优先复用，没有再建。
+
+    ⚠️ 新建必须带**撞码重试**：7 位码空间只有 10^6，``code`` 上有唯一索引，
+    撞了会抛 IntegrityError。这条路径是**无鉴权端点**（未绑定设备都能打），
+    一个未捕获的 500 会让设备每 15s 撞一次 —— 必须自己兜住。
+    """
+    from sqlalchemy import select
+    from sqlalchemy.exc import IntegrityError
+
+    global _last_purge_at
+    now_mono = time.monotonic()
+    if now_mono - _last_purge_at > 3600:
+        _last_purge_at = now_mono
+        try:
+            purged = _purge_stale_codes(db)
+            if purged:
+                log.info("清理过期激活码 %d 行（释放码空间）", purged)
+        except Exception:      # noqa: BLE001  清理失败绝不影响取码
+            db.rollback()
+            log.warning("清理过期激活码失败，本轮跳过", exc_info=True)
+
     row = _reusable_activation_code(db, mac)
     if row is not None:
         return row
-    code = generate_activation_code()
-    row = ActivationCode(
-        code=code,
-        device_id=mac,
-        used_by=None,
-        used=False,
-        expires_at=code_expires_at(),
-    )
-    db.add(row)
-    db.commit()
-    db.refresh(row)
-    return row
+
+    for _ in range(8):
+        code = generate_activation_code()
+        clash = db.scalar(
+            select(ActivationCode).where(ActivationCode.code == code).limit(1)
+        )
+        if clash is not None:
+            continue
+        row = ActivationCode(
+            code=code,
+            device_id=mac,
+            used_by=None,
+            used=False,
+            expires_at=code_expires_at(),
+        )
+        db.add(row)
+        try:
+            db.commit()
+        except IntegrityError:
+            # 并发撞码：另一个请求刚插了同一个 code，回滚后重试
+            db.rollback()
+            continue
+        db.refresh(row)
+        return row
+
+    raise RuntimeError(f"激活码生成失败（连续 8 次撞码），MAC={mac}")
 
 
 router = APIRouter(prefix=config.VOICE_OTA_PATH, tags=["voice"])
@@ -194,7 +296,8 @@ async def ota_check(
     token 等于开一个无主账户：任何人都能拿一个 MAC 换一个能调 LLM、
     能读该 owner 记忆的凭证。
 
-    激活码为什么复用而不每次新建：见 :data:`_MAX_ACTIVE_CODES_PER_MAC`。
+    激活码为什么复用而不每次新建：见 :func:`_reusable_activation_code`
+    （7 位码空间只有 10^6，一台设备反复新建会把可用空间吃光）。
     """
     mac = (device_id or "").strip()
     if not mac:

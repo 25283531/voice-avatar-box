@@ -870,8 +870,9 @@ def t_ota(ids: dict) -> None:
     check("OTA 未绑定**不带** websocket 段"
           "（给未绑定设备发 token = 开一个无主账户）",
           "websocket" not in unbound, str(list(unbound.keys())))
-    check("OTA 未绑定的激活码是 13 位",
-          len(str(unbound.get("activation", {}).get("code", ""))) == 13,
+    check("OTA 未绑定的激活码是 7 位（6 位随机 + 1 位校验，全数字）",
+          len(str(unbound.get("activation", {}).get("code", ""))) == 7
+          and str(unbound.get("activation", {}).get("code", "")).isdigit(),
           str(unbound.get("activation", {}).get("code")))
     check("OTA 响应带 server_time",
           isinstance(unbound.get("server_time", {}).get("timestamp"), int),

@@ -60,6 +60,7 @@ SERVER = ROOT / "server"
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from smoke_ports import guard_or_die, guard_port, release_port, resolve_port  # noqa: E402
+from smoke_common import unlink_retry
 
 # ⚠️ 本地请求绝不走系统代理（同 smoke_models.py 的理由：本机设了 http_proxy，
 # 会把「访问自己刚起的 127.0.0.1」绕到代理，表现为超时且零断言失败 —— 极像回归）。
@@ -70,7 +71,7 @@ DB_PATH = Path(os.environ.get(
     "SMOKE_VOICE_CATALOG_DB",
     str(Path(tempfile.gettempdir()) / f"elder_smoke_vcatalog_{os.getpid()}.db")))
 if DB_PATH.exists():
-    DB_PATH.unlink()
+    unlink_retry(DB_PATH)
 
 PORT = resolve_port("smoke_voice_catalog")
 BASE = f"http://127.0.0.1:{PORT}"
@@ -754,7 +755,7 @@ def main() -> int:
             print("\n[diag] ---- server log tail ----\n" + read_log_tail())
         try:
             if DB_PATH.exists():
-                DB_PATH.unlink()
+                unlink_retry(DB_PATH)
         except Exception:
             pass
 

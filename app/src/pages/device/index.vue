@@ -32,16 +32,16 @@ const loading = ref(false)
 const showBind = ref(false)
 const bindForm = ref({ code: '', alias: '' })
 
-// 激活码契约：1 位字母 + 12 位数字 = 13 位。
-// 与服务端 generate_activation_code()（server/app/security.py）逐位一致，
-// **校验逻辑本身不改** —— 用户输不上是因为语音漏播首字母只听到 12 位，
-// 修法是固件把码显示在屏幕上（大字分组），不是放宽长度。
-const CODE_LEN = 13
+// 激活码契约：**6 位随机数字 + 1 位校验位 = 7 位纯数字**。
+// 与服务端 generate_activation_code()（server/app/security.py）逐位一致。
+// ⚠️ 2026-10-20 从「1 字母 + 12 数字」改成全数字：设备内置音效表只有数字音，
+// 旧格式的首字母在语音播报时被静默跳过，老人只听得到 12 位数字、照输必被拒。
+const CODE_LEN = 7
 
 // 已输入的有效位数：过滤短横线等分隔符后按字符数算。
-// 屏幕上的码是 A-3829-4471-0056 分组形态，用户照抄会带 -，
+// 屏幕上的码是 123-4567 分组形态，用户照抄会带 -，
 // 按输入框原长度算会虚高，必须按「将要提交的形态」计。
-const codeLen = computed(() => bindForm.value.code.replace(/[^0-9a-zA-Z]/g, '').length)
+const codeLen = computed(() => bindForm.value.code.replace(/\D/g, '').length)
 
 /** 正在配置哪台设备：null=关闭 / 'net'=配网 / 'agent'=绑角色 */
 const panel = ref<null | { devicePk: number, mode: 'net' | 'agent' }>(null)
@@ -69,12 +69,12 @@ async function refresh() {
 }
 
 async function doBind() {
-  const code = bindForm.value.code.replace(/[^0-9a-zA-Z]/g, '').toUpperCase()
+  // 只留数字：屏幕上显示的是 123-4567，用户粘进来会带短横线。
+  const code = bindForm.value.code.replace(/\D/g, '')
   if (code.length !== CODE_LEN) {
-    // 带上实际位数：用户最常见的失误是只听清语音、漏了首字母只输入 12 位，
-    // 「还差 1 位 + 首位是字母」比一句笼统的「格式不正确」可操作得多。
+    // 带上实际位数：「还差 N 位」比一句笼统的「格式不正确」可操作得多。
     uni.showToast({
-      title: `激活码应为 13 位（1 字母 + 12 数字），当前 ${code.length} 位`,
+      title: `激活码应为 ${CODE_LEN} 位数字，当前 ${code.length} 位`,
       icon: 'none',
     })
     return
@@ -196,7 +196,7 @@ onShow(() => { refresh() })
         还没有设备
       </view>
       <view class="empty-sub">
-        打开设备电源，屏幕上会显示 13 位激活码，点右上角「添加设备」输入即可绑定
+        打开设备电源，屏幕上会显示 7 位数字激活码，点右上角「添加设备」输入即可绑定
       </view>
     </view>
 
@@ -232,17 +232,17 @@ onShow(() => { refresh() })
           添加设备
         </view>
         <view class="tip left">
-          在设备屏幕上可以看到形如 A-3829-4471-0056 的激活码，10 分钟内有效
+          在设备屏幕上可以看到形如 123-4567 的 7 位数字激活码，10 分钟内有效
         </view>
-        <input v-model="bindForm.code" class="input big" placeholder="A-3829-4471-0056" />
+        <input v-model="bindForm.code" class="input big" placeholder="123-4567" />
         <view class="code-count">
           已输入 {{ codeLen }}/{{ CODE_LEN }} 位
         </view>
         <view v-if="codeLen < CODE_LEN" class="code-tip">
-          还差 {{ CODE_LEN - codeLen }} 位：首位是字母，后面 12 位是数字
+          还差 {{ CODE_LEN - codeLen }} 位：全部是数字，屏幕上按 3+4 分组显示
         </view>
         <view v-else-if="codeLen > CODE_LEN" class="code-tip">
-          超出 {{ codeLen - CODE_LEN }} 位：激活码共 13 位（1 字母 + 12 数字），请核对屏幕
+          超出 {{ codeLen - CODE_LEN }} 位：激活码共 {{ CODE_LEN }} 位数字，请核对屏幕
         </view>
         <input v-model="bindForm.alias" class="input" placeholder="给设备起个名字（可选）" />
         <button class="btn" @click="doBind">
