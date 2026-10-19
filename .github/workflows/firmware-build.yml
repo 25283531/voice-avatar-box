@@ -272,6 +272,37 @@ jobs:
           }
           echo "merged-flash.bin = $(stat -c%s build/merged-flash.bin) 字节"
 
+      # ⚠️⚠️ **合并镜像自检**：上面「产物自检」是在 build/**/xiaozhi.bin 上做
+      #   **串检索（presence）**，它对「偏移错位」天然零鉴别力 —— 串放错位置也照样
+      #   在，断言照样绿。而用户烧的是合并镜像。两种静默失败必须分开抓：
+      #     A. merge 读到旧/别人的 xiaozhi.bin（缓存、并发、路径串了）→ 串检索能抓
+      #     B. 读对了但 app 偏移错位 / flasher_args 被改     → 串检索**抓不到**
+      #   所以这里不做串检索，做**按 flasher_args.json 声明的偏移逐字节比对**。
+      #   跟着 flasher_args.json 走、不硬编码 0x20000：merge-bin 本身就是读这个
+      #   文件拼的，用同一个源判定，才不至于「断言和拼装各说一套」。
+      - name: 合并镜像自检（app 段与 build/xiaozhi.bin 逐字节一致）
+        shell: bash
+        run: |
+          set -e
+          cd "$PROJECT_DIR"
+          python3 - <<'PY'
+          import json, pathlib, sys
+          b = pathlib.Path('build')
+          args = json.loads((b / 'flasher_args.json').read_text())
+          app_name = args['app']['file']
+          off = int(args['app']['offset'], 16)
+          app = (b / app_name).read_bytes()
+          merged = (b / 'merged-flash.bin').read_bytes()
+          if len(merged) < off + len(app):
+              sys.exit(f'合并镜像太短：{len(merged)} < app 偏移 {off:#x} + {len(app)}')
+          if merged[off:off + len(app)] != app:
+              sys.exit(
+                  f'合并镜像 {off:#x} 处的 app 段与 {app_name} 不一致 '
+                  f'⇒ 偏移错位，或 merge-bin 读到了旧文件')
+          print(f'OK：app {app_name} {len(app)} 字节落在 {off:#x}，与合并镜像逐字节一致')
+          print(f'    合并镜像总长 {len(merged)} 字节')
+          PY
+
       - name: 整理产物
         if: always()
         run: |
@@ -294,12 +325,54 @@ jobs:
           cp -v build/merged-flash.bin \
                "$GITHUB_WORKSPACE/out/elder-firmware-esp32s3-merged-flash.bin"
           cp -v build/flasher_args.json                "$GITHUB_WORKSPACE/out/" 2>/dev/null || true
-          # 应用镜像文件名随工程名变化，统一抓取
-          find build -maxdepth 1 -name "*.bin" ! -name "generated_assets.bin" \
-               ! -name "ota_data_initial.bin" -exec cp -v {} "$GITHUB_WORKSPACE/out/" \; 2>/dev/null || true
+          # 应用镜像文件名随工程名变化，统一抓取。
+          # ⚠️ 必须排除 merged-flash.bin：它就在 build/ 根下，不排除会被再拷一份，
+          #    artifact 里于是出现两个 12.4MB 的同内容大文件（其中一个还叫模糊的名字），
+          #    用户「该烧哪个」的困惑正是这么来的。合并镜像上面已按固定名拷过。
+          find build -maxdepth 1 -name "*.bin" \
+               ! -name "generated_assets.bin" ! -name "ota_data_initial.bin" \
+               ! -name "merged-flash.bin" -exec cp -v {} "$GITHUB_WORKSPACE/out/" \; 2>/dev/null || true
           echo "=== 收集到的产物 ==="
           ls -lh "$GITHUB_WORKSPACE/out" || true
           test -n "$(ls -A "$GITHUB_WORKSPACE/out")" || { echo "::error::未收集到任何 bin"; exit 1; }
+
+      # ⚠️ **最终上传件自检**：上面那道「产物自检」在 merge-bin 之前、且只查
+      #    build/**/xiaozhi.bin —— 它证明「编译出的应用镜像里有新代码」，
+      #    但用户真正烧的是 out/elder-firmware-esp32s3-merged-flash.bin。
+      #    这两者之间还隔着一次 esptool 合并，历史上恰恰在这一段出过事
+      #    （合并镜像没生成 / 拷错文件 / 用户下到散件）。所以这里对
+      #    **即将被 upload-artifact 打包的那份字节**再断言一遍。
+      - name: 产物自检（最终上传的合并镜像）
+        shell: bash
+        run: |
+          set -e
+          cd "$GITHUB_WORKSPACE/out"
+          python3 - <<'PY'
+          import pathlib, sys
+          merged = pathlib.Path('elder-firmware-esp32s3-merged-flash.bin')
+          if not merged.exists() or merged.stat().st_size == 0:
+              sys.exit('最终上传件 elder-firmware-esp32s3-merged-flash.bin 不存在或为空')
+          data = merged.read_bytes()
+          needle = '激活码\n%s\n%s'.encode()
+          if needle not in data:
+              sys.exit('合并镜像里检索不到屏显新格式串 ⇒ 用户烧的那份文件里没有这次修复')
+          if '%s\n激活码 %s'.encode() in data:
+              sys.exit('合并镜像里仍有旧的 ShowNotification 格式串 ⇒ 合并进来的是旧应用镜像')
+          # 偏移级一致性由上面「合并镜像自检（app 段逐字节一致）」负责。
+          # 这里刻意**不再**做 `app_bytes in data` 的包含性判断：它和串检索同族，
+          # 偏移错位时仍然成立，只会给人「已经校验过了」的错觉。
+          print(f'最终上传件自检通过：{merged.name} {len(data)} 字节')
+          PY
+
+      - name: 生成 SHA256SUMS（用户烧录前对账）
+        shell: bash
+        run: |
+          set -e
+          cd "$GITHUB_WORKSPACE/out"
+          # job summary 里只印 16 位截断值，用户没法拿它和本地 sha256 对账
+          # （sha256sum 出来是 64 位）。这里给一份完整摘要文件，随 artifact 一起下发。
+          sha256sum * > SHA256SUMS.txt
+          cat SHA256SUMS.txt
 
       - name: 汇总产物信息（job summary）
         if: always()
@@ -307,6 +380,10 @@ jobs:
         run: |
           # 名字/大小/校验和打进 job summary：用户不用下载就能确认下对了文件，
           # 也能跟本地 esptool 烧录前的 md5 对账。
+          # ⚠️ 校验和必须打**完整 64 位**：曾经只 `cut -c1-16`，用户本地
+          #    `sha256sum` 出来的 64 位没法直接比对（得手工截断），等于给了个
+          #    不可用的对账工具 —— 而「用户到底烧了哪个文件」正是本轮事故里
+          #    最需要回答的问题。完整值同时落进 out/SHA256SUMS.txt 随 artifact 下发。
           cd "$GITHUB_WORKSPACE/out" 2>/dev/null || exit 0
           {
             echo "### ESP32-S3 固件产物（artifact: elder-firmware-esp32s3）"
@@ -317,7 +394,7 @@ jobs:
               [ -f "$f" ] || continue
               printf '| `%s` | %s | `%s` |\n' \
                 "$f" "$(stat -c%s "$f" 2>/dev/null || echo '?')" \
-                "$(sha256sum "$f" 2>/dev/null | cut -c1-16 || echo '?')"
+                "$(sha256sum "$f" 2>/dev/null | cut -d' ' -f1 || echo '?')"
             done
             echo
             echo "**烧录用这一个**：\`elder-firmware-esp32s3-merged-flash.bin\`（offset 0x0，esptool 单文件直烧）"
