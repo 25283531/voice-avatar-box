@@ -138,6 +138,30 @@ def req(method: str, path: str, body: dict | None = None, token: str | None = No
             return e.code, raw
 
 
+def _lower_headers(resp) -> dict[str, str]:
+    """把响应头转成**键统一小写**的 dict。
+
+    ⚠️ 为什么必须转（2026-10-19 server-ci#96 的真实失败原因）
+    -------------------------------------------------------
+    原代码写的是 ``dict(resp.headers)``，把响应头降级成普通 dict ——
+    而 ``resp.headers`` 其实是 ``email.message.Message``，**HTTP 头名按规范
+    大小写不敏感**，``.get("Content-Type")`` 与 ``.get("content-type")`` 等价。
+    转成普通 dict 后这份能力就**丢了**，只剩字符串精确匹配。
+
+    而 uvicorn/h11 发出的头名是**小写**（HTTP/1.1 语义）⇒
+    ``dict(...).get("Content-Type")`` 必然返回 None ⇒
+    「Content-Type 是 audio/wav」这条断言恒红，而**服务端返回完全正确**。
+
+    本仓已为同一类坑留过伤疤：``smoke_proxy_headers.py`` 第一版就因为
+    「按 `Location` 取拿到空值」红过一次（那里是 h11 发小写、代码按驼峰取）。
+    同一个坑在同一个仓里出现第二次，说明**该修的是取法，不是那条断言**。
+
+    统一转小写后，调用方无论写 `content-type` 还是 `Content-Type` 都取得到，
+    且不必再依赖「当前 server 恰好发小写」这个隐含前提。
+    """
+    return {k.lower(): v for k, v in resp.headers.items()}
+
+
 def req_bin(method: str, path: str, token: str | None = None):
     """拿二进制的请求（试听音频是 wav，不能走 req() 的 JSON 解码）。"""
     r = urllib.request.Request(BASE + path, method=method)
@@ -145,9 +169,9 @@ def req_bin(method: str, path: str, token: str | None = None):
         r.add_header("Authorization", "Bearer " + token)
     try:
         with _LOCAL_OPENER.open(r, timeout=60) as resp:
-            return resp.status, resp.read(), dict(resp.headers)
+            return resp.status, resp.read(), _lower_headers(resp)
     except urllib.error.HTTPError as e:
-        return e.code, e.read(), dict(e.headers)
+        return e.code, e.read(), _lower_headers(e)
 
 
 def wait_ready(timeout: float = 120.0) -> bool:
@@ -284,7 +308,11 @@ def main() -> int:
             """
             try:
                 resp = _prov.voice_preview(voice=voice, text=text, user=None)
-                return resp.status_code, resp.body, dict(resp.headers)
+                # ⚠️ 这里也**不能**写 dict(resp.headers)（同 D37）：
+                # Starlette 的 Response.headers 是 MutableHeaders，本身大小写
+                # 不敏感；转成普通 dict 后按驼峰取就取不到。统一走 _lower_headers。
+                return (resp.status_code, resp.body,
+                        {k.lower(): v for k, v in resp.headers.items()})
             except HTTPException as exc:
                 return exc.status_code, str(exc.detail).encode(), {}
 
@@ -295,9 +323,11 @@ def main() -> int:
             status, wav, hdrs = _call_preview()
             check("C2 试听端点 200（打桩 PCM，不联网）", status == 200,
                   f"status={status} body={wav[:120]!r}")
+            # 键已由 _lower_headers 统一成小写，故这里大小写两种写法都能取到
+            # （不再依赖「uvicorn 恰好发小写」这个隐含前提）。
             check("C3 Content-Type 是 audio/wav",
                   "audio/wav" in (hdrs.get("content-type") or ""),
-                  f"got={hdrs.get('content-type')!r}")
+                  f"got={hdrs.get('content-type')!r} 全部头={list(hdrs)[:8]}")
 
             # C4 容器头：RIFF/WAVE 魔数 + 长度自洽（44 字节头 + 桩长度）。
             # 「能播但速度不对」（采样率写错）比不播更难排查，
