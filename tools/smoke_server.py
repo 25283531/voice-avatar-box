@@ -231,13 +231,28 @@ def main() -> int:
         # ---------------------------------------------------- 1b. 双入口路由
         # 2026-10-19 用户端入口重构（决策记录 D41）：/ = 用户端（未登录即
         # 登录/注册页），/admin = 管理后台，/user 已删除（项目未公开，
-        # 不重定向、不兼容渲染）。标记串取两个页面 h1 的实有文案。
+        # 不重定向、不兼容渲染）。
+        #
+        # ⚠️ 判据必须用**整行 <h1> 全串 + 反向否定**，不能用「用户端」
+        # 「管理后台」这类短标记：
+        #   · 「用户端」在 user.html 出现 4 次、index.html 也出现 3 次
+        #     （管理端有指向用户端的文案）；
+        #   · 「管理后台」在 index.html 7 次、user.html 6 次（用户端有
+        #     指向 /admin 的链接）。
+        # 短串两文件都有 ⇒ 把 / 与 /admin 整体对调后两条断言**照旧全绿**，
+        # 入口重构等于没有看门狗。QA 第 N 轮变异实证（M1）坐实了这个假绿。
+        # 所以用整行 h1（两个页面各自的 h1 文本不同）并双向否定：
+        # 既断言「有自己那个」，也断言「没有对方那个」。
+        H1_USER = "<h1>老人陪伴提醒助手 · 用户端</h1>"
+        H1_ADMIN = "<h1>老人陪伴提醒助手 · 管理后台</h1>"
         code, home_html = req_text("GET", "/")
-        check("GET / 是用户端页面（含「用户端」标记）",
-              code == 200 and "用户端" in home_html, f"code={code}")
+        check("GET / 是用户端页面（h1 全串命中且不含管理后台 h1）",
+              code == 200 and H1_USER in home_html and H1_ADMIN not in home_html,
+              f"code={code} user_h1={H1_USER in home_html} admin_h1={H1_ADMIN in home_html}")
         code, admin_html = req_text("GET", "/admin")
-        check("GET /admin 是管理后台页面（含「管理后台」标记）",
-              code == 200 and "管理后台" in admin_html, f"code={code}")
+        check("GET /admin 是管理后台页面（h1 全串命中且不含用户端 h1）",
+              code == 200 and H1_ADMIN in admin_html and H1_USER not in admin_html,
+              f"code={code} admin_h1={H1_ADMIN in admin_html} user_h1={H1_USER in admin_html}")
         code, _user_html = req_text("GET", "/user")
         check("GET /user 已删除（404，不做重定向/兼容渲染）",
               code == 404, f"code={code}")

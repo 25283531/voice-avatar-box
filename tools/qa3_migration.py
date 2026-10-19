@@ -518,9 +518,23 @@ for table, column, sqlite_ddl, mysql_ddl in NEW_COLUMNS:
     # NOT NULL 必须有 DEFAULT，否则老行 ALTER 后读出 NULL
     if "NOT NULL" in up and "DEFAULT" not in up:
         bad.append(f"{table}.{column}: MySQL NOT NULL 缺 DEFAULT -> {mysql_ddl}")
-    # SQLite 侧：带 DEFAULT 的必须写出 DEFAULT 关键字
-    if "DEFAULT" in sqlite_ddl.upper() and "DEFAULT" not in sqlite_ddl.upper():
-        bad.append(f"{table}.{column}: SQLite DEFAULT 写法异常")
+    # SQLite 侧：字符串列（VARCHAR/TEXT）**必须带 DEFAULT ''**。
+    #
+    # ⚠️ 这里原本写的是
+    #     `if "DEFAULT" in s and "DEFAULT" not in s:` —— 两个条件互斥，
+    #     恒假，这条检查从写下的那一刻起就是空转的假守卫（QA 第 N 轮 M3
+    #     实测：hardware_model 去掉 DEFAULT '' 后 qa3_migration 仍 45/45）。
+    #
+    # 为什么必须钉死它：老库 ALTER 补列时，不带 DEFAULT 的 VARCHAR 列
+    # 让**既有行读出 None**，而 Pydantic 侧对应字段大多是 `str = ""`
+    # （非空），model_validate 直接抛 ValidationError —— 接口 500，
+    # 而且只在「老库 + 有存量数据」时才炸，全新空库永远复现不出来。
+    # 2026-10-19 实测坐实：去掉 hardware_model 的 DEFAULT '' 后，
+    # 老行读出 None、DeviceOut 同形态序列化当场抛错。
+    st = sqlite_ddl.upper()
+    if ("VARCHAR" in st or "TEXT" in st) and "DEFAULT" not in st:
+        bad.append(f"{table}.{column}: SQLite 字符串列缺 DEFAULT '' → "
+                   f"老行 ALTER 后读出 NULL 会炸 Pydantic -> {sqlite_ddl}")
     # 两边类型族应一致（布尔/整数/时间）
     if ("BOOLEAN" in sqlite_ddl.upper()) != ("TINYINT" in up):
         bad.append(f"{table}.{column}: 布尔列两侧类型族不一致 -> "
