@@ -40,6 +40,12 @@ def get_current_device(
     dev = db.get(models.Device, int(payload["sub"]))
     if not dev:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "设备不存在")
+    # 代次校验：管理员解绑时 `token_epoch += 1`，此处旧 token 立刻失效。
+    # 没有这一行，解绑只是「清了归属」，原家属手上那枚 token 仍能读**新家庭**
+    # 的数据（提醒、服药回执），等于解绑没生效（见 models.Device.token_epoch）。
+    if int(payload.get("ep", 0)) != int(getattr(dev, "token_epoch", 0) or 0):
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED,
+                            "设备凭证已失效，请重新绑定")
     return dev
 
 

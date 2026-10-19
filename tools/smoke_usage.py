@@ -48,7 +48,7 @@ PY = sys.executable
 # 默认端口统一由 tools/smoke_ports.py 托管（唯一真源）：smoke_usage=8120，
 # 与 smoke_voice(8119) 错开。各脚本不再各写一份，并行跑必然撞车。
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from smoke_common import unlink_retry
+from smoke_common import seed_admin_env, unlink_retry
 from smoke_ports import (  # 见 smoke_ports.py 模块 docstring
     detect_addr_in_use,
     guard_or_die,
@@ -188,6 +188,11 @@ def start_app_server() -> tuple[object, threading.Thread]:
     os.environ["ELDER_JWT_SECRET"] = "smoke-usage-secret"
     os.environ["ELDER_SCHEDULER_INTERVAL"] = "3600"   # 不起后台调度
     os.environ["PYTHONIOENCODING"] = "utf-8"
+    # 种子管理员口令：本脚本硬用 admin/admin123 登录，而空库不设
+    # ELDER_SEED_ADMIN_PASSWORD 时种子口令是随机的（bb5ca98 起）——
+    # 不注入就「本地裸跑必 401」，全靠 CI job 级 env 兜住（见 smoke_common 文档）。
+    # 这里服务跑在**本进程**里，所以直接对 os.environ 做 setdefault。
+    seed_admin_env(os.environ)
 
     SERVER_LOG.parent.mkdir(parents=True, exist_ok=True)
     logging.basicConfig(

@@ -69,15 +69,18 @@ def check(name: str, ok: bool, detail: str = "") -> None:
         _failures.append(name)
 
 
-def req(method: str, path: str, body: dict | None = None, token: str | None = None):
+def req(method: str, path: str, body: dict | None = None, token: str | None = None,
+        headers: dict | None = None):
     url = BASE + path
     data = None
-    headers = {"Content-Type": "application/json"}
+    hdr = {"Content-Type": "application/json"}
     if body is not None:
         data = json.dumps(body).encode()
     if token:
-        headers["Authorization"] = f"Bearer {token}"
-    r = urllib.request.Request(url, data=data, headers=headers, method=method)
+        hdr["Authorization"] = f"Bearer {token}"
+    for k, v in (headers or {}).items():
+        hdr[k] = v
+    r = urllib.request.Request(url, data=data, headers=hdr, method=method)
     try:
         with _OPENER.open(r, timeout=30) as resp:
             raw = resp.read().decode("utf-8", "replace")
@@ -144,12 +147,13 @@ def main() -> int:
         check("登记设备", code == 201, f"HTTP {code}")
         dev_pk = (dev or {}).get("id")
 
-        code, cd = req("POST", f"/api/devices/{dev_pk}/code", {}, tok)
-        full_code = (cd or {}).get("code", "")
-        check("申请 7 位激活码", code == 200 and len(full_code) == 7, f"HTTP {code} code={full_code}")
-        code, bind = req("POST", "/api/devices/bind", {"code": full_code}, tok)
-        dev_token = (bind or {}).get("device_token", "")
-        check("绑定拿到 device_token", code == 200 and bool(dev_token), f"HTTP {code}")
+        code, cd = req("GET", "/api/voice/ota", None, None, {"Device-Id": "aabbccddeeff"})
+        ws = (cd or {}).get("websocket") or {} if isinstance(cd, dict) else {}
+        dev_token = ws.get("token", "")
+        # 建档即归属（D44 §3）⇒ 设备已是已绑定态，/code 会 409；凭证走 OTA。
+        check("OTA 下发 device_token（建档即归属，不再走激活码绑定）",
+              code == 200 and bool(dev_token),
+              f"HTTP {code} keys={list(cd) if isinstance(cd, dict) else cd}")
 
         print("── 2. 上报超长 hw_model（核心断言）──")
         check(f"上报长度 {len(LONG_MODEL)} 远大于列宽 {COLUMN_WIDTH}",

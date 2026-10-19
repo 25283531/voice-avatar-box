@@ -78,12 +78,15 @@ def check(name: str, ok: bool, detail: str = "") -> None:
     print(f"  [{'PASS' if ok else 'FAIL'}] {name}" + (f"  -> {detail}" if detail else ""))
 
 
-def req(method: str, path: str, body: dict | None = None, token: str | None = None):
+def req(method: str, path: str, body: dict | None = None, token: str | None = None,
+        headers: dict | None = None):
     data = json.dumps(body).encode() if body is not None else None
     r = urllib.request.Request(BASE + path, data=data, method=method)
     r.add_header("Content-Type", "application/json")
     if token:
         r.add_header("Authorization", "Bearer " + token)
+    for k, v in (headers or {}).items():
+        r.add_header(k, v)
     try:
         with _LOCAL_OPENER.open(r, timeout=20) as resp:
             raw = resp.read().decode("utf-8")
@@ -276,10 +279,22 @@ def main() -> int:
               bool(dev.get("bound_at")), str(dev.get("bound_at")))
 
         # ---------------------------------------------------- 4. 激活码
-        code, cd = req("POST", f"/api/devices/{dev_pk}/code", {}, token)
-        ok_code = code == 200 and len(cd.get("code", "")) == 7
-        check("生成 7 位激活码（6 位随机 + 1 位校验）", ok_code, cd.get("display", ""))
-        full = cd.get("code", "")
+        # ⚠️ 2026-10-20 改：激活码**只能**从设备真实路径拿 —— OTA 端点按
+        # `Device-Id`（MAC）下发。原先这里调 `POST /api/devices/{pk}/code`，
+        # 但「登记设备」本身就是「建档即归属」（create_device 直接写 owner_id），
+        # 按新规则「已绑定设备不再下发激活码」，该接口对已归属设备返回 409。
+        #
+        # 而且这才是**生产里真实发生的顺序**：设备先开机取码（此时服务端还没有
+        # Device 行），家属再输码 → 绑定那一刻才建出设备行。冒烟按真实顺序跑，
+        # 才能覆盖到「bind 现场建档」这条路径（曾经它要求 APP 传 MAC，
+        # 导致纯 APP 用户 100% 绑不上）。
+        ota_mac = "aa:bb:cc:dd:ee:77"       # 故意用带冒号写法：顺带覆盖 MAC 归一化
+        code, ota_body = req("GET", "/api/voice/ota", headers={"Device-Id": ota_mac})
+        act = (ota_body or {}).get("activation") or {}
+        full = act.get("code", "")
+        ok_code = code == 200 and len(full) == 7
+        check("OTA 按 MAC 下发 7 位激活码（6 位随机 + 1 位校验）", ok_code,
+              f"http={code} code={act.get('code')} 显示={act.get('code') and full[:3] + '-' + full[3:]}")
 
         # 与固件同算法校验 Luhn：完整码长 = 6 位 body + 1 位校验 = 7
         def luhn6(d: str) -> int:
@@ -297,9 +312,9 @@ def main() -> int:
         check("Luhn 校验位一致（对齐固件 C 实现）",
               len(full) == 7 and int(full[6]) == luhn6(full[:6]),
               f"expect={luhn6(full[:6]) if len(full) == 7 else '?'} actual={full[6:]}")
-        check("显示格式为 123-4567",
-              cd.get("display", "").count("-") == 1 and len(cd.get("display", "")) == 8,
-              cd.get("display", ""))
+        # 屏显分组：`123-4567`（3+4），与服务端 security.format_code 一致
+        shown = (full[:3] + "-" + full[3:]) if len(full) == 7 else ""
+        check("显示格式为 123-4567", shown.count("-") == 1 and len(shown) == 8, shown)
 
         # ---------------------------------------------------- 5. 错误码应当被拒
         bad = full[:-1] + str((int(full[-1]) + 1) % 10)
@@ -310,6 +325,10 @@ def main() -> int:
         code, bind = req("POST", "/api/devices/bind", {"code": full}, token)
         check("激活码绑定设备", code == 200 and bool(bind.get("device_token")), str(code))
         dev_token = bind.get("device_token", "")
+        # ⚠️ 后续断言一律用**绑定建出来的**那台设备（bind 现场建档），
+        # 不是第 3 段「登记」建的那台 —— 两者是不同 MAC、不同行。
+        # 混用会让「设备列表里找不到刚绑的设备」这类断言变成假绿。
+        dev_pk = bind.get("device_pk", dev_pk)
 
         # ---------------------------------------------------- 6b. 设备列表新字段
         # 设备列表缺口（2026-10-19）：hardware_model / bound_at / fw_version

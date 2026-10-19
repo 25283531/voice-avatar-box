@@ -39,6 +39,7 @@ PY = sys.executable
 # 默认端口统一由 tools/smoke_ports.py 托管（唯一真源），各脚本不再各写一份 ——
 # 早先 smoke_home/smoke_roles/smoke_memory 都是 8097，并行跑必然撞车。
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+from smoke_common import seed_admin_env  # noqa: E402
 from smoke_ports import (  # noqa: E402
 
 
@@ -160,8 +161,16 @@ def _dirty_column(raw: str, column: str):
 
 
 def _boot_env(db_url: str) -> dict:
-    """构造子进程环境变量（单独抽出来，重启时要复用同一份）。"""
-    env = dict(os.environ)
+    """构造子进程环境变量（单独抽出来，重启时要复用同一份）。
+
+    ⚠️ ``seed_admin_env`` 用 ``setdefault`` 语义注入种子管理员口令：本脚本
+    硬用 ``admin/admin123`` 登录，而 bb5ca98 起空库不设
+    ``ELDER_SEED_ADMIN_PASSWORD`` 时种子口令是**随机**的 —— 此前全靠 CI 的
+    job 级 env 兜住，于是「CI 绿、本地裸跑第一条断言就 401」，后续拿不到
+    token 的用例连环 FAIL，最后崩成 ``AttributeError: 'str' object has no
+    attribute 'get'``，读起来像权限系统坏了。CI 显式传了值就尊重它。
+    """
+    env = seed_admin_env(dict(os.environ))
     env.pop("MSYSTEM", None)
     env["ELDER_DB"] = db_url
     env["ELDER_JWT_SECRET"] = "smoke-roles-secret"

@@ -292,6 +292,21 @@ jobs:
       #   esptool merge-bin 的填充值就是 0xFF（已在真实产物上逐段实测：各间隙
       #   非 0xFF 字节数为 0），所以「有非 0xFF 残留」只可能是 app 被截断后
       #   后面还留着别的数据。
+      #
+      #   ⚠️ 本闸门只能发现「合并镜像与 build/ 源文件不一致」。以下两类发现不了，
+      #   因为它的参照物只有输入本身，没有产物之外的锚点：
+      #     ① 源文件与镜像**一致地**被损坏（构建期源就坏了，merge 忠实传递）：
+      #        源、镜像、长度、偏移、内容五个维度全部自洽，与"基准"无法区分。
+      #     ② 截断落在"真实内容恰好等于填充值 0xFF"的区域：
+      #        ota_data_initial.bin 整段 8192B 全是 0xFF、partition-table.bin 尾
+      #        2848B 是 0xFF，截掉后原地留下的填充与真值逐字节相同。
+      #   ② 里这两段能关，是因为**长度由 ESP-IDF 规范钉死**（分区表恒 0xC00、
+      #   ota_data_initial 恒 0x2000）—— 规范常量就是产物之外的锚点，
+      #   见下面 FIXED_LEN。其余段长度随构建变，没有这种锚点。
+      #   ① 要闭合需引入产物之外的尺寸锚点（app 有 ESP image header 可用，
+      #   assets 无任何内部锚点）—— 属于生成端职责，不在本步骤反推。
+      #   **刻意只闭合能闭合的、明说关不掉的**：部分闭合会制造"这一维已覆盖"
+      #   的错觉，比不闭合更危险。
       - name: 合并镜像自检（各段与 build/ 源文件逐字节一致）
         shell: bash
         run: |
@@ -303,23 +318,48 @@ jobs:
           args = json.loads((b / 'flasher_args.json').read_text())
           merged = (b / 'merged-flash.bin').read_bytes()
           segs = sorted((int(o, 16), f) for o, f in args['flash_files'].items())
+          #: ESP-IDF 规范里**长度固定**的段。间隙全 0xFF 这条不变量有个盲区：
+          #  若某段内容本身就以 0xFF 结尾（ota_data_initial 整段都是 0xFF，
+          #  分区表的尾部也是），把它截断后「前缀相等 + 间隙全 0xFF」两条都成立
+          #  ⇒ 截断被静默放过。这两段长度是规范钉死的，直接按常量判。
+          #  其余段（bootloader / app / assets）长度随构建变，没有独立真源，
+          #  **盲区无法消除** —— 见本步骤末尾的已知边界说明。
+          FIXED_LEN = {'partition-table.bin': 0xC00, 'ota_data_initial.bin': 0x2000}
           bad, checked = [], 0
           for i, (off, fname) in enumerate(segs):
               f = b / fname
               if not f.exists():
                   bad.append(f'{fname}: 源文件不存在'); continue
               want = f.read_bytes()
+              if not want:
+                  # 空源文件：`merged[off:off] == b''` 恒成立，会一路绿到底
+                  bad.append(f'{fname}: 源文件为空（0 字节）'); continue
+              base = pathlib.PurePosixPath(fname).name
+              if base in FIXED_LEN and len(want) != FIXED_LEN[base]:
+                  bad.append(f'{fname}: 长度 {len(want)} != 规范 {FIXED_LEN[base]:#x}'
+                             f'（若 IDF 改了规范请更新 FIXED_LEN）'); continue
               if len(merged) < off + len(want):
                   bad.append(f'{fname}: 合并镜像太短（{len(merged)} < {off:#x}+{len(want)}）'); continue
               if merged[off:off + len(want)] != want:
                   bad.append(f'{fname}: {off:#x} 处与源文件不一致'); continue
               # 截断防线：本段之后到下一段之前必须是纯 0xFF 填充
               nxt = segs[i + 1][0] if i + 1 < len(segs) else len(merged)
-              gap = merged[off + len(want):nxt]
+              end = off + len(want)
+              if end > nxt:
+                  # 段重叠：不静默跳过。重叠说明 flasher_args 与分区表已经不自洽，
+                  # 此时「比对了通过」没有意义 —— 必须红。
+                  bad.append(f'{fname}: 段区间 {off:#x}..{end:#x} 越过下一段起点 {nxt:#x}（段重叠）')
+                  continue
+              gap = merged[end:nxt]
               non_ff = len(gap) - gap.count(0xFF)
               if non_ff:
-                  bad.append(f'{fname}: 段后间隙 {off + len(want):#x}..{nxt:#x} '
-                             f'有 {non_ff} 字节非 0xFF ⇒ 该段可能被截断，后面残留了别的数据')
+                  # 把**实际字节**打出来：截断与「esptool 改了填充约定」会报同一句话，
+                  # 但修法完全相反（前者产物坏了要重烧，后者要改本闸门）。只给非 0xFF
+                  # 的字节数，看日志的人无从区分这两种情况。
+                  uniq = sorted(set(gap))[:4]
+                  bad.append(f'{fname}: {end:#x}..{nxt:#x} 非 0xFF 填充'
+                             f'（{len(gap)} 字节，实际字节 {uniq}）'
+                             f' —— 源文件疑似被截断；若为 [0] 则是填充策略变了')
                   continue
               checked += 1
               print(f'  OK {fname:34s} {len(want):>9d} 字节 @ {off:#x}  (间隙 {len(gap)}B 全 0xFF)')
@@ -327,6 +367,12 @@ jobs:
               sys.exit('合并镜像与源文件不一致 ⇒ 偏移错位 / 段被截断 / merge-bin 读到旧文件：\n  '
                        + '\n  '.join(bad))
           print(f'全部 {checked} 段逐字节一致且间隙纯 0xFF，合并镜像总长 {len(merged)} 字节')
+          print('')
+          print('已知边界（不要假装本闸门能覆盖）：')
+          print('  bootloader / app / assets 三段长度随构建变化，没有独立真源，')
+          print('  因此「该段尾部本身就是 0xFF 时被截断」无法检出。')
+          print('  要彻底消除，需要 esptool 输出各段真实长度（上游不支持），')
+          print('  或改为自建合并镜像并逐段比对（同样受此限）。')
           PY
 
       - name: 整理产物
@@ -390,6 +436,55 @@ jobs:
           print(f'最终上传件自检通过：{merged.name} {len(data)} 字节')
           PY
 
+      # ⚠️ 交付的 flasher_args.json 必须**路径可解析**。
+      #   「整理产物」把 bootloader/ 与 partition_table/ 两个子目录里的文件**平铺**
+      #   拷进 out/，而 json 里仍写着 `bootloader/bootloader.bin`、
+      #   `partition_table/partition-table.bin` ⇒ 用户照 json 烧会找不到文件，
+      #   而 README 里那句「其余文件是按 flasher_args.json 分地址烧写的备选」
+      #   就成了假话（与「让用户去下一个从未生成的文件」同一族）。
+      #
+      #   ⚠️ 必须同时改**嵌套子对象**：json 里除了 flash_files，还有
+      #   bootloader / app / partition-table / otadata / assets 五个子对象
+      #   各自带 `file` 字段。只改 flash_files 会让 json **内部自相矛盾**
+      #   （同一段两处路径不同），比不改更难查。
+      #
+      #   位置**必须在「生成 SHA256SUMS」之前**：否则清单哈希的是改写前的 json，
+      #   用户拿清单对账会对不上。
+      - name: 重写交付的 flasher_args.json（平铺布局下路径须可解析）
+        shell: bash
+        run: |
+          set -e
+          cd "$GITHUB_WORKSPACE/out"
+          python3 - <<'PY'
+          import json, pathlib, sys
+          j = pathlib.Path('flasher_args.json')
+          if not j.exists():
+              sys.exit('out/flasher_args.json 不存在 —— 整理产物步骤未拷入')
+          args = json.loads(j.read_text(encoding='utf-8'))
+          known = set(args['flash_files'].values())
+          def rewrite(o):
+              if isinstance(o, dict):
+                  return {k: rewrite(v) for k, v in o.items()}
+              if isinstance(o, list):
+                  return [rewrite(v) for v in o]
+              if isinstance(o, str) and o in known:
+                  return pathlib.PurePosixPath(o).name
+              return o
+          new = rewrite(args)
+          j.write_text(json.dumps(new, indent=4, ensure_ascii=False), encoding='utf-8')
+          missing = sorted(p for p in set(new['flash_files'].values())
+                           if not pathlib.Path(p).exists())
+          if missing:
+              sys.exit(f'重写后仍有不可解析路径：{missing}')
+          print('flasher_args.json 已按平铺布局重写，'
+                f'{len(new["flash_files"])} 段路径全部可解析')
+          for k in ('bootloader', 'app', 'partition-table', 'otadata', 'assets'):
+              sub = new.get(k)
+              if isinstance(sub, dict) and 'file' in sub:
+                  ok = pathlib.Path(sub['file']).exists()
+                  print(f'  子对象 {k:16s} -> {sub["file"]:28s} exists={ok}')
+          PY
+
       - name: 生成 SHA256SUMS（用户烧录前对账）
         shell: bash
         run: |
@@ -397,7 +492,20 @@ jobs:
           cd "$GITHUB_WORKSPACE/out"
           # job summary 里只印 16 位截断值，用户没法拿它和本地 sha256 对账
           # （sha256sum 出来是 64 位）。这里给一份完整摘要文件，随 artifact 一起下发。
-          sha256sum * > SHA256SUMS.txt
+          #
+          # ⚠️ 不能写 `sha256sum * > SHA256SUMS.txt`：`*` 展开**先于**重定向，
+          #   重跑时 SHA256SUMS.txt 已在 glob 结果里 ⇒ 它被算进自己的清单
+          #   （内容每跑一次都变，且是自我指涉）。显式跳过自己，先写临时文件再改名。
+          : > /tmp/SHA256SUMS.txt
+          for f in *; do
+            [ -f "$f" ] || continue
+            [ "$f" = "SHA256SUMS.txt" ] && continue
+            sha256sum "$f" >> /tmp/SHA256SUMS.txt
+          done
+          mv /tmp/SHA256SUMS.txt SHA256SUMS.txt
+          # 空清单会静默交付一个「什么都没有」的对账文件 —— 用户以为有校验，
+          # 实际 `sha256sum -c` 什么也不验。必须红。
+          test -s SHA256SUMS.txt || { echo "::error::out/ 无可校验文件"; exit 1; }
           cat SHA256SUMS.txt
 
       - name: 汇总产物信息（job summary）

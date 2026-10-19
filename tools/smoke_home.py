@@ -29,7 +29,7 @@ PY = sys.executable
 # 默认端口统一由 tools/smoke_ports.py 托管（唯一真源），各脚本不再各写一份 ——
 # 早先 smoke_home/smoke_roles/smoke_memory 都是 8097，并行跑必然撞车。
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from smoke_common import unlink_retry
+from smoke_common import cleanup_db, unlink_retry  # noqa: E402
 from smoke_ports import (  # noqa: E402
     detect_addr_in_use,
     guard_or_die,
@@ -85,12 +85,15 @@ def check(name: str, ok: bool, detail: str = "") -> None:
     print(f"  [{'PASS' if ok else 'FAIL'}] {name}" + (f"  -> {detail}" if detail else ""))
 
 
-def req(method: str, path: str, body: dict | None = None, token: str | None = None):
+def req(method: str, path: str, body: dict | None = None, token: str | None = None,
+        headers: dict | None = None):
     data = json.dumps(body).encode() if body is not None else None
     r = urllib.request.Request(BASE + path, data=data, method=method)
     r.add_header("Content-Type", "application/json")
     if token:
         r.add_header("Authorization", "Bearer " + token)
+    for k, v in (headers or {}).items():
+        r.add_header(k, v)
     try:
         with _LOCAL_OPENER.open(r, timeout=20) as resp:
             raw = resp.read().decode("utf-8")
@@ -239,12 +242,21 @@ def main() -> int:
               "membership" not in s0, ",".join(sorted(s0.keys())))
 
         # ==================================================== 准备：u1 绑定设备
+        # ⚠️ 2026-10-20 契约变更（D44 §3）后这条夹具有两种写法都错：
+        #   「建档 → /code 取码 → bind」：建档即归属（create_device 直接写 owner_id），
+        #   所以设备**已是已绑定态**，`POST /api/devices/{pk}/code` 返回 409；
+        #   对照真实链路也不该这么走 —— 码是设备自己开机向 OTA 端点申领的。
+        # 因此改为「建档 → 带 Device-Id 打 OTA → 取 websocket 段的 device_token」，
+        # 与固件完全相同的一条路。**别改回取码绑定的写法**：那会把 409 当成
+        # 「设备绑定失败」写进断言，看起来像服务端坏了。
         code, dev = req("POST", "/api/devices", {"device_id": "homedev000001"}, u1)
         dev_pk = dev.get("id", 0)
-        code, cd = req("POST", f"/api/devices/{dev_pk}/code", {}, u1)
-        code, bind = req("POST", "/api/devices/bind", {"code": cd.get("code", "")}, u1)
-        dev_token = bind.get("device_token", "")
-        check("u1 绑定设备", bool(dev_token), str(code))
+        code, ota = req("GET", "/api/voice/ota", None, None,
+                        {"Device-Id": "homedev000001"})
+        dev_token = ((ota or {}).get("websocket") or {}).get("token", "") if isinstance(ota, dict) else ""
+        check("u1 绑定设备（建档即归属，device_token 由 OTA 下发）",
+              code == 200 and bool(dev_token),
+              f"code={code} keys={list(ota) if isinstance(ota, dict) else ota}")
 
         # 建一条当天两次的服药提醒（rtype=0 服药，schedule_kind=1 每天）
         code, rem = req("POST", f"/api/reminders?device_pk={dev_pk}", {
@@ -553,22 +565,26 @@ def main() -> int:
         engine.dispose()
 
     finally:
-        proc.terminate()
+        # 收尾统一走 smoke_common.cleanup_db：**先停子进程 → 再关句柄 → 最后删库**
+        # （顺序反了就是 WinError 32），删不掉只打警告、**绝不把「断言全绿」
+        # 打成 exit 1 + traceback** —— 清理是卫生问题，不该污染正确性结论。
+        #
+        # ⚠️ 本脚本比别的冒烟脚本多一个句柄来源：第 5 段「离线清扫」在**本进程内**
+        # import 了 app.db 的 engine 并开了 Session（为了进程内跑 scheduler._tick）。
+        # SQLAlchemy 连接池会一直攥着 SQLite 文件，而原来那行 `engine.dispose()`
+        # 写在 try 体**末尾** —— 断言中途抛异常时根本走不到，于是收尾 unlink
+        # 必然 PermissionError。这是本脚本 WinError 32 的真实根因之一，
+        # 所以 dispose 必须挪进 finally（放在停进程之前，先松本进程自己的句柄）。
         try:
-            proc.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-        try:
-            log_fp.close()
-        except OSError:
+            engine.dispose()          # noqa: F821  第 5 段 import 的，可能尚未定义
+        except Exception:             # noqa: BLE001, S110  收尾失败不影响判定
             pass
+        cleanup_db(DB_FILE, procs=(proc,), handles=(log_fp,))
         # 失败时把服务端日志尾部打出来：定位卡点/500 最直接的证据
         failed = [r for r in results if not r[1]]
         if failed:
             print(f"\n[diag] ---- server log tail ({SERVER_LOG}) ----")
             print(_read_log_tail())
-        if DB_FILE.exists():
-            unlink_retry(DB_FILE)
 
     passed = sum(1 for _, ok, _ in results if ok)
     total = len(results)

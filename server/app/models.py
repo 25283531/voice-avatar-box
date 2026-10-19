@@ -120,6 +120,18 @@ class Device(Base):
     # 不同，混显会造成「绑定时间」的误读）。
     bound_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True)
+    # 设备 token 的**代次**（token revocation epoch）。
+    #
+    # 为什么需要它：device_token 是无状态 JWT，签出去就收不回来。管理员把设备
+    # 解绑后，原家属手上那枚 token 仍然有效 —— 若之后有新家庭绑了这台设备，
+    # 旧 token 会**直接读到新家庭的数据**（老人的提醒、服药回执）。
+    # 「解绑」若不能真正吊销凭证，就不是解绑。
+    #
+    # 做法：签发时把当前代次写进 JWT 的 `ep`，`deps.get_current_device` 校验
+    # `payload.ep == dev.token_epoch`；解绑时 `token_epoch += 1`，旧 token 全部失效。
+    # 带 server_default：老库 ALTER 补列后既有行读出 0 而不是 NULL。
+    token_epoch: Mapped[int] = mapped_column(
+        Integer, default=0, server_default="0")
     ip: Mapped[str] = mapped_column(String(64), default="")
 
     # 端侧个性化配置（音量、亮度、灯效开关、离线提示音开关等）

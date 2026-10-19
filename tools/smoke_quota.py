@@ -43,6 +43,7 @@ PY = sys.executable
 
 # 默认端口统一由 tools/smoke_ports.py 托管（唯一真源），各脚本不再各写一份。
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+from smoke_common import seed_admin_env  # noqa: E402
 from smoke_ports import (  # noqa: E402
     detect_addr_in_use,
     guard_or_die,
@@ -85,12 +86,15 @@ def check(name: str, ok: bool, detail: str = "") -> None:
     print(f"  [{'PASS' if ok else 'FAIL'}] {name}" + (f"  -> {detail}" if detail else ""))
 
 
-def req(method: str, path: str, body: dict | None = None, token: str | None = None):
+def req(method: str, path: str, body: dict | None = None, token: str | None = None,
+        headers: dict | None = None):
     data = json.dumps(body).encode() if body is not None else None
     r = urllib.request.Request(BASE + path, data=data, method=method)
     r.add_header("Content-Type", "application/json")
     if token:
         r.add_header("Authorization", "Bearer " + token)
+    for k, v in (headers or {}).items():
+        r.add_header(k, v)
     try:
         with _LOCAL_OPENER.open(r, timeout=20) as resp:
             raw = resp.read().decode("utf-8")
@@ -134,7 +138,10 @@ def _read_log_tail(max_bytes: int = 8192) -> str:
 
 
 def main() -> int:
-    env = dict(os.environ)
+    # seed_admin_env：本脚本硬用 admin/admin123 登录，而空库不设
+    # ELDER_SEED_ADMIN_PASSWORD 时种子口令是随机的（bb5ca98 起）——
+    # 不注入就「本地裸跑必 401」，全靠 CI job 级 env 兜住（见 smoke_common 文档）。
+    env = seed_admin_env(dict(os.environ))
     env.pop("MSYSTEM", None)
     env["ELDER_DB"] = f"sqlite:///{DB_PATH.as_posix()}"
     env["ELDER_JWT_SECRET"] = "smoke-quota-secret"
@@ -200,11 +207,14 @@ def main() -> int:
         check("注册并登录 2 个普通用户", all([u1, u2]), "")
 
         def bind_device(user_token: str, device_id: str) -> tuple[int, str]:
+            # ⚠️ 建档即归属（create_device 写 owner_id）⇒ 设备已是已绑定态，
+            # `POST /api/devices/{pk}/code` 会 409（D44 §3）。设备凭证只能走
+            # 真实链路：带 Device-Id 打 OTA，取 websocket 段的 token。
             _, dev = req("POST", "/api/devices", {"device_id": device_id}, user_token)
             pk = dev.get("id", 0)
-            _, cd = req("POST", f"/api/devices/{pk}/code", {}, user_token)
-            _, b = req("POST", "/api/devices/bind", {"code": cd.get("code", "")}, user_token)
-            return pk, b.get("device_token", "")
+            _, ota = req("GET", "/api/voice/ota", None, None, {"Device-Id": device_id})
+            tok = ((ota or {}).get("websocket") or {}).get("token", "") if isinstance(ota, dict) else ""
+            return pk, tok
 
         dev_pk, dev_token = bind_device(u1, "quodev000001")
         check("用户 1 绑定设备", bool(dev_token), str(dev_pk))

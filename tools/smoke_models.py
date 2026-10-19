@@ -39,7 +39,7 @@ PY = sys.executable
 # 默认端口统一由 tools/smoke_ports.py 托管（唯一真源），各脚本不再各写一份 ——
 # 早先 smoke_models/smoke_mail 都是 8096，并行跑必然撞车。
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from smoke_common import unlink_retry
+from smoke_common import seed_admin_env, unlink_retry
 from smoke_ports import (  # noqa: E402
     detect_addr_in_use,
     guard_or_die,
@@ -199,10 +199,13 @@ def start_stub() -> tuple[ThreadingHTTPServer, int]:
 
 
 # ================================================================ 被测服务
-def req(method: str, path: str, body: dict | None = None, token: str | None = None):
+def req(method: str, path: str, body: dict | None = None, token: str | None = None,
+        headers: dict | None = None):
     data = json.dumps(body).encode("utf-8") if body is not None else None
     r = urllib.request.Request(BASE + path, data=data, method=method)
     r.add_header("Content-Type", "application/json")
+    for _k, _v in (headers or {}).items():
+        r.add_header(_k, _v)
     if token:
         r.add_header("Authorization", "Bearer " + token)
     try:
@@ -248,7 +251,10 @@ def _read_log_tail(max_bytes: int = 8192) -> str:
 
 
 def main() -> int:
-    env = dict(os.environ)
+    # seed_admin_env：本脚本硬用 admin/admin123 登录，而空库不设
+    # ELDER_SEED_ADMIN_PASSWORD 时种子口令是随机的（bb5ca98 起）——
+    # 不注入就「本地裸跑必 401」，全靠 CI job 级 env 兜住（见 smoke_common 文档）。
+    env = seed_admin_env(dict(os.environ))
     env.pop("MSYSTEM", None)
     env["ELDER_DB"] = f"sqlite:///{DB_PATH.as_posix()}"
     env["ELDER_JWT_SECRET"] = "smoke-test-secret"
@@ -726,12 +732,17 @@ def main() -> int:
 
         # -------------------------------------------------- G. 设备下发平滑过渡
         print("\n── G. 设备下发（旧固件仍拿得到一条可用 LLM）──")
-        code, dev = req("POST", "/api/devices", {"device_id": "ddee00112233",
-                                                 "name": "测试机"}, token)
-        dev_pk = dev["id"]
-        code, cd = req("POST", f"/api/devices/{dev_pk}/code", {}, token)
-        code, bind = req("POST", "/api/devices/bind", {"code": cd["code"]}, token)
-        dev_token = bind.get("device_token", "")
+        # ⚠️ 取码走**设备自己那条路**（POST /api/voice/ota + Device-Id 头）。
+        # 2026-10-20 起 `POST /api/devices/{pk}/code` 对「已绑定设备」返回 409，
+        # 而 `POST /api/devices` 是「建档即归属」—— 老的三步流程因此自相矛盾
+        # （本脚本曾崩在 `cd["code"]` 的 KeyError 上：409 响应体里没有 code）。
+        # 走 OTA 也顺带覆盖真实链路：设备开机取码 → 家属在 APP 输码绑定。
+        dev_mac = "ddee00112233"
+        code, ota = req("POST", "/api/voice/ota", {}, headers={"Device-Id": dev_mac})
+        full_code = ((ota or {}).get("activation") or {}).get("code", "")
+        code, bind = req("POST", "/api/devices/bind",
+                         {"code": full_code, "device_id": dev_mac}, token)
+        dev_token = (bind or {}).get("device_token", "")
 
         patch_by_kind("llm", {"enabled": False})
         patch_by_kind("llm_main", {"enabled": True, "model": "main-big-model"})

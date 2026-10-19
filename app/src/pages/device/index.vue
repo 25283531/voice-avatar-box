@@ -248,6 +248,15 @@ onShow(() => { refresh() })
         <button class="btn" @click="doBind">
           绑定设备
         </button>
+        <!-- 换绑的前置条件必须写在绑定卡片里：家属最常见的误解是「再输一次码
+             就能把设备挪到我名下」，而服务端对已绑定设备已不再下发激活码
+             （voice.ota_check 的已绑定分支不含 activation 段），重复绑定只会失败。
+             ⚠️ 这里刻意**不写具体邮箱**：APP 没有配置类接口，硬编码一个地址意味着
+             换邮箱要重新发版；网页端（user.html）从 /api/support-contact 取。 -->
+        <view class="tip left">
+          已经绑定过的设备不会重复下发激活码：换绑需要先在原账户里解绑。
+          忘记用户名、无法自行解绑的，请联系平台管理员。
+        </view>
       </view>
     </view>
 

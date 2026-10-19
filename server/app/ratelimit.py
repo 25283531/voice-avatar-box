@@ -76,19 +76,23 @@ from .config import (
     LOGIN_FAIL_PER_MINUTE,
     LOGIN_RATE_LIMIT_ENABLED,
     LOGIN_RATE_LIMIT_MAX_KEYS,
+    OTA_NEW_CODE_PER_HOUR,
     TRUSTED_PROXY_IPS,
 )
 
 __all__ = [
     "BIND_RATE_LIMIT_DETAIL_PREFIX",
+    "OTA_RATE_LIMIT_DETAIL_PREFIX",
     "RATE_LIMIT_DETAIL_PREFIX",
     "bind_gate",
     "clear_bind_failures",
     "clear_login_failures_for",
     "client_ip",
     "login_gate",
+    "ota_new_code_gate",
     "record_bind_failure",
     "record_login_failure",
+    "record_ota_new_code",
 ]
 
 # ============================================================ 规则表（统一结构）
@@ -396,13 +400,60 @@ def record_bind_failure(request, user_id: int) -> None:
 
 
 def clear_bind_failures(request, user_id: int) -> None:
-    """绑定成功时清掉该 IP 与**该账号自己**的失败记录。
+    """绑定成功时清掉**该账号自己**的失败记录。**不清 IP 键。**
 
-    与 ``clear_login_failures_for`` 不同，这里清 IP 键是安全的：绑定成功
-    意味着手里已经有一枚合法激活码，攻击者不可能靠"撞中一次"来重置配额
-    （那已经是他得手的时刻）。而家属连续绑多台设备时，正需要这个清零。
+    ⚠️ 原先这里同时清 IP 键，理由是「绑定成功说明手里有合法激活码，攻击者
+    不可能靠撞中一次重置配额；家属连续绑多台设备正需要这个清零」。**两条都错**：
+
+    1. **攻击者可以自造成功**，不需要撞中任何东西：
+       删掉自己的设备（他是 owner）→ ``GET /api/voice/ota`` 按 MAC 领一枚码
+       → 用这枚真码绑定 → 成功 → IP 桶被清零。全程零猜测。
+       于是「绑定接口 IP 维 40/h」这个约束可以被无限重置 —— 而它正是挡住
+       「拿一批 MAC 批量领码再批量绑定」的唯一一道 IP 级闸。
+    2. **家属连续绑多台根本不需要清零**：``record_bind_failure`` 只记**失败**，
+       每台都输对时桶里一个失败都没有，清不清都一样。这条理由从一开始就不成立。
+
+    清账号维仍然保留：账号维挡的是「一个账号猛试别人的码」，成功一次就说明
+    这个账号自己的码是对的，之前那些失败尝试属于正常手抖，清掉是合理的；
+    而账号本身可以公开注册、量产，清它不损失任何防护强度。
     """
     if not LOGIN_RATE_LIMIT_ENABLED:
         return
-    _BIND_STORE.clear(_ip_key(client_ip(request)))
     _BIND_USER_STORE.clear(_bind_user_key(user_id))
+
+
+# ============================================================ OTA 新建激活码闸门
+# 见 config.OTA_NEW_CODE_PER_HOUR 的注释（阈值怎么定、为什么不误伤正常轮询）。
+# 这里只补一句实现上的取舍：
+#
+#   ⚠️ **只记「新建」，不记「复用」**。设备每 15s 轮询一次，一次一小时 240 次；
+#      若把复用也算进去，正常设备会在 25 分钟内被自己的轮询打满配额，表现为
+#      「设备突然不显示激活码」—— 那正是这一轮要修的症状，绝不能自己再造一个。
+#
+#   ⚠️ **被拦的请求不记账**（与登录同一条铁律）：否则攻击者持续敲，配额窗口
+#      被无限续期，一小时上限退化成永久封禁。
+OTA_RATE_LIMIT_DETAIL_PREFIX = "设备注册过于频繁"
+_OTA_RULES: tuple[tuple[float, int], ...] = (
+    ((3600.0, OTA_NEW_CODE_PER_HOUR) if OTA_NEW_CODE_PER_HOUR > 0 else (0.0, 0)),
+)
+_OTA_STORE = _FailureStore(LOGIN_RATE_LIMIT_MAX_KEYS,
+                           tuple(r for r in _OTA_RULES if r[0] > 0 and r[1] > 0))
+
+
+def ota_new_code_gate(request) -> Verdict | None:
+    """**新建**激活码前的闸门。复用已有码、已绑定设备取 token 都**不要**调用它。"""
+    if not LOGIN_RATE_LIMIT_ENABLED or not _OTA_STORE._rules:  # noqa: SLF001
+        return None
+    now = time.monotonic()
+    wait = _OTA_STORE.blocked_for(_ip_key(client_ip(request)), now)
+    if wait <= 0:
+        return None
+    sec = max(1, int(wait + 0.999))
+    return Verdict(sec, f"{OTA_RATE_LIMIT_DETAIL_PREFIX}，请 {_human_wait(sec)} 后再试")
+
+
+def record_ota_new_code(request) -> None:
+    """成功**新建**一行激活码之后调用一次。"""
+    if not LOGIN_RATE_LIMIT_ENABLED or not _OTA_STORE._rules:  # noqa: SLF001
+        return
+    _OTA_STORE.record(_ip_key(client_ip(request)), time.monotonic())

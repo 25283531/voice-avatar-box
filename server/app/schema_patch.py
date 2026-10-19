@@ -153,6 +153,13 @@ PATCH_REGISTRY: Final[dict[str, str]] = {
         "（修P0：kind 为空的用户角色曾被每次启动刷成 preset）",
     "persona_agent_key_v1":
         "回填 agent_persona_profiles.agent_key 并合并重复的 L1 全局画像行",
+    "device_token_epoch_unbound_v1":
+        "把部署前就已解绑的 devices.token_epoch 抬到 1"
+        "（否则这批设备原主人的旧 device_token 在解绑后仍然有效）",
+    "device_mac_norm_v1":
+        "把存量 MAC 统一成 norm_mac 口径（无分隔符小写），"
+        "让 _find_device 能用上索引、不再全表扫无鉴权的 OTA 热路径；"
+        "同时归一化 activation_codes.device_id",
 }
 
 # 登记表名。与 models.PatchMeta.__tablename__ 一致；不 import models 是为了
@@ -256,6 +263,10 @@ NEW_COLUMNS: Final[list[tuple[str, str, str, str]]] = [
     # 表名, 列名, SQLite 类型, MySQL 类型
     ("users", "email", "VARCHAR(128) DEFAULT ''", "VARCHAR(128) DEFAULT ''"),
     ("devices", "agent_id", "INTEGER", "INT NULL"),
+    # 设备 token 代次：解绑时 +1，让旧 device_token（无状态 JWT）立即失效。
+    # 没有它，管理员解绑只清了归属、没清访问权 —— 旧 token 在 365 天有效期内
+    # 仍能开 WS、读新家庭的提醒（见 models.Device.token_epoch 注释）。
+    ("devices", "token_epoch", "INTEGER DEFAULT 0", "INT DEFAULT 0"),
     # ai_providers 的 agent 角色字段（APP 的 AgentRole），见 models.AIProvider
     ("ai_providers", "description", "VARCHAR(255) DEFAULT ''", "VARCHAR(255) DEFAULT ''"),
     ("ai_providers", "system_prompt", "TEXT DEFAULT ''", "TEXT"),
@@ -323,6 +334,34 @@ NEW_INDEXES: Final[list[tuple[str, str, tuple[str, ...]]]] = [
     ("ai_providers", "ix_prov_parent", ("parent_id",)),
     ("avatars", "ix_avatars_record_type", ("record_type",)),
     ("avatars", "ix_avatars_owner", ("owner_id",)),
+    # ---- 设备侧两条热路径索引（2026-10-21）----
+    # ⚠️ 这两条不是性能优化，是**安全**：对应查询都在
+    #    ``GET /api/voice/ota`` 这条**无鉴权、设备每 15s 轮询**的路径上。
+    #    没有索引 = 每请求全表扫 = 任何人并发刷这个端点就能把正常设备挤掉
+    #    （DoS 放大器）。
+    #
+    # devices.device_id 已有 index=True（models.Device），但那条索引原先被
+    #   ``lower(replace(replace(device_id,...)))`` 这种**列上的函数表达式**
+    #   废掉了 —— 函数包住列，索引就不可用。修法是两件事配套：
+    #     1. _find_device 改回 ``device_id IN (...)`` 常量等值形态（索引可用，
+    #        且 mac_variants 同时覆盖两种历史写法 ⇒ **功能不依赖第 2 件**）；
+    #     2. schema_patch.normalize_device_macs() 把存量归一化，让 IN 列表
+    #        退化成单元素（纯索引收益，不影响正确性）。
+    #   ⚠️ 只做第 1 件：功能完全正确，热路径仍多一次索引查找（可接受）。
+    #      只做第 2 件：索引建了但查询仍走函数表达式 ⇒ 索引**永远不会被用上**。
+    #      所以第 1 件是必需的，第 2 件是收益项 —— 别把两者的优先级搞反。
+    #
+    # activation_codes.device_id **原先完全没有索引**（它是普通列，不是 FK），
+    #   而未绑定设备的每一次轮询都要按它查「有没有可复用的码」
+    #   （_reusable_activation_code）—— 那是**取码主路径**，同样无鉴权。
+    ("activation_codes", "ix_act_device_id", ("device_id",)),
+    # 过期清理（_purge_stale_codes：DELETE ... WHERE used=0 AND expires_at < cut）
+    #   与「有没有可用码」的判定都按 expires_at 过滤。表会随设备数线性增长
+    #   （一台设备一天换 144 枚码），没有索引时每小时一次的清理是全表扫。
+    ("activation_codes", "ix_act_expires_at", ("expires_at",)),
+    # 设备列表按 owner_id 过滤（GET /api/devices 每次都查）；SQLite 不会为
+    #   外键自动建索引，MySQL 的 FK 索引又依赖建表方式，两边都不保证有。
+    ("devices", "ix_devices_owner", ("owner_id",)),
 ]
 
 # agent_key 的唯一索引单独建：它必须在 dedupe_persona_globals() 之后建，
@@ -554,6 +593,202 @@ preset。``avatars`` 之所以没中招，只是因为它的判定端用了 ``ow
     else:
         log.warning("迁移登记表不可用，record_type 回填将每次启动重复执行"
                     "（功能仍正确，但没有『只执行一次』那层保护）")
+    return changed
+
+
+def backfill_token_epoch() -> int:
+    """把「部署前就已经解绑」的设备的 ``token_epoch`` 抬到 1，返回改动行数。
+
+    为什么需要这条一次性回填
+    ----------------------
+    ``token_epoch`` 是**本轮新增的列**，补列 DDL 带 ``DEFAULT 0``，所以存量行
+    全部读成 0。而 ``device_token`` 的 JWT 里，老版本签出的 token **根本没有
+    ``ep`` 声明** —— 校验端取 ``payload.get("ep", 0)``，缺省就是 0。
+
+    于是「0 == 0」成立，**老 token 全部继续通过校验**。这批 token 的有效期是
+    365 天，而它们恰恰属于「在本轮之前就被管理员/用户解绑过」的设备 ——
+    也就是用户规则 4（解绑后不许再用）**最需要防住的那一批**。
+    解绑动作发生时还没有 ``token_epoch`` 这一列，所以那些设备的代次永远停在 0，
+    只在**下一次**解绑时才会 +1。补列本身修不了历史，必须补一次数据。
+
+    判据为什么是 ``owner_id IS NULL AND token_epoch = 0``
+    ------------------------------------------------
+    两个条件都**由写入端无条件保证**，且各自回答一个独立问题：
+
+    * ``owner_id IS NULL`` —— 这台设备**当前没有归属**（= 已解绑或从未绑定）。
+      这是 :func:`app.routers.devices.unbind_device` 唯一会写出的「已解绑」状态。
+    * ``token_epoch = 0`` —— 代次**从未被抬过**。本轮之后发生的解绑都会 +1，
+      所以这一条把「本轮之后才解绑」的设备排除在外，**不会覆盖已经正确的值**。
+
+    只取交集，不做「未绑定就一律 +1」：那会把从未绑定过的设备也抬到 1（无害但
+    制造噪音），更糟的是若将来有人把判据改成 ``owner_id IS NULL`` 单条件，
+    每次启动都会 +1，**所有设备的 token 会在每次重启后集体失效** —— 那是
+    比原来更严重的故障。所以这里必须两个条件都在，且登记 patch_id 只跑一次。
+
+    ⚠️ 与 :func:`backfill_record_types` 的区别：那条是「修正分类」，判据错会
+    造成跨用户泄漏；这条是「让旧凭证失效」，判据错（漏判）会造成旧凭证继续
+    可用。**两者都必须「判据正确」+「只执行一次」**，见模块顶部铁律。
+    """
+    patch_id = "device_token_epoch_unbound_v1"
+    insp = inspect(engine)
+    existing_tables = set(insp.get_table_names())
+    if "devices" not in existing_tables:
+        # 表都还不存在：全新库，没有任何「部署前就解绑」的历史设备，无需回填。
+        return 0
+
+    cols = {c["name"] for c in insp.get_columns("devices")}
+    if "token_epoch" not in cols or "owner_id" not in cols:
+        # 补列还没跑（理论上 run_all 保证先补列），本轮跳过、不登记，
+        # 下次启动补列完成后会重试。宁可重跑，不可漏跑。
+        log.warning("devices 缺少 token_epoch/owner_id 列，跳过代次回填（下次启动重试）")
+        return 0
+
+    meta_ready = _patch_meta_ready(insp)
+    with engine.begin() as conn:
+        if meta_ready and _is_applied(conn, patch_id):
+            return 0
+        res = conn.execute(text(
+            "UPDATE devices SET token_epoch = 1 "
+            "WHERE owner_id IS NULL "
+            "AND (token_epoch IS NULL OR token_epoch = 0)"))
+        changed = int(res.rowcount or 0)
+        if meta_ready:
+            _mark_applied(conn, patch_id)
+
+    if changed:
+        log.warning(
+            "代次回填：%d 台「部署前已解绑」的设备 token_epoch 抬到 1，"
+            "其原持有者的旧 device_token 立即失效", changed)
+    return changed
+
+
+def normalize_device_macs() -> int:
+    """把存量 MAC 统一成 :func:`app.macs.norm_mac` 口径，返回改动的行数。
+
+    为什么必须做（不只是「好看」）
+    ----------------------------
+    ``Device.device_id`` 上**有唯一索引**，但历史上两种写法都进过库：
+    ``aa:bb:cc:dd:ee:ff``（固件上报）与 ``aabbccddeeff``（网页表单手输）。
+    只要库里存在两种写法，:func:`app.voice._find_device` 就**不能写成等值
+    比较**，只能退回「列上的函数表达式」（``lower(replace(...))``）去兜 ——
+    而函数包住列，**MySQL/SQLite 都用不上 ``device_id`` 上的索引**。
+
+    而 ``_find_device`` 处在 ``GET /api/voice/ota`` 这条**无鉴权、设备每 15s
+    轮询**的路径上（见 ``voice.ota_check`` 的注释）。全表扫 + 无鉴权 =
+    DoS 放大器：攻击者并发刷这个端点，正常设备就在这条路径上排队。
+
+    **本迁移与 ``_find_device`` 的改法是配套的两件事，缺一不可：**
+
+    * ``_find_device`` 已改成 ``device_id IN (mac_variants(mac))`` —— 常量
+      列表 + 等值比较，**索引可用**，且两种写法都覆盖；
+    * 本迁移把存量**收敛成单一写法**，让 ``mac_variants`` 退化成单元素，
+      ``IN`` 只剩一次索引查找。
+
+    ⚠️ 两者的依赖关系要看清：**功能正确性不依赖本迁移**（``mac_variants``
+    已经兜住两种写法，不迁移也能查到设备）；**索引是否真正生效才依赖它**
+    （不迁移时 ``IN`` 里有两个值，其中那个带冒号的分支在库里一条都匹配不到，
+    仍要各扫一次索引）。所以本迁移失败**不会**造成「查不到设备」，只会让
+    热路径继续多一次索引查找 —— 这个边界必须写清楚，否则排查时会误判。
+
+    两个必须避开的坑（security 复核时明确点名）
+    -----------------------------------------
+    **坑一：不能用 SQL 的 ``replace()``。** ``norm_mac`` 的规则是「只留
+    ``[a-z0-9]``」，SQL 侧只能穷举猜得到的分隔符；且 SQLite 没有内置
+    ``regexp_replace``，跨库不可移植。→ **在 Python 里调 ``norm_mac`` 本体**。
+
+    **坑二：``device_id`` 有唯一约束，UPDATE 会撞。** 若库里同时存在
+    ``aa:bb:cc:dd:ee:ff`` 与 ``aabbccddeeff`` **两行**，直接改会抛
+    ``IntegrityError``，而这个异常发生在**启动路径**上 ⇒ 「升级后服务起不来」。
+    所以必须先分组探测冲突；**冲突只报错、不自动合并** —— 合并要迁
+    ``reminders`` / ``events`` / ``interactions`` / ``activation_codes``
+    一串外键，自动做的风险远大于收益，报错让人处理才安全。
+
+    顺带归一化 ``activation_codes.device_id``（该列**无唯一约束**，无冲突风险）。
+    不归它的话 :func:`app.macs.mac_variants` 的双写法兜底永远退不掉，
+    「一设备一枚有效码」的锁定就永远要多跑一遍。
+
+    幂等：归一化是幂等映射（``norm_mac(norm_mac(x)) == norm_mac(x)``），
+    但因为它改业务列、且冲突时不能登记，仍按铁律走 ``patch_meta`` 只执行一次。
+    """
+    patch_id = "device_mac_norm_v1"
+    from .macs import norm_mac
+
+    insp = inspect(engine)
+    existing_tables = set(insp.get_table_names())
+    if "devices" not in existing_tables:
+        return 0
+    meta_ready = _patch_meta_ready(insp)
+
+    with engine.begin() as conn:
+        if meta_ready and _is_applied(conn, patch_id):
+            return 0
+
+        rows = conn.execute(text("SELECT id, device_id FROM devices")).all()
+        groups: dict[str, list[int]] = {}
+        for pk, raw in rows:
+            groups.setdefault(norm_mac(raw or ""), []).append(int(pk))
+
+        dupes = {k: v for k, v in groups.items() if len(v) > 1}
+        if dupes:
+            # ⚠️ 只跳过**冲突组**，其余行照常归一化。
+            #
+            # 为什么不整批放弃：冲突组通常只有一两对，而混合大小写/带分隔符的
+            # 无害行可能有几十条。整批 return 会让那些无害行**永远停在旧写法**
+            # —— 而 `_find_device` 的 6 种变体覆盖不到混合大小写（见 app/macs.py），
+            # 于是这些设备会被判成「未绑定」、被下发激活码。
+            # 归一化无害行不会让冲突变严重（冲突组原样不动），却能少一批漏网。
+            #
+            # 仍然**不登记** patch_id（下面提前返回）⇒ 下次启动重试，
+            # 等人工把冲突组合并掉之后，剩下的行也会被收口。
+            log.error(
+                "MAC 归一化冲突：以下归一化键对应多台设备行，**未合并**（需人工"
+                "处理，合并要迁 reminders/events/interactions 等外键，自动风险"
+                "过高）；其余行照常归一化：%s", dupes)
+
+        changed = 0
+        # ⚠️ 判据放在 **Python 侧**（``raw != key``），不写成 SQL 的
+        # ``WHERE device_id != :v``。原因：同一段 SQL 在两种库上行为相反 ——
+        # SQLite 的 ``!=`` 是**二进制**比较，对 ``AA:BB:CC:DD:EE:FF`` 这种
+        # 大小写不同的值判为「不等」⇒ 照常 UPDATE（行数被多计，无害）；
+        # 而 MySQL 8 默认排序规则 ``utf8mb4_0900_ai_ci``（本仓
+        # ``docker-compose.mysql.yml`` 另配 ``utf8mb4_unicode_ci``）都是
+        # **大小写不敏感**的，``!=`` 反而判为「相等」⇒ 跳过更新，那行
+        # **永远停在旧写法**，且 ``_mark_applied`` 照常执行 ⇒ 永不重试。
+        # 在 Python 里比字符串，两种库上语义完全一致。
+        for pk, raw in rows:
+            key = norm_mac(raw or "")
+            if key == (raw or ""):
+                continue
+            if key in dupes:
+                # ⚠️ **冲突组必须整组跳过**，不能只跳过其中一行：
+                # 把组内两行都改成同一个 key 会直接撞 `device_id` 的唯一约束，
+                # 而这个异常发生在**启动路径**上 ⇒ 升级后服务起不来。
+                # 保留原样 + 上面那条 log.error 让人工合并，是唯一安全解。
+                continue
+            conn.execute(
+                text("UPDATE devices SET device_id = :v WHERE id = :i"),
+                {"v": key, "i": int(pk)})
+            changed += 1
+
+        if "activation_codes" in existing_tables:
+            distinct = conn.execute(
+                text("SELECT DISTINCT device_id FROM activation_codes "
+                     "WHERE device_id IS NOT NULL")).all()
+            for (raw,) in distinct:
+                key = norm_mac(raw or "")
+                if key and key != raw:
+                    conn.execute(
+                        text("UPDATE activation_codes SET device_id = :k "
+                             "WHERE device_id = :r"),
+                        {"k": key, "r": raw})
+
+        # 有冲突时**不登记**：让人工合并后下次启动重跑，把冲突组收口。
+        # 登记了就等于把「这些行永远修不好」写进库里，且没有任何后续信号。
+        if meta_ready and not dupes:
+            _mark_applied(conn, patch_id)
+
+    if changed:
+        log.warning("MAC 归一化：%d 台设备的 device_id 改成无分隔符小写口径", changed)
     return changed
 
 
@@ -905,9 +1140,13 @@ def run_all() -> dict[str, int]:
 
     顺序**不能调换**，每一步都依赖前一步的结果：
       1. 补列 —— 没有 record_type 就没法回填，没有 agent_key 就没法去重；
+         同理没有 token_epoch 列就没法做代次回填；
       2. 回填 record_type —— 必须在建索引前完成，否则索引建在错误的分类上；
-      3. 去重 + 回填 agent_key —— 必须在建唯一索引前完成，否则索引直接失败；
-      4. 建索引 —— 最后一步，依赖前三步的列与数据。
+      3. 代次回填 —— 必须在补列之后（依赖 token_epoch 存在），且只跑一次；
+      4. MAC 归一化 —— 与代次回填互不依赖，但**必须在建索引之前**：
+         索引本身不挑数据，可 `_find_device` 能否用上索引取决于存量是否已归一；
+      5. 去重 + 回填 agent_key —— 必须在建唯一索引前完成，否则索引直接失败；
+      6. 建索引 —— 最后一步，依赖前几步的列与数据。
 
     删表（:func:`drop_membership_tables`）**与上面四步互不依赖**，放在最前面：
     它动的是五张已经没有任何 ORM 映射的孤儿表，先清掉再补列，
@@ -918,12 +1157,20 @@ def run_all() -> dict[str, int]:
     dropped = drop_membership_tables()
     added = ensure_missing_columns()
     backfilled = backfill_record_types()
+    epochs = backfill_token_epoch()
+    # ⚠️ 这条**必须真的被调用**，否则 `_find_device` 的 `IN (mac_variants(...))`
+    # 在带冒号的老数据上会退化成「查不到设备」—— 而 OTA 端点会因此把一台
+    # **已绑定**设备判成未绑定并下发激活码（违反用户规则 4）。
+    # `mac_variants` 的双写法兜底让功能不依赖它，但**索引生效**依赖它。
+    macs = normalize_device_macs()
     deduped = dedupe_persona_globals()
     indexed = ensure_missing_indexes()
     return {
         "membership_tables_dropped": dropped,
         "columns_added": added,
         "record_types_backfilled": backfilled,
+        "token_epochs_backfilled": epochs,
+        "device_macs_normalized": macs,
         "persona_globals_deduped": deduped,
         "indexes_created": indexed,
     }

@@ -233,6 +233,27 @@ LOGIN_FAIL_PER_HOUR = _int_env("ELDER_LOGIN_FAIL_PER_HOUR", 20)
 #     代价只是"某个很久没失败的主体重新计数"，不会锁死任何人。
 LOGIN_RATE_LIMIT_MAX_KEYS = _int_env("ELDER_LOGIN_RATE_LIMIT_MAX_KEYS", 10000)
 
+# ------------------------------------------------- OTA 端点新建激活码的配额（2026-10-20）
+# 只限「**新建**」——复用已有码、以及已绑定设备取 token，都不计入。
+#
+# 为什么必须限这一条：``/api/voice/ota`` **无鉴权**（设备此刻还没有 token），
+# 身份就是请求头里的 ``Device-Id``（MAC）。未绑定分支会按 MAC **建一行**
+# 激活码，于是「拿随机 MAC 刷这个端点」= 一条不需要任何凭证的写库放大路径，
+# 同时还能批量收割别人的待绑定码（配合绑定端点的限速慢慢试）。
+#
+# 阈值怎么定的（不能误伤）：
+#   · 设备端 ``GUIDE_POLL_MS = 15s`` ⇒ 单台设备约 240 次/小时，但**复用**不计数，
+#     所以正常轮询无论多频繁都不会碰到这个配额；
+#   · 只有「这个 MAC 在本机从没申请过码」才记一笔 ⇒ 配额实际约束的是
+#     **一个来源一小时能注册多少台新设备**。
+#   · 100 台/小时对任何真实家庭/养老院场景都绰绰有余（一天装 100 台都够）。
+#
+# ⚠️ 生产在 nginx 后面且 ``ELDER_TRUSTED_PROXY_IPS`` 没配时，``client_ip()``
+#    取到的是反代自己的地址 ⇒ 全站共用一个键。那种部署下本配额相当于
+#    「全站每小时最多注册 100 台新设备」，仍高于任何合理装机速度，故可接受；
+#    但**要按来源精确限流，仍需把 ELDER_TRUSTED_PROXY_IPS 配上**。
+OTA_NEW_CODE_PER_HOUR = _int_env("ELDER_OTA_NEW_CODE_PER_HOUR", 100)
+
 # ---------------------------------------------------------------- 客户端 IP 与反代
 # 生产是「Docker + 域名 + Nginx」，服务端看到的 TCP 对端是 **Nginx**，
 # 真实客户端 IP 只在 X-Forwarded-For 里。但盲目信任这个头等于限速器形同虚设
@@ -270,6 +291,11 @@ TRUSTED_PROXY_IPS = os.getenv("ELDER_TRUSTED_PROXY_IPS", "").strip()
 ACT_CODE_BODY_LEN = 6
 ACT_CODE_LEN = ACT_CODE_BODY_LEN + 1
 ACT_CODE_TTL_MINUTES = int(os.getenv("ELDER_ACT_TTL_MIN", "10"))
+
+#: 对用户公开的平台管理员联系邮箱（「忘记用户名无法解绑」时的唯一求助通道）。
+#: ⚠️ 不要用 mailer 的 SMTP notify_to：那是运维收信地址，渲染到页面上等于
+#: 把内部邮箱暴露给全部用户。这里必须是专门对外公开的地址。
+SUPPORT_EMAIL = os.getenv("ELDER_SUPPORT_EMAIL", "support@voice.250886.xyz").strip()
 
 # ---------------------------------------------------------------- 设备 OTA 固件分发
 # 两个变量**都非空**时，OTA 响应（已绑定 / 未绑定两条路径）才带

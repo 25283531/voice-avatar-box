@@ -97,8 +97,16 @@ def issue_user_token(user_id: int, username: str, is_admin: bool = False) -> str
                    "admin": bool(is_admin)}, USER_TOKEN_TTL)
 
 
-def issue_device_token(device_pk: int, device_id: str) -> str:
-    return _issue({"sub": str(device_pk), "typ": "device", "device_id": device_id},
+def issue_device_token(device_pk: int, device_id: str, token_epoch: int = 0) -> str:
+    """签发设备 token。
+
+    ``token_epoch`` 是设备当前的**代次**（``Device.token_epoch``）。校验侧
+    （``deps.get_current_device`` / ``voice.session``）要求 JWT 里的 ``ep`` 与
+    库里的代次相等 —— 管理员解绑时把代次 +1，**所有已签出的旧 token 立即失效**。
+    无状态 JWT 本身收不回来，代次是让它「可吊销」的最小代价实现。
+    """
+    return _issue({"sub": str(device_pk), "typ": "device", "device_id": device_id,
+                   "ep": int(token_epoch or 0)},
                   DEVICE_TOKEN_TTL)
 
 

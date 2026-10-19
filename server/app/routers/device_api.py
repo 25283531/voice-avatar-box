@@ -360,25 +360,40 @@ def report_interaction(payload: InteractionReportIn, db: Session = Depends(get_d
 @router.post("/activation-code")
 def request_activation_code(db: Session = Depends(get_db),
                             dev: models.Device = Depends(get_current_device)):
-    """设备主动申请一枚激活码用于屏显（APP 未发起时也能自助绑定）。"""
-    from ..security import code_expires_at, format_code, generate_activation_code
+    """设备主动申请一枚激活码用于屏显。
 
-    for _ in range(8):
-        code = generate_activation_code()
-        clash = db.scalar(select(models.ActivationCode).where(models.ActivationCode.code == code))
-        if not clash:
-            break
-    else:
-        return {"ok": False, "reason": "generate-failed"}
+    ⚠️ 2026-10-20 语义变更：本接口要 ``device_token`` 才能调，而设备 token
+    只在**绑定成功那一刻**签发（见 ``voice.ota_check`` 的已绑定分支）⇒ 能走到
+    这里的设备**必然已经绑定**。按用户要求「已绑定设备在解绑前不再下发激活码」，
+    这里直接如实拒绝，而不是照旧发一枚新码。
 
-    row = models.ActivationCode(code=code, device_id=dev.device_id, expires_at=code_expires_at())
-    db.add(row)
-    db.commit()
+    未绑定设备的取码路径是 ``GET/POST /api/voice/ota``（不需要任何凭证，
+    身份就是 ``Device-Id`` 头），固件每 15s 走的就是那条。
+
+    为什么不做成「已绑定也发，只是不生效」：发出去就意味着有人能读到屏幕、
+    抄下来、再撞一次绑定接口 —— 那正是 10 分钟 TTL 要压窄的窗口，不该自己开口子。
+    """
+    if dev.owner_id is not None:
+        return {"ok": False, "reason": "already-bound",
+                "message": "设备已绑定账户，不再下发激活码；如需换绑请先解绑"}
+    if not dev.device_id:
+        return {"ok": False, "reason": "missing-device-id",
+                "message": "设备缺少 MAC，无法申领激活码"}
+
+    # 延迟 import：voice 顶层会 import 本模块（_voice_endpoints），顶层互引会成环。
+    from ..security import format_code
+    from ..voice import _ensure_activation_code
+
+    row = _ensure_activation_code(db, str(dev.device_id))
+    expires_at = row.expires_at
+    if expires_at.tzinfo is None:      # SQLite 读回 naive，按 UTC 解释
+        from datetime import timezone as _tz
+        expires_at = expires_at.replace(tzinfo=_tz.utc)
     return {
         "ok": True,
-        "code": code,
-        "display": format_code(code),
-        "expires_in_sec": int((row.expires_at - utcnow()).total_seconds()),
+        "code": row.code,
+        "display": format_code(row.code),
+        "expires_in_sec": max(0, int((expires_at - utcnow()).total_seconds())),
         "payload": _qr_payload_hint(dev.device_id),
     }
 

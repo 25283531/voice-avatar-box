@@ -53,9 +53,6 @@
   .kpi{background:var(--brand-soft);border-radius:var(--radius);padding:12px}
   .kpi .n{font-size:24px;font-weight:700;color:var(--brand);line-height:1.2}
   .kpi .l{font-size:12px;color:var(--muted)}
-  .big-code{font:22px/1.4 ui-monospace,Consolas,monospace;letter-spacing:1px;
-       background:#0f172a;color:#7dd3fc;padding:12px 16px;border-radius:8px;
-       display:inline-block;margin:8px 0}
   .bars{display:flex;align-items:flex-end;gap:6px;height:120px;padding-top:8px}
   .bars .b{flex:1;background:var(--brand);border-radius:4px 4px 0 0;min-height:2px;position:relative}
   .bars .x{text-align:center;font-size:11px;color:var(--muted);margin-top:4px}
@@ -154,8 +151,13 @@
       <div class="card">
         <h2>添加设备</h2>
         <p class="muted" style="font-size:12px;margin:0 0 10px">
-          先登记设备（填设备标识），再点「激活码」让设备屏幕显示 13 位码，
-          在本页输入该码即完成绑定。激活码 10 分钟内有效。
+          设备连上 Wi-Fi 后，屏幕上会显示 <b>7 位数字激活码</b>（形如 <code>123-4567</code>），
+          在下方「输入激活码绑定设备」里填入该码即完成绑定。
+          激活码 <b>10 分钟内有效</b>，过期后设备会自动换一枚新码，照着屏幕重输即可。
+        </p>
+        <p class="muted" style="font-size:12px;margin:0 0 10px">
+          下面的「设备标识」是<b>可选</b>的备用登记方式：正常流程不需要手填，
+          绑定激活码时会按设备自报的 MAC 自动建档。
         </p>
         <div class="row">
           <div><label>设备标识（eFuse MAC）</label><input v-model="devForm.device_id" placeholder="aabbccddeeff" /></div>
@@ -164,19 +166,22 @@
         </div>
       </div>
 
-      <!-- 激活码绑定：设备端（或 APP）显示 13 位码，用户在本页输入即可完成绑定，
+      <!-- 激活码绑定：设备屏幕显示 7 位码（OTA 下发），用户在本页输入即可完成绑定，
            绑定后设备归到当前账号名下，随即出现在下方「我的设备」列表。
-           通用码场景下设备还没登记，用可选的「设备标识」现场建档。 -->
+           通用码场景下设备还没登记，用可选的「设备标识」现场建档。
+           ⚠️ 本页**不提供**「生成激活码」按钮：码的唯一来源是设备屏幕。
+           服务端对已绑定设备不再发码（POST /api/devices/{pk}/code → 409），
+           在这里放按钮只会让用户点到一条报错。 -->
       <div class="card">
         <h2>输入激活码绑定设备</h2>
         <p class="muted" style="font-size:12px;margin:0 0 10px">
-          让设备屏幕（或手机 APP）显示 13 位激活码，在本页输入即可完成绑定。
-          码的格式是 1 位字母 + 12 位数字，带不带短横线空格都行。
+          让设备屏幕显示 <b>7 位数字激活码</b>，在本页输入即可完成绑定。
+          多输的短横线（<code>123-4567</code>）或空格会被自动忽略。
         </p>
         <div class="row">
           <div><label>激活码</label>
-            <input id="bdCode" v-model="bindForm.code" placeholder="A-3829-4471-0056"
-                   style="width:220px;text-transform:uppercase" @keyup.enter="bindDeviceByCode" /></div>
+            <input id="bdCode" v-model="bindForm.code" placeholder="123-4567" maxlength="9"
+                   style="width:220px" @keyup.enter="bindDeviceByCode" /></div>
           <div><label>设备标识（设备未登记时必填）</label>
             <input id="bdDevId" v-model="bindForm.device_id" placeholder="留空表示该设备已登记" style="width:220px" /></div>
           <div><label>备注名称（选填）</label>
@@ -184,6 +189,27 @@
           <button id="bdBtn" class="primary" :disabled="busy" @click="bindDeviceByCode">绑定到我的账号</button>
         </div>
         <div v-if="bindMsg" class="muted" style="font-size:12px;margin-top:8px;color:var(--ok)">{{bindMsg}}</div>
+      </div>
+
+      <!-- 「忘记用户名」求助通道：这是唯一能救回一台被锁在原账户上的设备的路径。
+           为什么必须写在页面上而不是只写在后端报错里：走投无路的用户根本到不了
+           那条报错（他登不进原账户，连设备列表都看不到）。 -->
+      <div class="card">
+        <h2>忘记用户名、解绑不了设备？</h2>
+        <p class="muted" style="font-size:12px;margin:0 0 8px">
+          忘记注册时的用户名 ⇒ 登不进原账户 ⇒ 网页和 APP 里都看不到那台设备，
+          也就无法自行解绑。这时<b>只能由平台管理员代为解绑</b>：
+        </p>
+        <ol style="margin:0;padding-left:20px;font-size:13px;line-height:1.9">
+          <li>用<b>注册时留的邮箱</b>发邮件给平台管理员<span v-if="supportEmail">：<a :href="'mailto:'+supportEmail">{{supportEmail}}</a></span>。</li>
+          <li>邮件里写明<b>设备标识（MAC，见设备屏幕或机身标签）</b>与具体情况
+              （例如「用户名忘了、原邮箱也记不清」）。</li>
+          <li>管理员在后台把设备解绑后，设备会在 <b>15 秒内</b>重新显示激活码，
+              你可以用<b>新账户</b>把它重新绑定。</li>
+        </ol>
+        <p class="muted" style="font-size:12px;margin:8px 0 0">
+          解绑只清掉「这台设备归谁」，<b>提醒与历史记录都会保留</b>，不会因为换账户而丢失。
+        </p>
       </div>
       <!-- 配网引导：固件本身自带浏览器配网（未配网时自建热点 + 强制门户，
            屏幕上直接打出热点名与网址），所以这里只写操作说明、不发任何请求——
@@ -242,24 +268,12 @@
                 </select>
               </td>
               <td class="row">
-                <button @click="genCode(d)">激活码</button>
                 <button class="danger" @click="removeDevice(d)">删除</button>
               </td>
             </tr>
           </tbody>
         </table>
         <div v-else class="empty">还没有设备，先在上方登记一台</div>
-      </div>
-
-      <div v-if="codeBox" class="mask" @click.self="codeBox=null">
-        <div class="modal">
-          <button class="close" @click="codeBox=null">&times;</button>
-          <h2>设备激活码</h2>
-          <p class="muted">让设备屏幕显示该码，或在本页输入。<b>10 分钟内有效</b>，过期请重新获取。</p>
-          <div class="big-code">{{codeBox.display}}</div>
-          <p class="muted" style="font-size:12px">原始码：<code>{{codeBox.code}}</code> · 结构：1 位字母 + 12 位数字（末位 Luhn 校验位）</p>
-          <div class="row"><button class="primary" @click="copy(codeBox.code)">复制</button></div>
-        </div>
       </div>
     </section>
 
@@ -911,7 +925,10 @@ createApp({
       // 设备
       devices: [], devForm: { device_id:'', name:'我的陪伴助手' },
       bindForm: { code:'', device_id:'', alias:'' }, bindMsg: '',
-      codeBox: null, agentBind: {},
+      // 管理员联系邮箱：来自 GET /api/support-contact（config.SUPPORT_EMAIL）。
+      // 刻意不在前端写死 —— 换邮箱只该改服务端配置，不该改这份 HTML。
+      supportEmail: '',
+      agentBind: {},
       // 提醒
       curDeviceId: null, reminders: [], events: [],
       rBox: null, rForm: null, timesText:'', weekText:'', monthText:'',
@@ -1070,18 +1087,16 @@ createApp({
       }catch(e){ this.err = e.message; }
       finally{ this.busy = false; }
     },
-    async genCode(d){
-      try{
-        this.codeBox = await this.api('/api/devices/'+d.id+'/code', {method:'POST'});
-      }catch(e){ this.err = e.message; }
-    },
-    // 激活码绑定：客户端只做「去分隔符 + 转大写 + 长度 13」的粗筛，
+    // 激活码绑定：客户端只做「去分隔符 + 长度 7」的粗筛，
     // 真正的 Luhn 校验位由服务端判定（security.verify_activation_code），
     // 这里不重复实现，避免两套规则漂移。
+    // ⚠️ 长度必须与 config.ACT_CODE_LEN 一致（6 位随机 + 1 位 Luhn = 7）。
+    // 曾在这里写死 13（旧的「1 字母 + 12 数字」格式），服务端改成 7 位后
+    // 这一行把**所有**合法码都拦在了前端 —— 网页端绑定功能完全不可用。
     async bindDeviceByCode(){
-      const code = (this.bindForm.code||'').replace(/[^0-9a-zA-Z]/g,'').toUpperCase();
-      if (code.length !== 13){
-        this.err = '激活码应为 13 位（1 位字母 + 12 位数字）';
+      const code = (this.bindForm.code||'').replace(/\D/g,'');
+      if (code.length !== 7){
+        this.err = '激活码应为 7 位数字，当前 ' + code.length + ' 位';
         return;
       }
       this.busy = true; this.err = '';
@@ -1097,6 +1112,17 @@ createApp({
         this.bindMsg = '已绑定设备「' + r.name + '」，可在下方列表中看到它';
       }catch(e){ this.err = '绑定失败：' + e.message; }
       finally{ this.busy = false; }
+    },
+    // 管理员联系邮箱（「忘记用户名」时唯一求助通道）。无鉴权只读接口，
+    // 失败就静默留空：帮助卡片会退化成「发邮件给平台管理员」而不显示地址，
+    // 绝不能因为这一个字段取不到就把整页打成错误态。
+    async loadSupportEmail(){
+      try{
+        const r = await fetch('/api/support-contact');
+        if (!r.ok) return;
+        const d = await r.json();
+        if (d && d.email) this.supportEmail = d.email;
+      }catch(e){ /* 静默：帮助文案仍可用 */ }
     },
     async applyAvatar(d, ev){
       const v = ev.target.value;
@@ -1494,6 +1520,8 @@ createApp({
     }
   },
   async mounted(){
+    // 求助邮箱与登录态无关（登录页也可能有人需要），先取，且不阻塞后续流程。
+    this.loadSupportEmail();
     if (!this.token) return;
     // token 在但 user 对象不在（如只清了一半 localStorage）：先找 /api/auth/me 补身份
     if (!this.user || !this.user.id){

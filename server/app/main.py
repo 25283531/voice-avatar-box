@@ -29,6 +29,7 @@ from .config import (
     DEFAULT_ADMIN_PASSWORDS,
     RESET_ADMIN_PASSWORD,
     SEED_ADMIN_PASSWORD,
+    SUPPORT_EMAIL,
 )
 from .db import SessionLocal, init_db
 from .models import Avatar
@@ -543,6 +544,21 @@ def health_scheduler():
     from .scheduler import scheduler_health
 
     return scheduler_health()
+
+
+@app.get("/api/support-contact")
+def support_contact():
+    """对用户公开的管理员联系邮箱（无鉴权，只有这一个字段）。
+
+    为什么单独开一个端点而不是塞进 ``/api/health``：health 是容器探活的
+    固定契约（Dockerfile HEALTHCHECK 每 30 秒打一次，冒烟脚本也钉着它的
+    形状），往里加业务字段会让「探活响应」变成一个谁都想改的杂物间。
+    也刻意**不**复用 mailer 的 SMTP ``notify_to`` —— 那是运维收信地址，
+    渲染到用户端页面上等于把内部邮箱暴露给全部用户（见 config.SUPPORT_EMAIL）。
+
+    响应只有 ``{"email": ...}``，不泄露任何其他配置。
+    """
+    return {"email": SUPPORT_EMAIL}
 
 
 # ---------------------------------------------------------------- 双入口页面

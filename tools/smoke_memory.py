@@ -41,6 +41,7 @@ PY = sys.executable
 # 默认端口统一由 tools/smoke_ports.py 托管（唯一真源），各脚本不再各写一份 ——
 # 早先 smoke_home/smoke_roles/smoke_memory 都是 8097，并行跑必然撞车。
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+from smoke_common import seed_admin_env  # noqa: E402
 from smoke_ports import (  # noqa: E402
     detect_addr_in_use,
     guard_or_die,
@@ -141,7 +142,10 @@ def _read_log_tail(max_bytes: int = 8192) -> str:
 
 # ================================================================ 主流程
 def main() -> int:
-    env = dict(os.environ)
+    # seed_admin_env：本脚本硬用 admin/admin123 登录，而空库不设
+    # ELDER_SEED_ADMIN_PASSWORD 时种子口令是随机的（bb5ca98 起）——
+    # 不注入就「本地裸跑必 401」，全靠 CI job 级 env 兜住（见 smoke_common 文档）。
+    env = seed_admin_env(dict(os.environ))
     env.pop("MSYSTEM", None)
     env["ELDER_DB"] = f"sqlite:///{DB_PATH.as_posix()}"
     env["ELDER_JWT_SECRET"] = "smoke-memory-secret"

@@ -41,6 +41,7 @@ from starlette.websockets import WebSocket, WebSocketDisconnect
 from .. import config
 from ..db import SessionLocal
 from ..llm_gateway import ConfigMissingError, chat_stream
+from ..macs import norm_mac
 from ..chat_quota import local_date_str, quota_snapshot, record_chat_usage
 from ..memory import bridge as memory_bridge
 from ..models import InteractionKind
@@ -233,12 +234,28 @@ class VoiceSession:
             await self._safe_close(CLOSE_UNAUTHORIZED)
             return False
 
+        # 代次校验（与 deps.get_current_device 同一判据）：管理员解绑时
+        # `token_epoch += 1`，旧 token 必须**连 WS 也开不了**。
+        # 只在 HTTP 侧校验是不够的 —— WS 是真正读数据的通道，
+        # 漏了这里等于「解绑后还能听老人说话」。
+        if int(payload.get("ep", 0)) != int(getattr(dev, "token_epoch", 0) or 0):
+            log.warning("设备 token 代次过期（已解绑/换绑）：dev_pk=%s", dev_pk)
+            await self._safe_close(CLOSE_UNAUTHORIZED)
+            return False
+
         # 跨设备盗用 token：token 本身有效，但 Header 里的 Device-Id 与
         # 签发的不是同一台。**必须比对** —— 否则偷到一台设备的 token
         # 就能冒充任意 MAC（OTA 只认 Device-Id，token 与 MAC 分离时
         # 身份链就断了）。
+        #
+        # ⚠️⚠️ 必须按**归一化**后比较（2026-10-20）：`Device.device_id` 入库
+        # 已统一成不带冒号的小写形式（`aabbccddeeff`，见 app/macs.py），
+        # 而固件的 `Device-Id` 头是 `aa:bb:cc:dd:ee:ff`。这里若继续用裸串比，
+        # **每一台设备一开口就被 4001 关掉** —— 而且现象是「设备能连上、
+        # 一说就断」，与鉴权失败长得一模一样，极难定位。变异实证：
+        # 把下面这行改回 `header_mac != dev.device_id`，`smoke_voice` 必须红。
         header_mac = (self.ws.headers.get("device-id") or "").strip()
-        if header_mac and header_mac != (dev.device_id or ""):
+        if header_mac and norm_mac(header_mac) != norm_mac(dev.device_id):
             log.warning("Device-Id 与 token 不匹配：header=%r token=%r",
                         header_mac, dev.device_id)
             await self._safe_close(CLOSE_DEVICE_MISMATCH)

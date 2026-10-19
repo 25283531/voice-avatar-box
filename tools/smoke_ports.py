@@ -116,6 +116,17 @@ DEFAULT_PORTS: dict[str, int] = {
     "smoke_local_reminders": 8123, # 断网自建提醒上报：鉴权 + 幂等 + sync 可见性
     "smoke_voice_catalog": 8124,   # 音色目录 + 服务就绪度：预置清单单一真源 + 零配置如实反映
     "smoke_proxy_headers": 8125,   # 可信反代：ProxyHeaders 算法 + 307 Location 的 scheme 推导
+    # 硬件型号截断护栏：守 device_api.sync 的 hw[:64]（SQLite 不强制列宽，
+    # 删掉那行切片时**没有任何别的测试会红**，所以必须单独一条）。
+    # 它内部会起两次服务（原始 + 变异自检），故端口与 8125 相邻但独立。
+    "smoke_hw_model_truncation": 8126,
+    # OTA 端点「新建激活码」配额：证明超配额 429、且**复用路径不被误伤**
+    # （设备每 15s 轮询，若复用也计数，正常设备会被自己的轮询打满）。
+    "smoke_ota_ratelimit": 8127,
+    # 激活码 10 分钟 TTL / 服务端锁定 / 已绑定不发码 / 管理员解绑
+    "smoke_activation_ttl": 8128,
+    # QA-B 第二层独立验证（不引用实现者的冒烟断言，独立直连 SQLite 复核）
+    "qa_b_activation_gate": 8129,
 }
 
 

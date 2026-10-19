@@ -1632,13 +1632,20 @@ def t_activation_table() -> None:
 
     from app.db import SessionLocal
     from app.models import ActivationCode
+    from app.macs import mac_variants, norm_mac
 
     with SessionLocal() as db:
+        # ⚠️ 必须按**归一化键**计数，不能用 MAC_UNBOUND 原值。
+        # MAC_UNBOUND 是 "AA:BB:CC:DD:EE:02"（大写带冒号），而入库一律走
+        # `_ensure_activation_code` 里的 `norm_mac()`（→ "aabbccddee02"）。
+        # 按原值等值查永远是 0 条，会让这条断言**假红**——它红的时候
+        # 代码其实是对的，而真正的「重复建码」反而可能被它漏掉。
+        # 用 mac_variants 覆盖全部历史写法，无论库里存成哪种都能数到。
         n = db.scalar(
             select(func.count()).select_from(ActivationCode).where(
-                ActivationCode.device_id == MAC_UNBOUND)) or 0
+                ActivationCode.device_id.in_(mac_variants(MAC_UNBOUND)))) or 0
     check("1c · 未绑定 MAC 的激活码只建了一条（多次申领复用）", n == 1,
-          f"{n} 条")
+          f"{n} 条（查键 {norm_mac(MAC_UNBOUND)}）")
 
 
 # ================================================================ 12. 工具调用

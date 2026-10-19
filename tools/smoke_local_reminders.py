@@ -54,10 +54,13 @@ def check(name: str, ok: bool, detail: str = "") -> None:
     print(f"  [{'PASS' if ok else 'FAIL'}] {name}" + (f"  -> {detail}" if detail else ""))
 
 
-def req(method: str, path: str, body=None, token: str | None = None):
+def req(method: str, path: str, body=None, token: str | None = None,
+        headers: dict | None = None):
     data = json.dumps(body).encode() if body is not None else None
     r = urllib.request.Request(BASE + path, data=data, method=method)
     r.add_header("Content-Type", "application/json")
+    for k, v in (headers or {}).items():
+        r.add_header(k, v)
     if token:
         r.add_header("Authorization", "Bearer " + token)
     try:
@@ -130,17 +133,21 @@ def main() -> int:
         tok = (reg or {}).get("access_token", "")
         check("管理员登录", code == 200 and bool(tok), f"HTTP {code}")
 
-        code, dv = req("POST", "/api/devices",
-                       {"device_id": "e1de7700c0de", "name": "离线提醒测试机"}, tok)
-        check("创建设备", code == 201 and bool((dv or {}).get("device_id")), f"HTTP {code}")
-        dev_pk = (dv or {}).get("id")
-
-        # 走真流程拿 device_token：申请激活码 -> 校验 -> 绑定
-        code, cd = req("POST", f"/api/devices/{dev_pk}/code", {}, tok)
-        full_code = (cd or {}).get("code", "")
-        check("申请激活码", code == 200 and len(full_code) == 7, f"HTTP {code}")
-        code, bind = req("POST", "/api/devices/bind", {"code": full_code}, tok)
+        # ⚠️ 取码必须走**设备自己那条路**（POST /api/voice/ota + Device-Id 头）。
+        # 2026-10-20 起 `POST /api/devices/{pk}/code` 对「已绑定设备」返回 409
+        # （语义：已绑定不再发码），而 `POST /api/devices` 是「建档即归属」——
+        # 于是老的「建档 → 管理端取码 → 绑定」三步在同一份代码上**自相矛盾**，
+        # 本脚本曾因此从全绿变成 3/12（申请激活码 -> HTTP 409）。
+        # 走 OTA 不仅不再矛盾，还是真实链路：设备开机取码 → 家属在 APP 输码。
+        dev_mac = "e1de7700c0de"
+        code, ota = req("POST", "/api/voice/ota", {}, headers={"Device-Id": dev_mac})
+        full_code = ((ota or {}).get("activation") or {}).get("code", "")
+        check("设备经 OTA 领到激活码（固件真链路）",
+              code == 200 and len(full_code) == 7, f"HTTP {code} len={len(full_code)}")
+        code, bind = req("POST", "/api/devices/bind",
+                         {"code": full_code, "device_id": dev_mac}, tok)
         dev_token = (bind or {}).get("device_token", "")
+        dev_pk = (bind or {}).get("device_pk")
         check("绑定拿到 device_token", code == 200 and bool(dev_token), f"HTTP {code}")
 
         # ---------------------------------------------- 3. 上报断网自建提醒
