@@ -9,7 +9,8 @@ owner 或管理员。而本模块是**管理端**：非管理员403（先鉴权�
 （prefix ``/api/admin/<模块>`` + router 级 ``get_current_admin`` + 不包 envelope）。
 
 **本模块处理「调整现有平台预设」与「新建平台预设」**。新建入口
-（``POST /api/admin/presets``）是 2026-10-19 用户报「只有一个人格、无法新增」
+（``POST /api/admin/presets/``，**带尾斜杠**，原因见下方集合端点注释）
+是 2026-10-19 用户报「只有一个人格、无法新增」
 后补的：此前 ``_seed()`` 只写一个「小暖」，运营想加第二种说话风格时
 只能改数据库，而预设又是全平台共享行，手工改既无校验也无审计。
 
@@ -169,14 +170,30 @@ def _dirty_fields(row: models.AIProvider, traits: dict[str, Any]) -> list[str]:
 
 
 # ================================================================ 读
-# ⚠️ 集合端点用 ``""`` 而不是 ``"/"``（与 roles.py 的 ``@router.get("")`` 一致）。
-# 写成 ``"/"`` 时 FastAPI 注册到 ``/api/admin/presets/``（带斜杠），
-# 而不带斜杠的请求只能靠 Starlette 的 redirect_slashes 307 跳转 ——
-# 一旦同路径上再注册一个不带斜杠的方法（如本文件的 POST 创建），
-# 那条 307 就被精确匹配顶掉，GET 直接变 **405 Method Not Allowed**。
-# 实测踩过（2026-10-19）：加了 POST 创建端点后，原本全绿的
-# 「管理员可列平台预设」断言瞬间变红，而库里数据完全正常。
-@router.get("", response_model=PresetListOut)
+# ⚠️ 集合端点（GET 列表 + POST 创建）**两个方法必须挂在同一条路径上**，
+# 且这里选 ``"/"``（即 ``/api/admin/presets/``）而不是 ``""``。
+#
+# 为什么同路径：2026-10-19 先加了 ``@router.post("")``（不带斜杠）而 GET 仍在
+# ``"/"``，结果 ``GET /api/admin/presets`` 从 200 变 **405**。原因是 Starlette
+# 的匹配顺序：路径相同但方法不同的路由算 **PARTIAL 匹配**，会直接走该路由的
+# ``handle()`` 抛 405，**根本走不到** redirect_slashes 那段兜底 —— 原来靠
+# ``"/"``→``""`` 的 307 重定向被精确匹配顶掉了，而库里数据完全正常，
+# 表现是「管理员可列平台预设」断言莫名变红。两个方法分居两条路径，
+# 就是同一件事有两份真源，与版本号那次事故同形。
+#
+# 为什么选 ``"/"`` 而不是 ``""``（与 roles.py 的 ``""`` 故意不同）：
+# 无尾斜杠路径 ``/api/admin/presets`` 必须继续 307 重定向到带斜杠形态 ——
+# 那是 2026-10-18 线上 Mixed Content 事故的被测路径，管理端前端
+# （static/index.html 的 loadPresets）至今仍用它，``smoke_proxy_headers``
+# 的 C 组整组（C1/C1b/C1c/C2/C3/C4，共 6 条）都拿它当探针。
+# 改成 ``""`` 会让全仓再无一条尾斜杠路由 ⇒ 那 6 条断言失去被测对象，
+# 从"通过"退化成"恒真"，比红更难发现。
+#
+# ⚠️ 因此**所有 POST 调用方必须显式写带斜杠的** ``/api/admin/presets/``：
+# urllib 的 HTTPRedirectHandler 只对 GET/HEAD 跟随 307，POST 的 307 会直接
+# 抛 HTTPError（见 urllib/request.py::redirect_request 的条件），
+# 前端 fetch 虽然会跟，但没必要白跑一趟。
+@router.get("/", response_model=PresetListOut)
 def list_presets(
     limit: int = Query(50, ge=1, le=200),
     db: Session = Depends(get_db),
@@ -191,7 +208,7 @@ def list_presets(
     return PresetListOut(presets=[_preset_out(db, r) for r in rows])
 
 
-@router.post("", response_model=PresetOut, status_code=status.HTTP_201_CREATED)
+@router.post("/", response_model=PresetOut, status_code=status.HTTP_201_CREATED)
 def create_preset(payload: PresetCreateIn, db: Session = Depends(get_db),
                   admin: models.User = Depends(get_current_admin)):
     """新建平台人格预设。

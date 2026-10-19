@@ -2207,7 +2207,12 @@ createApp({
           // ⚠️ 只提交这 5 个字段：归属类字段（record_type/owner_id/parent_id/kind）
           // 服务端 schema 用 extra="forbid" 一律拒（422），前端**连传的入口都不给** ——
           // 创建入口不该有能力决定"这行归谁"，那是 P0 安全边界。
-          const r = await this.api('/api/admin/presets', {
+          // ⚠️ POST 必须写**带尾斜杠**的 /api/admin/presets/：集合路由挂在 "/"
+          // （GET+POST 同路径，见 admin_presets.py 集合端点注释），不带斜杠的
+          // POST 会吃一个 307。GET 反而继续用不带斜杠的 /api/admin/presets ——
+          // 那是 2026-10-18 Mixed Content 事故的被测路径，smoke_proxy_headers
+          // 的 C 组整组都指着它，不能为了"好看"把守卫对象删掉。
+          const r = await this.api('/api/admin/presets/', {
             method:'POST',
             body: JSON.stringify({
               name: this.pEdit.name.trim(),

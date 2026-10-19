@@ -1082,6 +1082,21 @@ def main() -> int:
         # 2026-10-19 用户报「平台人格预设中只有一个人格，无法新增多个人格预设」。
         # 这一节钉的是创建入口的**契约**，不只是"能建"：缺省值、用户端可见性、
         # 审计、以及归属/红线/非法值这三类必须被挡在门外的请求。
+        #
+        # ⚠️⚠️ 路径形态：本脚本里 **GET 一律不带斜杠、POST 一律带斜杠**，
+        # 看着不对称，但两边都不能改（2026-10-19 各踩过一次）：
+        #   · GET /api/admin/presets（无斜杠）→ Starlette redirect_slashes 给
+        #     307 到带斜杠形态，urllib 对 GET 会自动跟随 ⇒ 断言看到 200。
+        #     **这条 307 本身是被测对象**：smoke_proxy_headers 的 C 组整组
+        #     （C1/C1b/C1c/C2/C3/C4）都指着它，它是 2026-10-18 线上 Mixed
+        #     Content 事故的路径。把它改成带斜杠 = 删掉 6 条守卫的被测对象。
+        #   · POST /api/admin/presets/（带斜杠）→ urllib 的
+        #     HTTPRedirectHandler.redirect_request 只对 GET/HEAD 跟随 307，
+        #     POST 的 307 直接抛 HTTPError ⇒ 不带斜杠的 POST 会让下面每一条
+        #     断言拿到 307 而不是 201/403/422/400，整片假红。
+        # 根因：集合路由 GET+POST 必须挂在**同一条**路径上（分居两条就会让
+        # 精确匹配顶掉 307、GET 变 405），而这条路径只能是 "/"，因为无斜杠
+        # 路径必须继续重定向。详见 admin_presets.py 集合端点注释。
         print("── T32-T36 新建平台人格预设 ──")
         code, plist0 = req("GET", "/api/admin/presets", token=admin)
         n_before = len((plist0 or {}).get("presets", []))
@@ -1089,7 +1104,7 @@ def main() -> int:
 
         # 只给 name：其余必须走 catalog 出厂值。运营不该为了建一个"和小暖
         # 差不多"的角色而从零填 10 个性格档位 —— 从零填的结果通常是半途而废。
-        code, created = req("POST", "/api/admin/presets", {"name": NEW_NAME}, admin)
+        code, created = req("POST", "/api/admin/presets/", {"name": NEW_NAME}, admin)
         check("T32 admin POST 只给 name -> 201（缺省走出厂值）",
               code == 201 and isinstance(created, dict), f"code={code}")
         new_pk = created.get("id") if isinstance(created, dict) else None
@@ -1122,24 +1137,24 @@ def main() -> int:
                   code == 200 and patched.get("description") == "活泼型，语速偏快",
                   f"code={code}")
 
-        code, _ = req("POST", "/api/admin/presets", {"name": "x"}, u1)
+        code, _ = req("POST", "/api/admin/presets/", {"name": "x"}, u1)
         check("T35 非 admin POST -> 403（创建入口同样是管理端边界）",
               code == 403, f"code={code}")
-        code, _ = req("POST", "/api/admin/presets", {"name": "x"})
+        code, _ = req("POST", "/api/admin/presets/", {"name": "x"})
         check("T35b 未登录 POST -> 401", code == 401, f"code={code}")
         # 归属字段：创建入口不该有能力决定"这行归谁"（P0 边界的形状）
-        code, _ = req("POST", "/api/admin/presets",
+        code, _ = req("POST", "/api/admin/presets/",
                       {"name": "x", "record_type": "role"}, admin)
         check("T36 POST 带 record_type -> 422（归属不是请求方能决定的）",
               code == 422, f"code={code}")
-        code, _ = req("POST", "/api/admin/presets",
+        code, _ = req("POST", "/api/admin/presets/",
                       {"name": "x", "guardrails": {"hard": []}}, admin)
         check("T36b POST 带 guardrails -> 422（红线只能由代码常量注入）",
               code == 422, f"code={code}")
-        code, _ = req("POST", "/api/admin/presets", {"traits": {"humor": 1}}, admin)
+        code, _ = req("POST", "/api/admin/presets/", {"traits": {"humor": 1}}, admin)
         check("T36c 缺 name -> 422（name 是创建的唯一必填项）",
               code == 422, f"code={code}")
-        code, _ = req("POST", "/api/admin/presets",
+        code, _ = req("POST", "/api/admin/presets/",
                       {"name": "x", "traits": {"humor": "很好笑"}}, admin)
         check("T36d 非法 trait 值 -> 400（编译/值域校验先于落库）",
               code == 400, f"code={code}")
