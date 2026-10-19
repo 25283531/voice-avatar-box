@@ -63,6 +63,19 @@ jobs:
           python3 tools/merge_to_xiaozhi.py
           python3 tools/merge_to_xiaozhi.py --check
 
+      # ⚠️ 注入副本在 `firmware/xiaozhi/.gitignore` 里，**永远不会出现在
+      # `git status` / `git diff` 里** ⇒ 它落后于源树时，本地和 CI 都看不出来，
+      # 编出来的固件用的是旧逻辑（2026-10-20 的"改了引导逻辑但屏上还是没码"
+      # 就是这一类）。`diff -rq` 是唯一能发现它的手段，必须紧跟在 merge 之后。
+      - name: 合并完整性校验（注入副本须与源树逐字节一致）
+        run: |
+          set -e
+          if ! diff -rq firmware/components/elder firmware/xiaozhi/components/elder; then
+            echo "::error::注入副本与源树不一致 —— merge 未生效或只拷了一半"
+            exit 1
+          fi
+          echo "注入副本与源树一致"
+
       - name: 按输入覆盖板卡与后端地址
         env:
           BOARD_SYM: ${{ inputs.board || 'CONFIG_BOARD_TYPE_LICHUANG_DEV_S3' }}
@@ -160,6 +173,30 @@ jobs:
           idf.py build 2>&1 | tee build/ci-build.log | tail -120
           echo "=== 产物 ==="
           ls -lh build/*.bin build/bootloader/*.bin build/partition_table/*.bin 2>/dev/null || true
+
+      # ⚠️ **产物级断言**：只断言"编译成功"正是 2026-10-19 那次事故能漏过去的
+      # 直接原因 —— 源码改了、编译也绿，但二进制里没有新代码，用户烧完发现行为
+      # 一点没变，而所有日志/CI 都是绿的。这里直接对 .bin 做字节检索。
+      - name: 产物自检（新代码确实进了固件）
+        shell: bash
+        run: |
+          set -e
+          cd "$PROJECT_DIR"
+          python3 - <<'PY'
+          import pathlib, sys
+          bins = sorted(pathlib.Path('build').rglob('xiaozhi.bin'))
+          if not bins:
+              sys.exit('找不到 build/**/xiaozhi.bin')
+          data = bins[0].read_bytes()
+          # 7 位激活码的屏显格式串（elder_bind_guide.cc::show_guide）
+          needle = '激活码\n%s\n%s'.encode()
+          if needle not in data:
+              sys.exit('固件里检索不到屏显新格式串 ⇒ 改的代码没编进去（不是编译失败，是没生效）')
+          # 反面：旧 13 位实现的格式串必须已经不存在
+          if '%s\n激活码 %s'.encode() in data:
+              sys.exit('固件里仍有旧的 ShowNotification 格式串 ⇒ 注入副本是旧版')
+          print(f'产物自检通过：{bins[0]} {len(data)} bytes')
+          PY
 
       - name: 校验 OTA 地址指向本项目服务端
         shell: bash

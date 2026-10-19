@@ -283,14 +283,18 @@ void show_guide(const char *code)
     // 加上标题/分组码/换行最坏 82 字节，160 留足一倍余量。
     char text[160];
     if (code && code[0]) {
-        if (strlen(code) >= ELDER_ACT_CODE_LEN) {
+        if (strlen(code) == ELDER_ACT_CODE_LEN) {
             // elder_activation_format 要求 out 至少 ELDER_ACT_DISPLAY_LEN
             // （9 字节："123-4567" + '\0'），这里逐字对齐，不靠巧合。
             char grouped[ELDER_ACT_DISPLAY_LEN];
             elder_activation_format(code, grouped, sizeof(grouped));
             snprintf(text, sizeof(text), "激活码\n%s\n%s", grouped, kGuideText);
         } else {
-            // 码长不足（服务端异常）：原样显示也比空白有用。
+            // 长度不是 7（老库 13 位 / 服务端未升级 / 两树半合并）：
+            // 原样显示也比分错组好 —— 用 7 位规则切 13 位的码会切出
+            // "看着像、抄下来必错"的短码，比不显示更坑老人。
+            ESP_LOGE(TAG, "激活码格式异常（期望 %d 位，实得 %u 位）",
+                     ELDER_ACT_CODE_LEN, (unsigned)strlen(code));
             snprintf(text, sizeof(text), "激活码\n%s\n%s", code, kGuideText);
         }
     } else {

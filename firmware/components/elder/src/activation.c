@@ -63,11 +63,20 @@ esp_err_t elder_activation_generate(char *out_code, size_t len)
 
 void elder_activation_format(const char *code, char *out, size_t out_len)
 {
-    if (!code || !out || out_len < ELDER_ACT_DISPLAY_LEN) return;
-    /* 防御性兜底：万一 header 与 .c 版本不一致（合并脚本半途失败），
-     * 这里读到的是短码，直接返回比按 7 位布局越界写安全。
-     * 正常路径下服务端一定下发 7 位，这一行不会命中。 */
-    if (strlen(code) < ELDER_ACT_CODE_LEN) return;
+    if (!out || out_len < 1) return;
+    /* ★ 先把输出置空，且放在**所有早退之前**：任何一条守卫命中时，调用方
+     * `snprintf(..., "%s", out)` 读到的是空串，而不是栈上未初始化内存。
+     * 这一行比长度守卫更重要 —— 少了它，早退就变成"随机乱码"这种更难查的故障。 */
+    out[0] = '\0';
+
+    /* ⚠️ 判据里的 7 / 9 是**字面量，刻意不引用 header 宏**：半合并
+     * （header 与 .c 版本不一致）时，错的那一半恰好就是 header ——
+     * 拿错的值去校验自己必然失效。
+     * 本实现只写 out[0..8]（"123-4567" + '\0'），所以 9 字节下限是对的。
+     * ⚠️ 注意：旧 13 位实现写满 17 字节且自身无守卫，那种半合并**无法**
+     * 靠这里挡住，只能靠 merge 之后的 `diff -rq` 闸门（见 CI）。 */
+    if (!code || strlen(code) != 7) return;
+    if (out_len < 9) return;
     /* code: 7 digits -> "123-4567" */
     out[0] = code[0];
     out[1] = code[1];
