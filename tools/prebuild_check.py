@@ -251,6 +251,34 @@ def main() -> int:
             fatal=False,
         )
 
+    # ------------------------------------------------------ C5 固件自检期望值
+    # config_report.c 里有两处**硬编码的期望值**（唤醒词屏显、目标芯片），
+    # 设备开机时逐条比对，不符就 ESP_LOGE。
+    # ⇒ 这里必须在编译期把它们与 sdkconfig.defaults 对齐校验：
+    # 改了 defaults 的唤醒词却忘了改 C 侧，真机每次开机都会误报 ERROR。
+    # 误报比不报更糟——老人现场的日志只有这一段，一直刷 ERROR 会让人
+    # 忽略后面真正的报错。
+    cfg_report = ROOT / "firmware" / "components" / "elder" / "src" / "config_report.c"
+    try:
+        csrc = cfg_report.read_text(encoding="utf-8")
+        m = re.search(r'#define\s+EXPECTED_WAKE_WORD_DISPLAY\s+"([^"]*)"', csrc)
+        expected_display = m.group(1) if m else None
+        defaults_display = defaults.get("CONFIG_CUSTOM_WAKE_WORD_DISPLAY", "")
+        # defaults 里带引号，read_kv 已剥掉；这里只需去掉标点后比对
+        norm = lambda s: s.replace("，", "").replace(",", "").replace(" ", "")
+        check(
+            "C5 固件开机自检的期望唤醒词与 sdkconfig.defaults 一致",
+            expected_display is not None
+            and norm(expected_display) == norm(defaults_display),
+            f"config_report.c 里 EXPECTED_WAKE_WORD_DISPLAY={expected_display!r}，"
+            f"sdkconfig.defaults 里 CONFIG_CUSTOM_WAKE_WORD_DISPLAY="
+            f"{defaults_display!r}。不一致时设备每次开机都会 ESP_LOGE 误报。",
+            fatal=expected_display is not None,
+        )
+    except Exception as exc:  # noqa: BLE001
+        check("C5 固件开机自检期望值校验", False, f"无法读取 {cfg_report}: {exc}",
+              fatal=False)
+
     # ------------------------------------------------------ C4 merge 注入
     try:
         rc = subprocess.run(

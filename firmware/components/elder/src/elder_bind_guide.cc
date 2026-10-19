@@ -47,6 +47,7 @@
 
 #include "elder_bind_guide.h"
 #include "elder_net.h"
+#include "config_report.h"
 
 #define TAG "elder.bind"
 
@@ -258,6 +259,11 @@ extern "C" esp_err_t elder_bind_guide_start(void)
         return ESP_OK;
     }
     s_started = true;
+
+    // 开机配置自检：放在这里是因为本函数是本项目**保证会执行**的最早钩子
+    // （在 app.Start() 之前，且已绑定/未绑定两种设备都会走到）。
+    // elder_bridge 的日志在未绑定设备上永远看不到（app.Start() 不返回）。
+    elder_config_report();
 
     // 栈 6144：guide_task 里 Http + std::string 链比纯 NVS 操作深。
     // 栈不够的症状是第一次进循环就随机崩在 esp_http_client 里，

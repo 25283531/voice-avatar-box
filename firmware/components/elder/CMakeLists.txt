@@ -9,6 +9,7 @@ idf_component_register(
         "src/sync.c"
         "src/elder_cmd.c"
         "src/elder_mn.c"
+        "src/config_report.c"
     INCLUDE_DIRS "include"
     REQUIRES
         driver

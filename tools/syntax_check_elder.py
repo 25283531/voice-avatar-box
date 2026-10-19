@@ -46,6 +46,7 @@ CCJSON = BUILD / "compile_commands.json"
 TARGETS = {
     "elder_bridge.cc": ROOT / "firmware" / "xiaozhi" / "components" / "elder" / "src" / "elder_bridge.cc",
     "elder_bind_guide.cc": ROOT / "firmware" / "components" / "elder" / "src" / "elder_bind_guide.cc",
+    "config_report.c": ROOT / "firmware" / "components" / "elder" / "src" / "config_report.c",
 }
 
 #: 需要确保存在的宏（见坑 3）。
@@ -79,15 +80,31 @@ def ensure_def(base: str, name: str, fallback: str) -> str:
     return base + " " + fallback
 
 
-def base_command() -> str:
-    """取一份真实编译命令当模板（用 elder_bridge.cc 的，它 include 最全）。"""
+#: 编译命令模板来源：按**精确文件名**匹配，不能用后缀。
+#:
+#: ⚠️ 踩过的坑：用 `endswith(".cc")` 会匹配到上游 main 组件的 .cc
+#:（audio_service.cc 等），那条命令的 `-I` 只含 main 组件的头文件路径，
+#: 于是报 `nvs_flash.h / config_report.h: No such file or directory` ——
+#: 三个文件全红，但全是工具用错命令造成的假红，不是源码问题。
+#: 每个组件的 `-I` 集合不同，模板必须来自**同一组件**。
+TEMPLATE_FILE = {".cc": "elder_bridge.cc", ".c": "rgb.c"}
+
+
+def base_command(suffix: str = ".cc") -> str:
+    """取一份真实编译命令当模板。
+
+    ⚠️ C 与 C++ 必须**各用自己的模板**，不能共用一份：
+    ESP-IDF 对 `.c` 走 C 编译模式，对 `.cc` 走 C++ 且默认带 `-std=gnu++23`。
+    拿 C++ 命令去编 `.c` 文件，真实缺陷与语言差异混在一起报，根本分不清是
+    代码写错还是检查工具用错命令 —— 这种噪音会让人忽略真正的报错。
+    """
+    want = TEMPLATE_FILE[suffix]
     data = json.loads(CCJSON.read_text(encoding="utf-8"))
     for e in data:
         f = e["file"].replace("\\", "/")
-        if f.endswith("elder_bridge.cc"):
+        if f.endswith("/" + want):
             return (e.get("command") or " ".join(e["arguments"])).replace("\\", "/")
-    raise SystemExit("[fatal] compile_commands.json 里找不到 elder_bridge.cc，"
-                     "先跑一次 idf.py build")
+    raise SystemExit(f"[fatal] compile_commands.json 里找不到 {want}，先跑一次 idf.py build")
 
 
 def check(name: str, src: Path, base: str) -> bool:
@@ -130,10 +147,16 @@ def main() -> int:
         print(f"[fatal] 缺 {CCJSON}；请先在 firmware/xiaozhi 跑一次 idf.py build")
         return 1
     print("=" * 64)
-    print("elder C++ 适配层语法检查（交叉编译，秒级）")
+    print("elder 语法检查（交叉编译，秒级）")
     print("=" * 64)
-    base = base_command()
-    results = [(n, check(n, s, base)) for n, s in TARGETS.items() if s.is_file()]
+    results = []
+    for suffix in (".cc", ".c"):
+        targets = [(n, s) for n, s in TARGETS.items() if s.is_file() and n.endswith(suffix)]
+        if not targets:
+            continue
+        base = base_command(suffix)
+        for n, s in targets:
+            results.append((n, check(n, s, base)))
     failed = [n for n, ok in results if not ok]
     print("\n" + "=" * 64)
     print(f"共 {len(results)} 个文件：通过 {len(results) - len(failed)}，失败 {len(failed)}")
