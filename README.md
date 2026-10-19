@@ -121,6 +121,12 @@
 - `android-build`：选 `self`（仓库证书签名）/ `debug` → 产物为可直接安装的 APK
 - `firmware-build`：产物 artifact 名 `elder-firmware-esp32s3`，**日常只下 `elder-firmware-esp32s3-merged-flash.bin`**（offset `0x0`，esptool 单文件直烧）；其余 bin 是按 `flasher_args.json` 分地址烧写的备选
 
+⚠️ **固件只有一个可信来源：Actions 里对应 commit 的 artifact。** 仓库根的 `dist/`
+是 2026-10-19 前后手工暂存的历史包（已被 `.gitignore` 忽略、未入库），里面的固件
+**不含此后所有修复**。烧历史包的现象是「代码明明改了、行为一点没变」，且日志全绿、
+极难自查——2026-10-20 那次「激活码不上屏」排查中，它就是第一嫌疑。
+烧录前请用 `sha256sum` 与 artifact 内的 `SHA256SUMS.txt` 对账。
+
 ### 手机 APP 栏目
 
 APP 是给家属用的，不接入小智任何服务，业务后端地址在代码级写死

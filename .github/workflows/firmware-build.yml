@@ -284,6 +284,14 @@ jobs:
       #   ⚠️ 校验**全部** flash_files 段，不止 app：assets（语音资源）段换回旧版
       #   是最难查的一类 —— 固件逻辑全对、代码全对，但语音资源是旧的，表现为
       #   「行为怪但一切看起来都对」。只比 app 段会放过它。
+      #
+      #   ⚠️⚠️ 光比 `merged[off:off+len(want)] == want` 仍是**前缀比对**：
+      #   want 被截断（比如 merge 读到一个只写了一半的文件）时前缀照样相等，
+      #   断言照样绿 —— 而步骤名写着「逐字节一致」，**名字比行为强**正是这一轮
+      #   反复栽的形态。故补一条：本段结束到下一段起点之间的填充必须全是 0xFF。
+      #   esptool merge-bin 的填充值就是 0xFF（已在真实产物上逐段实测：各间隙
+      #   非 0xFF 字节数为 0），所以「有非 0xFF 残留」只可能是 app 被截断后
+      #   后面还留着别的数据。
       - name: 合并镜像自检（各段与 build/ 源文件逐字节一致）
         shell: bash
         run: |
@@ -294,9 +302,9 @@ jobs:
           b = pathlib.Path('build')
           args = json.loads((b / 'flasher_args.json').read_text())
           merged = (b / 'merged-flash.bin').read_bytes()
+          segs = sorted((int(o, 16), f) for o, f in args['flash_files'].items())
           bad, checked = [], 0
-          for off_s, fname in args['flash_files'].items():
-              off = int(off_s, 16)
+          for i, (off, fname) in enumerate(segs):
               f = b / fname
               if not f.exists():
                   bad.append(f'{fname}: 源文件不存在'); continue
@@ -305,12 +313,20 @@ jobs:
                   bad.append(f'{fname}: 合并镜像太短（{len(merged)} < {off:#x}+{len(want)}）'); continue
               if merged[off:off + len(want)] != want:
                   bad.append(f'{fname}: {off:#x} 处与源文件不一致'); continue
+              # 截断防线：本段之后到下一段之前必须是纯 0xFF 填充
+              nxt = segs[i + 1][0] if i + 1 < len(segs) else len(merged)
+              gap = merged[off + len(want):nxt]
+              non_ff = len(gap) - gap.count(0xFF)
+              if non_ff:
+                  bad.append(f'{fname}: 段后间隙 {off + len(want):#x}..{nxt:#x} '
+                             f'有 {non_ff} 字节非 0xFF ⇒ 该段可能被截断，后面残留了别的数据')
+                  continue
               checked += 1
-              print(f'  OK {fname:28s} {len(want):>9d} 字节 @ {off:#x}')
+              print(f'  OK {fname:34s} {len(want):>9d} 字节 @ {off:#x}  (间隙 {len(gap)}B 全 0xFF)')
           if bad:
-              sys.exit('合并镜像与源文件不一致 ⇒ 偏移错位 / merge-bin 读到旧文件：\n  '
+              sys.exit('合并镜像与源文件不一致 ⇒ 偏移错位 / 段被截断 / merge-bin 读到旧文件：\n  '
                        + '\n  '.join(bad))
-          print(f'全部 {checked} 段逐字节一致，合并镜像总长 {len(merged)} 字节')
+          print(f'全部 {checked} 段逐字节一致且间隙纯 0xFF，合并镜像总长 {len(merged)} 字节')
           PY
 
       - name: 整理产物
@@ -402,6 +418,8 @@ jobs:
             echo "| --- | --- | --- |"
             for f in *; do
               [ -f "$f" ] || continue
+              # SHA256SUMS.txt 由上一步生成，别把它自己也列进表里（自我指涉）
+              [ "$f" = "SHA256SUMS.txt" ] && continue
               printf '| `%s` | %s | `%s` |\n' \
                 "$f" "$(stat -c%s "$f" 2>/dev/null || echo '?')" \
                 "$(sha256sum "$f" 2>/dev/null | cut -d' ' -f1 || echo '?')"
