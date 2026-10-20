@@ -19,6 +19,9 @@ idf_component_register(
         esp_driver_rmt
         esp_driver_gpio
         esp_http_client
+        # esp_crt_bundle.h（证书包）在 mbedtls 组件里，必须显式声明：
+        # 漏了它 net.c 直接 fatal error: esp_crt_bundle.h: No such file。
+        mbedtls
         json
 )
 
