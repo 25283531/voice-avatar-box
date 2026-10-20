@@ -1,7 +1,11 @@
 #include "wifi_board.h"
 #include "codecs/box_audio_codec.h"
 #include "display/lcd_display.h"
+// emote 表情引擎只在 CONFIG_USE_EMOTE_MESSAGE_STYLE 下用；本产品固定 LVGL。
+// 对应的 display/emote_display.cc 已从编译列表移除（见 main/CMakeLists.txt）。
+#if defined(CONFIG_USE_EMOTE_MESSAGE_STYLE)
 #include "display/emote_display.h"
+#endif
 #include "application.h"
 #include "button.h"
 #include "config.h"

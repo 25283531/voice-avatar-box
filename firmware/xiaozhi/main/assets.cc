@@ -3,7 +3,13 @@
 #include "display.h"
 #include "application.h"
 #include "lvgl_theme.h"
+// emote（esp_emote_gfx 表情引擎）只在 CONFIG_USE_EMOTE_MESSAGE_STYLE 下使用。
+// 本产品固定走 LVGL（SpiLcdDisplay），该开关恒为 n ⇒ 不应把它拖进编译：
+// emote_display.cc 有 654 行、且无条件 LV_FONT_DECLARE(BUILTIN_TEXT_FONT)，
+// 留着会让表情引擎和一份字体被链接进 app 镜像（白占几百 KB）。
+#if defined(CONFIG_USE_EMOTE_MESSAGE_STYLE)
 #include "emote_display.h"
+#endif
 #ifdef HAVE_LVGL
 #include "display/lcd_display.h"
 #endif

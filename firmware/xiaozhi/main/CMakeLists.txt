@@ -16,7 +16,13 @@ set(SOURCES "audio/audio_codec.cc"
             "display/lcd_display.cc"
             "display/oled_display.cc"
             "display/lvgl_display/lvgl_display.cc"
-            "display/emote_display.cc"
+            # emote_display.cc 刻意**不编**：它没有整体条件编译保护（654 行都会
+            # 生成目标码），并且无条件 LV_FONT_DECLARE(BUILTIN_TEXT_FONT)，
+            # 会把表情引擎 gfx 和一份字体拖进 app 镜像。本项目固定用 LVGL
+            # （CONFIG_USE_EMOTE_MESSAGE_STYLE 恒为 n，见 sdkconfig.defaults 说明），
+            # 相关 include 已在 assets.cc / 板级文件里用 #if 包住。
+            # 真要改回 emote：把下面这行恢复，并打开 CONFIG_USE_EMOTE_MESSAGE_STYLE。
+            # "display/emote_display.cc"
             "display/lvgl_display/emoji_collection.cc"
             "display/lvgl_display/lvgl_theme.cc"
             "display/lvgl_display/lvgl_font.cc"

@@ -174,6 +174,40 @@ jobs:
           echo "=== 产物 ==="
           ls -lh build/*.bin build/bootloader/*.bin build/partition_table/*.bin 2>/dev/null || true
 
+      # 体积排名（只读报告，不参与判定）。
+      # 为什么必须有：删「用不到的代码」如果只按组件名或印象猜，十次有八次删错
+      # 对象 —— 体积几乎不动、功能却回归了。这份排名直接给出谁在占地方，
+      # 同时写进 job summary，省得每次下整份日志翻。
+      - name: 固件体积报告（组件排名）
+        shell: bash
+        run: |
+          set -eo pipefail
+          . "$IDF_PATH/export.sh"
+          cd "$PROJECT_DIR"
+          idf.py size-components 2>&1 | tee build/size-components.txt > /dev/null
+          echo "=== 组件占用排名（前 45 行）==="
+          head -45 build/size-components.txt
+          echo
+          echo "=== app / assets 分区占用 ==="
+          python3 - <<'PY'
+          import pathlib
+          app = sorted(pathlib.Path('build').rglob('xiaozhi.bin'))
+          if app:
+              n = app[0].stat().st_size
+              print(f'  xiaozhi.bin      {n:>9,d} B   app 分区 4,128,768 B   余量 {4128768-n:,d} B ({(4128768-n)*100/4128768:.1f}%)')
+          for p in ('generated_assets.bin',):
+              f = pathlib.Path('build') / p
+              if f.exists():
+                  n = f.stat().st_size
+                  print(f'  {p:16s}  {n:>9,d} B   assets 分区 8,388,608 B  余量 {8388608-n:,d} B')
+          PY
+          {
+            echo '### 固件体积（size-components 前 45 行）'
+            echo '```'
+            head -45 build/size-components.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
       # ⚠️ **产物级断言**：只断言"编译成功"正是 2026-10-19 那次事故能漏过去的
       # 直接原因 —— 源码改了、编译也绿，但二进制里没有新代码，用户烧完发现行为
       # 一点没变，而所有日志/CI 都是绿的。这里直接对 .bin 做字节检索。
