@@ -27,9 +27,15 @@
 
 #define DISPLAY_WIDTH   320
 #define DISPLAY_HEIGHT  240
-#define DISPLAY_MIRROR_X true
+// 2026-10-20 改回**横屏 320x240**（用户拍板：老人看得惯横屏，竖屏上下留白太多）。
+// 原值是 MIRROR_X=true / SWAP_XY=true ⇒ 屏交换 x/y 变成逻辑 240x320 竖屏。
+// 去掉 swap 后 LVGL 逻辑分辨率就是 320x240；mirror 一并关掉取屏的原生方向
+// （ST7789 320x240 模组原生即正向，原来的 mirror_x 是为了配竖屏坐标系）。
+// ⚠️ 触摸的 swap/mirror/x_max/y_max 必须同步改，见 lichuang_dev_board.cc:InitializeTouch，
+//    否则画面正了、点哪儿都偏。
+#define DISPLAY_MIRROR_X false
 #define DISPLAY_MIRROR_Y false
-#define DISPLAY_SWAP_XY true
+#define DISPLAY_SWAP_XY false
 
 #define DISPLAY_OFFSET_X  0
 #define DISPLAY_OFFSET_Y  0

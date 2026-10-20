@@ -825,27 +825,26 @@ void LcdDisplay::SetupUI() {
     lv_obj_set_style_bg_color(container_, lvgl_theme->background_color(), 0);
     lv_obj_set_style_border_color(container_, lvgl_theme->border_color(), 0);
 
-    /* Center layer: emoji_box_ - 屏幕中央大图区（56% x 42%，2026-10-20 布局）
+    /* Center layer: emoji_box_ - 屏幕中央大图区（42% x 46%，2026-10-20 横屏布局）
      *
-     * 为什么从「右下角 30%x30%」改成「正中 56%x42%」：
-     * 老人坐在 1-2 米外看这块 240x320 的小屏，右下角 30% 的图形只有 ~70px，
-     * 实际观感是「看不清、像是屏保」。把表情放到正中并放大一倍多之后，
+     * 为什么从「右下角 30%x30%」改成「正中大图」：
+     * 老人坐在 1-2 米外看这块屏，右下角 30% 的图形只有 ~72px，
+     * 实际观感是「看不清、像是屏保」。放大到中央之后，
      * 「小暖在听你说话 / 小暖在回答」这件事才看得出来。
      *
-     * 布局约束（必须与 preview_image_、bottom_bar_ 一起理解）：
-     *   top_bar_   ≈ 顶部状态栏（内容高度）
-     *   emoji_box_ 居中偏上，占 56% 宽 × 42% 高
-     *   bottom_bar_ 贴屏幕底部，占 30% 高，专放字幕
-     * 三者纵向不重叠：320 * (1 - 0.42) / 2 - 10 ≈ 83 处起，到 217 结束，
-     * 而字幕条从 320 - 96 = 224 起 —— 留 7px 间隙。
+     * 布局按**横屏 320x240** 算（config.h 已把 swap_xy/mirror 关掉）：
+     *   top_bar_   顶部状态栏 ≈ 28
+     *   emoji_box_ 320*42%=134 宽 × 240*46%=110 高，居中 y=-8 ⇒ 范围 59..169
+     *   bottom_bar_ 贴底 240*28%=67 高 ⇒ 从 173 起
+     * 两者留 3px 间隙，不重叠。
      */
     emoji_box_ = lv_obj_create(screen);
-    lv_obj_set_size(emoji_box_, lv_pct(56), lv_pct(42));
+    lv_obj_set_size(emoji_box_, lv_pct(42), lv_pct(46));
     lv_obj_set_style_bg_opa(emoji_box_, LV_OPA_TRANSP, 0);
     lv_obj_set_style_pad_all(emoji_box_, 0, 0);
     lv_obj_set_style_border_width(emoji_box_, 0, 0);
     // 偏移量与 preview_image_ 必须逐字一致（两者是同一块区域，只是内容不同）
-    lv_obj_align(emoji_box_, LV_ALIGN_CENTER, 0, -lvgl_theme->spacing(6));
+    lv_obj_align(emoji_box_, LV_ALIGN_CENTER, 0, -lvgl_theme->spacing(4));
 
     emoji_label_ = lv_label_create(emoji_box_);
     lv_obj_set_style_text_font(emoji_label_, large_icon_font, 0);
@@ -863,11 +862,11 @@ void LcdDisplay::SetupUI() {
 
     /* Middle layer: preview_image_ - 与 emoji_box_ 同一块正中大图区 */
     preview_image_ = lv_image_create(screen);
-    lv_obj_set_size(preview_image_, lv_pct(56), lv_pct(42));
+    lv_obj_set_size(preview_image_, lv_pct(42), lv_pct(46));
     // CONTAIN：LVGL 自动按图片区等比缩放（替代原先手算 128*width_/w 的公式，
     // 那个公式按半屏宽算，在固定图片区下会把图放出界）
     lv_image_set_inner_align(preview_image_, LV_IMAGE_ALIGN_CONTAIN);
-    lv_obj_align(preview_image_, LV_ALIGN_CENTER, 0, -lvgl_theme->spacing(6));
+    lv_obj_align(preview_image_, LV_ALIGN_CENTER, 0, -lvgl_theme->spacing(4));
     lv_obj_add_flag(preview_image_, LV_OBJ_FLAG_HIDDEN);
 
     /* Layer 1: Top bar - for status icons */
@@ -942,7 +941,7 @@ void LcdDisplay::SetupUI() {
     lv_label_set_text(status_label_, Lang::Strings::INITIALIZING);
     lv_obj_align(status_label_, LV_ALIGN_CENTER, 0, 0);
 
-    /* Top layer: Bottom bar - 字幕区（2026-10-20 布局：贴屏幕底部，高度 30%）
+    /* Top layer: Bottom bar - 字幕区（2026-10-20 横屏布局：贴屏幕底部，高度 28%）
      *
      * 与 2026-10-19 的「紧贴状态栏、占 70%」相比，这一版把字幕压到底部固定一条，
      * 把屏幕中央让给放大的表情区（见上面 emoji_box_ 的注释）。
@@ -950,13 +949,13 @@ void LcdDisplay::SetupUI() {
      */
     bottom_bar_ = lv_obj_create(screen);
     lv_obj_set_width(bottom_bar_, LV_HOR_RES);
-    // 高度 = 屏幕 30%；下限 64 保底（中文一行约需 20-24px，留两行半余量）。
-    int subtitle_height = LV_VER_RES * 30 / 100;
-    if (subtitle_height < 64) {
-        subtitle_height = 64;
+    // 高度 = 屏幕 28%；下限 60 保底（横屏 240 高时 28%≈67，约三行中文）。
+    int subtitle_height = LV_VER_RES * 28 / 100;
+    if (subtitle_height < 60) {
+        subtitle_height = 60;
     }
     lv_obj_set_height(bottom_bar_, subtitle_height);
-    lv_obj_set_style_min_height(bottom_bar_, 64, 0);
+    lv_obj_set_style_min_height(bottom_bar_, 60, 0);
     lv_obj_set_style_radius(bottom_bar_, 0, 0);
     lv_obj_set_style_bg_color(bottom_bar_, lvgl_theme->background_color(), 0);
     lv_obj_set_style_text_color(bottom_bar_, lvgl_theme->text_color(), 0);

@@ -204,8 +204,12 @@ private:
          * 运气好 assert 崩掉重启，运气不好 assert 通过、拿着野指针往下走。 */
         esp_lcd_touch_handle_t tp = nullptr;
         esp_lcd_touch_config_t tp_cfg = {
-            .x_max = DISPLAY_HEIGHT,
-            .y_max = DISPLAY_WIDTH,
+            // 2026-10-20 随显示一起改横屏：显示不再 swap_xy ⇒ 驱动上报的就是
+            // 屏原生帧 (320x240)，触摸这边也必须停止交换，x/y 上限跟着对调。
+            // 保持 sync：config.h 里 DISPLAY_SWAP_XY / DISPLAY_MIRROR_X 改了几处，
+            // 这里就要改几处，否则"画面对了、点哪儿都偏"。
+            .x_max = DISPLAY_WIDTH,
+            .y_max = DISPLAY_HEIGHT,
             .rst_gpio_num = GPIO_NUM_NC, // Shared with LCD reset
             .int_gpio_num = GPIO_NUM_NC, // NC => 轮询模式，见 lvgl_port_add_touch
             .levels = {
@@ -213,8 +217,8 @@ private:
                 .interrupt = 0,
             },
             .flags = {
-                .swap_xy = 1,
-                .mirror_x = 1,
+                .swap_xy = 0,
+                .mirror_x = 0,
                 .mirror_y = 0,
             },
         };
