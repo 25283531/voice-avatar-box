@@ -421,7 +421,7 @@
         <div v-else class="empty">还没有形象</div>
       </div>
 
-      <div v-if="aBox" class="mask" @click.self="aBox=null">
+      <div v-if="aBox" class="mask" @mousedown.self="maskDownAt=Date.now()" @click.self="maskClose('aBox',$event)">
         <div class="modal">
           <button class="close" @click="aBox=null">&times;</button>
           <h2>{{aForm.id?'编辑形象':'新增形象'}}</h2>
@@ -524,7 +524,7 @@
       </div>
 
       <!-- 编辑弹窗：5 区（基本信息 / 提示词 / 性格 10 维 / 家属额外要求 / 安全底线） -->
-      <div v-if="pEditBox" class="mask" @click.self="closePreset">
+      <div v-if="pEditBox" class="mask" @mousedown.self="maskDownAt=Date.now()" @click.self="maskClose('pEditBox',$event)">
         <div class="modal" style="max-width:860px">
           <button class="close" @click="closePreset">&times;</button>
           <h2>{{ pEdit.isNew ? '新建平台预设' : '编辑平台预设：' + pEdit.name }}</h2>
@@ -643,7 +643,7 @@
       </div>
 
       <!-- 预览层：不落库，只展示编译结果 -->
-      <div v-if="pPreview" class="mask" @click.self="pPreview=null">
+      <div v-if="pPreview" class="mask" @mousedown.self="maskDownAt=Date.now()" @click.self="maskClose('pPreview',$event)">
         <div class="modal">
           <button class="close" @click="pPreview=null">&times;</button>
           <h2>预览：编译后的完整 system prompt（未保存）</h2>
@@ -901,7 +901,7 @@
         <div v-else class="empty">还没有配置任何 AI 平台</div>
       </div>
 
-      <div v-if="pBox" class="mask" @click.self="pBox=null">
+      <div v-if="pBox" class="mask" @mousedown.self="maskDownAt=Date.now()" @click.self="maskClose('pBox',$event)">
         <div class="modal">
           <button class="close" @click="pBox=null">&times;</button>
           <h2>{{pForm.id?'编辑 AI 配置':'新增 AI 配置'}}</h2>
@@ -1419,6 +1419,7 @@ createApp({
       remDeviceFilter: '', remUserFilter: '', remBusy: false,
       aBox: null, aForm: null, clipsText:'', lightsText:'',
       pBox: null, pForm: null, paramsText:'',
+      maskDownAt: 0,  // 遮罩 mousedown 时间戳，maskClose 用它区分「短点击」与「拖拽选中」
       // 打开 AI 配置弹窗那一刻的表单快照（editProvider 赋值）。
       // 用途：testVoice 要能识别「表单有未保存改动」，因为测试读的是数据库里
       // 已保存的配置，表单里没保存的内容服务端一概看不见。
@@ -2270,6 +2271,22 @@ createApp({
       this.pEditBox = true;
     },
     closePreset(){ this.pEditBox = false; this.pEdit = null; },
+    // 点遮罩关弹窗：只在「mousedown 与 click 都落在遮罩自身」时关闭。
+    // ⚠️ 为什么不能直接 @click.self="xxx=null"：
+    // 1) 在弹窗外遮罩上按下、拖进输入框选中文字、松开 —— mouseup 冒泡到 mask，
+    //    .self 成立 ⇒ 弹窗被误关（用户报「选中字符串界面就消失」）。
+    // 2) Ctrl/Alt+点击也走 click；鼠标位置若在弹窗主体外就会误关。
+    // 修法：记 mousedown 的时间戳（且必须是 self，防止从弹窗内拖出松开），
+    // click 时再验 self + 修饰键 + 「约 700ms 内的短点击」——超时视为拖拽选中。
+    maskClose(which, e){
+      if (e.ctrlKey || e.altKey || e.shiftKey) return;      // 复制粘贴/多选不关
+      const downAt = this.maskDownAt; this.maskDownAt = 0;
+      if (!downAt || Date.now() - downAt > 700) return;     // 拖拽选中不关
+      if (which === 'pBox') this.pBox = null;
+      else if (which === 'aBox') this.aBox = null;
+      else if (which === 'pPreview') this.pPreview = null;
+      else if (which === 'pEditBox') this.closePreset();
+    },
     toggleSoft(id, on){
       const list = this.pEdit.guardrails_soft;
       const i = list.indexOf(id);
