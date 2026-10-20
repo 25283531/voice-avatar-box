@@ -450,7 +450,7 @@ endpoint `https://api.siliconflow.cn/v1`），因为它是唯一一家把记忆�
 缺的只是 `user.html` 里的调用——所以**用户端不推去 APP，浏览器就能绑**。
 
 **WiFi 配网固件已原生支持浏览器配网，不需要 APP**：ESP32 自开热点
-（前缀 `XiaoNuan-` + MAC 后两位，**不是上游项目的 `Xiaozhi-`**），屏显热点名与
+（前缀 `XiaoZhi-` + MAC 后两位，**与上游项目的 `Xiaozhi-` 只差 Z 的大小写**），屏显热点名与
 `http://192.168.4.1`，DNS 强制门户，HTML 页在
 `firmware/xiaozhi/managed_components/78__esp-wifi-connect/assets/wifi_configuration.html`。
 APP 只是另一层封装。

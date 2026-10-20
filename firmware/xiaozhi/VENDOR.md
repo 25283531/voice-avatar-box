@@ -58,7 +58,7 @@
 | `main/boards/bread-compact-esp32-lcd/esp32_bread_board_lcd.cc` | 同上 |
 | `main/boards/esp32-cgc-144/esp32_cgc_144_board.cc` | 同上 |
 | `main/boards/esp32-cgc/esp32_cgc_board.cc` | 同上 |
-| `main/boards/common/wifi_board.cc` | 配网热点前缀 XiaoNuan + 唤醒词注释同步 |
+| `main/boards/common/wifi_board.cc` | 配网热点前缀 XiaoZhi + 唤醒词注释同步 |
 | `sdkconfig.defaults` | elder-companion overlay 段（板卡/显示风格/后端地址） |
 
 一次 `sync`（含 `--force` / `--prune`）会把上面全部**静默覆盖**——因为同步脚本

@@ -38,8 +38,8 @@ void WifiBoard::EnterWifiConfigMode() {
 
     auto& wifi_ap = WifiConfigurationAp::GetInstance();
     wifi_ap.SetLanguage(Lang::CODE);
-    // 配网热点名前缀。成品叫「小安」，热点要跟产品名对得上 —— 老人拿手机
-    // 搜 WiFi 时看到的是 XiaoNuan-XXXX，而不是上游项目的小智。
+    // 配网热点名前缀。产品名 2026-10-20 统一为「小智」，热点跟产品名对得上 ——
+    // 子女拿手机搜 WiFi 时看到的是 XiaoZhi-XXXX，与唤醒词「你好小智」同源。
     //
     // ⚠️ **全仓只改这一处**。main/ 下其余的 "Xiaozhi" 全是**上游标识**，
     // 改了会出事，逐类说明（grep "Xiaozhi" 可复现）：
@@ -57,7 +57,7 @@ void WifiBoard::EnterWifiConfigMode() {
     //
     // 长度核对：GetSsid() 用 char ssid[32] 拼 "%s-%02X%02X"，
     // 即 前缀(8) + '-' + 4 位 MAC = 13 字符，加结尾 NUL 共 14，远小于 32。
-    wifi_ap.SetSsidPrefix("XiaoNuan");
+    wifi_ap.SetSsidPrefix("XiaoZhi");
     wifi_ap.Start();
 
     // Wait 1.5 seconds to display board information
@@ -210,7 +210,7 @@ std::string WifiBoard::GetDeviceStatusJson() {
      *     },
      *     "network": {
      *         "type": "wifi",
-     *         "ssid": "XiaoNuan-XXXX",
+     *         "ssid": "XiaoZhi-XXXX",
      *         "rssi": -60
      *     },
      *     "chip": {

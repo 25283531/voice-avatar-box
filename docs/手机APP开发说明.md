@@ -7,7 +7,7 @@
 > （如 `POST /api/devices/bind`），缺的只是网页端的调用。
 >
 > 此外，**WiFi 配网也不需要 APP**：固件原生支持浏览器配网（ESP32 自开热点
-> `XiaoNuan-XXXX`，屏显热点名与 `http://192.168.4.1`，DNS 强制门户拦截），
+> `XiaoZhi-XXXX`，屏显热点名与 `http://192.168.4.1`，DNS 强制门户拦截），
 > 页面在 `firmware/xiaozhi/managed_components/78__esp-wifi-connect/assets/wifi_configuration.html`。
 > APP 只是这层浏览器配网的另一层封装。
 >

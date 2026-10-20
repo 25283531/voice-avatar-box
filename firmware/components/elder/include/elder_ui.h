@@ -98,6 +98,18 @@ void elder_ui_announce(const char *text, elder_tone_t tone);
 void elder_ui_play_tone(elder_tone_t tone);
 
 /**
+ * @brief 只屏显一条通知，**不发声**（不发 TTS、不播提示音）。
+ *
+ * 与 elder_ui_announce 的区别：announce 是「有事要告诉老人，得让他听见」，
+ * notice 是「状态提示，安静地说」。典型用途：时钟未校准 —— 这时设备可能
+ * 完全离线，播提示音会吓人一跳，但必须让老人/子女知道「今天不会提醒」。
+ *
+ * @param text     显示文本；为空则忽略
+ * @param emotion  可选形象名（见文件头列表），NULL 表示沿用当前形象
+ */
+void elder_ui_notice(const char *text, const char *emotion);
+
+/**
  * @brief 内部计时器 tick；由本组件自有任务驱动，外部无需调用。
  */
 void elder_ui_tick(void);

@@ -29,7 +29,11 @@ typedef enum {
     ELDER_RMD_PENDING,       /* 已触发，等待确认 */
     ELDER_RMD_CONFIRM_WIN,   /* 已长按，等待 30s 内短按 */
     ELDER_RMD_DONE,          /* 已确认完成 */
-    ELDER_RMD_ESCALATED      /* 超时升级（持续告警） */
+    ELDER_RMD_ESCALATED,     /* 超时升级（持续告警） */
+    /* 过期作废：到点时设备已离线/断电太久（> ELDER_RMD_STALE_MIN 分钟），
+     * 不再补响。语义对齐服务端 EventState.SKIPPED(4)——「不算待服药，
+     * 也不算漏服」。加这个状态是为了堵住「校时后第一个 tick 就谎报漏服」。 */
+    ELDER_RMD_SKIPPED
 } elder_rmd_state_t;
 
 typedef enum {

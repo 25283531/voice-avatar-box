@@ -1,5 +1,6 @@
 #include "elder_reminder.h"
 #include "elder_rgb.h"
+#include "elder_ui.h"
 
 #include "nvs.h"
 #include "nvs_flash.h"
@@ -19,6 +20,17 @@ static const char *TAG = "elder.reminder";
  * 时间不可信时**绝不触发提醒** —— 响错时间的服药提醒比不提醒更危险。 */
 #define ELDER_MIN_TRUSTED_EPOCH 1577836800L   /* 2020-01-01T00:00:00Z */
 
+/* 过期阈值（分钟）：到点时设备已经离线/断电超过这么久，就**不再补响**，
+ * 直接判 SKIPPED。两条理由，任何一条都足以定这个阈值：
+ *   ① 安全：晚上 8 点才播「该吃降压药了」，老人补服后与次日晨药间隔过近，
+ *      低血压的风险比"少提醒一次"大得多；
+ *   ② 正确性：不挡的话，校时后的**第一个 tick** 里 `now_min >= due` 与
+ *      `now_min - due >= 15` 同时成立 —— PENDING 刚设上就被推成 ESCALATED，
+ *      子女端收到「漏服」告警，而事实只是设备没开机。
+ * 取 60 分钟：比 15 分钟升级阈值宽，能容纳「重启/短暂断网后几分钟内补响」；
+ * 又短到不会把半天前的提醒翻出来。 */
+#define ELDER_RMD_STALE_MIN     60
+
 /* 确认方式默认值（数值与 elder_sync.h 的 elder_confirm_method_t 一致） */
 #define ELDER_CFM_BUTTON_NUM 2
 
@@ -28,6 +40,10 @@ static struct {
     void             *ctx;
     uint8_t           state[ELDER_REMINDER_MAX];
     int64_t           confirm_deadline_us[ELDER_REMINDER_MAX];
+    /* 本轮「已响铃」的时刻（RAM）。升级判定用它而不是 due：
+     * 「15 分钟未确认」的语义必须是**从响铃算起**，不能从计划时刻算起，
+     * 否则设备晚开机 20 分钟就会在响铃的同一个 tick 里被判漏服。 */
+    int64_t           pending_since_us[ELDER_REMINDER_MAX];
     bool              fired_today[ELDER_REMINDER_MAX];
     bool              dirty;
     int64_t           last_flush_us;
@@ -217,7 +233,8 @@ static void set_state(int idx, elder_rmd_state_t st)
              st == ELDER_RMD_PENDING ? "PENDING" :
              st == ELDER_RMD_CONFIRM_WIN ? "CONFIRM_WIN" :
              st == ELDER_RMD_DONE ? "DONE" :
-             st == ELDER_RMD_ESCALATED ? "ESCALATED" : "IDLE");
+             st == ELDER_RMD_ESCALATED ? "ESCALATED" :
+             st == ELDER_RMD_SKIPPED ? "SKIPPED" : "IDLE");
 
     /* 需求 11：服药未完成 → 红灯长亮；完成 → 绿灯 */
     if (g.table.items[idx].type == ELDER_RMD_TYPE_MEDICINE) {
@@ -231,6 +248,10 @@ static void set_state(int idx, elder_rmd_state_t st)
         g.table.pending_today &= ~(1u << idx);
     } else if (st == ELDER_RMD_PENDING || st == ELDER_RMD_ESCALATED) {
         g.table.pending_today |= (1u << idx);
+        g.table.done_today &= ~(1u << idx);
+    } else if (st == ELDER_RMD_SKIPPED) {
+        /* 过期作废：既不算完成（不能给绿灯），也不算待办（不能再提醒） */
+        g.table.pending_today &= ~(1u << idx);
         g.table.done_today &= ~(1u << idx);
     }
     g.dirty = true;
@@ -248,6 +269,14 @@ static void tick(void)
         if (now_us() - last_warn_us > 60LL * 1000 * 1000) {
             last_warn_us = now_us();
             ESP_LOGE(TAG, "系统时钟不可信（未校时），暂停触发提醒；联网后自动校准");
+        }
+        /* 光打日志等于没说：老人看到的是**一切正常的待机屏**，而当天所有
+         * 提醒一条都不会响。所以必须屏显告知。30 分钟一次，够醒目又不刷屏；
+         * 只屏显不发声 —— 此刻多半离线，突兀的提示音只会吓人。 */
+        static int64_t last_notice_us = -1;   /* -1 = 本次上电还没提示过 */
+        if (last_notice_us < 0 || now_us() - last_notice_us > 30LL * 60 * 1000 * 1000) {
+            last_notice_us = now_us();
+            elder_ui_notice("时间未校准，请连网", "confused");
         }
         return;
     }
@@ -272,6 +301,7 @@ static void tick(void)
             g.state[i] = ELDER_RMD_IDLE;
             g.fired_today[i] = false;
             g.confirm_deadline_us[i] = 0;
+            g.pending_since_us[i] = 0;
             g.table.items[i].fired_due_at = 0;
         }
         g.dirty = true;
@@ -304,7 +334,19 @@ static void tick(void)
             due_tm.tm_min  = it->minute;
             due_tm.tm_sec  = 0;
             it->fired_due_at = (int64_t)mktime(&due_tm);
-            set_state(i, ELDER_RMD_PENDING);
+
+            int late_min = now_min - due;
+            if (late_min > ELDER_RMD_STALE_MIN) {
+                /* 过期太久：设备在到点前后处于离线/断电状态。
+                 * **不补响、不升级**，只报 SKIPPED 让子女端知道「这次没提醒」，
+                 * 而不是收到一条「漏服」告警。详见 ELDER_RMD_STALE_MIN 注释。 */
+                ESP_LOGW(TAG, "[%s] 已过期 %d 分钟（设备离线/断电期间错过），"
+                              "不补响，上报 SKIPPED", it->label, late_min);
+                set_state(i, ELDER_RMD_SKIPPED);
+            } else {
+                g.pending_since_us[i] = now_us();
+                set_state(i, ELDER_RMD_PENDING);
+            }
         }
 
         /* 确认窗口超时 → 升级 */
@@ -314,9 +356,17 @@ static void tick(void)
             set_state(i, ELDER_RMD_PENDING);   /* 回到未确认，红灯保持 */
         }
 
-        /* PENDING 超过 15 分钟未确认 → 升级告警 */
-        if (g.state[i] == ELDER_RMD_PENDING && (now_min - due) >= 15) {
-            set_state(i, ELDER_RMD_ESCALATED);
+        /* PENDING 超过 15 分钟未确认 → 升级告警。
+         * 计时基准是**响铃时刻**（pending_since_us），不是计划时刻 due ——
+         * 用 due 的话，设备晚开机 20 分钟就会在响铃的同一个 tick 里被判漏服，
+         * 子女端收到假告警。pending_since_us 是 RAM 值，重启后为 0；那时退回
+         * due 基准：能走到这里说明这条当天确实响过（fired_today 位已落盘），
+         * 判漏服是合理的。 */
+        if (g.state[i] == ELDER_RMD_PENDING) {
+            bool overdue = g.pending_since_us[i]
+                ? (now_us() - g.pending_since_us[i]) >= (15LL * 60 * 1000 * 1000)
+                : (now_min - due) >= 15;
+            if (overdue) set_state(i, ELDER_RMD_ESCALATED);
         }
     }
 

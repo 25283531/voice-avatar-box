@@ -138,6 +138,13 @@ static bool online_now(void)
     return g.hooks.is_online(g.hooks.ctx);
 }
 
+void elder_ui_notice(const char *text, const char *emotion)
+{
+    if (!text || !text[0]) return;
+    if (!g.has_hooks || !g.hooks.notify) return;
+    g.hooks.notify(text, emotion, g.hooks.ctx);
+}
+
 void elder_ui_announce(const char *text, elder_tone_t tone)
 {
     if (!text || !text[0]) return;

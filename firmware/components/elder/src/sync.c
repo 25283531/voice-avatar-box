@@ -566,6 +566,13 @@ void elder_sync_on_reminder_state(const elder_rmd_item_t *item, elder_rmd_state_
         elder_sync_enqueue_event(sid, due, ELDER_EV_MISSED, ELDER_CFM_NONE, "timeout");
         elder_sync_report_interaction(ELDER_IT_REMINDER_MISS, 0);
         break;
+    case ELDER_RMD_SKIPPED:
+        /* 到点时设备已离线/断电太久，本条作废、没补响。
+         * 报 SKIPPED 而不是 MISSED：子女端看到的是「这次没提醒」，
+         * 而不是「老人漏服」—— 后者是假告警，也是这类产品最坏的失败模式。
+         * 服务端 home.py 已把 EventState.SKIPPED 排除在「待服药」之外。 */
+        elder_sync_enqueue_event(sid, due, ELDER_EV_SKIPPED, ELDER_CFM_NONE, "stale");
+        break;
     default:
         break;
     }
