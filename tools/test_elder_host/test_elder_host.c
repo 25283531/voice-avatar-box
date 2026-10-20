@@ -685,9 +685,9 @@ static void test_nvs_crc_rejects_corrupt(void)
      * （判 SKIPPED，见 T12）。此时钟已在 09:00，若仍用 08:00，这里测到的
      * 就会是过期跳过逻辑，而不是「引擎有没有被坏表卡死」——
      * 断言会红，但红的原因跟本用例要守的东西无关。 */
-    elder_rmd_item_t b = mk_med(10, 0, "早上的药", 0);
+    elder_rmd_item_t re = mk_med(10, 0, "早上的药", 0);
     check("重新下发提醒后引擎恢复正常",
-          elder_reminder_add(&b) == ESP_OK && tbl()->count == 1,
+          elder_reminder_add(&re) == ESP_OK && tbl()->count == 1,
           det("%s", dump_tbl(tbl())));
     stub_time_advance(3600);         /* 10:00 到点 */
     elder_reminder_tick_once();
