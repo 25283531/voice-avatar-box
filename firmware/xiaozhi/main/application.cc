@@ -12,12 +12,69 @@
 
 #include <cstring>
 #include <esp_log.h>
+#include <esp_system.h>
+#include <nvs.h>
 #include <cJSON.h>
 #include <driver/gpio.h>
 #include <arpa/inet.h>
 #include <font_awesome.h>
 
 #define TAG "Application"
+
+/* ---------------------------------------------------------------- 启动诊断
+ * 缘由（2026-10-20）：设备会在运行 30 秒~2 分钟后**自发重启**，但串口抓不到
+ * ROM 打印的 `rst:0x..(RESET_REASON)` 那一行。
+ *
+ * 真因不在固件：本板是 ESP32-S3 的**原生 USB-Serial-JTAG**，复位瞬间 USB
+ * 会重新枚举，主机侧 COM 句柄随之失效，开机头（约 0~16 秒）整段丢失。
+ * 三次抓取的起点分别是 16.1s / 0.0s(由 esptool 主动复位) —— 自发重启那几次
+ * 全都从 16 秒处才开始有日志，正好把复位原因漏掉。
+ *
+ * 所以改为**固件自己解码**，并且在启动后 2 分钟内每 10 秒重打一次：
+ * 这样任何一个抓取窗口都能看到，不依赖抢在复位瞬间连着串口。
+ *
+ * 判读表（见 ResetReasonName）：BROWNOUT=供电不足；PANIC=程序崩溃（多为
+ * 内存分配失败后 abort）；TASK_WDT/INT_WDT=有任务卡住；SW=有代码主动重启。
+ * ---------------------------------------------------------------------- */
+static const char* ResetReasonName(esp_reset_reason_t r) {
+    switch (r) {
+        case ESP_RST_POWERON:   return "POWERON(上电/拔插USB)";
+        case ESP_RST_EXT:       return "EXT(外部复位脚)";
+        case ESP_RST_SW:        return "SW(软件调用 esp_restart)";
+        case ESP_RST_PANIC:     return "PANIC(崩溃/abort，多为内存分配失败)";
+        case ESP_RST_INT_WDT:   return "INT_WDT(中断看门狗)";
+        case ESP_RST_TASK_WDT:  return "TASK_WDT(任务看门狗，有任务卡住)";
+        case ESP_RST_WDT:       return "WDT(其它看门狗)";
+        case ESP_RST_DEEPSLEEP: return "DEEPSLEEP(深睡唤醒)";
+        case ESP_RST_BROWNOUT:  return "BROWNOUT(欠压！供电不足)";
+        case ESP_RST_SDIO:      return "SDIO(复位)";
+        default:                return "UNKNOWN(未知)";
+    }
+}
+
+static char s_reset_reason[64] = "未知";
+static uint32_t s_boot_count = 0;
+
+/* 只在开机调一次：解码复位原因 + 累加启动次数（存 NVS，跨重启可累计）。
+ * 启动次数是判断「偶发重启」还是「重启循环」的关键证据。 */
+static void BootDiagInit() {
+    snprintf(s_reset_reason, sizeof(s_reset_reason), "%s",
+             ResetReasonName(esp_reset_reason()));
+
+    nvs_handle_t h;
+    if (nvs_open("diag", NVS_READWRITE, &h) == ESP_OK) {
+        uint32_t v = 0;
+        nvs_get_u32(h, "boot", &v);
+        v++;
+        nvs_set_u32(h, "boot", v);
+        nvs_commit(h);
+        nvs_close(h);
+        s_boot_count = v;
+    }
+    ESP_LOGW("BootDiag", "复位原因=%s 累计启动=%u 次 最小空闲堆=%u 字节",
+             s_reset_reason, (unsigned)s_boot_count,
+             (unsigned)esp_get_minimum_free_heap_size());
+}
 
 
 static const char* const STATE_STRINGS[] = {
@@ -352,6 +409,11 @@ void Application::Start() {
     auto& board = Board::GetInstance();
     SetDeviceState(kDeviceStateStarting);
 
+    /* 复位原因必须在最早的时机解码：此时 nvs_flash_init() 已由 main 完成，
+     * 之后再取 esp_reset_reason() 也仍是同一次开机的值，但越早越不会被
+     * 后续初始化把它掩盖。 */
+    BootDiagInit();
+
     /* Setup the display */
     auto display = board.GetDisplay();
 
@@ -623,6 +685,15 @@ void Application::MainEventLoop() {
                 // SystemInfo::PrintTaskCpuUsage(pdMS_TO_TICKS(1000));
                 // SystemInfo::PrintTaskList();
                 SystemInfo::PrintHeapStats();
+                /* 前 120 秒把复位原因重打一遍：自发重启时 USB 会重新枚举，
+                 * 开机头 16 秒的串口日志在主机侧整段丢失（见文件顶部说明）。
+                 * 只重打 120 秒是为了不让它变成长跑噪声 —— 够覆盖任何抓取窗口。 */
+                if (clock_ticks_ <= 120) {
+                    ESP_LOGW("BootDiag", "复位原因=%s 累计启动=%u 次 已运行=%ds 当前空闲堆=%u 最小空闲堆=%u",
+                             s_reset_reason, (unsigned)s_boot_count, clock_ticks_,
+                             (unsigned)esp_get_free_heap_size(),
+                             (unsigned)esp_get_minimum_free_heap_size());
+                }
             }
         }
     }
