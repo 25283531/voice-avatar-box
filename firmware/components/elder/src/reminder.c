@@ -412,7 +412,24 @@ esp_err_t elder_reminder_init(elder_rmd_cb_t cb, void *ctx)
     /* 恢复当天运行态（旧表无数据时这里是全 IDLE，行为与修复前一致） */
     restore_daily_state();
 
-    xTaskCreatePinnedToCore(reminder_task, "elder_rmd", 3072, NULL, 5, &g.task, 1);
+    /* 栈 8192 而不是 3072：2026-10-20 线上实测
+     *   ***ERROR*** A stack overflow in task elder_rmd has been detected.
+     * 溢出路径是 set_state() 的同步回调链：
+     *   tick() -> set_state() -> OnReminder() -> elder_ui_announce()
+     *     -> OnSpeak() -> Application::SendMcpMessage()
+     * 最后一环是 C++ std::string 拼 JSON 再走 WebSocket 发送，
+     * 单这一段的栈需求就超过 3KB，再加上 set_state 里的 ESP_LOGx 与
+     * nvs_set_blob，3072 必崩。
+     *
+     * ⚠️ 崩溃会形成**稳定循环**（这是最狠的地方）：崩 -> 重启 ->
+     * restore_daily_state() 把 pending_today 恢复成 PENDING -> 下一轮 tick
+     * 里 (now_min-due)>=15 又推成 ESCALATED -> 再次回调播报 -> 再崩。
+     * 线上表现为设备每 ~18 秒重启一次、语音每次播到一半就断
+     * （用户原话：「话没有说完整」「发音卡卡顿顿」）。
+     *
+     * 取 8192 的依据：同工程里 elder_report 12288、elder_sync 6144，
+     * 这条链路要跑 UI+TTS+WS，比 sync 深，取两者之间偏上。 */
+    xTaskCreatePinnedToCore(reminder_task, "elder_rmd", 8192, NULL, 5, &g.task, 1);
     ESP_LOGI(TAG, "reminder engine ready");
     return ESP_OK;
 }
