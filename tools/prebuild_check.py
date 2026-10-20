@@ -435,6 +435,46 @@ def main() -> int:
     else:
         check("C6 emote 依赖清理", SKIP, f"找不到 {comp_yml}")
 
+    # ------------------------------------------------------ C7 网络栈已拆分
+    # 2026-10-20 用户要求「4G 模组用不到就删除」。
+    # 78/esp-ml307 是「ESP 原生网络栈 + Cat.1 4G 模组」的合体包，19 个源文件
+    # 一起编译；main 是 WHOLE_ARCHIVE 链接 ⇒ 4G 那 12 个文件会整个进固件。
+    # WiFi 侧的 7 个源文件已搬进 main/net（逐字未改），组件依赖整个删掉。
+    #
+    # C7c 是这里最要命的一条：esp_ssl.cc 里挂着证书 bundle。
+    # 搬文件时漏掉那一行，HTTPS 会以「No server verification option set」
+    # 在建连阶段就死，症状是「设备一直离线」，而日志只说连不上 —— 排查成本极高。
+    net_dir = ROOT / "firmware" / "xiaozhi" / "main" / "net"
+    ssl_src = net_dir / "esp" / "esp_ssl.cc"
+    if comp_yml.exists():
+        effective2 = "\n".join(line.split("#", 1)[0]
+                              for line in comp_yml.read_text(encoding="utf-8").splitlines())
+        check(
+            "C7 4G 模组依赖（78/esp-ml307）已从依赖清单移除",
+            "esp-ml307" not in effective2,
+            "idf_component.yml 里仍有 esp-ml307 —— 它会带回 12 个 4G 源文件，"
+            "而 main 是 WHOLE_ARCHIVE 链接，这些代码会整个进固件"
+            if "esp-ml307" in effective2 else "WiFi 网络栈已内聚到 main/net，4G 依赖已删",
+        )
+    check(
+        "C7b 网络栈源文件在 main/net 下齐备",
+        (net_dir / "esp_network.h").exists() and (net_dir / "esp" / "esp_network.cc").exists()
+        and (net_dir / "http_client.cc").exists() and (net_dir / "web_socket.cc").exists()
+        and (net_dir / "network_interface.h").exists(),
+        f"{net_dir} 缺文件；缺哪个都会在链接期报 undefined reference",
+        fatal=True,
+    )
+    if ssl_src.exists():
+        ssl_text = ssl_src.read_text(encoding="utf-8", errors="ignore")
+        check(
+            "C7c HTTPS 证书 bundle 仍在 esp_ssl.cc 里",
+            "esp_crt_bundle_attach" in ssl_text,
+            "esp_ssl.cc 里找不到 esp_crt_bundle_attach —— HTTPS 会在建连阶段"
+            "以 No server verification option set 失败，表现为「设备一直离线」"
+            if "esp_crt_bundle_attach" not in ssl_text else "证书 bundle 挂载点还在",
+            fatal=True,
+        )
+
     # ------------------------------------------------------ 汇总
     failed = [r for r in results if not r[1] and r[3]]
     warned = [r for r in results if not r[1] and not r[3]]

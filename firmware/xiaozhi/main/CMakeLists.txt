@@ -42,10 +42,26 @@ set(SOURCES "audio/audio_codec.cc"
             "main.cc"
             )
 
-set(INCLUDE_DIRS "." "display" "display/lvgl_display" "display/lvgl_display/jpg" "audio" "protocols")
+set(INCLUDE_DIRS "." "display" "display/lvgl_display" "display/lvgl_display/jpg" "audio" "protocols" "net" "net/esp")
+
+# ── 网络栈（2026-10-20 从 78/esp-ml307 拆出来，只保留 WiFi 侧）───────────
+# 上游组件把「ESP 原生网络栈」和「ML307/EC801E Cat.1 4G 模组」放在同一个
+# 包里，19 个源文件一起编译。本板是 WiFi 版，4G 那 12 个文件（at_uart /
+# at_modem / ec801e/* / ml307/*）永远用不到 —— 但 main 是 WHOLE_ARCHIVE
+# 链接，只要它们出现在 main 的 SRCS 里就会被**整个**塞进固件，
+# 不会被 --gc-sections 回收。
+# 所以把 WiFi 侧那 7 个源文件 + 8 个头文件搬进 main/net，组件依赖整个删掉。
+# 这两个目录的文件与上游 MIT 代码逐字一致，只改了目录（见 net/README.md）。
+file(GLOB NET_SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/net/*.cc)
+file(GLOB NET_ESP_SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/net/esp/*.cc)
+list(APPEND SOURCES ${NET_SOURCES} ${NET_ESP_SOURCES})
 
 # Add board common files
 file(GLOB BOARD_COMMON_SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/boards/common/*.cc)
+# boards/common 下这两个是 4G 模组的板级实现，本板（WiFi）不用。
+# 它们 #include <at_modem.h>，而 esp-ml307 组件已被删除 ⇒ 必须排除，
+# 否则编译直接失败。排除后 4G 相关目标码也不再进固件。
+list(FILTER BOARD_COMMON_SOURCES EXCLUDE REGEX "/(ml307|dual_network)_board\\.cc$")
 list(APPEND SOURCES ${BOARD_COMMON_SOURCES})
 list(APPEND INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/boards/common)
 

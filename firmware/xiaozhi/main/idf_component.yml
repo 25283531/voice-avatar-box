@@ -20,7 +20,12 @@ dependencies:
   78/esp_lcd_nv3023: ~1.0.0
   78/esp-wifi-connect: ~2.6.2
   78/esp-opus-encoder: ~2.4.1
-  78/esp-ml307: ~3.5.1
+  # 78/esp-ml307 已删除（2026-10-20）：那是「ESP 原生网络栈 + ML307/EC801E
+  # Cat.1 4G 模组」的合体包。本板是 WiFi 版，4G 那 12 个文件（at_uart /
+  # at_modem / ec801e/* / ml307/*）永远用不到。而 main 是 WHOLE_ARCHIVE
+  # 链接，只要它们在 SRCS 里就会整个塞进固件、不被 gc 回收。
+  # WiFi 侧的 7 个源文件 + 8 个头文件已搬进 main/net/（逐字未改），
+  # 见 net/README.md。
   78/xiaozhi-fonts: ~1.5.5
   espressif/led_strip: ~3.0.1
   espressif/esp_codec_dev: ~1.5
