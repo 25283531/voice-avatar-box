@@ -208,8 +208,14 @@ esp_err_t elder_time_apply_server_time(const char *iso)
     /* 把 tm 当 UTC 解释 → epoch。
      * 不用 timegm()：newlib 在 -std=gnu17 下不声明它（隐式声明会被 -Werror=all 拦下），
      * 这里用 days-from-civil 算法自行计算，纯算术、无全局时区副作用。 */
-    time_t local_epoch = elder_utc_epoch(&tmv);
-    time_t utc_epoch = local_epoch - off_min * 60;
+    /* 变量语义必须写清（2026-10-20 真机日志踩过）：
+     *   wall_epoch = 把后端给的「墙上时间」当 UTC 解释出的 epoch（≈ 真 UTC + 8h）
+     *   utc_epoch  = 真正写进 RTC 的 UTC epoch
+     * 曾经把 wall_epoch 当「本地时间」再按 UTC+8 格式化打日志 ⇒ 日志比真实
+     * 时间**快 8 小时**（真机打 16:59，实际 08:59），排查时差点去改服务端时钟。
+     * 而 settimeofday 用的是 utc_epoch ⇒ **只有日志错、时钟没错**。 */
+    time_t wall_epoch = elder_utc_epoch(&tmv);
+    time_t utc_epoch = wall_epoch - off_min * 60;
 
     struct timeval tv = { .tv_sec = utc_epoch, .tv_usec = 0 };
     settimeofday(&tv, NULL);
@@ -219,12 +225,12 @@ esp_err_t elder_time_apply_server_time(const char *iso)
     tzset();
 
     g.time_synced = true;
-    g.last_server_time = local_epoch;
+    g.last_server_time = utc_epoch;   /* 语义是 UTC epoch，不是墙上时间 */
 
     char buf[32];
-    elder_time_iso_local(local_epoch, buf, sizeof(buf));
+    elder_time_iso_local(utc_epoch, buf, sizeof(buf));
     /* %lld 在 nano-printf（CONFIG_LIBC_NEWLIB_NANO_FORMAT=y）下会打成字面量 */
-    ESP_LOGI(TAG, "校时完成: 服务器 %s (epoch %d)", buf, (int)local_epoch);
+    ESP_LOGI(TAG, "校时完成: 服务器 %s (UTC epoch %d)", buf, (int)utc_epoch);
     return ESP_OK;
 }
 

@@ -259,15 +259,25 @@ def expect_boot_fail(name: str, env: dict[str, str], needles: tuple[str, ...]) -
 
 # ================================================================ 变异执行
 def exec_fresh_module(name: str, src: str,
-                      package: str | None = None) -> types.ModuleType:
+                      package: str | None = "app") -> types.ModuleType:
     """把一段源码 exec 进一个**全新模块命名空间**（磁盘文件不动）。
 
     package 用于让源码里的相对导入（``from ..config import ...``）解析到
     真实的 app 包 —— 这样变异版 device_api 读到的就是当前场景的 config。
-    """
+
+    ⚠️ 三个字段缺一不可（2026-10-20，`3827a35` 之后本脚本整段崩掉）：
+      * ``__package__`` 默认 **"app"**：config.py 现在有模块级
+        ``from . import dbpath``，package 为空时 exec 直接抛
+        ``attempted relative import with no known parent package``；
+      * ``__file__`` **必须指向真实形态的路径**：config.py 用
+        ``Path(__file__).resolve().parent.parent`` 推导 server 目录，
+        缺 ``__file__`` 就是 NameError；
+      * ``__spec__`` 留 None 无妨（这些模块不会被 importlib 二次加载）。
+    主理人踩过的教训：**契约变更要搜全部夹具** —— 加一个相对 import
+    就让 17 条部署断言静默不执行（跳过不等于通过）。"""
     mod = types.ModuleType(name)
-    if package:
-        mod.__package__ = package
+    mod.__package__ = package or ""
+    mod.__file__ = str(SERVER / "app" / f"{name}.py")
     sys.modules[name] = mod
     exec(compile(src, name, "exec"), mod.__dict__)
     return mod
