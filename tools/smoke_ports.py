@@ -127,6 +127,12 @@ DEFAULT_PORTS: dict[str, int] = {
     "smoke_activation_ttl": 8128,
     # QA-B 第二层独立验证（不引用实现者的冒烟断言，独立直连 SQLite 复核）
     "qa_b_activation_gate": 8129,
+    # pk 复用 → 已删除设备的旧 token 复活（P0）：必须起真实服务走真实 HTTP/WS
+    # （缺陷依赖「删→建→旧 token」三跳的跨请求状态，进程内打桩测不出来）。
+    "smoke_pk_reuse": 8130,
+    # 求助邮箱解析：env → 管理端 SMTP → 空串（不许写死地址）。
+    # 两个阶段共用同一个库文件，故不与其他脚本共享端口。
+    "smoke_support_email": 8131,
 }
 
 

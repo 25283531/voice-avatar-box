@@ -10,7 +10,7 @@
 
 时间相关的断言怎么做到不 sleep 10 分钟
 ------------------------------------
-**两阶段**，各自起一个服务实例：
+**三阶段**，各自起一个服务实例：
 
   * 阶段 A 注入 ``ELDER_ACT_TTL_MIN=0`` —— ``code_expires_at()`` 返回 now，码刚
     发出就过期。用来逼出「过期 ⇒ 换新码」分支：连打两次 OTA，码值必须不同，
@@ -18,10 +18,34 @@
     ``_reusable_activation_code`` 里的 ``expires_at > now`` 判据。
   * 阶段 B 用**生产默认 TTL=10** —— 验「有效期内复用同一枚码」（服务端锁定）、
     绑定成功、已绑定不发码、不允许重复绑定、管理员解绑。
+  * 阶段 C（2026-10-20 QA 补，另起一个 TTL=10 实例）—— 专门守
+    ``_retire_codes_for`` 的**作废语义**：绑定成功后，该设备名下**不能残留**
+    仍然有效且未使用的码。这一条此前**没有任何脚本守**：QA 把
+    ``_retire_codes_for`` 的条件写反（只「退役」已经过期的行 = 只新建不废旧码），
+    阶段 A/B 与 qa_b 全部照样绿 —— 属「有防线、无回归网」的假绿。
 
-为什么必须分两次起服务：TTL=0 时任何码都绑不上（生成即过期），把绑定相关
+为什么必须分三个实例起服务：TTL=0 时任何码都绑不上（生成即过期），把绑定相关
 断言和过期断言塞进同一个实例里，等于用一个必然失败的夹具去测另一件事
-（本脚本第一版就是这么错的：5 条绑定断言全红，而代码是对的）。
+（本脚本第一版就是这么错的：5 条绑定断言全红，而代码是对的）；阶段 C 则要求
+「绑定前该 MAC 只有一枚有效码 + 一枚人为残留」，与阶段 B 的既有夹具状态不同。
+  * 阶段 C（2026-10-20 QA 补，另起一个 TTL=10 实例）—— 专门守
+    ``_retire_codes_for`` 的**作废语义**：绑定成功后，该设备名下**不能残留**
+    仍然有效且未使用的码。这一条此前**没有任何脚本守**：QA 把
+    ``_retire_codes_for`` 的条件写反（只「退役」已经过期的行 = 只新建不废旧码），
+    阶段 A/B 与 qa_b 全部照样绿 —— 属「有防线、无回归网」的假绿。
+
+为什么阶段 C 要**直连库播种**一枚「残留码」，而不是「再取一次码产生新码」
+--------------------------------------------------------------------
+「再触发一次取码就产生新码、旧码被作废」在当前实现里**不可能发生**：
+TTL=10 且未过期时 ``_reusable_activation_code`` 命中复用，压根不走新建分支
+（阶段 B 第 3 条断言的正是这件事）。所以想让「同一 MAC 同时有两枚有效码」，
+唯一现实来源就是**库里的历史残留** —— 旧版本服务端签发过、或管理员手工改过
+归属（这正是 ``_retire_codes_for`` docstring 点名的真实场景），于是用直连
+SQLite 播一枚 ``c_stale`` 来复现它。
+
+⚠️ 也不能拿阶段 A（TTL=0）的旧码来充当「被作废的旧码」：那枚码是**已过期**
+才绑不上的，绑不上与退役无关 ⇒ 断言恒绿（假绿）。阶段 C 的 ``c_stale`` 在
+绑定前**仍然有效**，绑定后才会因为退役而失效 —— 这是它唯一有鉴别力的形态。
 
 用法：
     python tools/smoke_activation_ttl.py
@@ -30,6 +54,7 @@ from __future__ import annotations
 
 import json
 import os
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -315,10 +340,145 @@ def phase_b() -> None:
             check("重复解绑返回 400（不是 500）", code == 400, f"http={code}")
 
 
+def skip(name: str, reason: str) -> None:
+    """第三态：判据对象不存在。
+
+    D33：门禁只能约束**已存在**的东西。前置自检没过（比如这一版实现不再出现
+    「同一 MAC 两枚有效码」）时，后续断言会**因为别的原因**通过 —— 那是假绿，
+    必须 SKIP 且单列可见，不能算「通过」。
+    """
+    print(f"  [SKIP] {name}  {reason}")
+
+
+def _seed_stale_code(db_path: Path, mac: str) -> str:
+    """直连 SQLite 播一枚「残留的有效未用码」，返回码值。
+
+    为什么必须直连库：见模块 docstring「为什么阶段 C 要直连库播种」。
+    码值用产品自己的 ``generate_activation_code()``（不手写 Luhn）：手写一份
+    7 位校验算法，一旦算错，绑定会因**格式**被拒，断言就变成假绿。
+    """
+    import contextlib
+    import io
+
+    sys.path.insert(0, str(SERVER))
+    with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+        from app.security import generate_activation_code
+
+    code = generate_activation_code()
+    plain = mac.lower().replace(":", "")
+    con = sqlite3.connect(str(db_path), timeout=10)
+    try:
+        con.execute(
+            "INSERT INTO activation_codes (code, device_id, used, attempts,"
+            " max_attempts, expires_at, created_at)"
+            " VALUES (?, ?, 0, 0, 5, datetime('now','+9 minutes'), datetime('now'))",
+            (code, plain))
+        con.commit()
+    finally:
+        con.close()
+    return code
+
+
+def _valid_unused_codes(db_path: Path, mac: str) -> list[str]:
+    """直连库数「该 MAC 仍然有效且未使用」的码（不信接口自述）。
+
+    ⚠️ 用 ``julianday()`` 而不是 ``expires_at > datetime('now')``：
+    退役写入的是 ``expires_at = now``（**带微秒**，如 ``...02:35:12.123456``），
+    而 ``datetime('now')`` 精确到秒（``...02:35:12``）。裸字符串比较时
+    ``"…12.123456" > "…12"`` 为真 ⇒ 刚被退役的行仍被数成「有效」，
+    这条断言就会**恒红**（红得莫名其妙，且改断言的人容易顺手把它改成恒绿）。
+    ``julianday()`` 按时间数值比较，微秒不影响边界判断。
+    """
+    plain = mac.lower().replace(":", "")
+    con = sqlite3.connect(str(db_path), timeout=10)
+    try:
+        rows = con.execute(
+            "SELECT code FROM activation_codes"
+            " WHERE device_id = ? AND used = 0"
+            " AND julianday(expires_at) > julianday('now')",
+            (plain,)).fetchall()
+    finally:
+        con.close()
+    return [r[0] for r in rows]
+
+
+def phase_c() -> None:
+    """``_retire_codes_for`` 作废语义的行为断言（此前完全没有回归网）。
+
+    判据（与 QA 变异探针 ``logs/qa_regress/m2_gap_probe.py`` 同一套，未另发明）：
+      1. 正常取码 ``c_keep``（有效）；
+      2. 直连库播一枚 ``c_stale``（**同样有效**且未使用）—— 模拟历史残留码；
+      3. 账户 A 用 ``c_keep`` 绑定成功 ⇒ ``c_stale`` 必须立刻作废；
+      4. 绑定成功后，该 MAC 名下**有效未用码 = 0**（直连库）；
+      5. 管理员解绑后用 ``c_stale`` 去绑 ⇒ 必须 400/404（且不是「设备已绑定」）。
+    """
+    print("\n--- 阶段 C：_retire_codes_for 作废语义（绑定后不留可用码）---")
+    mac = "aa:bb:cc:dd:ee:21"
+    with Server("10", "c") as srv:
+        code, b = ota(mac)
+        c_keep = ((b or {}).get("activation") or {}).get("code")
+        ok = check("C1 取到一枚有效码 c_keep", code == 200 and bool(c_keep), f"http={code} {c_keep}")
+        if not ok:
+            skip("C2/C3/C4 作废语义", "没拿到基准码，夹具不成立")
+            return
+
+        # ---- 前置自检：必须真的存在「两枚有效码」，否则后面的 0 是空断言 ----
+        c_stale = _seed_stale_code(srv.db, mac)
+        valid_before = _valid_unused_codes(srv.db, mac)
+        ok = check("C2 前置自检：播种后该 MAC 确实有 2 枚有效未用码",
+                   len(valid_before) == 2, f"codes={valid_before}")
+        if not ok:
+            skip("C3/C4 作废语义", "前置不成立（本版实现不再允许两枚有效码）⇒ 断言会空转")
+            return
+
+        tok_a = register(f"ttlc{os.getpid() % 100000}", "Passw0rd!23")
+        check("C3 账户 A 可用", bool(tok_a))
+        code, _ = req("POST", "/api/devices/bind", {"code": c_keep}, token=tok_a)
+        check("C4 用 c_keep 绑定成功", code == 200, f"http={code}")
+
+        # ★ 断言一：绑定成功后不能残留任何仍有效未用的码（red 于「只新建不废旧码」）
+        left = _valid_unused_codes(srv.db, mac)
+        check("★ C5 绑定成功后该 MAC 名下有效未用码 = 0（残留码必须被作废）",
+              left == [], f"left={left}（c_stale={c_stale}）")
+
+        # 为了排除「已绑定」这个与作废无关的拒绝理由：先解绑，再拿残留码去绑。
+        admin_tok = login(ADMIN_USER, LEGACY_PW)
+        pk = None
+        code, lst = req("GET", "/api/devices", token=tok_a)
+        for d in (lst or []):
+            if str(d.get("device_id", "")).lower().replace(":", "") == mac.replace(":", ""):
+                pk = d.get("id")
+        check("C6 能定位到 device_pk", pk is not None, f"pk={pk}")
+        if pk is None or not admin_tok:
+            skip("C7/C8 残留码不可再绑", "解绑前置不成立")
+            return
+        code, _ = req("POST", f"/api/devices/{pk}/unbind", token=admin_tok)
+        check("C7 管理员解绑成功（204）", code == 204, f"http={code}")
+
+        # ★ 断言二：换绑通道上，残留码必须已经失效（red 于「只新建不废旧码」：
+        #   变异下这枚码仍然有效且设备已解绑 ⇒ 绑定会成功 200）。
+        tok_b = register(f"ttlc2{os.getpid() % 100000}", "Passw0rd!23")
+        check("C8 账户 B 可用", bool(tok_b))
+        if tok_b:
+            code, body = req("POST", "/api/devices/bind", {"code": c_stale}, token=tok_b)
+            detail = (body or {}).get("detail") or ""
+            check("★ C9 残留码 c_stale 不得把设备绑走（400/404）",
+                  code in (400, 404), f"http={code} detail={detail!r}")
+            # 鉴别力备注：只断言 400 不够 —— 「设备已绑定」也会给 400/409。
+            # C7 已解绑，所以这里若出现「已绑定」字样，说明拒绝理由与本缺陷无关。
+            check("C10 拒绝理由不是「设备已绑定」（排除无关原因）",
+                  "已绑定" not in str(detail), f"detail={detail!r}")
+            code, lst_b = req("GET", "/api/devices", token=tok_b)
+            got = [d.get("id") for d in (lst_b or [])]
+            check("★ C11 账户 B 名下没有这台设备（绑定确实没发生）",
+                  code == 200 and not got, f"http={code} devices={got}")
+
+
 def main() -> int:
     try:
         phase_a()
         phase_b()
+        phase_c()
     except SystemExit:
         raise
     print()

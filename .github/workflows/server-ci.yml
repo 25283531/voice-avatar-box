@@ -92,6 +92,35 @@ jobs:
               print(f"OK {url} -> {got}")
           PY
 
+      # 上面那步守的是「连接串能不能被正确解析」，**不守「默认值落在哪」** ——
+      # 而后者才是运行库跑进仓库树、再被 `git clean -xdf` 静默删掉的成因
+      # （design-p2 §B.1 R2/R3）。本步是今天**唯一**管默认值位置的断言。
+      #
+      # 它是纯函数直调（不起服务、不建 uvicorn）：解析逻辑在 app/dbpath.py 里，
+      # 所以能在同一进程内被喂各种输入。⚠️ 这条**必须**留在 CI 里：本机（Windows）
+      # 与 runner（Linux）的默认目录布局不同，本地跑绿不能证明 CI 分支对。
+      - name: 运行库默认路径解析冒烟（含双库冲突 / 0 字节 / 不落回仓库树）
+        run: python tools/run_smoke.py logs/smoke_smoke_db_path.log python tools/smoke_db_path.py
+
+      # P0：`devices.id` 无 AUTOINCREMENT ⇒ 删掉最大行后 pk 被复用，而已删设备的
+      # 旧 device_token（ep 与代次都是 0）会**通过鉴权读到另一家人**的提醒与回执；
+      # 同一根因还有一条不需要 token 的通道（Interaction / ChatUsage 无 cascade ⇒
+      # 孤儿行挂到新设备名下）。两条都必须在这一步变红。
+      #
+      # 为什么必须起真实服务：缺陷依赖「删→建→旧 token」三跳的**跨请求状态**，
+      # 进程内直调测不出来。P5 是前置自检——若哪天引擎不再复用 pk，P5 会
+      # **SKIP 并单独列出**（不是 PASS），P1/P2/P3 一并 SKIP，避免反向假绿。
+      - name: 设备 pk 复用 / 旧 token 复活冒烟（P0，含 WS 侧与从属行）
+        run: python tools/run_smoke.py logs/smoke_smoke_pk_reuse.log python tools/smoke_pk_reuse.py
+
+      # 求助邮箱**不许写死**：解析顺序 env → 管理端 SMTP（notify_to → from_addr）→ 空串。
+      # 之前写死的 support@voice.250886.xyz 指向一个不可达域名，而已登录页的
+      # 「忘记用户名 › 发邮件给管理员」是忘记用户名后**唯一**能解绑设备的通道。
+      # 两个阶段共用同一个库文件（证明「DB 里有地址时 env 仍然优先」），
+      # 故第二阶段用另一个空闲端口，避免 TIME_WAIT 让 bind 失败。
+      - name: 求助邮箱解析冒烟（env → 管理端 SMTP → 空串，含死信箱回归）
+        run: python tools/run_smoke.py logs/smoke_smoke_support_email.log python tools/smoke_support_email.py
+
       # 端口必须与 tools/smoke_ports.py 的 DEFAULT_PORTS 一致（那里是唯一真源）。
       # 同一 job 内两个脚本用不同端口，MySQL job 整体又与 SQLite job 错开 ——
       # 虽然它们跑在不同 runner 上不会真撞车，但保持全表唯一才能在本地

@@ -5,7 +5,7 @@ import logging
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
-from sqlalchemy import func, select
+from sqlalchemy import delete, func, select
 from sqlalchemy.orm import Session
 
 from .. import models
@@ -136,9 +136,50 @@ def update_device(device_pk: int, payload: DeviceUpdate, db: Session = Depends(g
 def delete_device(device_pk: int, db: Session = Depends(get_db),
                   user: models.User = Depends(get_current_user)):
     dev = require_device_owner(device_pk, user, db)
+    # 先清掉两张**没有 cascade** 的从属表，再删设备行（顺不顺序很要紧）：
+    # `Interaction`（models.py:565）与 `ChatUsage`（models.py:614）只有外键、
+    # 既没有 relationship 也没有 cascade ⇒ 删设备后它们会变成**孤儿行**；
+    # 而 `devices.id` 无 AUTOINCREMENT，pk 一被复用，这些行就挂到新设备名下：
+    #   * stats 按 device 聚合 Interaction ⇒ 新家庭的「交互次数」混入上一家的；
+    #   * chat_quota 按 device_id+date 求和 ChatUsage ⇒ 新设备直接读到上一家的
+    #     陪聊时长，且 `uq_chat_usage_device_date` 唯一约束会让新设备当天的上报
+    #     **累加到上一家那行**上。
+    # 这条路径不需要任何 token，家属正常打开 App 就能看到，比 token 那条更险。
+    #
+    # 只删这两张：`Reminder` / `ReminderEvent` 已由 ORM cascade 处理
+    # （models.py:145-147 / :505-507）。手写一遍会与 cascade 形成**两份真源**，
+    # 且 `synchronize_session` 语义不同（D45 §5 那个 naive/aware 的坑就在这条路上）。
+    #
+    # ⚠️ 属性必须在 `db.delete(dev)` **之前**读出来：删完这行是 detached 的，
+    # 再读 `dev.id` / `dev.owner_id` 会抛 ObjectDeletedError，审计日志直接丢。
+    pk = int(dev.id)
+    mac = str(dev.device_id or "")
+    old_owner = dev.owner_id
+    n_ia = db.execute(
+        delete(models.Interaction).where(models.Interaction.device_id == pk)
+    ).rowcount or 0
+    n_cu = db.execute(
+        delete(models.ChatUsage).where(models.ChatUsage.device_id == pk)
+    ).rowcount or 0
     db.delete(dev)
     db.commit()
 
+    # 审计：这是**破坏性最大**的一条路径（连行带历史一起没了），而破坏性更小的
+    # `admin_unbind_device`（:212）反而有日志 —— 原来这条是静默的。
+    #
+    # 为什么非有它不可：它是**归属可推的唯一前提**。日志给 `pk ↔ mac ↔ 原 owner`
+    # 的映射，`interactions.ts` 给时间，两者一对才能判断「某条数据原本属于谁」。
+    # pk 一旦被复用（`devices.id` 无 AUTOINCREMENT），没有这条日志就**永远**
+    # 查不出受影响的是哪一家 —— 而 `/api/stats/recent` 只回
+    # `{id,kind,ts,duration_ms,meta}`，不含任何归属字段，补不回来。
+    #
+    # 级别必须 **WARNING**：生产日志级别可能把 INFO 过滤掉，那就等于没写。
+    # ⚠️ 只打 id / MAC / 计数：**不许**出现老人姓名、提醒标题等业务内容
+    # （口径见 tools/qa3_log_privacy.py —— 日志会进 CI artifact 与被拷走的
+    # 容器日志，业务内容一旦进去就收不回来）。
+    log.warning("DELETE-DEVICE device_pk=%s mac=%s 原归属用户=%s 操作人=%s(id=%s) "
+                "删除行数: interactions=%d chat_usage=%d",
+                pk, mac, old_owner, user.username, user.id, n_ia, n_cu)
 
 @router.post("/{device_pk}/unbind", status_code=status.HTTP_204_NO_CONTENT)
 def admin_unbind_device(device_pk: int, db: Session = Depends(get_db),
@@ -150,8 +191,23 @@ def admin_unbind_device(device_pk: int, db: Session = Depends(get_db),
         家属忘了自己注册的用户名 ⇒ 登不进原账户 ⇒ 网页/APP 里那个「删除设备」
         也点不到（它要求你是设备主人）⇒ 设备被永久锁在原账户上，而设备本身
         还在老人家里正常使用。这时**唯一可行的通道**是：家属发邮件给平台管理员，
-        管理员在后台把设备解绑，设备下一次 OTA 轮询（15s）就重新变成未绑定态、
-        屏幕上重新出现激活码，家属可以用**新账户**重新绑定。
+        管理员在后台把设备解绑，家属可以用**新账户**重新绑定。
+
+    ⚠️ **解绑后设备不会自己恢复，必须断电重启**（2026-10-20 静态核实后的更正，
+    这里原来写的是「下一次 OTA 轮询（15s）就重新显示激活码」，那是**做不到**的）：
+
+      * 取码只在**开机那一次**发生 —— 设备上的配网引导任务收到「服务端说已绑定」
+        就 ``break`` 退出（``firmware/xiaozhi/main/elder_bind_guide.cc:333-338``），
+        这个任务不会再被启动；
+      * OTA 检查只在 ``Application::Start()`` 里调一次
+        （``application.cc:398``），不是周期任务。看到的「15s 轮询」是**未绑定**
+        设备在 ``CheckNewVersion()`` 内部 ``while(true)`` 里跑的
+        （``elder_bind_guide.cc:393``），设备一绑定就跳出那个循环；
+      * WS 被拒（4001/4003）不会触发重启：全仓没有一处 ``esp_restart()`` 由关闭码触发。
+
+    所以在断电之前设备是「哑机」：不对话、屏幕也不提示（``Display::ShowNotification``
+    在固件里是只打日志的桩，``display/display.cc:31-32``）。运维口径就说
+    「解绑已生效，请把设备断电重启一次」。
 
     与 ``delete_device`` 的区别（两者不能互相替代）：
       * ``delete_device`` 是**用户自助**，删整行，连带提醒/回执/审计一起没；
@@ -186,8 +242,12 @@ def admin_unbind_device(device_pk: int, db: Session = Depends(get_db),
     dev.token_epoch = int(getattr(dev, "token_epoch", 0) or 0) + 1
     db.commit()
 
-    # 解绑后设备应能立刻被重新绑定 ⇒ 作废它名下所有残留码，让设备下一轮
-    # OTA（15s）拿到一枚全新的码，而不是拿到一枚「别人已经看过」的旧码。
+    # 作废残留码，让设备**下次上电**时拿到一枚全新的码，而不是拿到一枚
+    # 「别人已经看过」的旧码。
+    # ⚠️ 是「下次上电」，不是「下一轮 15s OTA」：解绑后没有任何路径把设备送回
+    # 那个 15s 轮询（见本函数 docstring 里 `elder_bind_guide.cc:333-338` 的
+    # ``break`` 与 `application.cc:398` 的一次性调用）。这条动作本身是对的
+    # （不作废，断电重启后就会拿到别人看过的旧码），只是不能承诺"自动"。
     from ..voice import _retire_codes_for
 
     retired = _retire_codes_for(db, mac)

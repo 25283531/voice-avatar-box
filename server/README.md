@@ -72,6 +72,19 @@ export ELDER_JWT_SECRET="dev-secret"
 uvicorn app.main:app --reload --port 8080
 ```
 
+> **不设 `ELDER_DB` 时库落在哪**：由 `app/dbpath.py` 裁决（唯一真源，纯函数，
+> 被 `tools/smoke_db_path.py` 守着）。本机裸跑默认落到**用户数据目录**
+> —— Windows `%LOCALAPPDATA%\voice-avatar-box\elder.db`、
+> macOS `~/Library/Application Support/voice-avatar-box/elder.db`、
+> Linux `~/.local/share/voice-avatar-box/elder.db`；容器里仍是 `/data/elder.db`
+> （compose 显式设了 `ELDER_DB`，语义不变）。**不再默认 `./elder.db`**：那会把
+> 运行库写进 git 工作树，被 `*.db` 藏起来之后既不会被 review、又会被
+> `git clean -xdf` 一起删掉。
+>
+> 如果你目录里**已经有** `./elder.db` 或 `server/elder.db` **且有数据**（大小 > 0），
+> 服务会**继续用它**（不自动迁移，回滚成本才为 0），并在启动日志打一条 WARNING。
+> 启动日志里的 `【数据库】<路径>（来源=<source>）` 就是「我现在连的是哪个库」的答案。
+
 冒烟测试（自动起服务跑完整业务闭环）：
 
 ```bash
@@ -183,7 +196,7 @@ OTA 只给**已绑定设备**签发 token；未绑定只返激活码。
 | 变量 | 默认 | 说明 |
 | --- | --- | --- |
 | `ELDER_DB` | 内置 SQLite 路径 | **留空即用内置 SQLite**；填 `mysql+pymysql://...` 切 MySQL |
-| `ELDER_DATA_DIR` | `/data` | 内置 SQLite 的持久化目录（容器里是命名卷） |
+| `ELDER_DATA_DIR` | 见下行 | 内置 SQLite 的持久化目录：容器里是 `/data`（命名卷）；**非容器默认用平台用户数据目录**（`%LOCALAPPDATA%\voice-avatar-box` / `~/Library/Application Support/voice-avatar-box` / `~/.local/share/voice-avatar-box`）。显式指定时目录不存在会**建出来**，建不出来则启动失败 |
 | `ELDER_HTTP_PORT` | 8064 | 宿主机对外端口（容器内固定 8080） |
 | `ELDER_JWT_SECRET` | 弱默认值 | **生产必须改** |
 | `ELDER_SEED_ADMIN_PASSWORD` | 无 | **首次启动必填**，不填则种子口令随机化 |

@@ -20,10 +20,14 @@ def _ensure_sqlite_parent_dir() -> None:
     """SQLite 是「一个文件就是一个库」，父目录不存在会直接报
     `sqlite3.OperationalError: unable to open database file`。
 
-    命名卷挂进容器后 /data 一般已经存在，但下面两种情况目录可能还没有：
-      1. 宿主机目录挂载（bind mount）时目标目录尚未创建；
-      2. 本机裸跑 / 自定义 ELDER_DATA_DIR。
-    这里提前 mkdir 兜底，避免首次启动因为少一个目录就崩掉。
+    ⚠️ **默认路径的目录现在由 `app/dbpath.py` 建（import config 时就建好了）**，
+    这里保留为**兜底**，有两类情形仍然需要它：
+      1. 显式 `ELDER_DB` 指向一个还不存在的目录 —— dbpath 刻意不碰显式配置
+         （显式值逐字使用，不加工，也不会替它建目录）；
+      2. 宿主机目录挂载（bind mount）时目标目录尚未创建，或容器里 /data 由
+         编排层挂进来但父目录缺失。
+    两处都 mkdir 并不重复：dbpath.ensure_dir 只对 `data_dir` / `new_default`
+    两种来源动文件系统，其余来源走这里。
     """
     if not _is_sqlite:
         return

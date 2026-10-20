@@ -44,26 +44,129 @@ TZ = ZoneInfo(os.getenv("ELDER_TZ", "Asia/Shanghai"))
 # 也不再默认拉一个 MySQL 容器。想用 MySQL 就显式设 ELDER_DB（或叠加
 # docker-compose.mysql.yml），见 docs/DEPLOY.md。
 #
-# 默认文件位置的选择依据：
-#   1. 镜像里 WORKDIR 是 /app，直接放 ./elder.db 会落在容器可写层，
-#      容器一重建数据就没了 —— 所以优先放持久化目录；
-#   2. docker-compose.yml 把命名卷 elder-data 挂到 /data，
-#      那里才是真正的持久化落点，故容器内的首选路径是 /data/elder.db；
-#   3. 但同一个默认值也要能在本机（Windows / macOS 裸跑）直接跑起来，
-#      这些机器上不存在 /data，此时退回当前工作目录下的 ./elder.db。
-# 因此这里做一次「存在且可写」的判断，而不是写死某一个路径。
-# 持久化目录本身可用 ELDER_DATA_DIR 覆盖（例如挂到 NAS / 宿主机目录时）。
-def _default_sqlite_url() -> str:
-    """选出默认 SQLite 库文件位置，返回 SQLAlchemy 连接串。"""
-    data_dir = Path(os.getenv("ELDER_DATA_DIR", "/data"))
-    if data_dir.is_dir() and os.access(data_dir, os.W_OK):
-        # sqlite:////data/elder.db 的四条斜杠：前两条是 scheme 分隔，后两条才是绝对路径的 /
-        return f"sqlite:///{data_dir.as_posix()}/elder.db"
-    # 退回当前工作目录（uvicorn 启动时所在的目录），相对路径的 sqlite:///./elder.db
-    return "sqlite:///./elder.db"
+# 「不设 ELDER_DB 时到底落在哪个文件」由 `app/dbpath.py` 的纯函数裁决 ——
+# **唯一真源**，本文件只做两件薄事：把进程环境喂给它、把结论落成 DATABASE_URL。
+# 完整分支表见 `dbpath.resolve()` 的 docstring 与 design-p2 §B.2，摘要：
+#   1. 显式 ELDER_DB  -> 原样使用（不加工、不 resolve，逐字照用）
+#   2. 显式 ELDER_DATA_DIR -> 用它（建不出来就启动失败，**不**静默回落）
+#   3. 容器形态：/data 已存在且可写 -> /data/elder.db（与历史行为逐字一致）
+#   4. 新默认目录里已有库 -> 用它
+#   5. 仓库里已有的旧库有数据 -> **沿用，不迁移**（回滚成本保持为 0）
+#   6. 都没有 -> 新默认目录（Windows %LOCALAPPDATA%、macOS Application Support、
+#      Linux $XDG_DATA_HOME，都拼 voice-avatar-box/elder.db）
+#
+# ⚠️ 为什么不再「退回当前工作目录的 ./elder.db」：那正是本特性要消灭的缺陷 ——
+# 运行库写进 git 工作树后，`.gitignore` 里的 `*.db` 让它**既看不见**（不会被
+# review）**又会被 `git clean -xdf` 静默删掉**（design-p2 §B.1 R2/R3）。
+# 容器与 MySQL 部署**完全不受影响**（它们都走显式 ELDER_DB，见 §B.4）。
+#
+# 注：`from . import dbpath` 刻意放在这里（而不是文件顶部的 import 区）：
+# dbpath 是叶子模块（不 import 本文件），所以没有循环依赖；放在这里是为了让
+# 「谁能决定库路径」这件事在阅读时一眼可定位。
+from . import dbpath  # noqa: E402  （模块级 import，仅位置特殊，无循环依赖）
+
+#: `server/` 目录 —— 旧库候选之一（`server/elder.db`），也是「新默认目录是否
+#: 落在仓库树内」这条断言的基准（tools/smoke_db_path.py 的 B7）。
+_SERVER_DIR = Path(__file__).resolve().parent.parent
 
 
-DATABASE_URL = os.getenv("ELDER_DB", _default_sqlite_url())
+def _resolve_db() -> dbpath.Resolution:
+    """把进程环境喂给纯函数，拿回本次的库路径结论。
+
+    ⚠️ 这里**必须**显式传 `os.environ`，而 `DATABASE_URL` 也**不能**再写成
+    `os.getenv("ELDER_DB", _default_sqlite_url())` —— `getenv` 的默认参数会被
+    **无条件求值**，即使 ELDER_DB 已设置，`_default_sqlite_url()` 也会跑（它要做
+    文件探测与小目录创建）。那正是「设了 ELDER_DB 还起不来」的隐患形态。
+    """
+    try:
+        return dbpath.resolve(
+            env=os.environ,
+            cwd=Path.cwd(),
+            server_dir=_SERVER_DIR,
+        )
+    except Exception as exc:  # noqa: BLE001  解析期不允许任何未分类异常逃逸
+        raise SystemExit(
+            f"【启动失败】解析默认数据库位置时出错：{type(exc).__name__}: {exc}\n"
+            f"    显式指定 ELDER_DB 可以绕过默认值解析：\n"
+            f"        ELDER_DB=sqlite:///C:/绝对路径/elder.db"
+        ) from exc
+
+
+_db_resolution = _resolve_db()
+
+
+def _db_display() -> str:
+    """排障用的「库在哪」文字。
+
+    sqlite 直接给文件路径；其它连接串只给 `scheme://host/db` 并且**隐去密码** ——
+    启动日志会进 CI artifact 与被随手拷走的容器日志，把 MySQL 口令原样打出来
+    是最容易发生、也最不需要发生的一次泄露。
+    """
+    if _db_resolution.path is not None:
+        # 显式值**逐字**打出来：它本来就是运维自己写的，任何"美化"都只会在
+        # 排障时制造「日志里的路径和我配的不一样」的困惑。
+        if _db_resolution.source == dbpath.SOURCE_EXPLICIT:
+            return _db_resolution.url
+        return str(_db_resolution.path)
+    parsed = urlparse(_db_resolution.url)
+    host = parsed.hostname or ""
+    if parsed.port:
+        host = f"{host}:{parsed.port}"
+    secret_note = "（密码已隐去）" if parsed.password else ""
+    return f"{parsed.scheme}://{host}{(parsed.path or '').rstrip('/')}{secret_note}"
+
+
+def _abort_on_db_conflict(resolution: dbpath.Resolution) -> None:
+    """两个都有数据的库并存 ⇒ **拒启动**，并把两条可执行的修复写出来。
+
+    为什么不挑「更新」的那个：挑错的后果是「服务起来了但数据是空的」，而且
+    运行期零报错 —— 这正是本仓库反复踩的「两份真源比没有更危险」。
+    """
+    if not resolution.conflict:
+        return
+    new_path = resolution.path
+    others = [p for p in resolution.conflict if p != new_path] or list(resolution.conflict)
+    lines = [
+        "【启动失败】发现两个都有数据的 SQLite 库，拒绝替你猜：",
+    ]
+    if new_path is not None:
+        lines.append(f"    A: {new_path}   (新默认位置)")
+    for idx, path in enumerate(others):
+        lines.append(f"    {'BCDEFG'[min(idx, 5)]}: {path}")
+    lines.extend([
+        "    二选一，显式指定后重启：",
+        f"        ELDER_DB=sqlite:///{others[0].as_posix() if others else '/绝对路径/elder.db'}",
+        "    为什么不在两库里挑「更新」的那个：挑错的后果是「服务起来了但数据是空的」，",
+        "    而且运行期零报错 —— 这正是本仓库反复踩的「两份真源比没有更危险」。",
+        "    处置办法见 docs/DEPLOY.md §1.5（手工迁移时判据是行数一致，不是「能起来」）。",
+    ])
+    raise SystemExit("\n".join(lines))
+
+
+# 冲突先判、再动文件系统：冲突场景本来就该退出，不该顺手建目录留垃圾
+_abort_on_db_conflict(_db_resolution)
+
+try:
+    dbpath.ensure_dir(_db_resolution)
+except OSError as exc:
+    # 「建不出来就抛给调用方，不回落」：静默回落 = 又一个把库写进仓库树的入口
+    raise SystemExit(
+        f"【启动失败】默认数据库目录建不出来：{exc}\n"
+        f"    目标：{_db_resolution.path}\n"
+        f"    显式指定一个已存在且可写的 ELDER_DATA_DIR，或直接给 ELDER_DB 连接串：\n"
+        f"        ELDER_DATA_DIR=D:/elder-data"
+    ) from exc
+
+#: SQLAlchemy 连接串。显式 ELDER_DB 时**逐字**等于环境变量的值（不加工）。
+DATABASE_URL = _db_resolution.url
+#: 上面这个连接串是怎么来的：explicit / data_dir / data_dir_default /
+#: legacy_cwd / legacy_server / new_default。启动摘要会打出来 ——
+#: 「我现在连的是哪个库」必须能在第一现场回答（design-p2 §B.1 R4）。
+DB_SOURCE = _db_resolution.source
+#: 解析出的库文件路径（MySQL 等非 sqlite 连接串时为 None），只用于日志与排障。
+DB_PATH = _db_resolution.path
+#: 本次探测过的旧库路径（去重后，顺序固定），只用于日志与排障。
+DB_LEGACY_SEEN = _db_resolution.legacy_seen
 DB_ECHO = os.getenv("ELDER_DB_ECHO", "0") == "1"
 DB_POOL_PRE_PING = True
 
@@ -293,9 +396,28 @@ ACT_CODE_LEN = ACT_CODE_BODY_LEN + 1
 ACT_CODE_TTL_MINUTES = int(os.getenv("ELDER_ACT_TTL_MIN", "10"))
 
 #: 对用户公开的平台管理员联系邮箱（「忘记用户名无法解绑」时的唯一求助通道）。
-#: ⚠️ 不要用 mailer 的 SMTP notify_to：那是运维收信地址，渲染到页面上等于
-#: 把内部邮箱暴露给全部用户。这里必须是专门对外公开的地址。
-SUPPORT_EMAIL = os.getenv("ELDER_SUPPORT_EMAIL", "support@voice.250886.xyz").strip()
+#:
+#: ⚠️ **不写死默认值**（2026-10-20）。这里曾经是
+#: ``os.getenv("ELDER_SUPPORT_EMAIL", "support@voice.250886.xyz")``，而那个域名
+#: 当前不可达（生产是 IP 直连、没有 DNS 记录）—— 等于把老人家属**唯一**的求助
+#: 通道指向一个死信箱，而页面上照样渲染成一个可点的 mailto，谁都不会发现信没到。
+#:
+#: 现在的解析顺序在 ``main._resolve_support_email``：
+#:     env ``ELDER_SUPPORT_EMAIL`` → DB ``smtp_config.from_addr``
+#:     → DB ``smtp_config.notify_to`` → 空串
+#: **``from_addr`` 在前、``notify_to`` 只兜底**：前者是管理员对外身份，
+#: 后者是工单通知的**内部收件箱**（生产上是个私人 QQ 邮箱），不该渲染到
+#: 公网登录页上。写反 = 不登录就能拿到运维的个人邮箱。
+#: 生产的管理员邮箱是**在管理端配的 SMTP**里（存 DB），代码里不该有第二个真源。
+#: 解析不到时端点是空串 + 启动期一条 WARNING；前端对空串不渲染 mailto（不是
+#: 渲染一个空地址），所以「没有求助通道」是可观测的，不是静默失效。
+#:
+#: 与 2026-10-19 那条「不要用 mailer 的 notify_to」相反，这里是**刻意反转**：
+#: 那条担心的是「内部收信地址被渲染给全部用户」；现在用户明确要求「SMTP 是在
+#: 生产 Docker 实例的管理端配好的，代码里不许写死邮箱」，而私有化部署里
+#: ``notify_to`` 就是管理员自己的邮箱。取舍：宁可公开一个真能收到的地址，
+#: 也不能给家属一个看着能点、实际进死信箱的地址。
+SUPPORT_EMAIL = os.getenv("ELDER_SUPPORT_EMAIL", "").strip()
 
 # ---------------------------------------------------------------- 设备 OTA 固件分发
 # 两个变量**都非空**时，OTA 响应（已绑定 / 未绑定两条路径）才带
@@ -537,6 +659,23 @@ def _deploy_startup_check() -> None:
 def _log_deploy_summary() -> None:
     """启动摘要 —— 排障第一现场，写成人能一眼看懂的话。"""
     lines = [f"【部署】模式：{_MODE_DESC[DEPLOY_MODE]}"]
+    # 「我现在连的是哪个库」曾经有三个来源（/data、CWD、ELDER_DB）却**没有一行
+    # 日志**说最终用了哪个（design-p2 §B.1 R4）。来源字段由 dbpath.Resolution
+    # 给出，这里只渲染 —— 判定仍在纯函数里，改日志格式不会影响任何断言。
+    _deploy_log.info("【数据库】%s（来源=%s）", _db_display(), DB_SOURCE)
+    if DB_SOURCE in (dbpath.SOURCE_LEGACY_CWD, dbpath.SOURCE_LEGACY_SERVER):
+        # 沿用旧库是**故意的**（不迁移，回滚成本才为 0），但必须让人看见：
+        # 否则「数据好像没跟着升级走」会被误判成数据丢失。
+        wanted = dbpath.default_data_dir(env=os.environ)
+        _deploy_log.warning(
+            "【数据库】沿用仓库目录里已有的旧库（**未迁移**）：%s\n"
+            "    新默认位置是 %s —— 目前没在用它。\n"
+            "    为什么不自动搬：启动期无法可靠判断另一个进程是否正在写这个库，"
+            "搬到一半比不搬更糟；沿用旧路径的代价只是一条 WARNING，"
+            "收益是「回滚 = 0 成本」。\n"
+            "    想搬见 docs/DEPLOY.md §1.5：先 cp 不 move，判据是 users/devices/"
+            "reminders 三张表行数一致（「能起来」不算判据，空库也能起来）。",
+            _db_display(), wanted)
     if PUBLIC_BASE_URL:
         ws_show = WS_PUBLIC_BASE_URL or PUBLIC_BASE_URL.replace(
             "https://", "wss://").replace("http://", "ws://")

@@ -16,7 +16,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
-from fastapi import FastAPI
+from fastapi import Depends, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
@@ -31,7 +31,7 @@ from .config import (
     SEED_ADMIN_PASSWORD,
     SUPPORT_EMAIL,
 )
-from .db import SessionLocal, init_db
+from .db import SessionLocal, get_db, init_db
 from .models import Avatar
 from .routers import (admin_presets, avatars, auth, chat_quota, device_api, devices,
                       home, mail, providers, reminders, roles, stats, support, usage)
@@ -458,6 +458,9 @@ async def lifespan(app: FastAPI):
     _admin_password_audit()
     _seed_migration()
     _seed_chat_quota()
+    # 求助通道的可用性必须在**启动期**说清（端点本身不打日志：登录页每次渲染
+    # 都会调它，每请求一条 WARNING 等于没有告警）。
+    _warn_support_email_once()
     from . import scheduler
 
     task = asyncio.create_task(scheduler.run_forever())
@@ -546,19 +549,90 @@ def health_scheduler():
     return scheduler_health()
 
 
+def _resolve_support_email(db) -> str:
+    """解析「对用户公开的管理员联系邮箱」：env → DB ``from_addr`` → DB ``notify_to`` → 空串。
+
+    ⚠️ **顺序是 from_addr 在前，notify_to 只在 from_addr 为空时兜底**（2026-10-20
+    在生产库上核到实际配置后订正，别写反）：
+
+        from_addr  = zxh@250886.xyz        ← 管理员**对外身份**，用户该看到的
+        notify_to  = xiaohui0302@qq.com    ← 工单通知的**内部收件箱**（个人邮箱）
+
+    ``notify_to`` 的语义见 ``models.SmtpConfig``：它是「工单通知收件邮箱」，
+    是运维内部收信口；把它渲染到**公网登录页**上，等于不登录就能拿到一个私人
+    邮箱。所以：``from_addr`` 优先，``notify_to`` 只作兜底。
+
+    为什么允许回落到 DB 里的 SMTP 配置：生产实例的 SMTP 是管理员**在管理端配的**
+    （存 ``smtp_config`` 表），代码里再写死一个地址就是第二个真源 —— 而
+    2026-10-20 之前那个写死的 ``support@voice.250886.xyz`` 指向一个不可达域名
+    （生产是 IP 直连、没有 DNS 记录），家属点「忘记用户名 → 发邮件给管理员」时
+    邮件直接进死信箱，页面却照样渲染成一个可点的 mailto，谁都不会发现信没到。
+
+    Args:
+        db: SQLAlchemy 会话（端点用 ``Depends(get_db)``，启动自检用 ``SessionLocal()``）。
+
+    Returns:
+        邮箱字符串；解析不到返回**空串**（不是任何兜底地址）。
+    """
+    if SUPPORT_EMAIL:
+        return SUPPORT_EMAIL
+    # 读取方式**复用** mailer.get_smtp_config，不另写一份查询（那是两份真源：
+    # 它还会在缺行时补一条空配置，保证「没配过」与「配了但全空」同一条路径）。
+    from .mailer import get_smtp_config
+
+    try:
+        cfg = get_smtp_config(db)
+        return (cfg.from_addr or cfg.notify_to or "").strip()
+    except Exception as exc:  # noqa: BLE001
+        # 这是个**无鉴权**的公开端点：读配置失败（并发首次建行撞主键 / 库锁 /
+        # 老库缺列）只能退化成空串，**不能 500** —— 500 会把登录页的
+        # 「忘记用户名」整块打崩，而那正是本功能存在的意义。
+        db.rollback()
+        log.warning("读取 SMTP 配置失败，求助邮箱退化为空：%s: %s",
+                    type(exc).__name__, exc)
+        return ""
+
+
+def _warn_support_email_once() -> None:
+    """启动期检查一次「求助邮箱能否解析」，解析不到就 WARNING。
+
+    为什么不在端点里打：``/api/support-contact`` 会被登录页**每次渲染**调用，
+    每请求一条 WARNING 会把日志冲成噪音，真正的告警反而被淹掉。
+    """
+    try:
+        with SessionLocal() as db:
+            email = _resolve_support_email(db)
+    except Exception as exc:  # noqa: BLE001  启动自检不许因为查配置失败而崩
+        log.warning("求助邮箱自检失败（不影响启动）：%s: %s", type(exc).__name__, exc)
+        return
+    if email:
+        log.info("【求助通道】/api/support-contact 将下发 %s", email)
+        return
+    # 单行标题 + 多行解释：运维 grep「【求助通道】」就能定位，不需要通读日志。
+    log.warning(
+        "【求助通道】未解析到管理员联系邮箱：ELDER_SUPPORT_EMAIL 未设置，"
+        "且管理端 SMTP 的 from_addr / notify_to 都为空。\n"
+        "    后果：用户点「忘记用户名 › 发邮件给管理员」时**拿不到地址**"
+        "（前端对空串不渲染 mailto），而这是忘记用户名之后唯一能解绑设备的通道。\n"
+        "    修法（二选一）：管理端「邮件设置」里填好发件邮箱（from_addr）"
+        "或通知收件邮箱（notify_to）；或设环境变量 ELDER_SUPPORT_EMAIL=<管理员邮箱>。"
+    )
+
+
 @app.get("/api/support-contact")
-def support_contact():
+def support_contact(db=Depends(get_db)):
     """对用户公开的管理员联系邮箱（无鉴权，只有这一个字段）。
 
     为什么单独开一个端点而不是塞进 ``/api/health``：health 是容器探活的
     固定契约（Dockerfile HEALTHCHECK 每 30 秒打一次，冒烟脚本也钉着它的
     形状），往里加业务字段会让「探活响应」变成一个谁都想改的杂物间。
-    也刻意**不**复用 mailer 的 SMTP ``notify_to`` —— 那是运维收信地址，
-    渲染到用户端页面上等于把内部邮箱暴露给全部用户（见 config.SUPPORT_EMAIL）。
+
+    邮箱从哪来见 :func:`_resolve_support_email` —— **不再有写死的默认值**，
+    解析不到就是空串（前端对空串不渲染 mailto）。
 
     响应只有 ``{"email": ...}``，不泄露任何其他配置。
     """
-    return {"email": SUPPORT_EMAIL}
+    return {"email": _resolve_support_email(db)}
 
 
 # ---------------------------------------------------------------- 双入口页面

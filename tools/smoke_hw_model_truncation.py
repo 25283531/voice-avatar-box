@@ -451,12 +451,21 @@ def main() -> int:
             mutation_detail = "变异版服务没起来，自检无效（环境问题，不算断言失败）"
             print(f"  [WARN] {mutation_detail}")
         else:
-            failed_trunc = [n for n, ok, _ in mutated
-                            if not ok and n in TRUNCATION_CHECKS]
+            # ⚠️ 计数口径：日志里第三段会打出**所有**变红的断言（[FAIL] 行），
+            # 而这里若只报「截断判据」的条数，读者会看到「12 条 FAIL、却写着 5 条变红」，
+            # 以为有一条不该红的红了。所以两个数都报，并把非截断判据的名字列出来。
+            # （变红的那条「空 hw_model 不清空已有值」确实是同一行 `hw[:64]` 的连带
+            # 影响，但它不属于 TRUNCATION_CHECKS —— 不解释就等于留了个谜。）
+            failed_all = [n for n, ok, _ in mutated if not ok]
+            failed_trunc = [n for n in failed_all if n in TRUNCATION_CHECKS]
             if failed_trunc:
                 mutation_verdict = True
-                mutation_detail = (f"变异后 {len(failed_trunc)} 条截断判据变红"
-                                   f"（如「{failed_trunc[0]}」）→ 断言有鉴别力")
+                extra = [n for n in failed_all if n not in TRUNCATION_CHECKS]
+                mutation_detail = (f"变异后 {len(failed_all)} 条断言变红"
+                                   f"（其中 {len(failed_trunc)} 条属截断判据，"
+                                   f"如「{failed_trunc[0]}」）→ 断言有鉴别力")
+                if extra:
+                    mutation_detail += f"；另 {len(extra)} 条连带守卫也红：{extra}"
                 print(f"  [PASS] {mutation_detail}")
             else:
                 mutation_verdict = False

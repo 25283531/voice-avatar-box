@@ -102,6 +102,76 @@ docker volume inspect server_elder-data      # 看 Mountpoint，即卷在宿主�
 docker compose exec elder-server ls -l /data # 容器视角
 ```
 
+容器里库文件的路径**永远是 `/data/elder.db`**（compose 显式设了
+`ELDER_DB=sqlite:////data/elder.db`，且 `/data` 是命名卷），本节下面这些新规则
+**不影响容器**。
+
+#### 不设 `ELDER_DB` 时落在哪（非容器 / 本机裸跑）
+
+| 优先级 | 条件 | 落点 |
+| --- | --- | --- |
+| 1 | 显式 `ELDER_DB` | **原样使用**（不加工、不改写，生产与所有冒烟脚本都走这条） |
+| 2 | 显式 `ELDER_DATA_DIR` | `<ELDER_DATA_DIR>/elder.db`；**目录不存在就建**，建不出来则启动失败（不再静默回落） |
+| 3 | `/data` 已存在且可写 | `/data/elder.db`（容器形态，与历史行为逐字一致） |
+| 4 | 上面都没有 | 用户数据目录：Windows `%LOCALAPPDATA%\voice-avatar-box\elder.db`；macOS `~/Library/Application Support/voice-avatar-box/elder.db`；Linux `$XDG_DATA_HOME/voice-avatar-box/elder.db`（缺省 `~/.local/share/voice-avatar-box/`） |
+
+**本机裸跑时库不会再落在仓库目录里**（这是本次变更的目的）。但有一种情况会
+**沿用**仓库里已有的旧库：`./elder.db` 或 `server/elder.db` **已经有数据**
+（文件大小 > 0）时，服务继续用它，并在启动日志里打一条 WARNING：
+
+```
+WARNING elder.deploy | 【数据库】沿用仓库目录里已有的旧库（**未迁移**）：...\server\elder.db
+INFO    elder.deploy | 【数据库】G:\...\server\elder.db（来源=legacy_cwd）
+```
+
+> 启动摘要里那行 `【数据库】<路径>（来源=<source>）` 是排障第一现场：
+> 以前「我现在连的是哪个库」有三个来源却**没有一行日志**说最终用了哪个。
+> `source` 取值：`explicit` / `data_dir` / `data_dir_default` /
+> `legacy_cwd` / `legacy_server` / `new_default`。
+
+> ⚠️ **0 字节的 `.db` 不算「有数据」**。仓库里曾经有几个 0 字节的空壳库，
+> 它们会被忽略（新位置生效）。判断依据是 `size > 0`，不是「文件存在」。
+
+#### 三种处置方式（都不丢数据）
+
+1. **什么都不做**（推荐）：旧库原地继续被使用，只是多一条 WARNING。
+   **回滚成本为 0**：把代码退回上一版，老代码看的还是那个路径。
+2. **手工迁移**（想要整洁时，**仅停机时**执行）：
+
+   ```bash
+   docker compose stop elder-server                # 或停掉本机 uvicorn
+   cp -p server/elder.db "$NEW_DIR/elder.db"       # 先拷，不要 mv
+   # 用新路径起一次：ELDER_DB=sqlite:///$NEW_DIR/elder.db
+   ```
+
+   **验收判据不是「服务能起来」**（空库也能起来），而是三张表行数一致：
+
+   ```bash
+   for t in users devices reminders; do
+     echo -n "$t old="; sqlite3 server/elder.db "select count(*) from $t"
+     echo -n "$t new="; sqlite3 "$NEW_DIR/elder.db" "select count(*) from $t"
+   done
+   ```
+
+   三对数字都相等后，才可以把原文件删掉。
+3. **孤儿库**（`server/_lead_check.db` 之类历史手工产物）：全仓已无代码再写它们。
+   处置权在数据所有者 —— 先确认「这是不是我要的」，**不要直接删**。
+
+#### 两个都有数据的库并存 ⇒ 服务**拒绝启动**
+
+如果你手工往新位置拷过一份库、旧位置的那份又还在，启动会直接失败并列出两条路径：
+
+```
+【启动失败】发现两个都有数据的 SQLite 库，拒绝替你猜：
+    A: C:\Users\...\AppData\Local\voice-avatar-box\elder.db
+    B: G:\...\server\elder.db
+    二选一，显式指定后重启：
+        ELDER_DB=sqlite:///G:/.../server/elder.db
+```
+
+为什么不挑「更新」的那个：挑错的后果是「服务起来了，但数据是空的」，
+而且运行期零报错 —— 这比停一下服务难查得多。**显式指定**即可恢复。
+
 ### 1.6 语音链路（内置，无需额外操作）
 
 语音链路是**本镜像自带**的（自研 WebSocket 服务端 `server/app/voice/`），
@@ -202,7 +272,17 @@ export ELDER_DB="sqlite:///./elder.db"    # 相对路径 = 当前工作目录
 uvicorn app.main:app --reload --port 8080
 ```
 
-不设 `ELDER_DB` 时，代码会自动挑一个可写目录：`/data` 存在且可写就用 `/data/elder.db`（容器里的命名卷），否则退回当前工作目录下的 `./elder.db`（本机裸跑）。持久化目录可用 `ELDER_DATA_DIR` 覆盖。
+不设 `ELDER_DB` 时**不要指望库落在当前工作目录**：落点由 §1.5 那张优先级表决定，
+本机裸跑默认落到**用户数据目录**（Windows `%LOCALAPPDATA%\voice-avatar-box\elder.db`，
+macOS `~/Library/Application Support/voice-avatar-box/elder.db`，
+Linux `~/.local/share/voice-avatar-box/elder.db`）。
+持久化目录可用 `ELDER_DATA_DIR` 覆盖（目录不存在会**建出来**，建不出来则启动失败）。
+
+为什么不再默认 `./elder.db`：运行库写进 git 工作树后，`*.db` 被 `.gitignore` 遮住，
+于是它**既不会被 review、又会被 `git clean -xdf` 一起删掉**。旧库的处理见 §1.5
+（有数据就沿用，不自动迁移）。
+
+启动日志里有一行 `【数据库】<路径>（来源=<source>）`，**先看它**再排障。
 
 ### 1.10 设备 OTA 固件分发（可选，**默认不启用**）
 

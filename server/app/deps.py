@@ -7,6 +7,7 @@ from sqlalchemy.orm import Session
 
 from . import models
 from .db import get_db
+from .macs import norm_mac
 from .security import decode_token
 
 bearer = HTTPBearer(auto_error=False)
@@ -46,6 +47,26 @@ def get_current_device(
     if int(payload.get("ep", 0)) != int(getattr(dev, "token_epoch", 0) or 0):
         raise HTTPException(status.HTTP_401_UNAUTHORIZED,
                             "设备凭证已失效，请重新绑定")
+    # 设备身份校验：token 里声明的设备标识必须与这一行是同一台。
+    #
+    # 为什么 ep 不够（2026-10-20，P0）：`devices.id` 是裸 Integer 主键（无
+    # AUTOINCREMENT）⇒ 删掉当前最大行后，SQLite 下一次插入**复用同一个 id**，
+    # 而新行的 `token_epoch` 又从 DEFAULT 0 起算、旧 token 的 ep 也是 0
+    # ⇒ `0 == 0` 直接通过，一枚 365 天有效期的旧 token 于是读到了**另一家人**
+    # 的提醒与服药回执。代次是「行内代次」，行被硬删时它随行一起消失，
+    # 所以身份**不能**依赖行槽（pk），只能依赖 token 自己声明的设备标识。
+    #
+    # ⚠️ 必须**双边归一化**后比较，不许裸串比：token 里存的是**签发当时**的
+    # 列值，而 `schema_patch.normalize_device_macs()` 已把存量收敛成
+    # `aabbccddeeff`，历史 token 里可能是 `AA:BB:CC:DD:EE:FF`。裸串比会让
+    # 全部存量设备在部署那一刻集体 401（`smoke_pk_reuse` 的 P4① 就是这条的守卫）。
+    #
+    # ⚠️ 缺 `device_id` 声明 ⇒ **直接拒**，不做兼容放行：该声明自初始提交
+    # （fc70c95）起每一枚设备 token 都带（`security.issue_device_token`），
+    # 不存在"老格式无声明"的包袱，放行只会把洞留在 token 有效期内。
+    did = str(payload.get("device_id") or "")
+    if not did or norm_mac(did) != norm_mac(str(dev.device_id or "")):
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "设备凭证与设备不符")
     return dev
 
 

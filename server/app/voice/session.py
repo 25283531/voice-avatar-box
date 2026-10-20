@@ -243,6 +243,26 @@ class VoiceSession:
             await self._safe_close(CLOSE_UNAUTHORIZED)
             return False
 
+        # 设备身份校验（pk 复用，2026-10-20 P0）：**必须先查 token 自己声明的
+        # 设备标识**，不能只查下面那段 header 比较。
+        #
+        # 为什么下面那段不够：`devices.id` 是裸 Integer 主键（无 AUTOINCREMENT），
+        # 删掉当前最大行后 SQLite 会复用同一个 id；新设备的 header MAC 与它自己
+        # 那一行的 device_id 天然一致 ⇒ **header 比较照样通过**，而 token 是
+        # 上一家的旧 token。也就是说 header 比较只能挡住"拿 A 的 token 冒充 B 的
+        # MAC"，挡不住"pk 被复用"。
+        #
+        # ⚠️ 与 deps.get_current_device 同一判据、同一坑：必须**双边 norm_mac**
+        # 后比较（token 里是签发当时的列值，历史 token 可能是 `AA:BB:..`）。
+        # 缺声明一律拒，不做兼容放行（该声明自初始提交起就有）。
+        did = str(payload.get("device_id") or "")
+        if not did or norm_mac(did) != norm_mac(str(getattr(dev, "device_id", "") or "")):
+            log.warning("token 的 device_id 声明与设备行不符（pk 被复用？）："
+                        "dev_pk=%s claim=%r db=%r",
+                        dev_pk, did, getattr(dev, "device_id", None))
+            await self._safe_close(CLOSE_DEVICE_MISMATCH)
+            return False
+
         # 跨设备盗用 token：token 本身有效，但 Header 里的 Device-Id 与
         # 签发的不是同一台。**必须比对** —— 否则偷到一台设备的 token
         # 就能冒充任意 MAC（OTA 只认 Device-Id，token 与 MAC 分离时
