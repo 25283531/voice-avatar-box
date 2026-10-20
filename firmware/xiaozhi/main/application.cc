@@ -796,11 +796,23 @@ void Application::SetDeviceState(DeviceState state) {
 
             // Make sure the audio processor is running
             if (!audio_service_.IsAudioProcessorRunning()) {
+                audio_service_.EnableVoiceProcessing(true);
+            }
+            /* realtime 模式（设备 AEC 开）下，播报完回到 listening 时音频
+             * 处理器全程没停（speaking 分支特意不清它），原条件
+             * !IsAudioProcessorRunning() 恒假 ⇒ 不再向服务端发 listen
+             * start。而服务端一轮对话结束后会回到 idle、静音看门狗退出，
+             * 上行音频被静默丢弃 —— 两侧互相等成死锁：设备开着麦却听不到
+             * 唤醒词（listening 态关了 WakeNet），用户连喊多次毫无反应。
+             * 2026-10-20 实测一次 ASR 失败后设备聋了 164 秒。
+             * ⇒ realtime 模式每次进入 listening 都重新宣布一次。
+             * 服务端也有对应兜底（idle 态收到上行音频自动重新武装）。 */
+            if (!audio_service_.IsAudioProcessorRunning() ||
+                listening_mode_ == kListeningModeRealtime) {
                 // Send the start listening command
                 protocol_->SendStartListening(listening_mode_);
-                audio_service_.EnableVoiceProcessing(true);
-                audio_service_.EnableWakeWordDetection(false);
             }
+            audio_service_.EnableWakeWordDetection(false);
             break;
         case kDeviceStateSpeaking:
             display->SetStatus(Lang::Strings::SPEAKING);

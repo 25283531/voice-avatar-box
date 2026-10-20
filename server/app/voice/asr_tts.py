@@ -212,6 +212,18 @@ def _post_multipart(row: Any, path: str, fields: dict[str, str],
 
 
 # ---------------------------------------------------------------- ASR
+def _asr_endpoint_scheme(row: Any) -> str:
+    """取这一行 endpoint 的协议（小写）。空 endpoint 返回空串。"""
+    endpoint = (getattr(row, "endpoint", "") or "").strip()
+    if not endpoint:
+        return ""
+    return (urllib.parse.urlsplit(endpoint).scheme or "").lower()
+
+
+def _row_label(row: Any) -> str:
+    return f"{getattr(row, 'name', '')}({getattr(row, 'model', '')})"
+
+
 def asr(db: Any, pcm_16k: bytes) -> str:
     """16kHz/mono/S16LE PCM -> 识别文本。
 
@@ -222,26 +234,65 @@ def asr(db: Any, pcm_16k: bytes) -> str:
     为什么 wav 头在这里手写而不是调 wave 模块：标准库的 wave 会写出
     带 LIST/INFO 块的变体，且接口是文件而非字节；这里是 44 字节固定头，
     写死更可预测（固件/厂商都能解）。
-    """
-    from ..llm_gateway import resolve_row
 
-    row = resolve_row(db, "asr")
-    if row is None:
+    为什么按配置列表逐个兜底而不是只取第一条（2026-10-20 事故）：
+    生产库里有三条 asr 行，优先级最高的一条 endpoint 是
+    ``wss://api-maas.teleai.com.cn/...``（TeleAI 实时 ASR）。本函数只走
+    HTTP multipart（``urllib`` 不认识 wss，报
+    ``unknown url type: wss``），原先只调 ``resolve_row`` 取第一条 ⇒
+    高优先级的 wss 行一票否决，后面两条好好的 https 行永远轮不到，
+    整条语音链路「唤醒成功但一个字都识别不出」。
+    ⇒ 改成与 LLM 网关同构的「按序兜底」：非 http(s) 端点跳过并告警，
+    调用失败换下一条，全部失败才抛。
+    """
+    from ..llm_gateway import resolve_plan
+
+    plan = resolve_plan(db, "asr")
+    if not plan:
         raise VoiceConfigMissingError("asr")
-    timeout = _row_timeout(row, ASR_TIMEOUT_SEC)
-    model = (getattr(row, "model", "") or "").strip() or "whisper-1"
 
     wav = wav_header_bytes(len(pcm_16k), 16000) + pcm_16k
 
-    fields = {
-        "model": model,
-        "language": config.VOICE_ASR_LANGUAGE,
-        "response_format": "json",
-    }
-    payload = _post_multipart(row, "/audio/transcriptions", fields,
-                              "file", "utterance.wav", wav, timeout)
-    text = str(payload.get("text", "") or "").strip()
-    return text
+    last_error: VoiceUpstreamError | None = None
+    skipped: list[str] = []
+
+    for _kind, row in plan:
+        scheme = _asr_endpoint_scheme(row)
+        if scheme not in ("http", "https"):
+            skipped.append(
+                f"{_row_label(row)} endpoint={scheme + '://' if scheme else '（空）'}"
+                f"{'（实时 ASR 等服务端未实现的协议）' if scheme in ('ws', 'wss') else ''}")
+            continue
+
+        timeout = _row_timeout(row, ASR_TIMEOUT_SEC)
+        model = (getattr(row, "model", "") or "").strip() or "whisper-1"
+        fields = {
+            "model": model,
+            "language": config.VOICE_ASR_LANGUAGE,
+            "response_format": "json",
+        }
+        try:
+            payload = _post_multipart(row, "/audio/transcriptions", fields,
+                                      "file", "utterance.wav", wav, timeout)
+        except VoiceUpstreamError as exc:
+            log.warning("ASR 配置「%s」调用失败，按序换下一条：%s",
+                        _row_label(row), exc)
+            last_error = exc
+            continue
+
+        text = str(payload.get("text", "") or "").strip()
+        if skipped:
+            log.warning("ASR 跳过 %d 条不兼容配置：%s", len(skipped),
+                        "；".join(skipped))
+        return text
+
+    if last_error is not None:
+        raise last_error
+    if skipped:
+        raise VoiceUpstreamError(
+            f"全部 ASR 配置的 endpoint 都不是 http/https（共 {len(skipped)} 条）："
+            f"{'；'.join(skipped)}")
+    raise VoiceConfigMissingError("asr")
 
 
 # ---------------------------------------------------------------- TTS

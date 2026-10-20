@@ -145,6 +145,15 @@ class VoiceSession:
         # 读不到上行消息、abort 失效（见 run() 里的注释）。
         self._turn_task: asyncio.Task | None = None
 
+        # 设备上报的收听模式（realtime/auto/manual）。连续对话模式下
+        # 设备播完后继续听、不再喊唤醒词，服务端必须能自己重新武装监听
+        # （见 _rearm_listening 的死锁说明）。
+        self._listen_mode: str = ""
+
+        # 静音看门狗 task 的单实例引用。重新武装前先取消旧的，
+        # 否则会出现两个看门狗同时等静音（重复触发一轮对话）。
+        self._watchdog_task: asyncio.Task | None = None
+
         self._t0: float = 0.0               # 本轮 listen start 时刻
 
     # ================================================================ 生命周期
@@ -200,6 +209,10 @@ class VoiceSession:
                           type(exc).__name__, exc)
         finally:
             self.state = "closed"
+            if self._watchdog_task is not None and not self._watchdog_task.done():
+                # 会话结束后看门狗必须退：它 while state == "listening" 会
+                # 自然退出，但显式取消更及时（少一个 0.2s 轮询的空转 task）。
+                self._watchdog_task.cancel()
             if self._turn_task is not None and not self._turn_task.done():
                 # 断开时把本轮标成打断：否则它还会继续往下发音频帧，
                 # 对已断开的连接每帧抛一次异常（刷满日志且掩盖真因）。
@@ -329,6 +342,13 @@ class VoiceSession:
     # ================================================================ 上行
     def _on_binary(self, data: bytes) -> None:
         """收一个二进制帧。type==1（JSON over binary）按 JSON 解析。"""
+        if self.state == "idle" and self._continuous():
+            # 连续对话会话里，设备还在推流但服务端已回 idle —— 就是
+            # _rearm_listening 注释里那个死锁。设备以为我们在听，我们
+            # 以为会话结束了。⇒ 把上行音频当作设备重新宣布 listening。
+            log.info("[%s] idle 态仍收到上行音频，按连续对话重新武装监听",
+                     self.session_id)
+            self._rearm_listening()
         if self.state != "listening":
             # 非 listening 态收到的音频：设备在播报时也可能继续推流
             # （固件不停止麦克风）。丢弃即可，不回错误 —— 回错误会让
@@ -455,21 +475,9 @@ class VoiceSession:
         state = obj.get("state")
         if state == "start":
             mode = str(obj.get("mode") or "auto")
-            self._frames.clear()
-            self._pcm.clear()
-            self._speech_ms = 0
-            self._silence_ms = 0
-            self._noise_floor = _NOISE_FLOOR_INIT
-            self._ms_since_loud = 10 ** 9
-            self._max_closed_pause_ms = 0
-            self._abort = False
-            self._t0 = time.monotonic()
-            self.state = "listening"
+            self._listen_mode = mode
             log.info("[%s] listen start（mode=%s）", self.session_id, mode)
-            # 服务端静音兜底：单独起一个 task，不阻塞收包主循环。
-            # realtime 模式固件不做 VAD、等我们断句；auto 模式设备先到
-            # 就以设备为准（谁先到谁 finalize，见 _finalize 的幂等设计）。
-            asyncio.create_task(self._silence_watchdog())
+            self._rearm_listening()
         elif state == "stop":
             log.info("[%s] listen stop", self.session_id)
             # 起 task 而非 await：见 run() 里的注释（await 会卡住收包
@@ -497,6 +505,47 @@ class VoiceSession:
         self._frames.clear()
         if self.state == "speaking":
             self.state = "idle"
+
+    # ---------------------------------------------------------------- 重新武装
+    def _continuous(self) -> bool:
+        """本轮是否是连续对话（设备播完后继续听，不需要再喊唤醒词）。
+
+        manual 模式设备播完回 idle 等新唤醒词，服务端必须保持 idle ——
+        此时若擅自回到 listening，设备并不在推流，看门狗空转 60s 后还会
+        拿一段静音去识别，纯属浪费。
+        """
+        return self._listen_mode in ("realtime", "auto")
+
+    def _rearm_listening(self) -> None:
+        """把会话状态重置回 listening 并（重）起静音看门狗。
+
+        死锁背景（2026-10-20 实测，一次 ASR 失败后设备聋了 164 秒）：
+        连续对话模式下，固件播报完后回到 listening 态 —— 关闭 WakeNet、
+        继续向上推流。而服务端一轮对话结束（_finalize 的 finally）后停在
+        idle：_on_binary 因 state != "listening" **静默丢弃**所有上行音频，
+        _silence_watchdog 也早已退出。两侧互相等：设备以为服务端在听，
+        服务端以为会话结束了。用户再喊唤醒词毫无反应 —— 固件在 listening
+        态根本不跑 WakeNet，只能等连接自己断（实测要几分钟以上）。
+        ⇒ 两条恢复通道：
+          1. 固件 realtime 模式每次进入 listening 都重发 listen start
+             （固件侧修复，见 application.cc SetDeviceState）；
+          2. 服务端在 idle 态收到上行音频时，自动按连续对话重新武装
+             （本函数，覆盖固件不发消息的路径，如 ASR 失败后的 alert）。
+        """
+        self._frames.clear()
+        self._pcm.clear()
+        self._speech_ms = 0
+        self._silence_ms = 0
+        self._noise_floor = _NOISE_FLOOR_INIT
+        self._ms_since_loud = 10 ** 9
+        self._max_closed_pause_ms = 0
+        self._abort = False
+        self._t0 = time.monotonic()
+        self.state = "listening"
+        # 看门狗单实例：旧的先取消，避免两个看门狗同时等静音。
+        if self._watchdog_task is not None and not self._watchdog_task.done():
+            self._watchdog_task.cancel()
+        self._watchdog_task = asyncio.create_task(self._silence_watchdog())
 
     async def _silence_watchdog(self) -> None:
         """连续静音达到阈值就自动 finalize（等价于设备端 VAD 断句）。
