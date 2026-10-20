@@ -20,6 +20,17 @@ const LvglImage* EmojiCollection::GetEmojiImage(const char* name) {
     return nullptr;
 }
 
+std::vector<std::string> EmojiCollection::EnumNames() const {
+    std::vector<std::string> names;
+    names.reserve(emoji_collection_.size());
+    /* std::map 按 key 排序 ⇒ 顺序稳定，便于日志复现。
+     * 轮播只要求"每次不一样"，不要求随机分布均匀。 */
+    for (const auto& kv : emoji_collection_) {
+        names.push_back(kv.first);
+    }
+    return names;
+}
+
 EmojiCollection::~EmojiCollection() {
     for (auto it = emoji_collection_.begin(); it != emoji_collection_.end(); ++it) {
         delete it->second;

@@ -10,8 +10,23 @@
 
 #include <atomic>
 #include <memory>
+#include <string>
 
 #define PREVIEW_IMAGE_DURATION_MS 5000
+
+/* 防烧屏轮播（2026-10-20 用户要求：屏幕常亮固定一张图，担心烧屏）。
+ *
+ * 做法：空闲时每隔一段时间把表情图换一张。为什么是"轮换表情"而不是
+ * "整屏平移"：这是 320x240 IPS，真正会留下残影的是**长期不动的高对比
+ * 区域**（中央的表情图正是这种）；整屏平移一两个像素在 LVGL 里要动
+ * 所有对象、每帧重排，代价远大于收益，而且用户看不懂"界面在抖"。
+ *
+ * 判据用「距上次 UI 变化多久」而不是「当前设备状态」：设备状态要问
+ * Application，显示层不该反向依赖它；而"界面 60 秒没变过"本身就是
+ * 烧屏风险的定义。
+ */
+#define ANTI_BURN_CHECK_MS  20000   /* 每 20s 检查一次 */
+#define ANTI_BURN_IDLE_MS   60000   /* 界面 60s 无变化才轮换 */
 
 
 class LcdDisplay : public LvglDisplay {
@@ -40,6 +55,13 @@ protected:
     void SetupUI();
     virtual bool Lock(int timeout_ms = 0) override;
     virtual void Unlock() override;
+
+    /* 防烧屏：在 SetupUI 末尾启动，空闲时随机换表情（见文件顶部宏注释） */
+    void StartAntiBurnInTimer();
+    void AntiBurnInStep();
+    lv_timer_t* anti_burn_timer_ = nullptr;
+    uint32_t last_ui_change_tick_ = 0;      /* lv_tick 毫秒 */
+    std::string anti_burn_last_emoji_;      /* 上一次轮播选中的表情，避免连选同一张 */
 
 protected:
     // Add protected constructor

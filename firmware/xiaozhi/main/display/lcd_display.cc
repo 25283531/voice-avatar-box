@@ -9,6 +9,7 @@
 #include <font_awesome.h>
 #include <esp_log.h>
 #include <esp_err.h>
+#include <esp_random.h>
 #include <esp_lvgl_port.h>
 #include <esp_psram.h>
 #include <cstring>
@@ -508,6 +509,8 @@ void LcdDisplay::SetupUI() {
     lv_obj_set_style_text_font(emoji_label_, large_icon_font, 0);
     lv_obj_set_style_text_color(emoji_label_, lvgl_theme->text_color(), 0);
     lv_label_set_text(emoji_label_, FONT_AWESOME_MICROCHIP_AI);
+
+    StartAntiBurnInTimer();
 }
 #if CONFIG_IDF_TARGET_ESP32P4
 #define  MAX_MESSAGES 40
@@ -515,6 +518,8 @@ void LcdDisplay::SetupUI() {
 #define  MAX_MESSAGES 20
 #endif
 void LcdDisplay::SetChatMessage(const char* role, const char* content) {
+    /* 有新字幕 = 界面正在变化 ⇒ 重置防烧屏空闲计时（见 StartAntiBurnInTimer） */
+    last_ui_change_tick_ = lv_tick_get();
     DisplayLockGuard lock(this);
     if (content_ == nullptr) {
         return;
@@ -989,6 +994,8 @@ void LcdDisplay::SetupUI() {
     lv_obj_set_style_text_color(low_battery_label_, lv_color_white(), 0);
     lv_obj_center(low_battery_label_);
     lv_obj_add_flag(low_battery_popup_, LV_OBJ_FLAG_HIDDEN);
+
+    StartAntiBurnInTimer();
 }
 
 void LcdDisplay::SetPreviewImage(std::unique_ptr<LvglImage> image) {
@@ -1027,6 +1034,8 @@ void LcdDisplay::SetPreviewImage(std::unique_ptr<LvglImage> image) {
 }
 
 void LcdDisplay::SetChatMessage(const char* role, const char* content) {
+    /* 有新字幕 = 界面正在变化 ⇒ 重置防烧屏空闲计时（见 StartAntiBurnInTimer） */
+    last_ui_change_tick_ = lv_tick_get();
     DisplayLockGuard lock(this);
     if (chat_message_label_ == nullptr) {
         return;
@@ -1036,6 +1045,11 @@ void LcdDisplay::SetChatMessage(const char* role, const char* content) {
 #endif
 
 void LcdDisplay::SetEmotion(const char* emotion) {
+    /* 任何主动表情切换都算"界面有变化" ⇒ 重置防烧屏的空闲计时。
+     * 放在最前面：下面有多个 return 分支，漏掉哪个都会让轮播在
+     * 对话进行中乱换图。 */
+    last_ui_change_tick_ = lv_tick_get();
+
     // Stop any running GIF animation
     if (gif_controller_) {
         DisplayLockGuard lock(this);
@@ -1102,6 +1116,56 @@ void LcdDisplay::SetEmotion(const char* emotion) {
         lv_obj_add_flag(emoji_label_, LV_OBJ_FLAG_HIDDEN);
     }
 #endif
+}
+
+void LcdDisplay::StartAntiBurnInTimer() {
+    if (anti_burn_timer_ != nullptr || emoji_image_ == nullptr) {
+        return;
+    }
+    last_ui_change_tick_ = lv_tick_get();
+    /* lv_timer 回调必须是裸函数指针，所以用 user_data 带回 this。 */
+    anti_burn_timer_ = lv_timer_create([](lv_timer_t* t) {
+        static_cast<LcdDisplay*>(lv_timer_get_user_data(t))->AntiBurnInStep();
+    }, ANTI_BURN_CHECK_MS, this);
+    if (anti_burn_timer_ == nullptr) {
+        ESP_LOGW(TAG, "防烧屏定时器创建失败（界面仍可用，只是不轮播）");
+    }
+}
+
+void LcdDisplay::AntiBurnInStep() {
+    /* 界面刚刚变过（有人在对话/收到通知）⇒ 现在换图就是捣乱，跳过。
+     * 只在真正长时间静止时才轮换。 */
+    if (lv_tick_elaps(last_ui_change_tick_) < ANTI_BURN_IDLE_MS) {
+        return;
+    }
+
+    auto* theme = static_cast<LvglTheme*>(current_theme_);
+    auto collection = theme != nullptr ? theme->emoji_collection() : nullptr;
+    if (collection == nullptr) {
+        return;
+    }
+    auto names = collection->EnumNames();
+    if (names.size() < 2) {
+        return;
+    }
+
+    /* 最多试 8 次：要避开"和上次一样"以及 GIF（GIF 会一直播、反而更费电，
+     * 而且 lv_image_set_src 每帧刷新对防烧屏没意义）。 */
+    for (int attempt = 0; attempt < 8; ++attempt) {
+        const std::string& candidate = names[esp_random() % names.size()];
+        if (candidate == anti_burn_last_emoji_) {
+            continue;
+        }
+        if (collection->GetEmojiImage(candidate.c_str()) == nullptr) {
+            continue;   /* assets 里没这张（只有 PNG 集合里有的才可用） */
+        }
+        anti_burn_last_emoji_ = candidate;
+        ESP_LOGI(TAG, "防烧屏：空闲 %u 秒，表情轮换为 \"%s\"",
+                 (unsigned)(lv_tick_elaps(last_ui_change_tick_) / 1000),
+                 candidate.c_str());
+        SetEmotion(candidate.c_str());   /* 内部会重置 last_ui_change_tick_ */
+        return;
+    }
 }
 
 void LcdDisplay::SetTheme(Theme* theme) {
