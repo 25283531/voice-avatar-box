@@ -475,6 +475,54 @@ def main() -> int:
             fatal=True,
         )
 
+    # ------------------------------------------------------ 表情动图
+    # 帧数据（anim_frames.bin）是**生成物但入库**，索引头（anim_emoji_index.h）
+    # 和它必须同步。改了 tools/anim_emoji_pack.py 的 --frames / --size 之后
+    # 只重跑了一半，就会得到「bin 比索引头小」⇒ 运行时 dsc 指到越界地址，
+    # 表现是随机花屏（读 PSRAM/flash 映射区的脏数据），极难归因。
+    anim_dir = ROOT / "firmware" / "xiaozhi" / "main" / "display" / "lvgl_display" / "anim"
+    anim_bin = anim_dir / "anim_frames.bin"
+    anim_hdr = anim_dir / "anim_emoji_index.h"
+    if anim_bin.exists() and anim_hdr.exists():
+        hdr_text = anim_hdr.read_text(encoding="utf-8", errors="ignore")
+        m = re.search(r"kAnimEmojiBlobSize\s*=\s*(\d+)", hdr_text)
+        declared = int(m.group(1)) if m else -1
+        actual = anim_bin.stat().st_size
+        check(
+            "C8 动图帧数据与索引头同步",
+            declared == actual,
+            f"索引头声明 kAnimEmojiBlobSize={declared}，实际 bin={actual} 字节。"
+            f"改过 tools/anim_emoji_pack.py 的参数就重跑一遍生成"
+            if declared != actual else f"bin {actual} 字节与索引头一致",
+            fatal=True,
+        )
+        # 帧偏移必须首尾相接且落在 bin 内，否则中间有空洞/重叠
+        ok_layout = True
+        detail = ""
+        entries = re.findall(
+            r'\{"([^"]+)",\s*(\d+)u,\s*(\d+)u,\s*(\d+)u,\s*(\d+)u\}', hdr_text)
+        expect_off = 0
+        for name, off, nfr, fbytes, _side in entries:
+            off, nfr, fbytes = int(off), int(nfr), int(fbytes)
+            if off != expect_off:
+                ok_layout = False
+                detail = f"{name} 的 offset={off}，按前一条推算应为 {expect_off}"
+                break
+            if off + nfr * fbytes > actual:
+                ok_layout = False
+                detail = (f"{name} 末尾 {off + nfr * fbytes} 超出 bin 长度 {actual}")
+                break
+            expect_off = off + nfr * fbytes
+        if ok_layout and entries and expect_off != actual:
+            ok_layout = False
+            detail = f"所有动画合计 {expect_off} 字节，与 bin {actual} 字节不等（尾部有残留）"
+        check(
+            "C8b 动图索引的偏移首尾相接且不越界",
+            ok_layout and len(entries) > 0,
+            detail or f"{len(entries)} 个动画的偏移连续，合计 {expect_off} 字节",
+            fatal=True,
+        )
+
     # ------------------------------------------------------ 汇总
     failed = [r for r in results if not r[1] and r[3]]
     warned = [r for r in results if not r[1] and not r[3]]

@@ -15,5 +15,11 @@ main/mmap_generate_emoji.h
 .cache
 *.pyc
 *.bin
+# 表情动图的帧数据是**产物但必须入库**：CI 编译要 target_add_binary_data 它，
+# 而生成它需要访问 fonts.gstatic.com（CI 跑在境外能下，但构建机不一定）。
+# 入库能保证「谁编都一样」，且它是一次性产物（换素材才重新生成）。
+# 唯一约束：改了 tools/anim_emoji_pack.py 的帧数/尺寸后必须重跑生成，
+# prebuild_check.py 的 C8 会比对 bin 大小与索引头里的 kAnimEmojiBlobSize。
+!main/display/lvgl_display/anim/anim_frames.bin
 mmap_generate_*.h
 .clangd

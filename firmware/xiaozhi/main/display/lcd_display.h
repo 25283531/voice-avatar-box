@@ -62,6 +62,7 @@ protected:
     lv_timer_t* anti_burn_timer_ = nullptr;
     uint32_t last_ui_change_tick_ = 0;      /* lv_tick 毫秒 */
     std::string anti_burn_last_emoji_;      /* 上一次轮播选中的表情，避免连选同一张 */
+    std::string anti_burn_last_anim_;       /* 上一次轮播选中的动画名，同理 */
 
 protected:
     // Add protected constructor

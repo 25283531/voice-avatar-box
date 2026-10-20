@@ -1,5 +1,6 @@
 #include "lcd_display.h"
 #include "gif/lvgl_gif.h"
+#include "anim_emoji_player.h"
 #include "settings.h"
 #include "lvgl_theme.h"
 #include "assets/lang_config.h"
@@ -1056,6 +1057,11 @@ void LcdDisplay::SetEmotion(const char* emotion) {
         gif_controller_->Stop();
         gif_controller_.reset();
     }
+
+    /* 动图帧定时器必须在换图**之前**停掉：否则它会在这个函数把
+     * emoji_image_ 换成静态表情之后，继续把旧动画的下一帧怼回去，
+     * 表现为「表情闪一下就变了」或者干脆花屏。 */
+    AnimEmojiPlayer::Get().Stop();
     
     if (emoji_image_ == nullptr) {
         return;
@@ -1122,6 +1128,9 @@ void LcdDisplay::StartAntiBurnInTimer() {
     if (anti_burn_timer_ != nullptr || emoji_image_ == nullptr) {
         return;
     }
+    /* 动图和防烧屏是同一件事的两面，一起在这里初始化。
+     * Init() 幂等，且帧数据缺失时只是 Available()=false，不影响静态轮播。 */
+    AnimEmojiPlayer::Get().Init();
     last_ui_change_tick_ = lv_tick_get();
     /* lv_timer 回调必须是裸函数指针，所以用 user_data 带回 this。 */
     anti_burn_timer_ = lv_timer_create([](lv_timer_t* t) {
@@ -1137,6 +1146,30 @@ void LcdDisplay::AntiBurnInStep() {
      * 只在真正长时间静止时才轮换。 */
     if (lv_tick_elaps(last_ui_change_tick_) < ANTI_BURN_IDLE_MS) {
         return;
+    }
+
+    /* 优先播动图：静止这么久说明没人在用，放个会动的比一张死图更有生气，
+     * 而且「有东西在动」本身就是最好的防烧屏（像素一直在变）。
+     * 动图不参与对话状态：一旦有语音/通知，SetEmotion() 会先 Stop() 掉它。 */
+    auto& anim = AnimEmojiPlayer::Get();
+    if (anim.Available() && emoji_image_ != nullptr) {
+        const char* name = anim.RandomName(
+            anti_burn_last_anim_.empty() ? nullptr : anti_burn_last_anim_.c_str());
+        if (name != nullptr) {
+            const uint32_t idle_sec = lv_tick_elaps(last_ui_change_tick_) / 1000;
+            DisplayLockGuard lock(this);
+            if (anim.Play(emoji_image_, name)) {
+                anti_burn_last_anim_ = name;
+                if (emoji_label_ != nullptr) {
+                    lv_obj_add_flag(emoji_label_, LV_OBJ_FLAG_HIDDEN);
+                }
+                lv_obj_remove_flag(emoji_image_, LV_OBJ_FLAG_HIDDEN);
+                last_ui_change_tick_ = lv_tick_get();   /* 再等 60s 换下一个 */
+                ESP_LOGI(TAG, "防烧屏：空闲 %u 秒，播放动图 \"%s\"",
+                         (unsigned)idle_sec, name);
+                return;
+            }
+        }
     }
 
     auto* theme = static_cast<LvglTheme*>(current_theme_);

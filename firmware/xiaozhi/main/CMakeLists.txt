@@ -22,6 +22,9 @@ set(SOURCES "audio/audio_codec.cc"
             # 而它没有整体条件编译保护（654 行都会生成目标码）。
             # 真要恢复必须先改显示层依赖，不能只把这行加回来。
             "display/lvgl_display/emoji_collection.cc"
+            # 表情动图（Noto Animated Emoji → RGB565A8 帧序列）。
+            # 帧数据是 anim/anim_frames.bin，下面用 target_add_binary_data 嵌入。
+            "display/lvgl_display/anim_emoji_player.cc"
             "display/lvgl_display/lvgl_theme.cc"
             "display/lvgl_display/lvgl_font.cc"
             "display/lvgl_display/lvgl_image.cc"
@@ -721,12 +724,21 @@ idf_component_register(SRCS ${SOURCES}
                     WHOLE_ARCHIVE
                     )
 
+# 表情动图的帧数据（Noto Animated Emoji，64x64 RGB565A8，6 个动画 × 8 帧）
+# 生成方式：C:/Python314/python.exe tools/anim_emoji_pack.py \
+#             --out firmware/xiaozhi/main/display/lvgl_display/anim
+# ⚠️ 走 .bin + 嵌入而不是生成 .c 源码：同一份数据写成 "0x12," 文本会膨胀约 6 倍，
+#    仓库里躺 3MB 源码、每次编译都要重新解析。.bin 只有 576KB。
+# 符号名由 IDF 按**文件名**生成（见 tools/cmake/utilities.cmake 里
+# get_filename_component(... NAME)）：_binary_anim_frames_bin_start / _end。
+target_add_binary_data(${COMPONENT_LIB}
+                    "display/lvgl_display/anim/anim_frames.bin" BINARY)
+
 # Use target_compile_definitions to define BOARD_TYPE, BOARD_NAME
 # If BOARD_NAME is empty, use BOARD_TYPE
 if(NOT BOARD_NAME)
     set(BOARD_NAME ${BOARD_TYPE})
-endif()
-target_compile_definitions(${COMPONENT_LIB}
+endif()target_compile_definitions(${COMPONENT_LIB}
                     PRIVATE BOARD_TYPE=\"${BOARD_TYPE}\" BOARD_NAME=\"${BOARD_NAME}\"
                     PRIVATE BUILTIN_TEXT_FONT=${BUILTIN_TEXT_FONT} BUILTIN_ICON_FONT=${BUILTIN_ICON_FONT}
                     )
