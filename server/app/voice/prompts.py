@@ -20,6 +20,7 @@
 """
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Final
 
 #: 语音会话的基础 system prompt。拼接顺序：
@@ -70,3 +71,25 @@ LLM_NOT_CONFIGURED_MESSAGE: Final[str] = (
 #: ASR 未配置时的提示。没有 ASR 就收不到任何声音，直接说明比静默好。
 ASR_NOT_CONFIGURED_MESSAGE: Final[str] = (
     "我现在听不见，请让家人在管理后台配置好语音识别")
+
+
+#: 每轮注入的「当前时间」行。
+#:
+#: 为什么必须有：老人最高频的问题是「现在几点了」「今天几号」「星期几」，
+#: 而 system prompt 里原来**完全没有当前时间** —— 模型只能编或者答"我不知道"。
+#: 这不是能力问题，是缺一行上下文。加一行（约 30 token）就够，不必为此加工具。
+#:
+#: 时区必须用 schedule.TZ（与提醒调度同源）：两处时区不一致时，老人问
+#: "现在几点"答 8 点、提醒却在 9 点响，是最难解释的一类 bug。
+def now_context(now: datetime | None = None) -> str:
+    """拼出「现在是 2026年10月21日 星期三 06:30」这一行。
+
+    ``now`` 只在测试里传，生产走 ``schedule.local_now()``。
+    """
+    if now is None:
+        from ..schedule import local_now   # 延迟导入：prompts 被 voice 各模块引用，
+        now = local_now()                  # 顶层引 schedule 会拉进 models/sqlalchemy
+    weekday = "一二三四五六日"[now.weekday()]
+    return (f"现在是 {now.year}年{now.month}月{now.day}日 "
+            f"星期{weekday} {now.hour:02d}:{now.minute:02d}。\n"
+            "老人问几点、今天几号、星期几，直接按这一行回答，不要推算、不要猜。")

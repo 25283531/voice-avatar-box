@@ -55,6 +55,7 @@ from .prompts import (
     EMPTY_UTTERANCE_REPLY,
     LLM_NOT_CONFIGURED_MESSAGE,
     TOOL_LOOP_FALLBACK,
+    now_context,
 )
 from .tools import TOOL_DEFS, execute_tool
 
@@ -705,7 +706,7 @@ class VoiceSession:
                         self.session_id, type(exc).__name__, exc)
             memory_ctx = ""
 
-        system = BASE_VOICE_PROMPT
+        system = BASE_VOICE_PROMPT + "\n\n" + now_context()
         if memory_ctx:
             system = system + "\n\n" + memory_ctx
 
