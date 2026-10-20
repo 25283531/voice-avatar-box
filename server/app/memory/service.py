@@ -91,12 +91,26 @@ def memorize(
         ))
     db.flush()
 
+    # 🔴 原文落库后**立刻结束事务**（仅当调用方把提交权交给我们时）。
+    #
+    # 原实现在 flush() 之后直接跑 extract_facts()（一次 15~30s 的 LLM 调用）
+    # 和 cli.embed()（又一次网络往返），**整个期间持有 SQLite 写锁**。
+    # 后果不是「慢一点」：WAL 只让读写互不阻塞，写与写之间仍然互斥，
+    # 于是设备心跳（last_seen 更新）、token 记账、管理后台保存等所有写请求
+    # 全部排队等到 busy_timeout（15s）后抛 database is locked → HTTP 500。
+    # 线上症状就是「web 界面频繁无法访问」，且与 Docker 重启无关
+    # （容器 RestartCount=0，是请求层被锁堵死）。
+    #
+    # 拆成「短事务存原文 → 放锁 → 慢速抽取 → 新事务存事实」之后，
+    # 持锁时间从 15~30s 降到毫秒级。原文先落库也保证了抽取失败不丢数据。
+    if commit:
+        db.commit()
+
     # 2) 抽事实（失败返回 []，绝不抛异常，见 extract.py）
+    #    注意：此处已不持锁，慢速调用不再堵死其他写请求。
     known = store.entity_types(user_id, agent_id)
     facts: list[Fact] = extract_facts(turns, client=client, known_entities=known)
     if not facts:
-        if commit:
-            db.commit()
         return []
 
     # 3) 幂等去重：完全相同的句子不再写一条
