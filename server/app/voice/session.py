@@ -1023,6 +1023,11 @@ class _ReplySpeaker:
             log.info("[%s] 未配置 TTS，只发文本", s.session_id)
             self._tts_ok = False
         except Exception as exc:  # noqa: BLE001
+            # ⚠️ 必须同时把 _tts_ok 置 False：这一轮**没有任何音频**发出去，
+            # 而 finish() 的收尾日志本来只看这个标志。2026-10-20 的事故就是
+            # 「TTS 抛 TypeError 两次、日志仍写『播报完成（2 句，音频已发）』」，
+            # 排查时被这行日志带偏了两轮。
+            self._tts_ok = False
             log.warning("[%s] TTS 失败，跳过音频：%s: %s",
                         s.session_id, type(exc).__name__, exc)
 

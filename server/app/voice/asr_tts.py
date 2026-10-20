@@ -439,8 +439,14 @@ def tts_stream(db: Any, sentence: str, *, voice: str = "",
     # 症状是「非流式能出声、流式不出声」，属于最难自查的一类不一致。
     _style = _tts_dispatch_style(row)
     if _style in ("edge", "volcengine"):
-        for chunk in tts(db, sentence, voice=voice, speed=speed):
-            yield chunk
+        # ⚠️ 这两个分支的 tts() 返回**整段 bytes**，不是分片迭代器。
+        # 曾经写成 `for chunk in tts(...)`：bytes 被逐字节迭代 ⇒ chunk 是 int
+        # ⇒ 上层 session.py 的 `carry += chunk` 抛
+        # `TypeError: can't concat int to bytes`，老人一个字都听不到，
+        # 而 finish() 照样打印「音频已发」（假绿日志把这起事故藏了两周）。
+        # 这两条路径本身没有增量能力（Edge 要等整段解码完，火山是整包响应），
+        # 所以这里**整段 yield 一次**：行为与 tts() 等价，也不假装流式。
+        yield tts(db, sentence, voice=voice, speed=speed)
         return
 
     timeout = _row_timeout(row, TTS_TIMEOUT_SEC)
