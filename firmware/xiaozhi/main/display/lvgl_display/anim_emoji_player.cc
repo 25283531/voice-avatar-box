@@ -1,12 +1,11 @@
 #include "anim_emoji_player.h"
 
 #include <esp_log.h>
-#include <esp_random.h>
 #include <esp_heap_caps.h>
 
 #include <cstring>
 
-#include "anim_emoji_index.h"
+#include "anim/anim_emoji_index.h"
 
 #define TAG "AnimEmoji"
 
@@ -17,11 +16,6 @@ extern const uint8_t anim_frames_bin_start[] asm("_binary_anim_frames_bin_start"
 extern const uint8_t anim_frames_bin_end[]   asm("_binary_anim_frames_bin_end");
 
 namespace {
-
-/* 帧间隔。Noto 原 GIF 是 30ms/帧、58 帧；我们抽成 8 帧后，
- * 每帧 100ms ⇒ 一轮 0.8 秒，接近原速，又不会把刷屏总线占满。
- * 再快意义不大：320x240 屏一次全屏刷新就是 150KB。 */
-constexpr uint32_t kFrameIntervalMs = 100;
 
 /* 只允许在 PSRAM 上分配描述符池：内部 SRAM 在运行期只剩 45KB 上下
  * （见串口 SystemInfo 日志），几十个 dsc 塞进去会挤压音频缓冲。 */
@@ -89,10 +83,21 @@ void AnimEmojiPlayer::Init() {
     }
 
     available_ = true;
-    ESP_LOGI(TAG, "动图就绪：%u 个动画，%ux%u，最多 %u 帧，每帧 %ums，共 %u 字节",
+    ESP_LOGI(TAG, "动图就绪：%u 个动画，%ux%u，最多 %u 帧，共 %u 字节",
              (unsigned)kAnimEmojiCount, (unsigned)kAnimEmojiFrameSize,
              (unsigned)kAnimEmojiFrameSize, (unsigned)max_frames,
-             (unsigned)kFrameIntervalMs, (unsigned)blob_len);
+             (unsigned)blob_len);
+}
+
+uint16_t AnimEmojiPlayer::FrameMs(uint16_t idx) const {
+    if (current_ == nullptr) {
+        return 40;
+    }
+    const size_t at = (size_t)current_->ms_off + idx;
+    if (at >= kAnimEmojiFrameMsCount) {
+        return 40;   /* 索引头与时长表不同步时的兜底，别让定时器周期变 0 */
+    }
+    return kAnimEmojiFrameMs[at];
 }
 
 bool AnimEmojiPlayer::Has(const char* name) const {
@@ -107,18 +112,16 @@ bool AnimEmojiPlayer::Has(const char* name) const {
     return false;
 }
 
-const char* AnimEmojiPlayer::RandomName(const char* avoid) const {
+const char* AnimEmojiPlayer::DefaultName() const {
     if (!available_ || kAnimEmojiCount == 0) {
         return nullptr;
     }
-    /* 最多试 8 次避开上一次；全撞上就随便给一个（总比不换好） */
-    for (int attempt = 0; attempt < 8; ++attempt) {
-        const AnimEmojiEntry& e = kAnimEmojiTable[esp_random() % kAnimEmojiCount];
-        if (avoid == nullptr || strcmp(e.name, avoid) != 0) {
-            return e.name;
-        }
-    }
     return kAnimEmojiTable[0].name;
+}
+
+bool AnimEmojiPlayer::PlayDefault(lv_obj_t* img) {
+    const char* name = DefaultName();
+    return name != nullptr && Play(img, name);
 }
 
 bool AnimEmojiPlayer::Play(lv_obj_t* img, const char* name) {
@@ -143,12 +146,16 @@ bool AnimEmojiPlayer::Play(lv_obj_t* img, const char* name) {
 
     target_ = img;
     current_ = found;
+    current_index_ = index;
     frame_idx_ = 0;
 
     lv_image_set_src(img, &dscs_[index * dsc_stride_]);
+    /* 周期用第一帧的时长；之后每切一帧按该帧的时长重设（见 Step）。
+     * 这样「动作快的地方 30ms、停顿处 300ms」能原样还原，
+     * 而不用把定时器固定成最短周期去空转。 */
     timer_ = lv_timer_create([](lv_timer_t* t) {
         static_cast<AnimEmojiPlayer*>(lv_timer_get_user_data(t))->Step();
-    }, kFrameIntervalMs, this);
+    }, FrameMs(0), this);
     if (timer_ == nullptr) {
         ESP_LOGW(TAG, "帧定时器创建失败，退回静态帧");
         target_ = nullptr;
@@ -173,15 +180,19 @@ void AnimEmojiPlayer::Step() {
     }
 
     frame_idx_ = (uint16_t)((frame_idx_ + 1) % current_->frames);
-    /* 用当前动画在表里的下标算 dsc 位置 */
-    size_t index = 0;
-    for (size_t i = 0; i < kAnimEmojiCount; ++i) {
-        if (&kAnimEmojiTable[i] == current_) {
-            index = i;
-            break;
-        }
+    lv_image_set_src(target_, &dscs_[current_index_ * dsc_stride_ + frame_idx_]);
+
+    /* 下一帧该等多久：lv_timer 的周期就是「这一帧停留时间」。
+     * 先在回调里改周期再 reset，等价于「从现在起等 ms 毫秒」，
+     * 不会因为回调本身耗时把时间轴越拖越慢。 */
+    uint16_t ms = FrameMs(frame_idx_);
+    if (ms == 0) {
+        ms = 40;
     }
-    lv_image_set_src(target_, &dscs_[index * dsc_stride_ + frame_idx_]);
+    if (timer_ != nullptr) {
+        lv_timer_set_period(timer_, ms);
+        lv_timer_reset(timer_);
+    }
 }
 
 void AnimEmojiPlayer::Stop() {
@@ -191,5 +202,6 @@ void AnimEmojiPlayer::Stop() {
     }
     target_ = nullptr;
     current_ = nullptr;
+    current_index_ = 0;
     frame_idx_ = 0;
 }

@@ -67,9 +67,32 @@ private:
      * （2026-10-20），代价是整轮排查方向跑偏到麦克风/AEC 上。 */
     size_t FeedOne(WakeWord* engine, Framer& framer, const std::vector<int16_t>& data);
 
+    /* 装上 MultiNet 的命中回调。Initialize() 与懒加载两条路径共用，
+     * 避免两份回调各写一遍、改一个忘一个。 */
+    void WireMultinet();
+
+    /* 未绑定设备跳过 MultiNet 之后的「热启动」：绑定了就现建现起。
+     * 由 Feed() 低频调用（见 .cc 里的说明）。成功返回 true。 */
+    bool TryStartMultinet();
+
     std::unique_ptr<AfeWakeWord> wakenet_;
     std::unique_ptr<CustomWakeWord> multinet_;
     bool wakenet_ready_ = false;
+
+    /* ── 未绑定设备不跑 MultiNet（2026-10-20 用户拍板）──────────────
+     * 理由：MultiNet 在未绑定的设备上纯属空转 —— 它承载的是 9 条**离线
+     * 服药命令词**，而未绑定 = 服务端没有这台设备的提醒表，命令词认出来
+     * 也无处可报；唤醒兜底这时也不重要（设备还没进陪伴流程）。
+     * 代价是少一套 AFE + 一次 mn7 推理，音频线程和自己的 PSRAM 都省一份。
+     *
+     * 判据必须用 elder_sync_token_persisted()（直接读 NVS），
+     * **不能用 elder_net_has_token()**：开机顺序是 app.Start()（起 WakeWord）
+     * 在前、elder_sync_init() 在后 2 秒，用后者会把已绑定设备判成未绑定。 */
+    bool multinet_pending_ = false;      /* 跳过了、等绑定时再起 */
+    bool running_ = false;               /* Start() 是否已被调用过 */
+    uint32_t mn_probe_cnt_ = 0;          /* Feed() 里数帧，用来降频检查 */
+    AudioCodec* codec_ = nullptr;        /* 懒加载要用，Initialize 时存下 */
+    srmodel_list_t* models_ = nullptr;   /* 同上；由 AudioService 持有，生命周期更长 */
 
     size_t channels_ = 1;
     Framer wn_framer_;

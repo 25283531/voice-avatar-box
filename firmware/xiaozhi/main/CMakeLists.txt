@@ -724,11 +724,13 @@ idf_component_register(SRCS ${SOURCES}
                     WHOLE_ARCHIVE
                     )
 
-# 表情动图的帧数据（Noto Animated Emoji，64x64 RGB565A8，6 个动画 × 8 帧）
+# 表情动图的帧数据（Noto Animated Emoji，64x64 RGB565A8，熊猫 59 帧 / 2.4 秒）
 # 生成方式：C:/Python314/python.exe tools/anim_emoji_pack.py \
 #             --out firmware/xiaozhi/main/display/lvgl_display/anim
 # ⚠️ 走 .bin + 嵌入而不是生成 .c 源码：同一份数据写成 "0x12," 文本会膨胀约 6 倍，
-#    仓库里躺 3MB 源码、每次编译都要重新解析。.bin 只有 576KB。
+#    仓库里躺 3MB 源码、每次编译都要重新解析。.bin 只有 708KB。
+# ⚠️ 只有**一张**动画（空闲屏保）。曾经做过 6 个轮流放，但轮播只在空闲时触发，
+#    实际看不到几个，预算集中到一张才够把帧数做满、动作才平滑。
 # 符号名由 IDF 按**文件名**生成（见 tools/cmake/utilities.cmake 里
 # get_filename_component(... NAME)）：_binary_anim_frames_bin_start / _end。
 target_add_binary_data(${COMPONENT_LIB}

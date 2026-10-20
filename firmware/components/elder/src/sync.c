@@ -68,6 +68,10 @@ static struct {
     TaskHandle_t      report_task;
 } g;
 
+/* elder_sync_token_persisted() 的锁存位：一旦确认绑过就不再开 NVS，
+ * 因为该函数会被音频喂数据路径低频轮询（见函数注释）。 */
+static bool s_token_known;
+
 #define ELDER_REPORT_Q_LEN 8
 
 typedef struct {
@@ -898,9 +902,31 @@ esp_err_t elder_sync_set_token(const char *token)
         nvs_commit(h);
         nvs_close(h);
     }
+    if (token && token[0]) {
+        s_token_known = true;   /* 让 elder_sync_token_persisted() 立刻承认 */
+    }
     ESP_LOGI(TAG, "设备令牌已更新并保存");
     elder_sync_request_now();
     return ESP_OK;
+}
+
+bool elder_sync_token_persisted(void)
+{
+    /* 锁存：一旦确认绑过就不再开 NVS。本函数会被 DualWakeWord::Feed()
+     * 周期性调用（音频每帧一次的低频抽样），nvs_get_str 每次几十微秒，
+     * 不能当热路径用。
+     * 反向（token 被清空 = 解绑）只在后台重置设备时发生，那种场景本来就要
+     * 重启，锁存不会带来问题。 */
+    if (s_token_known) return true;
+
+    nvs_handle_t h;
+    if (nvs_open(NVS_NS, NVS_READONLY, &h) != ESP_OK) return false;
+    char tok[ELDER_NET_TOKEN_MAX];
+    size_t n = sizeof(tok);
+    bool ok = (nvs_get_str(h, NVS_KEY_TOK, tok, &n) == ESP_OK) && tok[0] != '\0';
+    nvs_close(h);
+    if (ok) s_token_known = true;
+    return ok;
 }
 
 esp_err_t elder_sync_request_now(void)

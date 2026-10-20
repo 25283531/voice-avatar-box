@@ -56,13 +56,13 @@ protected:
     virtual bool Lock(int timeout_ms = 0) override;
     virtual void Unlock() override;
 
-    /* 防烧屏：在 SetupUI 末尾启动，空闲时随机换表情（见文件顶部宏注释） */
+    /* 空闲屏保：在 SetupUI 末尾启动，静止 60s 后循环播放熊猫动图，
+     * 一有语境（SetEmotion / SetChatMessage）就停掉、回到静态表情图标。 */
     void StartAntiBurnInTimer();
     void AntiBurnInStep();
     lv_timer_t* anti_burn_timer_ = nullptr;
     uint32_t last_ui_change_tick_ = 0;      /* lv_tick 毫秒 */
-    std::string anti_burn_last_emoji_;      /* 上一次轮播选中的表情，避免连选同一张 */
-    std::string anti_burn_last_anim_;       /* 上一次轮播选中的动画名，同理 */
+    std::string anti_burn_last_emoji_;      /* 兜底轮播用：避免连选同一张 */
 
 protected:
     // Add protected constructor

@@ -475,6 +475,27 @@ def main() -> int:
             fatal=True,
         )
 
+    # ------------------------------------------------------ 未绑定不跑 MultiNet
+    # 判据必须是 elder_sync_token_persisted()（直接读 NVS），不能用
+    # elder_net_has_token()（读内存）。开机顺序是 app.Start() 起 WakeWord
+    # 在前、elder_sync_init() 在后 2 秒 —— 用内存版会把**已绑定设备**判成
+    # 未绑定，MultiNet 永远不起。症状是「绑定后唤醒召回下降、离线服药确认
+    # 失灵」，而日志里一切正常，属于极难归因的一类。
+    dua = ROOT / "firmware" / "xiaozhi" / "main" / "audio" / "wake_words" / "dual_wake_word.cc"
+    if dua.exists():
+        dua_text = dua.read_text(encoding="utf-8", errors="ignore")
+        check(
+            "C9 MultiNet 启停判据用的是 NVS 版绑定状态（elder_sync_token_persisted）",
+            "elder_sync_token_persisted" in dua_text
+            and "elder_net_has_token" not in dua_text,
+            "dual_wake_word.cc 里找不到 elder_sync_token_persisted，或误用了"
+            " elder_net_has_token（读内存，开机时序上会把已绑定设备判成未绑定）"
+            if ("elder_sync_token_persisted" not in dua_text
+                or "elder_net_has_token" in dua_text)
+            else "判据正确：读 NVS 的持久化令牌，与初始化顺序无关",
+            fatal=True,
+        )
+
     # ------------------------------------------------------ 表情动图
     # 帧数据（anim_frames.bin）是**生成物但入库**，索引头（anim_emoji_index.h）
     # 和它必须同步。改了 tools/anim_emoji_pack.py 的 --frames / --size 之后
@@ -500,10 +521,12 @@ def main() -> int:
         ok_layout = True
         detail = ""
         entries = re.findall(
-            r'\{"([^"]+)",\s*(\d+)u,\s*(\d+)u,\s*(\d+)u,\s*(\d+)u\}', hdr_text)
+            r'\{"([^"]+)",\s*(\d+)u,\s*(\d+)u,\s*(\d+)u,\s*(\d+)u,\s*(\d+)u\}', hdr_text)
         expect_off = 0
-        for name, off, nfr, fbytes, _side in entries:
+        total_frames = 0
+        for name, off, nfr, fbytes, _ms_off, _side in entries:
             off, nfr, fbytes = int(off), int(nfr), int(fbytes)
+            total_frames += nfr
             if off != expect_off:
                 ok_layout = False
                 detail = f"{name} 的 offset={off}，按前一条推算应为 {expect_off}"
@@ -520,6 +543,19 @@ def main() -> int:
             "C8b 动图索引的偏移首尾相接且不越界",
             ok_layout and len(entries) > 0,
             detail or f"{len(entries)} 个动画的偏移连续，合计 {expect_off} 字节",
+            fatal=True,
+        )
+        # 每帧一个时长，少一条运行时就会退化到 40ms 兜底 ⇒ 整段动画快慢错乱。
+        # 这条在只有一张动画时最容易漏：改帧数只重跑一半、时长表还是旧的。
+        m = re.search(r"kAnimEmojiFrameMsCount\s*=\s*sizeof\(kAnimEmojiFrameMs\)"
+                      r"\s*/\s*sizeof\(kAnimEmojiFrameMs\[0\]\)", hdr_text)
+        ms_vals = re.findall(r"(\d+)u,", hdr_text.split("kAnimEmojiFrameMs[]")[-1]
+                             .split("};")[0]) if "kAnimEmojiFrameMs[]" in hdr_text else []
+        check(
+            "C8c 动图时长表条数等于总帧数",
+            m is not None and len(ms_vals) == total_frames and total_frames > 0,
+            f"时长表 {len(ms_vals)} 条，帧数合计 {total_frames} —— 不等就说明索引头"
+            f"是半新半旧，重跑 tools/anim_emoji_pack.py 生成",
             fatal=True,
         )
 

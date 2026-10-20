@@ -84,6 +84,20 @@ esp_err_t elder_sync_start(void);
 /** 运行时更新令牌（激活完成后调用） */
 esp_err_t elder_sync_set_token(const char *token);
 
+/**
+ * @brief 设备是否已绑定（NVS 里持久化过 device token）。
+ *
+ * ⚠️ 别用 elder_net_has_token() 代替：那个读的是**内存里**的 token，
+ *    而开机顺序是 app.Start()（拉起 AudioService/WakeWord）→ 2 秒后
+ *    elder_bridge_start()（才 elder_sync_init 并恢复 token）。
+ *    在 WakeWord 初始化那一刻问 elder_net_has_token()，**已绑定的设备也会
+ *    回答 false**，于是 MultiNet 被误判为「未激活设备才不需要」而永远不起。
+ *
+ * 本函数直接读 NVS，与初始化顺序无关；结果锁存（一旦 true 就一直 true），
+ * 所以可以在音频喂数据的路径上周期性调用，不需要每次都开 NVS。
+ */
+bool elder_sync_token_persisted(void);
+
 /** 手动触发一次同步（开机 / 按键 / 提醒触发后都可调） */
 esp_err_t elder_sync_request_now(void);
 

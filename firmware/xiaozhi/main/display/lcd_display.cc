@@ -1148,27 +1148,29 @@ void LcdDisplay::AntiBurnInStep() {
         return;
     }
 
-    /* 优先播动图：静止这么久说明没人在用，放个会动的比一张死图更有生气，
-     * 而且「有东西在动」本身就是最好的防烧屏（像素一直在变）。
-     * 动图不参与对话状态：一旦有语音/通知，SetEmotion() 会先 Stop() 掉它。 */
+    /* 2026-10-20 用户拍板：空闲屏保 = **一只会动的动物，一直播着**。
+     *
+     * 之前是「每 60 秒从 6 个表情动画里随机换一个」，问题有两个：
+     *   1. 只在空闲时触发，实际能看到的机会很少，做 6 个浪费了 5 个
+     *   2. 每轮换一张 = 每 60 秒一次大跳变，反而不像「屏保」
+     * 现在：空闲就开播熊猫并**无限循环**，像素一直在变（这才真防烧屏）；
+     * 有人说话时 SetEmotion() 会先 Stop()，立刻回到语境对应的静态图标。
+     * 所以这里只需要「没在播就开播」，播着就什么都不做。 */
     auto& anim = AnimEmojiPlayer::Get();
+    if (anim.Playing()) {
+        return;
+    }
     if (anim.Available() && emoji_image_ != nullptr) {
-        const char* name = anim.RandomName(
-            anti_burn_last_anim_.empty() ? nullptr : anti_burn_last_anim_.c_str());
-        if (name != nullptr) {
-            const uint32_t idle_sec = lv_tick_elaps(last_ui_change_tick_) / 1000;
-            DisplayLockGuard lock(this);
-            if (anim.Play(emoji_image_, name)) {
-                anti_burn_last_anim_ = name;
-                if (emoji_label_ != nullptr) {
-                    lv_obj_add_flag(emoji_label_, LV_OBJ_FLAG_HIDDEN);
-                }
-                lv_obj_remove_flag(emoji_image_, LV_OBJ_FLAG_HIDDEN);
-                last_ui_change_tick_ = lv_tick_get();   /* 再等 60s 换下一个 */
-                ESP_LOGI(TAG, "防烧屏：空闲 %u 秒，播放动图 \"%s\"",
-                         (unsigned)idle_sec, name);
-                return;
+        const uint32_t idle_sec = lv_tick_elaps(last_ui_change_tick_) / 1000;
+        DisplayLockGuard lock(this);
+        if (anim.PlayDefault(emoji_image_)) {
+            if (emoji_label_ != nullptr) {
+                lv_obj_add_flag(emoji_label_, LV_OBJ_FLAG_HIDDEN);
             }
+            lv_obj_remove_flag(emoji_image_, LV_OBJ_FLAG_HIDDEN);
+            ESP_LOGI(TAG, "空闲屏保：静止 %u 秒，开始循环播放 \"%s\"",
+                     (unsigned)idle_sec, anim.DefaultName());
+            return;
         }
     }
 
@@ -1193,8 +1195,9 @@ void LcdDisplay::AntiBurnInStep() {
             continue;   /* assets 里没这张（只有 PNG 集合里有的才可用） */
         }
         anti_burn_last_emoji_ = candidate;
-        ESP_LOGI(TAG, "防烧屏：空闲 %u 秒，表情轮换为 \"%s\"",
-                 (unsigned)(lv_tick_elaps(last_ui_change_tick_) / 1000),
+        /* 走到这里说明动图不可用（帧数据缺失/描述符池分配失败），
+         * 退回静态轮换，至少还能防烧屏。这条分支正常情况下走不到。 */
+        ESP_LOGW(TAG, "防烧屏兜底：动图不可用，静态表情轮换为 \"%s\"",
                  candidate.c_str());
         SetEmotion(candidate.c_str());   /* 内部会重置 last_ui_change_tick_ */
         return;

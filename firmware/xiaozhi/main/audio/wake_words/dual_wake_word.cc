@@ -7,6 +7,9 @@
 
 #include "afe_wake_word.h"
 #include "custom_wake_word.h"
+/* 判「设备是否已绑定」用。必须是 elder_sync 的 NVS 版本，别换成 elder_net.h
+ * 的内存版 —— 原因见 Initialize() 里的长注释。 */
+#include "elder_sync.h"
 
 #define TAG "DualWakeWord"
 
@@ -27,24 +30,37 @@ bool DualWakeWord::Initialize(AudioCodec* codec, srmodel_list_t* models_list) {
         return false;
     }
     channels_ = (size_t)codec->input_channels();
+    codec_ = codec;          /* 懒加载 MultiNet 时要用 */
+    models_ = models_list;
 
-    /* 1) MultiNet 先起：它承载**离线服药命令词**，是功能刚需，
-     *    失败就等于老人说不出话也按不动（只剩按键），必须当致命错误上报。 */
-    multinet_ = std::make_unique<CustomWakeWord>();
-    if (!multinet_->Initialize(codec, models_list)) {
-        ESP_LOGE(TAG, "MultiNet 初始化失败 → 离线命令词不可用");
-        multinet_.reset();
-        return false;
-    }
-    multinet_->OnWakeWordDetected([this](const std::string& word) {
-        last_word_ = word;
-        fired_ = 2;
-        ESP_LOGI(TAG, "MultiNet 命中唤醒词：%s", word.c_str());
-        if (wake_word_detected_callback_) {
-            wake_word_detected_callback_(word);
+    /* 1) MultiNet：只在**已绑定**的设备上起。
+     *
+     * 为什么未绑定就不起：它承载的 9 条离线服药命令词在未绑定设备上
+     * 无处可报（服务端还没有这台设备的提醒表），唤醒兜底这时候也不重要。
+     * 少一套 AFE + 一次 mn7 推理，音频线程和自己的 PSRAM 都省一份。
+     *
+     * 为什么判据是 elder_sync_token_persisted()（读 NVS）而不是
+     * elder_net 的内存版取值接口（读内存）：开机顺序是 app.Start() 拉起
+     * AudioService/WakeWord，2 秒后 elder_bridge_start() 才 elder_sync_init()
+     * 并把 NVS 里的 token 恢复到内存。此刻问内存版，**已绑定的设备也会回答
+     * false**，MultiNet 就再也不会起了 —— 症状是「绑定后唤醒召回明显下降、
+     * 离线服药确认失灵」，而且日志看起来一切正常。 */
+    multinet_pending_ = !elder_sync_token_persisted();
+    if (!multinet_pending_) {
+        multinet_ = std::make_unique<CustomWakeWord>();
+        if (!multinet_->Initialize(codec, models_list)) {
+            /* 已绑定设备上这是硬伤：离线命令词是老人断网时唯一的自助确认手段。
+             * 仍然返回 false 让上层知道，但下面 WakeNet 继续起、不整体失败。 */
+            ESP_LOGE(TAG, "MultiNet 初始化失败 → 离线命令词不可用");
+            multinet_.reset();
+        } else {
+            WireMultinet();
+            mn_framer_.chunk = multinet_->GetFeedSize();
         }
-    });
-    mn_framer_.chunk = multinet_->GetFeedSize();
+    } else {
+        ESP_LOGW(TAG, "设备未绑定 → 暂不启动 MultiNet（绑定后自动热启动，无需重启）");
+        mn_framer_.chunk = 0;
+    }
 
     /* 2) WakeNet 尽力而起：模型没打进 assets / AFE 内存不够时**降级继续**，
      *    不能让整个唤醒功能起不来（MultiNet 仍在，只是召回差一些）。 */
@@ -72,6 +88,48 @@ bool DualWakeWord::Initialize(AudioCodec* codec, srmodel_list_t* models_list) {
              (unsigned)wn_framer_.chunk, (unsigned)mn_framer_.chunk,
              (unsigned)channels_);
     return true;
+}
+
+void DualWakeWord::WireMultinet() {
+    if (multinet_ == nullptr) {
+        return;
+    }
+    multinet_->OnWakeWordDetected([this](const std::string& word) {
+        last_word_ = word;
+        fired_ = 2;
+        ESP_LOGI(TAG, "MultiNet 命中唤醒词：%s", word.c_str());
+        if (wake_word_detected_callback_) {
+            wake_word_detected_callback_(word);
+        }
+    });
+}
+
+bool DualWakeWord::TryStartMultinet() {
+    if (multinet_ != nullptr || !multinet_pending_) {
+        return false;
+    }
+    if (elder_sync_token_persisted()) {
+        auto mn = std::make_unique<CustomWakeWord>();
+        if (!mn->Initialize(codec_, models_)) {
+            /* 分配/模型加载失败（PSRAM 碎片、WakeNet 的 AFE 已占大块）。
+             * 不清 multinet_pending_，下一个检查周期再试 —— 每 ~2 秒一次，
+             * 失败会刷日志，所以用 W 级而不是 E 级。 */
+            ESP_LOGW(TAG, "设备已绑定，但 MultiNet 暂时起不来（下次再试）");
+            return false;
+        }
+        WireMultinet();
+        mn_framer_.chunk = mn->GetFeedSize();
+        mn_framer_.buf.clear();
+        multinet_ = std::move(mn);
+        multinet_pending_ = false;
+        if (running_) {
+            multinet_->Start();
+        }
+        ESP_LOGI(TAG, "设备已绑定 → MultiNet 热启动完成（chunk=%u，离线命令词可用）",
+                 (unsigned)mn_framer_.chunk);
+        return true;
+    }
+    return false;
 }
 
 size_t DualWakeWord::FeedOne(WakeWord* engine, Framer& framer, const std::vector<int16_t>& data) {
@@ -142,6 +200,14 @@ void DualWakeWord::Feed(const std::vector<int16_t>& data) {
         wn_fed_ += (uint32_t)FeedOne(wakenet_.get(), wn_framer_, data);
     }
     mn_fed_ += (uint32_t)FeedOne(multinet_.get(), mn_framer_, data);
+
+    /* 未绑定设备跳过 MultiNet 之后，每 ~2 秒（64 帧 × 32ms）看一眼绑定状态。
+     * 绑定成功后在这里现建现起，不需要用户重启设备。
+     * ⚠️ 建引擎要加载 mn7 模型、几百毫秒，会卡住本次喂数据；
+     *    这是**一次性**代价，且发生在「刚绑定」那一刻，值得。 */
+    if (multinet_pending_ && (++mn_probe_cnt_ & 0x3F) == 0) {
+        TryStartMultinet();
+    }
 }
 
 void DualWakeWord::OnWakeWordDetected(std::function<void(const std::string&)> callback) {
@@ -151,6 +217,7 @@ void DualWakeWord::OnWakeWordDetected(std::function<void(const std::string&)> ca
 }
 
 void DualWakeWord::Start() {
+    running_ = true;
     if (wakenet_ready_) {
         wakenet_->Start();
     }
@@ -160,6 +227,7 @@ void DualWakeWord::Start() {
 }
 
 void DualWakeWord::Stop() {
+    running_ = false;
     if (wakenet_ready_) {
         wakenet_->Stop();
     }
