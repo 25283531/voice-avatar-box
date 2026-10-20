@@ -437,8 +437,16 @@ void Application::Start() {
     protocol_->OnAudioChannelClosed([this, &board]() {
         board.SetPowerSaveMode(true);
         Schedule([this]() {
-            auto display = Board::GetInstance().GetDisplay();
-            display->SetChatMessage("system", "");
+            // 🔴 这里**刻意不清空字幕**（2026-10-20，真机现象驱动）。
+            //
+            // 原实现是 `display->SetChatMessage("system", "")`：每轮音频通道一关
+            // 立刻把刚说的话擦掉。设备端 `sentence_start` 确实到了、`<< 文本`
+            // 也确实打进了串口日志，但老人在设备说完之后抬头看屏幕时，
+            // 字幕早就被这行清空了 —— 于是"屏幕上没有字幕"。
+            //
+            // 症状是「代码两侧都通、屏幕上却没有」，所以修法不是加显示，
+            // 而是**别在老人还没看完的时候擦掉**。字幕保留到下一次
+            // kDeviceStateConnecting（新一轮真正开始）时由 SetDeviceState 清。
             SetDeviceState(kDeviceStateIdle);
         });
     });

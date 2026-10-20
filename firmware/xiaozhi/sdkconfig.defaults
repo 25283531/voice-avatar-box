@@ -192,7 +192,13 @@ CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions/v2/16m.csv"
 CONFIG_USE_CUSTOM_WAKE_WORD=y
 CONFIG_CUSTOM_WAKE_WORD="ni hao xiao nuan"
 CONFIG_CUSTOM_WAKE_WORD_DISPLAY="你好，小暖"
-CONFIG_CUSTOM_WAKE_WORD_THRESHOLD=20
+# 唤醒阈值 2026-10-20 由 20 降到 12：
+# 真机实测（COM10，4 分钟静默抓取）老人连喊多遍，串口**零** `Custom wake word
+# detected` 行 —— 不是"偶尔不灵"，是基本不命中。理论上 MultiNet 的 det_threshold
+# 越低越容易触发，20 → 12 是保守下调（再低会开始把日常对话误当唤醒，
+# 而误唤醒对老人比"喊两遍"更烦）。若仍不灵，先按 BOOT 键（短按=ToggleChatState，
+# 见 lichuang_dev_board.cc:115），那条路不依赖语音识别。
+CONFIG_CUSTOM_WAKE_WORD_THRESHOLD=12
 # mn7_cn：官方推荐（S3/P4），比 mn6_cn 小约 1MB。
 # 模型 2671229 字节 + fst 9648 字节 = 2680877 字节，进 assets 分区。
 CONFIG_SR_MN_CN_MULTINET7_QUANT=y
