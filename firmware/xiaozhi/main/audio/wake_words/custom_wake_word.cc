@@ -7,6 +7,7 @@
 #include <esp_mn_iface.h>
 #include <esp_mn_models.h>
 #include <esp_mn_speech_commands.h>
+#include <esp_timer.h>
 #include <cJSON.h>
 
 // elder 离线命令词：词表本体 + 异步投递通道（C 链接，见 elder_mn.h）。
@@ -248,7 +249,18 @@ void CustomWakeWord::Stop() {
 }
 
 void CustomWakeWord::Feed(const std::vector<int16_t>& data) {
+    /* 探针：先记「被跳过」次数。running_ 为 false 时下面会直接 return，
+     * 那种情况下 calls 不涨、skipped 涨 —— 一眼区分「没跑」与「跑了但认不出」。 */
     if (multinet_model_data_ == nullptr || !running_) {
+        mn_probe_skipped_++;
+        int64_t now_ms = esp_timer_get_time() / 1000;
+        if (now_ms - mn_probe_last_ms_ >= 2000) {
+            ESP_LOGW(TAG, "MultiNet 探针：引擎未运行（跳过 %u 帧，running=%d，data=%p）",
+                     (unsigned)mn_probe_skipped_, (int)running_.load(),
+                     (void*)multinet_model_data_);
+            mn_probe_skipped_ = 0;
+            mn_probe_last_ms_ = now_ms;
+        }
         return;
     }
 
@@ -268,8 +280,19 @@ void CustomWakeWord::Feed(const std::vector<int16_t>& data) {
     }
     
     if (mn_state == ESP_MN_STATE_DETECTING) {
+        /* 探针：detect 调用本身在跑（说明数据到了模型），2 秒汇总一次。 */
+        mn_probe_calls_++;
+        int64_t now_ms = esp_timer_get_time() / 1000;
+        if (now_ms - mn_probe_last_ms_ >= 2000) {
+            ESP_LOGI(TAG, "MultiNet 探针：detect 调用=%u 次/2s，累计命中=%d（正在识别）",
+                     (unsigned)mn_probe_calls_, mn_probe_detected_);
+            mn_probe_calls_ = 0;
+            mn_probe_last_ms_ = now_ms;
+        }
         return;
     } else if (mn_state == ESP_MN_STATE_DETECTED) {
+        mn_probe_detected_++;
+        mn_probe_calls_++;
         esp_mn_results_t *mn_result = multinet_->get_results(multinet_model_data_);
         for (int i = 0; i < mn_result->num && running_; i++) {
             int id = mn_result->command_id[i];

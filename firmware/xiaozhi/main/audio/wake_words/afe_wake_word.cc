@@ -2,6 +2,7 @@
 #include "audio_service.h"
 
 #include <esp_log.h>
+#include <esp_timer.h>
 #include <sstream>
 
 #define DETECTION_RUNNING_EVENT 1
@@ -75,7 +76,13 @@ bool AfeWakeWord::Initialize(AudioCodec* codec, srmodel_list_t* models_list) {
     afe_config->aec_init = codec_->input_reference();
     afe_config->aec_mode = AEC_MODE_SR_HIGH_PERF;
     afe_config->afe_perferred_core = 1;
-    afe_config->afe_perferred_priority = 1;
+    /* 优先级必须是 5（esp-sr 官方默认），不能是 1。
+     * 2026-10-20 实测：设成 1 后日志反复刷
+     *   "AFE: Ringbuffer of AFE(FEED) is full, Please use fetch() to read data"
+     * —— 优先级 1 的 AFE 处理线程被 AudioInputTask / MultiNet / LVGL / WiFi
+     * 轮番抢占，pipeline 处理不过来，喂进去的音频在环形缓冲里被覆盖丢弃。
+     * 丢的是**唤醒词所在的那几帧**，症状就是「喊不醒」，而初始化日志全绿。 */
+    afe_config->afe_perferred_priority = 5;
     afe_config->memory_alloc_mode = AFE_MEMORY_ALLOC_MORE_PSRAM;
     
     afe_iface_ = esp_afe_handle_from_config(afe_config);
@@ -148,6 +155,23 @@ void AfeWakeWord::AudioDetectionTask() {
         auto res = afe_iface_->fetch_with_delay(afe_data_, portMAX_DELAY);
         if (res == nullptr || res->ret_value == ESP_FAIL) {
             continue;;
+        }
+
+        /* 探针（2026-10-20 诊断「喊不醒」）：证明 AFE 出口**真的在出数据**。
+         * fetch 出现即说明 AEC/VAD/WakeNet 整条 pipeline 在跑；
+         * 若这里恒 0（且伴随 "Ringbuffer of AFE(FEED) is full"），
+         * 那就是喂进去的音频在 AFE 出口被吞掉了，与唤醒词模型无关。 */
+        {
+            static uint32_t fetch_cnt = 0;
+            static int64_t fetch_probe_ms = 0;
+            fetch_cnt++;
+            int64_t now_ms = esp_timer_get_time() / 1000;
+            if (now_ms - fetch_probe_ms >= 2000) {
+                ESP_LOGI(TAG, "WakeNet 探针：AFE fetch=%u 次/2s（每次 %d 帧），最近状态=%d",
+                         (unsigned)fetch_cnt, (int)fetch_size, (int)res->wakeup_state);
+                fetch_cnt = 0;
+                fetch_probe_ms = now_ms;
+            }
         }
 
         // Store the wake word data for voice recognition, like who is speaking

@@ -74,18 +74,21 @@ bool DualWakeWord::Initialize(AudioCodec* codec, srmodel_list_t* models_list) {
     return true;
 }
 
-void DualWakeWord::FeedOne(WakeWord* engine, Framer& framer, const std::vector<int16_t>& data) {
+size_t DualWakeWord::FeedOne(WakeWord* engine, Framer& framer, const std::vector<int16_t>& data) {
     if (engine == nullptr || framer.chunk == 0) {
-        return;
+        return 0;
     }
     const size_t need = framer.chunk * channels_;
     framer.buf.insert(framer.buf.end(), data.begin(), data.end());
 
+    size_t fed = 0;
     while (framer.buf.size() >= need) {
         scratch_.assign(framer.buf.begin(), framer.buf.begin() + need);
         engine->Feed(scratch_);
         framer.buf.erase(framer.buf.begin(), framer.buf.begin() + need);
+        ++fed;
     }
+    return fed;
 }
 
 void DualWakeWord::Feed(const std::vector<int16_t>& data) {
@@ -136,22 +139,9 @@ void DualWakeWord::Feed(const std::vector<int16_t>& data) {
     }
 
     if (wakenet_ready_) {
-        size_t before = wn_framer_.buf.size();
-        FeedOne(wakenet_.get(), wn_framer_, data);
-        /* FeedOne 内部按 chunk 切帧，切了几帧 = 缓冲缩小量 / 一帧样本数 */
-        size_t need = wn_framer_.chunk * channels_;
-        if (need > 0 && wn_framer_.buf.size() < before) {
-            wn_fed_ += (uint32_t)((before - wn_framer_.buf.size()) / need);
-        }
+        wn_fed_ += (uint32_t)FeedOne(wakenet_.get(), wn_framer_, data);
     }
-    {
-        size_t before = mn_framer_.buf.size();
-        FeedOne(multinet_.get(), mn_framer_, data);
-        size_t need = mn_framer_.chunk * channels_;
-        if (need > 0 && mn_framer_.buf.size() < before) {
-            mn_fed_ += (uint32_t)((before - mn_framer_.buf.size()) / need);
-        }
-    }
+    mn_fed_ += (uint32_t)FeedOne(multinet_.get(), mn_framer_, data);
 }
 
 void DualWakeWord::OnWakeWordDetected(std::function<void(const std::string&)> callback) {

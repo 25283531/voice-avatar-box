@@ -60,7 +60,12 @@ private:
         std::vector<int16_t> buf;         /* 交织样本（帧 * channels） */
     };
 
-    void FeedOne(WakeWord* engine, Framer& framer, const std::vector<int16_t>& data);
+    /* 返回本次实际切出并喂给引擎的帧数。
+     * ⚠️ 别再用「缓冲变短了」来推断切了几帧：当缓冲恰好切到 0 时
+     * size==0 而 before 也可能刚是 0，`size < before` 恒假 ⇒ 探针恒报 0，
+     * 把「数据一直在正常喂」误读成「模型一帧没收到」。这个错判过一次
+     * （2026-10-20），代价是整轮排查方向跑偏到麦克风/AEC 上。 */
+    size_t FeedOne(WakeWord* engine, Framer& framer, const std::vector<int16_t>& data);
 
     std::unique_ptr<AfeWakeWord> wakenet_;
     std::unique_ptr<CustomWakeWord> multinet_;

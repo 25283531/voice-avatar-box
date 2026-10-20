@@ -77,6 +77,17 @@ private:
 
     void StoreWakeWordData(const std::vector<int16_t>& data);
     void ParseWakenetModelConfig();
+
+    /* MultiNet 探针（2026-10-20 诊断「喊不醒」）。
+     * 只观测不判定。判据：
+     *   · calls 恒 0  → Feed() 在 `!running_` 处提前返回，**引擎根本没在跑**，
+     *                   与模型好坏无关（上游命中一次后会 Stop，等应用层重启）
+     *   · calls 在涨但从未 DETECTED → 数据在进、模型认不出，问题在模型/阈值
+     *   · calls 在涨且出现 DETECTED  → 通路完全正常，问题在唤醒后的状态机 */
+    int64_t mn_probe_last_ms_ = 0;
+    uint32_t mn_probe_calls_ = 0;
+    uint32_t mn_probe_skipped_ = 0;
+    int mn_probe_detected_ = 0;
 };
 
 #endif
