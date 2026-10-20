@@ -105,6 +105,44 @@ static esp_err_t build_url(const char *path, char *out, size_t out_len)
     return ESP_OK;
 }
 
+/* ---- 响应体收集：必须走事件回调，不能 perform() 之后再 read ----
+ *
+ * ⚠️ 这是 2026-10-20 真机（COM10）钉死的第三个缺陷，只有一行日志可循：
+ *      W elder.net: 响应被截断: 0/… 字节（缓冲 2403）
+ *      E elder.sync: 响应不是合法 JSON（前 120 字节）:
+ *   而服务端明明回了 200 + 合法 JSON。
+ *
+ * 原因在 IDF v5.5.1 的实现里：esp_http_client_perform() 内部会
+ *      while (client->response->data_process < client->response->content_length)
+ *          esp_http_client_get_data(client);
+ * 也就是**整个响应体在 perform 里就被读完丢弃**（本该交给
+ * HTTP_EVENT_ON_DATA 回调），之后 esp_http_client_read() 一律返回 0。
+ * ⇒ 「连得上、状态码 200、读不到内容」。
+ *
+ * 所以：响应体只能在事件回调里收。谁把它改回 perform 后再 read，谁的
+ * 同步就会回到「静默拿到空串」——比崩溃更难查，别改。 */
+typedef struct {
+    char  *buf;
+    size_t cap;        /* 含结尾 \0 的容量 */
+    size_t len;
+    bool   truncated;
+} resp_sink_t;
+
+static esp_err_t on_http_event(esp_http_client_event_t *ev)
+{
+    if (ev->event_id != HTTP_EVENT_ON_DATA) return ESP_OK;
+    resp_sink_t *s = (resp_sink_t *)ev->user_data;
+    if (!s || !s->buf || s->cap == 0 || ev->data_len <= 0) return ESP_OK;
+    size_t room = s->cap - 1 - s->len;          /* 留 1 字节给结尾 \0 */
+    size_t n = (size_t)ev->data_len < room ? (size_t)ev->data_len : room;
+    if (n > 0) {
+        memcpy(s->buf + s->len, ev->data, n);
+        s->len += n;
+    }
+    if (n < (size_t)ev->data_len) s->truncated = true;
+    return ESP_OK;
+}
+
 /* 统一的请求执行器 */
 static esp_err_t perform(esp_http_client_method_t method, const char *path,
                          const char *body, char *resp, size_t *resp_len, int *status)
@@ -122,6 +160,8 @@ static esp_err_t perform(esp_http_client_method_t method, const char *path,
     if (resp_len) *resp_len = 0;
     if (status) *status = 0;
 
+    resp_sink_t sink = {.buf = resp, .cap = cap, .len = 0, .truncated = false};
+
     esp_http_client_config_t cfg = {
         .url = url,
         .method = method,
@@ -131,6 +171,9 @@ static esp_err_t perform(esp_http_client_method_t method, const char *path,
         /* 不要 keep-alive：老人设备长时间离线，连接池反而增加出错面 */
         .keep_alive_enable = false,
         .buffer_size = 2048,
+        /* 响应体从这里收（见 resp_sink_t 上方的长注释） */
+        .event_handler = on_http_event,
+        .user_data = &sink,
         /* 🔴 必须挂证书包（2026-10-20，真机 COM10 实证）：
          * 后端是 https://152.136.230.132，本结构体若不填任何 cert 相关字段，
          * esp-tls 会在建连前就报
@@ -165,8 +208,11 @@ static esp_err_t perform(esp_http_client_method_t method, const char *path,
 
     if (err != ESP_OK) {
         /* 网络层失败：DNS/连接/超时都在这里 */
-        ESP_LOGW(TAG, "%s %s 失败: %s (%lldms)", method == HTTP_METHOD_POST ? "POST" : "GET",
-                 path, esp_err_to_name(err), cost_ms);
+        /* ⚠️ 这里不能用 %lld：本工程 CONFIG_LIBC_NEWLIB_NANO_FORMAT=y，
+         * nano-printf 不支持 64 位长度修饰符，真机打出来的是字面量
+         * 「(ldms)」——2026-10-20 排查时这行日志差点被当成正常输出忽略。 */
+        ESP_LOGW(TAG, "%s %s 失败: %s (%dms)", method == HTTP_METHOD_POST ? "POST" : "GET",
+                 path, esp_err_to_name(err), (int)cost_ms);
         res = (err == ESP_ERR_HTTP_CONNECT || err == ESP_ERR_HTTP_CONNECTING)
               ? ESP_ERR_TIMEOUT : err;
         goto done;
@@ -175,32 +221,24 @@ static esp_err_t perform(esp_http_client_method_t method, const char *path,
     int code = esp_http_client_get_status_code(cli);
     if (status) *status = code;
 
-    int64_t total = esp_http_client_get_content_length(cli);
-
     if (code >= 200 && code < 300) {
+        /* 响应体已经在 on_http_event 里收进 sink（perform 之后 read 恒为 0） */
         if (resp && cap > 0) {
-            /* 分段读取，最多读 cap-1 字节，保证结尾有 \0 */
-            int read = 0, remain = (int)(cap - 1);
-            while (remain > 0) {
-                int r = esp_http_client_read(cli, resp + read, remain);
-                if (r <= 0) break;
-                read += r;
-                remain -= r;
-            }
-            resp[read] = '\0';
-            if (resp_len) *resp_len = (size_t)read;
-            if (total > 0 && (int64_t)read < total) {
-                ESP_LOGW(TAG, "响应被截断: %d/%lld 字节（缓冲 %u）", read, total, (unsigned)cap);
+            resp[sink.len] = '\0';
+            if (resp_len) *resp_len = sink.len;
+            if (sink.truncated) {
+                ESP_LOGW(TAG, "%s 响应超出缓冲（%u 已收，最多 %u），已截断",
+                         path, (unsigned)sink.len, (unsigned)(cap - 1));
             }
         }
         g.online = true;
         g.last_ok_us = esp_timer_get_time();
-        ESP_LOGD(TAG, "%s -> %d (%d bytes, %lldms)", path, code,
-                 resp_len ? (int)*resp_len : 0, cost_ms);
+        ESP_LOGD(TAG, "%s -> %d (%u bytes, %dms)", path, code,
+                 (unsigned)sink.len, (int)cost_ms);
         res = ESP_OK;
     } else {
         /* 业务层错误：不算网络失败，不触发退避阶梯 */
-        ESP_LOGW(TAG, "%s -> HTTP %d (%lldms)", path, code, cost_ms);
+        ESP_LOGW(TAG, "%s -> HTTP %d (%dms)", path, code, (int)cost_ms);
         res = ESP_ERR_INVALID_RESPONSE;
         if (code >= 500) {
             /* 服务端故障按网络问题处理，稍后重试 */

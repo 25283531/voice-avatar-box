@@ -223,7 +223,8 @@ esp_err_t elder_time_apply_server_time(const char *iso)
 
     char buf[32];
     elder_time_iso_local(local_epoch, buf, sizeof(buf));
-    ESP_LOGI(TAG, "校时完成: 服务器 %s (epoch %lld)", buf, (long long)local_epoch);
+    /* %lld 在 nano-printf（CONFIG_LIBC_NEWLIB_NANO_FORMAT=y）下会打成字面量 */
+    ESP_LOGI(TAG, "校时完成: 服务器 %s (epoch %d)", buf, (int)local_epoch);
     return ESP_OK;
 }
 
