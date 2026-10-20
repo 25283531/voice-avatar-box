@@ -591,8 +591,6 @@ endif()
 if(CONFIG_IDF_TARGET_ESP32S3 OR CONFIG_IDF_TARGET_ESP32P4)
     list(APPEND SOURCES "audio/wake_words/afe_wake_word.cc")
     list(APPEND SOURCES "audio/wake_words/custom_wake_word.cc")
-    # 双引擎（WakeNet + MultiNet 同时跑）：见 dual_wake_word.h 头注释
-    list(APPEND SOURCES "audio/wake_words/dual_wake_word.cc")
 else()
     list(APPEND SOURCES "audio/wake_words/esp_wake_word.cc")
 endif()

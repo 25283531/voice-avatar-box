@@ -3,7 +3,7 @@
  * 覆盖的断言都对应医疗事故级的失效（详见 Makefile 顶部说明）：
  *   T1  提醒时间存本地（NVS）—— 断网重启后提醒还在
  *   T2  replace_all 不抹掉本地自建 —— 一次心跳同步不该让老人的服药提醒消失
- *   T3  断网新建 + 断网确认 + 确认方式正确回传
+ *   T3  （已删除）断网新建 + 断网确认 —— 2026-10-20 回归上游小智，离线命令词全删
  *   T4  时钟不可信时不触发 —— 响错时间比不提醒更危险
  *   T5  本地日界不错判 —— 08:00 不是「新的一天」
  *   T6  跨天真的重置 —— 第二天提醒仍要响
@@ -18,8 +18,6 @@
 #include "stubs.h"
 
 #include "elder_reminder.h"
-#include "elder_cmd.h"
-#include "elder_cmd_words.h"
 #include "elder_ui.h"
 
 #include <stdarg.h>
@@ -262,159 +260,6 @@ static void test_replace_all_keeps_local(void)
     check("表不超过 16 条上限", t && t->count <= ELDER_REMINDER_MAX,
           det("实际 count=%u（上限 %d），%s",
               t ? t->count : 0, ELDER_REMINDER_MAX, dump_tbl(t)));
-}
-
-/* =================================================================== */
-/* T3：断网新建 + 断网确认（命令词分发器）                                 */
-/* =================================================================== */
-static void test_offline_command_dispatch(void)
-{
-    printf("\n[T3] 断网新建服药提醒 + 断网语音确认\n");
-    stub_nvs_init();
-    stub_time_set(1772665200L);
-    elder_reminder_init(NULL, NULL);
-
-    /* --- 词表自检：不能有重复短语（重复会让 MultiNet 注册冲突） --- */
-    int n = elder_cmd_word_count();
-    check("词表非空", n > 0, NULL);
-    int dup = 0;
-    for (int i = 0; i < n; i++) {
-        for (int j = i + 1; j < n; j++) {
-            const elder_cmd_word_t *a = elder_cmd_word_at(i);
-            const elder_cmd_word_t *b = elder_cmd_word_at(j);
-            if (a && b && strcmp(a->phrase, b->phrase) == 0) dup++;
-        }
-    }
-    check("词表无重复短语", dup == 0, NULL);
-
-    /* --- 词表自检：每条都必须带拼音（MultiNet 的注册单元） ---
-     * MultiNet 中文模型识别的是拼音音节（mn7_cn/vocab 里的 405 个音节），
-     * 不是汉字。拼音留空 → esp_mn_commands_add() 直接 return
-     * ESP_ERR_INVALID_STATE 且不挂链表 → 那条命令**永远不会被识别**，
-     * 而固件不会因此报错，只会安静地少一条功能。
-     * 「以为装好了其实没装」在医疗设备上等于漏一次服药提醒。 */
-    int missing_pinyin = 0;
-    int bad_pinyin = 0;
-    char missing_list[192];
-    missing_list[0] = '\0';
-    for (int i = 0; i < n; i++) {
-        const elder_cmd_word_t *w = elder_cmd_word_at(i);
-        if (!w) continue;
-        if (w->pinyin == NULL || w->pinyin[0] == '\0') {
-            missing_pinyin++;
-            snprintf(missing_list + strlen(missing_list),
-                     sizeof(missing_list) - strlen(missing_list),
-                     "%s\"%s\"", missing_list[0] ? ", " : "", w->phrase);
-            continue;
-        }
-        /* 格式：小写字母与空格。混入汉字/数字/符号都会被模型判为无法解析。
-         * 声调也不能带（"ni3 hao3" 非法），FST 表 commands_cn.txt 就是基准。 */
-        for (const char *p = w->pinyin; *p; p++) {
-            if (!((*p >= 'a' && *p <= 'z') || *p == ' ')) { bad_pinyin++; break; }
-        }
-    }
-    check("词表每条都带拼音（否则 MultiNet 会静默不注册该命令）",
-          missing_pinyin == 0,
-          det("%d 条缺拼音：%s", missing_pinyin, missing_list));
-    check("词表拼音格式合法（只含小写字母与空格，不带声调）",
-          bad_pinyin == 0,
-          det("%d 条拼音含非法字符", bad_pinyin));
-
-    /* --- 拼音也不能重复 ---
-     * esp_mn_commands_add() 遇到已存在的短语只改 command_id 不报错，
-     * 两条不同汉字映射到同一串拼音时，后者会把前者的 id 顶掉，
-     * 于是老人说那句话执行的是**另一条**命令。 */
-    int dup_pinyin = 0;
-    for (int i = 0; i < n; i++) {
-        for (int j = i + 1; j < n; j++) {
-            const elder_cmd_word_t *a = elder_cmd_word_at(i);
-            const elder_cmd_word_t *b = elder_cmd_word_at(j);
-            if (a && b && a->pinyin && b->pinyin && strcmp(a->pinyin, b->pinyin) == 0) dup_pinyin++;
-        }
-    }
-    check("词表无重复拼音（重复会让 id 被顶掉，说 A 执行 B）",
-          dup_pinyin == 0,
-          det("%d 条拼音重复", dup_pinyin));
-
-    /* --- 词表必须保守：不能有删除/改期类命令 ---
-     * 误识别删除一条服药提醒不可逆，所以只允许 create/confirm/query。 */
-    int destructive = 0;
-    for (int i = 0; i < n; i++) {
-        const elder_cmd_word_t *w = elder_cmd_word_at(i);
-        if (!w) continue;
-        if (w->action != ELDER_CMD_CREATE_MORNING && w->action != ELDER_CMD_CREATE_NOON &&
-            w->action != ELDER_CMD_CREATE_EVENING && w->action != ELDER_CMD_CREATE_ALL &&
-            w->action != ELDER_CMD_CONFIRM &&
-            w->action != ELDER_CMD_QUERY_NEXT && w->action != ELDER_CMD_QUERY_TODAY) {
-            destructive++;
-        }
-    }
-    check("词表不含删除/改期类危险命令", destructive == 0, NULL);
-
-    /* --- 断网新建：命令词 -> 本地提醒（server_id=0） --- */
-    elder_cmd_result_t r;
-    check("识别「新建早上吃药提醒」",
-          elder_cmd_dispatch("新建早上吃药提醒", &r) == ESP_OK && r.recognized, r.feedback);
-    const elder_rmd_table_t *t = tbl();
-    check("已写入 08:00 早上的药",
-          t && find_idx(t, 8, 0, "早上的药") >= 0,
-          det("08:00「早上的药」idx=%d，%s", t ? find_idx(t, 8, 0, "早上的药") : -1, dump_tbl(t)));
-    check("新建的是 server_id==0 的本地提醒",
-          t && t->items[find_idx(t, 8, 0, "早上的药")].server_id == 0,
-          det("server_id=%u（0=设备本地自建），%s",
-              t ? t->items[find_idx(t, 8, 0, "早上的药")].server_id : 0xFFFFFFFF, dump_tbl(t)));
-
-    /* 重复说同一句不应建出第二条（老人会连着说两遍） */
-    int before = tbl()->count;
-    elder_cmd_dispatch("新建早上吃药提醒", &r);
-    check("重复新建不产生第二条", tbl()->count == before,
-          "count 未变（已存在时明确告知）");
-
-    /* --- 断网确认：到点触发 -> 说「吃过了」-> 完成 --- */
-    stub_time_advance(3600);      /* 08:00 到点 */
-    elder_reminder_tick_once();
-    t = tbl();
-    int idx = find_idx(t, 8, 0, "早上的药");
-    check("08:00 已触发待确认", t && idx >= 0 && (t->done_today & (1u << idx)) == 0, NULL);
-
-    check("识别「吃过了」",
-          elder_cmd_dispatch("吃过了", &r) == ESP_OK && r.recognized, r.feedback);
-    t = tbl();
-    check("确认后标记为已完成",
-          t && idx >= 0 && (t->done_today & (1u << idx)) != 0, r.feedback);
-
-    /* 确认方式必须是「语音」（1），不能被误报成按键（2）——
-     * 子女端靠它算依从率，误报会让数据不可信。 */
-    check("确认方式记为语音(VOICE=1)",
-          elder_reminder_last_confirm_method() == 1,
-          "实际 method 应为 1");
-
-    /* --- 没响过的提醒不能被「吃过了」误确认 ---
-     * 老人一天里可能说好几遍「吃过了」：第一遍确认 08:00 那条，
-     * 后面几遍如果去确认一条从没响过的提醒，就等于凭空记了一次服药完成，
-     * 子女端看到的是「按时服药」，实际老人压根没到点。这属于假绿，
-     * 必须由 find_confirmable() 挡住。 */
-    elder_cmd_dispatch("新建晚上吃药提醒", &r);
-    t = tbl();
-    check("已建 20:00 晚上的药", t && find_idx(t, 20, 0, "晚上的药") >= 0,
-          det("20:00「晚上的药」idx=%d，%s", t ? find_idx(t, 20, 0, "晚上的药") : -1, dump_tbl(t)));
-
-    elder_cmd_dispatch("吃过了", &r);      /* 再说一遍，不应确认 20:00 那条 */
-    t = tbl();
-    int idx2 = find_idx(t, 20, 0, "晚上的药");
-    check("今天没响过的提醒不被误确认",
-          t && idx2 >= 0 && (t->done_today & (1u << idx2)) == 0,
-          "20:00 未到点，不应被记为已完成");
-    check("重复说「吃过了」被明确拒绝而非误确认",
-          strstr(r.feedback, "没有需要确认") != NULL, r.feedback);
-
-    /* --- 未识别的语句必须老实说没听懂，不能瞎猜（宁可走按键） --- */
-    check("无关语句不被误命中",
-          elder_cmd_dispatch("今天天气怎么样", &r) != ESP_OK && !r.recognized, NULL);
-
-    /* --- 查询类 --- */
-    check("查询下一个提醒", elder_cmd_dispatch("下一个提醒", &r) == ESP_OK, r.feedback);
-    check("查询今天的提醒", elder_cmd_dispatch("今天的提醒", &r) == ESP_OK, r.feedback);
 }
 
 /* =================================================================== */
@@ -1520,7 +1365,6 @@ int main(void)
     printf("=== elder 断网链路宿主测试 ===\n");
     test_local_persistence();
     test_replace_all_keeps_local();
-    test_offline_command_dispatch();
     test_untrusted_clock_guard();
     test_local_day_boundary();
     test_next_day_fires_again();

@@ -20,12 +20,19 @@
 
 #include "elder_net.h"
 #include "elder_reminder.h"
+#include "elder_rtc.h"
 
 static const char *TAG = "elder.sync";
 
 #define NVS_NS       "elder_sync"
 #define NVS_KEY_Q    "evtq"
 #define NVS_KEY_TOK  "token"
+#define NVS_KEY_EPOCH "epoch"   /* 最后一次联网校时的 UTC epoch，无 RTC 时兜底 */
+
+/* 低于这个时刻认为时钟不可信（未校时/掉电归零）。
+ * 与 reminder.c 的 ELDER_MIN_TRUSTED_EPOCH 同值同义 —— 那边是"不响"的闸门，
+ * 这边是"不采信"的闸门，两处必须一致，否则会出现"时间被采信但提醒不响"的怪状态。 */
+#define ELDER_TIME_MIN_TRUSTED 1577836800L   /* 2020-01-01T00:00:00Z */
 
 #ifndef CONFIG_ELDER_SYNC_INTERVAL_SEC
 #define CONFIG_ELDER_SYNC_INTERVAL_SEC 300
@@ -180,6 +187,83 @@ static time_t elder_utc_epoch(const struct tm *tm)
     return (time_t)(days * 86400 + tm->tm_hour * 3600 + tm->tm_min * 60 + tm->tm_sec);
 }
 
+/* ---------------------------------------------------------------- 时间基准
+ *
+ * 设备没有电池供电的 RTC 时，`settimeofday` 的结果在**完全断电后丢失**
+ * （ESP32 的 RTC 域只扛软复位/看门狗复位，扛不住拔电）。
+ * 于是掉电重启 + 无网 = 时钟停在 1970 → reminder.c 的可信时间守卫主动暂停
+ * → 当天所有提醒一条不响，而屏幕一切正常，老人和子女都察觉不到。
+ *
+ * 这里做两件事：
+ *   1) 每次联网校时成功后，把 epoch 落 NVS（近似兜底）；
+ *   2) 开机时按 RTC → NVS 的顺序恢复时钟（见 elder_time_restore_boot）。
+ */
+
+static void epoch_save(time_t t)
+{
+    nvs_handle_t h;
+    if (nvs_open(NVS_NS, NVS_READWRITE, &h) != ESP_OK) return;
+    nvs_set_i64(h, NVS_KEY_EPOCH, (int64_t)t);
+    nvs_commit(h);
+    nvs_close(h);
+}
+
+#if CONFIG_ELDER_TIME_NVS_FALLBACK
+static time_t epoch_load(void)
+{
+    nvs_handle_t h;
+    int64_t v = 0;
+    if (nvs_open(NVS_NS, NVS_READONLY, &h) != ESP_OK) return 0;
+    if (nvs_get_i64(h, NVS_KEY_EPOCH, &v) != ESP_OK) v = 0;
+    nvs_close(h);
+    return (time_t)v;
+}
+#endif
+
+/*
+ * 开机恢复时钟。必须在 reminder 引擎开始 tick 之前调用。
+ *
+ * 三级降级：
+ *   1) DS3231 且 OSF=0   → 采信（精确）
+ *   2) NVS 里的上次校时  → 采信但**标为近似**（关机时长未知，会偏慢）
+ *   3) 都没有            → 什么都不做，让 reminder.c 的守卫暂停并屏显提示
+ *
+ * ⚠️ 第 2 级是"宁可偏差也别静默"的取舍，不是精确方案：断电 3 天再开机，
+ *    时间就慢 3 天，日提醒的星期判断会错。所以它必须配合"联网后立刻校正"，
+ *    并且**不能**用于任何对外宣称时间的场景。
+ */
+esp_err_t elder_time_restore_boot(void)
+{
+    time_t t = 0;
+
+    esp_err_t err = elder_rtc_read(&t);
+    if (err == ESP_OK && t >= (time_t)ELDER_TIME_MIN_TRUSTED) {
+        struct timeval tv = { .tv_sec = t, .tv_usec = 0 };
+        settimeofday(&tv, NULL);
+        g.time_synced = true;
+        ESP_LOGI(TAG, "开机时钟来源: DS3231（%d）", (int)t);
+        return ESP_OK;
+    }
+    if (err == ESP_OK) {
+        ESP_LOGW(TAG, "RTC 读数早于 2020，判为不可信，转 NVS 兜底");
+    }
+
+#if CONFIG_ELDER_TIME_NVS_FALLBACK
+    time_t saved = epoch_load();
+    if (saved >= (time_t)ELDER_TIME_MIN_TRUSTED) {
+        struct timeval tv = { .tv_sec = saved, .tv_usec = 0 };
+        settimeofday(&tv, NULL);
+        /* 刻意不置 g.time_synced：这是近似值，不是"已校时" */
+        ESP_LOGW(TAG, "开机时钟来源: NVS 近似值（关机时长未知，可能偏慢），"
+                      "联网后立即校正");
+        return ESP_OK;
+    }
+#endif
+
+    ESP_LOGW(TAG, "无可用时间源：时钟停在 1970，提醒将暂停直到联网校时");
+    return ESP_ERR_NOT_FOUND;
+}
+
 /*
  * 后端 /api/device/sync 返回的 server_time 是**带偏移的 ISO8601**
  * （Pydantic 序列化 aware datetime，如 "2026-10-15T09:30:00+08:00"）。
@@ -244,6 +328,17 @@ esp_err_t elder_time_apply_server_time(const char *iso)
 
     g.time_synced = true;
     g.last_server_time = utc_epoch;   /* 语义是 UTC epoch，不是墙上时间 */
+
+    /* 校时结果必须**落两处**：
+     *   - NVS：无 RTC 时掉电重启的近似兜底；
+     *   - RTC：有 DS3231 时下次掉电可精确恢复（写失败只告警，不影响本次校时）。 */
+    epoch_save(utc_epoch);
+    if (elder_rtc_present()) {
+        esp_err_t rtc_err = elder_rtc_write(utc_epoch);
+        if (rtc_err != ESP_OK) {
+            ESP_LOGW(TAG, "回写 RTC 失败: %s（本次校时仍生效）", esp_err_to_name(rtc_err));
+        }
+    }
 
     char buf[32];
     elder_time_iso_local(utc_epoch, buf, sizeof(buf));
@@ -912,7 +1007,7 @@ esp_err_t elder_sync_set_token(const char *token)
 
 bool elder_sync_token_persisted(void)
 {
-    /* 锁存：一旦确认绑过就不再开 NVS。本函数会被 DualWakeWord::Feed()
+    /* 锁存：一旦确认绑过就不再开 NVS。本函数会被唤醒引擎的音频任务（如 AfeWakeWord::Feed()）
      * 周期性调用（音频每帧一次的低频抽样），nvs_get_str 每次几十微秒，
      * 不能当热路径用。
      * 反向（token 被清空 = 解绑）只在后台重置设备时发生，那种场景本来就要

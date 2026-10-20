@@ -211,58 +211,18 @@ CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
 CONFIG_SPIRAM=y
 CONFIG_SPIRAM_MODE_OCT=y
 CONFIG_SPIRAM_SPEED_80M=y
-# 分区表：v2/16m.csv（含 8MB assets 分区，存放 EAF 形象包 + MultiNet 模型）
+# 分区表：v2/16m.csv（含 8MB assets 分区，存放 EAF 形象包 + 唤醒模型）
 CONFIG_PARTITION_TABLE_CUSTOM=y
 CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions/v2/16m.csv"
-# 离线语音命令词（esp-sr MultiNet）。切到 USE_CUSTOM_WAKE_WORD 是必须的：
-# build_default_assets.py 只在这个开关打开时才把 multinet 模型打进 assets，
-# 且 audio_service.cc SetModelsList() 见到 mn* 模型就改用 CustomWakeWord。
-#
-# 唤醒词 = **「你好小安」**（2026-10-20 用户拍板，产品未发布，统一改名）。
-# 只用一个名字：WakeNet（专用模型）与 MultiNet（命令词引擎）都认「你好小安」，
-# MultiNet 另外多注册一条 2 音节短名「小安」提高召回。
-# ⚠️ 拼音↔汉字必须同步改：MultiNet 的注册键是拼音串，DISPLAY 只影响屏显；
-#    改了拼音忘改汉字（或反之）会出现「喊 A 显示 B」的割裂。
-# Kconfig 要求中文写拼音、空格分隔。
-CONFIG_USE_CUSTOM_WAKE_WORD=y
-CONFIG_CUSTOM_WAKE_WORD="ni hao xiao an"
-CONFIG_CUSTOM_WAKE_WORD_DISPLAY="你好，小安"
-# 唤醒阈值 20 → 12（2026-10-20）。
-# 真机实证（COM10 连抓 4 分钟）：老人连喊多遍，串口**零** `Custom wake word
-# detected` 行 —— 不是"偶尔不灵"，是基本不命中。
-# 注意 CustomWakeWord 是**纯 MultiNet**（不经过 WakeNet），通用中文命令词模型
-# 对自定义短语本来就弱；阈值属保守下调，再低会把日常对话误当唤醒，
-# 而误唤醒比"喊两遍"更烦。现在主通路已换成 WakeNet「你好小安」（见下），
-# 这条 MultiNet 只作为兜底 + 承载离线服药命令词。
-#
-# ⚠️ 这个值是**唯一真源**：sdkconfig.defaults 里同名项由本 overlay 注入生成。
-#    直接去改生成出来的 sdkconfig.defaults 会在下次 merge 时被覆盖回 20 ——
-#    2026-10-20 已实际踩到（本地改成 12，跑一次 merge 就变回 20），
-#    而 merge 的输出还是"已是最新"，看不出发生过覆盖。
-CONFIG_CUSTOM_WAKE_WORD_THRESHOLD=12
-# mn7_cn：官方推荐（S3/P4），比 mn6_cn 小约 1MB。
-# 模型 2671229 字节 + fst 9648 字节 = 2680877 字节，进 assets 分区。
-CONFIG_SR_MN_CN_MULTINET7_QUANT=y
-# --- WakeNet（专用唤醒网络）：唤醒词「你好小安」 ---
-#
-# 为什么是「你好小安」：**WakeNet 的唤醒词训练在模型里，改不了字符串**，
-# esp-sr 自带的中文 wn9 里没有我们最初起的那个名字。可选集里挑「你好小安」：
-#   1) 4 音节、节奏规整，老人喊起来顺口；
-#   2) 「安」= 平安/安心，符合陪伴看护的调性；
-#   3) 不和常见家居品牌撞（「小爱同学」会和米家设备抢唤醒）；
-#   4) 家庭日常对话里几乎不出现「你好小安」⇒ 误唤醒低。
-# 可选（esp-sr 自带，仅供参考）：你好小智 / 小爱同学 / 你好喵伴 / 你好小益 / 你好小鑫 …
-# 绝不用「你好小智」顶上：那是别人家的名字，设备会应答一个没人叫的称呼。
-#
-# 于是形成两条唤醒通路（这是「两个引擎都保留」的落地方式）：
-#   · WakeNet 「你好小安」    —— 主通路，专用模型召回高，且带 AEC，播报时也能打断；
-#   · MultiNet 「你好，小安」+「小安」 —— 兜底通路，同时承载 9 条离线服药命令词。
-# 两条谁命中都算唤醒。
-# 两个模型都会打进 srmodels.bin（build_default_assets.py 按 CONFIG_SR_WN_* /
-# CONFIG_SR_MN_* 收集），固件侧由 main/audio/wake_words/dual_wake_word.cc 同时驱动。
-CONFIG_SR_WN_WN9_NIHAOXIAOAN_TTS2=y
-# MultiNet 额外注册 2 音节短名「小安」（比 4 音节好叫，命中也算唤醒）。
-CONFIG_ELDER_WAKE_ALIASES="xiao an"
+# --- 唤醒：回归上游小智（2026-10-20 用户拍板）---
+# 放弃自研 dual_wake_word/MultiNet 离线命令词，唤醒/对话/发声全用上游原生。
+# 唤醒词 = 「你好小智」（上游 WakeNet 默认 wn9_nihaoxiaozhi_tts）。
+# 这里**不覆盖** CONFIG_USE_CUSTOM_WAKE_WORD / CONFIG_CUSTOM_WAKE_WORD /
+# CONFIG_SR_WN_* / CONFIG_SR_MN_* —— 让 Kconfig 默认 USE_AFE_WAKE_WORD（S3+SPIRAM）
+# 接管。上游 sdkconfig.defaults.esp32s3 自带 CONFIG_SR_WN_WN9_NIHAOXIAOZHI_TTS=y，
+# 正是「你好小智」的模型，与本次回归一致，不要再删。
+# 离线命令词（elder_cmd/elder_mn/custom_wake_word）已删除，NVS 离线提醒
+# 引擎（reminder.c 到点播报）保留。
 # 业务后端地址（2026-10-18 起 IP 直连：域名未备案被厂商按 SNI 阻断，
 # 连 IP 不带 SNI 可绕过；服务端配 IP 证书后可开证书校验，见 Kconfig 帮助）
 CONFIG_ELDER_SERVER_URL="https://152.136.230.132"
@@ -271,6 +231,19 @@ CONFIG_ELDER_SYNC_INTERVAL_SEC=300
 CONFIG_ELDER_HTTP_TIMEOUT_MS=8000
 # 立创板无板载 WS2812；外接灯珠时才打开
 CONFIG_ELDER_ENABLE_RGB=n
+# --- 引脚：产品级换板只改这里，不改代码（2026-10-20）---
+# GH1.25 5P 扩展口只引出 GPIO10/11 两根信号线：彩灯 10、按键 11。
+# 时钟走板载 I2C（立创板建在端口 1，地址 0x68 与音频器件不冲突）。
+# ⚠️ 不要把 ELDER_KEY_GPIO 填回 0：GPIO0 是 BOOT 键，被自动下载电路接管，
+#    与上游 xiaozhi 的按键语义双触发，USB 无主机时还会被持续拉低。
+CONFIG_ELDER_KEY_GPIO=11
+CONFIG_ELDER_RGB_GPIO=10
+# 原型期无时钟芯片：先关。接上 DS3231 模块后改 y，开机即从 RTC 恢复时间。
+CONFIG_ELDER_RTC_ENABLE=n
+CONFIG_ELDER_RTC_I2C_PORT=1
+# 无 RTC 时用 NVS 里的上次校时 epoch 兜底，避免掉电重启后当天提醒一条不响。
+# 注意这是近似时间（关机时长未知），联网后立刻校正。
+CONFIG_ELDER_TIME_NVS_FALLBACK=y
 # 演示提醒数据（无后端联调时可临时打开）
 CONFIG_ELDER_DEMO_DATA=n
 # xiaozhi 的 OTA/WS 地址由后端 /api/device/sync 下发，此处保持默认即可

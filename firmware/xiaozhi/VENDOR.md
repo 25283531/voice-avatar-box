@@ -54,16 +54,16 @@
 | --- | --- |
 | `main/display/lcd_display.cc` | 对话界面 70/30 布局（6 处几何改造，带 `elder-layout-70-30` 标记） |
 | `main/main.cc` | elder_boot 任务 + 未绑定设备绑定引导任务 |
-| `main/boards/bread-compact-esp32/esp32_bread_board.cc` | 唤醒词改宏引用 |
+| `main/boards/bread-compact-esp32/esp32_bread_board.cc` | ASR 按钮唤醒词硬编码「你好小智」 |
 | `main/boards/bread-compact-esp32-lcd/esp32_bread_board_lcd.cc` | 同上 |
 | `main/boards/esp32-cgc-144/esp32_cgc_144_board.cc` | 同上 |
 | `main/boards/esp32-cgc/esp32_cgc_board.cc` | 同上 |
-| `main/boards/common/wifi_board.cc` | 唤醒词模型注释同步 |
-| `sdkconfig.defaults` | 唤醒词段落去重（消除死配置） |
+| `main/boards/common/wifi_board.cc` | 配网热点前缀 XiaoNuan + 唤醒词注释同步 |
+| `sdkconfig.defaults` | elder-companion overlay 段（板卡/显示风格/后端地址） |
 
 一次 `sync`（含 `--force` / `--prune`）会把上面全部**静默覆盖**——因为同步脚本
 只做「与上游内容比对」，**不认识「本地已定制」**。后果不是报错，而是「布局悄悄
-回退 / 唤醒词又变回你好小智」，排查成本极高。
+回退 / 唤醒词又变回上游默认」，排查成本极高。
 
 ### 机制：sync 脚本默认拒绝同步
 

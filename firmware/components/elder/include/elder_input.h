@@ -21,10 +21,12 @@ extern "C" {
  *    （`***ERROR*** A stack overflow in task elder_input`），设备直接重启，
  *    求助反而发不出去；而聊天机器人场景里「按着说话」比「长按求救」常用得多。
  *
- * 设计约束：立创板 BOOT(GPIO0) 上电 3s 内长按会进 USB 下载模式，
- * 因此使能时间由 ELDER_KEY_BOOT_GUARD_MS 控制，由本模块内部延迟使能。
- * 另外 GPIO0 会被板上自动下载电路拉低（USB 无主机时），
- * 所以本模块只认「先松开、再按下」的边沿，长时间低电平判为卡住并忽略。
+ * 硬件：按键接在 GH1.25 5P 扩展口的 **GPIO11**（由 CONFIG_ELDER_KEY_GPIO 配置）。
+ *      2026-10-20 已从 GPIO0 迁走：GPIO0 是 BOOT 键，被板上自动下载电路与
+ *      CH340 的 DTR/RTS 接管，既会与上游 xiaozhi 的按键语义双触发，也会在
+ *      USB 无主机时被持续拉低。迁到干净 IO 后，原先的「上电 3 秒使能窗」
+ *      与「先松开再按下」两道守卫已删除，只保留卡键保护（按键被压住时忽略）。
+ *      CONFIG_ELDER_KEY_GPIO = -1 表示原型期未接按键，模块静默关闭。
  */
 
 typedef enum {

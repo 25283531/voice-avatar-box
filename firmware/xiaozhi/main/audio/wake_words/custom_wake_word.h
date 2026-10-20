@@ -32,11 +32,6 @@ public:
     bool GetWakeWordOpus(std::vector<uint8_t>& opus);
     const std::string& GetLastDetectedWakeWord() const { return last_detected_wake_word_; }
 
-    /* 放弃对 models_list 的所有权（析构时不再 esp_srmodel_deinit）。
-     * 只有 DualWakeWord 会用到：同一份 srmodel 列表被两个引擎共享，
-     * 两边都 deinit 就是双重释放。见 dual_wake_word.cc 析构函数。 */
-    void ForgetModels() { models_ = nullptr; }
-
 private:
     struct Command {
         std::string command;
@@ -53,14 +48,6 @@ private:
     int duration_ = 3000;
     float threshold_ = 0.2;
     std::deque<Command> commands_;
-
-    // command_id → commands_ 下标。
-    // 不用 id-1 直取的原因：esp_mn_commands_add() 遇到模型解析不了的短语会
-    // return ESP_ERR_INVALID_STATE 且不把短语挂进链表，但 command_id 是我们
-    // 自己递增传进去的。若有短语被拒，id 与 commands_ 下标就会错位，
-    // Feed() 里按 id-1 取命令会拿到**另一条短语** —— 对服药提醒来说
-    // 这是「说 A 执行 B」，比识别失败严重得多。
-    std::vector<std::pair<int, int>> registered_ids_;
  
     std::function<void(const std::string& wake_word)> wake_word_detected_callback_;
     AudioCodec* codec_ = nullptr;
@@ -77,17 +64,6 @@ private:
 
     void StoreWakeWordData(const std::vector<int16_t>& data);
     void ParseWakenetModelConfig();
-
-    /* MultiNet 探针（2026-10-20 诊断「喊不醒」）。
-     * 只观测不判定。判据：
-     *   · calls 恒 0  → Feed() 在 `!running_` 处提前返回，**引擎根本没在跑**，
-     *                   与模型好坏无关（上游命中一次后会 Stop，等应用层重启）
-     *   · calls 在涨但从未 DETECTED → 数据在进、模型认不出，问题在模型/阈值
-     *   · calls 在涨且出现 DETECTED  → 通路完全正常，问题在唤醒后的状态机 */
-    int64_t mn_probe_last_ms_ = 0;
-    uint32_t mn_probe_calls_ = 0;
-    uint32_t mn_probe_skipped_ = 0;
-    int mn_probe_detected_ = 0;
 };
 
 #endif

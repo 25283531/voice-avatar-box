@@ -32,30 +32,20 @@
 
 static const char *TAG = "elder.cfg";
 
-/* ── 期望值 ──────────────────────────────────────────────────────────────
- * 这里是全项目唯一一处「硬编码的期望唤醒词」。改唤醒词时必须同步改这里，
- * 否则设备开机会报 ERROR（这是有意的：宁可吵，也不要静默地跑错配置）。
- * 想临时绕过（例如做对照实验）可编译时 -DEXPECTED_WAKE_WORD_DISPLAY=\"xxx\"。
+/* ── 期望值 ────────────────────────────────────────────────────────────
+ * 2026-10-20 回归上游小智后，唤醒词由 WakeNet 模型决定（wn9_nihaoxiaozhi_tts），
+ * 自定义 MultiNet 唤醒词（CONFIG_CUSTOM_WAKE_WORD）已删除，不再硬编码屏显期望值。
  */
-#ifndef EXPECTED_WAKE_WORD_DISPLAY
-#define EXPECTED_WAKE_WORD_DISPLAY "你好，小安"
-#endif
-
 #ifndef EXPECTED_IDF_TARGET
 #define EXPECTED_IDF_TARGET "esp32s3"
 #endif
 
-/* ── WakeNet 唤醒词（2026-10-20 起启用）──────────────────────────────────
- * WakeNet 的唤醒词**训练在模型里**，Kconfig 只能选模型、不能选字符串，
- * 所以「实际生效的是哪个词」完全取决于打开了哪个 CONFIG_SR_WN_*。
- * 本段把「实际选中的模型」核对成它对应的唤醒词再打日志：
- * 选错模型（比如手滑选成别的名字的 wn9）时，串口第一屏就能看出来，
- * 不用去猜模型名 —— 那种错误在真机上只表现为「设备对别人家的名字应答」。
- * 主通路 = wn9_nihaoxiaoan_tts2（「你好小安」），挑它的理由见
- * tools/merge_to_xiaozhi.py 的 SDKCONFIG_OVERLAY 注释。
- * 两个引擎认同一个词：MultiNet 那边由 CONFIG_CUSTOM_WAKE_WORD 配成同一个。 */
+/* ── WakeNet 唤醒词（2026-10-20 回归上游小智）────────────────────────
+ * WakeNet 的唤醒词**训练在模型里**，Kconfig 只能选模型、不能选字符串。
+ * 上游默认模型 wn9_nihaoxiaozhi_tts = 「你好小智」。
+ */
 #ifndef EXPECTED_WAKENET_WORD
-#define EXPECTED_WAKENET_WORD "你好小安"
+#define EXPECTED_WAKENET_WORD "你好小智"
 #endif
 
 static bool str_eq(const char *a, const char *b)
@@ -67,41 +57,6 @@ static bool str_eq(const char *a, const char *b)
 }
 
 /*
- * 唤醒词自检。
- *
- * 判据是「实际值 == 期望值」，不是「值是不是非空」——非空只能证明配过，
- * 证明不了配的是哪一个。而我们要挡的恰恰是「配了但没生效」这一类。
- */
-static void report_wake_word(void)
-{
-    const char *pinyin = CONFIG_CUSTOM_WAKE_WORD;
-    const char *display = CONFIG_CUSTOM_WAKE_WORD_DISPLAY;
-
-    ESP_LOGI(TAG, "MultiNet 唤醒词 拼音=[%s] 屏显=[%s] 阈值=%d（同时承载离线命令词）",
-             pinyin, display, CONFIG_CUSTOM_WAKE_WORD_THRESHOLD);
-
-    if (!str_eq(display, EXPECTED_WAKE_WORD_DISPLAY)) {
-        ESP_LOGE(TAG, "唤醒词屏显不是期望值：期望=[%s] 实际=[%s]",
-                 EXPECTED_WAKE_WORD_DISPLAY, display);
-        ESP_LOGE(TAG, "多半是 sdkconfig 残留（它优先级高于 sdkconfig.defaults 且不覆盖）"
-                      "—— 删掉 sdkconfig 与 build/ 后 set-target esp32s3 重编");
-    }
-
-    /* 屏显是给老人看的，拼音是给唤醒引擎匹配的，两者必须成对存在。
-     * 只有一侧有值说明 sdkconfig.defaults 的唤醒词段被改残了。 */
-    if ((display == NULL || display[0] == '\0') !=
-        (pinyin == NULL || pinyin[0] == '\0')) {
-        ESP_LOGE(TAG, "唤醒词拼音与屏显不成对：拼音=[%s] 屏显=[%s]",
-                 pinyin, display);
-    }
-
-    int threshold = CONFIG_CUSTOM_WAKE_WORD_THRESHOLD;
-    if (threshold <= 0 || threshold > 100) {
-        ESP_LOGE(TAG, "唤醒词阈值越界：%d（应为 1..100）", threshold);
-    }
-}
-
-/*
  * WakeNet 自检：确认「专用唤醒模型」真的编进来了，且是我们挑的那一个。
  *
  * 判据是**具体符号**，不是「有打开任何一个 wn9」——只有具体符号能挡住
@@ -110,19 +65,19 @@ static void report_wake_word(void)
  */
 static void report_wakenet(void)
 {
-#if defined(CONFIG_SR_WN_WN9_NIHAOXIAOAN_TTS2)
-    ESP_LOGI(TAG, "WakeNet 唤醒词=[%s]（专用模型 wn9_nihaoxiaoan_tts2，主唤醒通路）",
+#if defined(CONFIG_SR_WN_WN9_NIHAOXIAOZHI_TTS)
+    ESP_LOGI(TAG, "WakeNet 唤醒词=[%s]（上游模型 wn9_nihaoxiaozhi_tts，主唤醒通路）",
              EXPECTED_WAKENET_WORD);
 #else
-    ESP_LOGE(TAG, "WakeNet 未启用（缺 CONFIG_SR_WN_WN9_NIHAOXIAOAN_TTS2）⇒ "
-                  "唤醒只剩 MultiNet，召回会明显变差；请检查 sdkconfig 是否残留");
+    ESP_LOGE(TAG, "WakeNet 未启用（缺 CONFIG_SR_WN_WN9_NIHAOXIAOZHI_TTS）⇒ "
+                  "唤醒失效；请检查 sdkconfig 是否残留");
 #endif
 
     /* 反向守卫：别的 wn9 模型被同时打开时会抢唤醒词（AfeWakeWord 只认最后一个
      * 匹配到的 wn 模型），这是「改了没生效」的另一种形态，必须吵出来。 */
-#if defined(CONFIG_SR_WN_WN9_NIHAOXIAOZHI_TTS) || defined(CONFIG_SR_WN_WN9_XIAOAITONGXUE)
-    ESP_LOGE(TAG, "检测到其它 wn9 唤醒模型被同时启用（你好小智/小爱同学）⇒ "
-                  "设备可能应答错误的唤醒词，请只保留 wn9_nihaoxiaoan_tts2");
+#if defined(CONFIG_SR_WN_WN9_NIHAOXIAOAN_TTS2) || defined(CONFIG_SR_WN_WN9_XIAOAITONGXUE)
+    ESP_LOGE(TAG, "检测到其它 wn9 唤醒模型被同时启用（自研旧词/小爱同学）⇒ "
+                  "设备可能应答错误的唤醒词，请只保留 wn9_nihaoxiaozhi_tts");
 #endif
 }
 
@@ -166,7 +121,6 @@ void elder_config_report(void)
 {
     ESP_LOGI(TAG, "===== elder 开机自检（编译期实际生效值）=====");
     report_target();
-    report_wake_word();
     report_wakenet();
     report_display_style();
 

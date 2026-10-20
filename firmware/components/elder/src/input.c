@@ -18,25 +18,23 @@ static const char *TAG = "elder.input";
 static struct {
     elder_key_cb_t cb;
     void          *ctx;
-    int64_t        enabled_at_us;
     int64_t        press_start_us;
     bool           pressed;
     bool           long_fired;
     int64_t        window_deadline_us;
 
-    /* ---- 反向守卫（2026-10-20 真机事故的补丁）----
+    /* ---- 卡键保护 ----
      *
-     * 事实链：设备每 21.8 秒重启一次，串口原文
-     *     I (16808) elder.input: long hold 3s reached
-     *     W (21808) elder.input: SOS hold 8s
-     *     ***ERROR*** A stack overflow in task elder_input has been detected.
-     *     rst:0xc (RTC_SW_CPU_RST)
-     * 而**没有人按过**这个键：GPIO0 是 BOOT 脚，板上自动下载电路把它和 CH340 的
-     * DTR/RTS 三极管接在一起，USB 线插着但没有主机 / 串口被打开时，IO0 会被
-     * 持续拉低。旧代码在「启动 3s 后」直接看电平，于是把「引脚一直是低」
-     * 当成「老人一直按着」，到点就进长按流程。
+     * 这条判据原本是为了绕开 GPIO0 的坑：BOOT 脚被板上自动下载电路与 CH340 的
+     * DTR/RTS 接在一起，USB 线插着但没有主机 / 串口被打开时会被持续拉低，
+     * 旧代码把「引脚一直是低」当成「老人一直按着」，到点就进长按流程
+     * （真机事故：每 21.8 秒重启一次，栈溢出在 elder_input）。
      *
-     * ⇒ 判据改成**边沿**而不是电平：没见过一次「确认过的释放」（高电平）之前，
+     * 2026-10-20 按键迁到扩展口 GPIO11 后，那个坑不存在了，但「按键被卡住/
+     * 线被压住」仍是真实故障（老人把设备压在枕头下），所以保留卡键保护，
+     * 只把文案里关于自动下载电路的部分去掉。
+     *
+     * ⇒ 判据仍是**边沿**而不是电平：没见过一次「确认过的释放」（高电平）之前，
      *   任何低电平都不算按压；连续低超过 STUCK_MS 直接判定卡住，直到真的松开。 */
     bool           released_seen;
     int64_t        low_since_us;
@@ -47,14 +45,14 @@ static struct {
 
 static int64_t now_us(void) { return esp_timer_get_time(); }
 
-static bool boot_guard_passed(void)
-{
-    return (now_us() - g.enabled_at_us) > (ELDER_KEY_BOOT_GUARD_MS * 1000LL);
-}
+#if ELDER_KEY_ENABLED
+/* 以下检测逻辑只在真正接了按键时编译。
+ * 原型期 CONFIG_ELDER_KEY_GPIO=-1 ⇒ 整段不参与构建，避免
+ * -Wunused-function 把编译打断（本项目开了 -Werror 级别的告警）。 */
 
 static bool key_down(void)
 {
-    int lvl = gpio_get_level(ELDER_KEY_SOS);
+    int lvl = gpio_get_level(ELDER_KEY_GPIO);
     return ELDER_KEY_ACTIVE_LEVEL ? (lvl == 0) : (lvl != 0);
 }
 
@@ -72,9 +70,9 @@ static bool track_level(bool stable_down)
             g.low_since_us = now_us();
         } else if (!g.stuck && (now_us() - g.low_since_us) > (STUCK_MS * 1000LL)) {
             g.stuck = true;
-            ESP_LOGW(TAG, "GPIO%d 持续低电平 %.0fs → 判为按键卡住/被自动下载电路拉低，"
+            ESP_LOGW(TAG, "GPIO%d 持续低电平 %.0fs → 判为按键卡住/被压住，"
                           "本次按压不予采信（松开后自动恢复）",
-                     ELDER_KEY_SOS, (now_us() - g.low_since_us) / 1e6);
+                     ELDER_KEY_GPIO, (now_us() - g.low_since_us) / 1e6);
             /* 卡住时必须把进行中的按压状态清掉，否则松开时会误发 RELEASE */
             g.pressed = false;
             g.long_fired = false;
@@ -110,12 +108,6 @@ static void input_task(void *arg)
                 vTaskDelay(pdMS_TO_TICKS(POLL_MS));
                 continue;
             }
-        }
-
-        if (!boot_guard_passed()) {
-            /* 启动 3s 内不做长按检测，避免误入 USB 下载模式 */
-            vTaskDelay(pdMS_TO_TICKS(POLL_MS));
-            continue;
         }
 
         bool acceptable = track_level(stable_down);
@@ -157,14 +149,23 @@ static void input_task(void *arg)
     }
 }
 
+#endif /* ELDER_KEY_ENABLED */
+
 esp_err_t elder_input_init(elder_key_cb_t cb, void *ctx)
 {
+#if !ELDER_KEY_ENABLED
+    /* 原型期未接独立按键（CONFIG_ELDER_KEY_GPIO = -1）。
+     * 这里**返回 ESP_OK 而不是错误**：调用方按"按键可用"继续跑，
+     * 服药确认改由屏幕/语音/APP 完成，不该因为少一个按键就报错。 */
+    (void)cb; (void)ctx;
+    ESP_LOGW(TAG, "未配置独立按键（ELDER_KEY_GPIO=-1），按键功能关闭");
+    return ESP_OK;
+#else
     g.cb = cb;
     g.ctx = ctx;
-    g.enabled_at_us = now_us();
 
     gpio_config_t io = {
-        .pin_bit_mask = (1ULL << ELDER_KEY_SOS),
+        .pin_bit_mask = (1ULL << ELDER_KEY_GPIO),
         .mode = GPIO_MODE_INPUT,
         .pull_up_en = GPIO_PULLUP_ENABLE,
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
@@ -172,19 +173,19 @@ esp_err_t elder_input_init(elder_key_cb_t cb, void *ctx)
     };
     ESP_ERROR_CHECK(gpio_config(&io));
 
-    /* 开机就把 GPIO0 的真实电平打出来。
-     * 这条日志是排查「设备莫名重启 / 莫名叮咚」的第一现场证据 ——
-     * 若这里是 0 且之后从没变成 1，说明是自动下载电路在拉低，不是老人按键。 */
+    /* 开机把按键脚的真实电平打出来。
+     * 这条日志是排查「设备莫名响铃 / 按键无反应」的第一现场证据 ——
+     * 若这里是 0 且之后从没变成 1，说明按键被压住或线接反了。 */
     ESP_LOGI(TAG, "GPIO%d 初始电平=%d（1=松开，0=被拉低/按住）",
-             ELDER_KEY_SOS, gpio_get_level(ELDER_KEY_SOS));
+             ELDER_KEY_GPIO, gpio_get_level(ELDER_KEY_GPIO));
 
     /* 栈 4096：emit() 是**同步**调用 elder.bridge::OnKey 的，那条 switch 里会跑
      * UI 状态切换 + 提示音 + 日志格式化。2560 字节实测被撑爆过（2026-10-20）。
      * ⚠️ 但**不要**指望靠加栈来扛 HTTPS：联网上报必须留在独立任务里。 */
     xTaskCreatePinnedToCore(input_task, "elder_input", 4096, NULL, 6, &g.task, 1);
-    ESP_LOGI(TAG, "key on GPIO%d ready (long-press armed after %dms)",
-             ELDER_KEY_SOS, ELDER_KEY_BOOT_GUARD_MS);
+    ESP_LOGI(TAG, "key on GPIO%d ready", ELDER_KEY_GPIO);
     return ESP_OK;
+#endif
 }
 
 bool elder_input_open_confirm_window(void)

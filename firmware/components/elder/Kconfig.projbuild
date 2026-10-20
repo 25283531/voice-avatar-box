@@ -40,8 +40,61 @@ menu "老人陪伴 & 提醒助手 (Elder Companion)"
         bool "启用外扩 WS2812 指示灯"
         default y
         help
-            立创实战派板载没有 WS2812，需在 GPIO10（可改 elder_board.h）
-            外接灯珠。硬件上 ESP32-S3 的 3.3V 电平需经 74HCT 转换。
+            立创实战派板载没有 WS2812，需在扩展口外接灯珠。
+            硬件上 ESP32-S3 的 3.3V 电平需经 74HCT 转换（DIN 要求 >=0.7*VDD）。
+
+    config ELDER_RGB_GPIO
+        int "WS2812 数据脚 GPIO（-1 = 未接）"
+        default 10
+        depends on ELDER_ENABLE_RGB
+        help
+            立创实战派 GH1.25 5P 扩展口只引出 GPIO10 / GPIO11 两根信号线，
+            本项占 GPIO10，独立按键占 GPIO11。
+            产品级换板时只改这个数字，不要改 elder_board.h。
+
+    config ELDER_KEY_GPIO
+        int "独立按键 GPIO（-1 = 未接）"
+        default 11
+        help
+            老人服药确认键。**不要再填 0**：GPIO0 是 BOOT 键，被板上自动下载
+            电路与 CH340 的 DTR/RTS 接管，USB 无主机时会被持续拉低，
+            与上游 xiaozhi 的按键语义也会双触发。
+            填 -1 表示原型期未接按键，按键模块静默不启动（不报错）。
+
+    config ELDER_RTC_ENABLE
+        bool "启用 DS3231 外部时钟"
+        default n
+        help
+            原型期没有时钟芯片，默认关闭。接上 DS3231 模块后打开，
+            开机从 RTC 恢复时间，联网校时后回写 RTC。
+            OSF 位（0x0F bit7）置位表示掉电停振过，此时读出的时间不可信，
+            固件会自动降级到 NVS 兜底而不是采信垃圾时间。
+
+    config ELDER_RTC_I2C_PORT
+        int "DS3231 所在 I2C 端口号"
+        default 1
+        depends on ELDER_RTC_ENABLE
+        help
+            立创板的音频 I2C 总线建在 **端口 1**（见 lichuang_dev_board.cc
+            的 i2c_new_master_bus）。DS3231 挂同一条总线即可，地址 0x68
+            与 PCA9557(0x19) / FT5x06(0x38) / ES8311(0x18) 不冲突。
+            填错时固件会在 1 和 0 之间自动回退探测。
+
+    config ELDER_RTC_I2C_ADDR
+        hex "DS3231 I2C 地址"
+        default 0x68
+        depends on ELDER_RTC_ENABLE
+
+    config ELDER_TIME_NVS_FALLBACK
+        bool "无 RTC 时用 NVS 里的上次校时时间兜底"
+        default y
+        help
+            没有 RTC（或 RTC 电池失效）时，开机用 NVS 里最后一次联网校时的
+            epoch 恢复时钟，避免掉电重启后时钟停在 1970、当天提醒一条不响。
+
+            ⚠️ 这是**近似时间**：关机时长无法得知，断电越久偏差越大。
+            固件会打 WARN 并在 UI 上提示时间可能不准，联网后立刻校正。
+            它解决的是"短暂掉电后仍能响"，不是"长期离线也精确"。
 
     config ELDER_DEMO_DATA
         bool "烧录出厂演示提醒（早8点/晚8点服药）"
@@ -49,21 +102,5 @@ menu "老人陪伴 & 提醒助手 (Elder Companion)"
         help
             打开后首次启动会写入两条演示提醒，方便无后端时验证链路。
             正式部署请关闭，避免与后端下发的规则冲突。
-
-    config ELDER_WAKE_ALIASES
-        string "唤醒词同义短语（拼音，分号分隔；只对 MultiNet 有效）"
-        default "xiao nuan"
-        help
-            除了主唤醒词（CONFIG_CUSTOM_WAKE_WORD="ni hao xiao nuan"）之外，
-            再注册几条**同义**短语。老人嘴里的叫法不止一种，而 MultiNet 的
-            召回率和短语长度强相关 —— 「xiao nuan」（2 音节）比
-            「ni hao xiao nuan」（4 音节）好叫得多，实测前者命中率明显更高。
-
-            多条短语共用同一个阈值（CONFIG_CUSTOM_WAKE_WORD_THRESHOLD），
-            命中任何一条都等同唤醒，屏显/上报统一用主唤醒词的汉字。
-            分号或逗号分隔；留空则不追加。
-
-            注意：这些短语只在 MultiNet 引擎里生效。WakeNet 的唤醒词是
-            训练进模型里的，改不了字符串（esp-sr 自带的 wn9 模型没有「你好小暖」）。
 
 endmenu

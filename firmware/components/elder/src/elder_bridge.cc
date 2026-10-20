@@ -34,14 +34,12 @@
 #include "elder_rgb.h"
 #include "elder_input.h"
 #include "elder_reminder.h"
+#include "elder_rtc.h"
 // elder_activation.h 已移除：激活码改为向服务端要（真码才有效），逻辑搬到
 // src/elder_bind_guide.cc（且必须在 app.Start() 之前起任务，见该文件头注释）。
 #include "elder_ui.h"
-#include "elder_cmd.h"     /* 离线命令词词表（启动自检时遍历，见 elder_bridge_start 第 9 步） */
-#include "elder_mn.h"      /* MultiNet 识别结果 → 分发器的异步通道 */
 #include "elder_net.h"
 #include "elder_sync.h"
-#include "elder_cmd.h"
 
 #define TAG "elder.bridge"
 
@@ -319,50 +317,7 @@ void OnDeviceStateChanged(DeviceState prev, DeviceState cur)
     }
 }
 
-/* ---------------------------------------------------------------- 离线命令词 */
-
-// MultiNet（或任何离线识别层）命中命令词后调这个入口。
-//
-// ⚠️ 调用方**不是**音频任务：custom_wake_word.cc 的识别回调走
-// elder_mn_post()，由 elder_mn_task（独立任务）调到这里。
-// 所以这里可以同步做 NVS 写入与屏显，不必担心阻塞喂音频。
-// 若将来有别的识别层直接调本函数，请先经 elder_mn_post() 转交。
-void OnCommandRecognized(const char *phrase)
-{
-    elder_cmd_result_t r;
-    esp_err_t err = elder_cmd_dispatch(phrase, &r);
-
-    if (err != ESP_OK || !r.recognized) {
-        // 认不出来就老实说认不出来，并提示走按键兜底（医疗场景宁可多按一下）
-        ESP_LOGW(TAG, "未识别的离线指令: %s", phrase ? phrase : "(null)");
-        elder_ui_set_state(ELDER_UI_OFFLINE, 0);
-        OnNotify("没听清，请长按按键两下再操作", nullptr, nullptr);
-        OnPlayTone(ELDER_TONE_EXCLAMATION, nullptr);
-        return;
-    }
-
-    ESP_LOGI(TAG, "离线指令: '%s' -> action=%d ok=%d: %s",
-             phrase, (int)r.action, (int)r.ok, r.feedback);
-
-    // 命令词一律走屏显 + 内置提示音，**不走 TTS**：
-    // 触发离线命令的前提就是没网，此时 TTS 必然失败。
-    OnNotify(r.feedback, nullptr, nullptr);
-    OnPlayTone(r.tone, nullptr);
-    if (r.ok) {
-        elder_ui_set_state(ELDER_UI_CONFIRMED, 4000);
-    }
-}
-
 }  // namespace
-
-/* ---------------------------------------------------------------- 离线命令词入口 */
-
-// 必须放在匿名 namespace **之外**：extern "C" 若声明在匿名 namespace 内，
-// 符号会退化成内部链接，识别层就链接不到这个入口了。
-extern "C" void elder_cmd_on_recognized(const char *phrase)
-{
-    OnCommandRecognized(phrase);
-}
 
 /* ---------------------------------------------------------------- 入口 */
 
@@ -384,30 +339,23 @@ extern "C" void elder_bridge_start(void)
     }
 #endif
 
-    // 2) 按键：单键三段式确认手势
+    // 2) 按键：单键三段式确认手势（GPIO11，由 CONFIG_ELDER_KEY_GPIO 配置）
     if (elder_input_init(OnKey, nullptr) != ESP_OK) {
         ESP_LOGW(TAG, "按键初始化失败");
     }
 
-    // 3) 提醒引擎（读 NVS，离线可用）
+    // 3) 时间基准：DS3231 → NVS 兜底。**必须早于提醒引擎**，
+    //    否则 reminder 会先拿 1970 跑一轮 tick（守卫会拦，但日志会误导）。
+    //    原型期没有时钟芯片，两个都探不到是预期状态，只打 WARN。
+    elder_rtc_init();
+    elder_time_restore_boot();
+
+    // 4) 提醒引擎（读 NVS，离线可用）
     if (elder_reminder_init(OnReminder, nullptr) != ESP_OK) {
         ESP_LOGE(TAG, "提醒引擎初始化失败");
     }
 
-    // 3b) 断网自建服药提醒的默认时段。
-    // 「新建吃药提醒」说出口后落到哪几个时间点，全靠这张表 ——
-    // 老人不会报时间，只会用早/中/晚三个粗粒度时段。
-    // 数值可后续按实际用药方案调整。
-    {
-        elder_cmd_med_times_t mt = {};
-        mt.n = 3;
-        mt.slots[0] = { 8,  0 };
-        mt.slots[1] = { 12, 0 };
-        mt.slots[2] = { 20, 0 };
-        elder_cmd_set_med_times(&mt);
-    }
-
-    // 4) UI 钩子：把 elder 的抽象动作接到 xiaozhi
+    // 5) UI 钩子：把 elder 的抽象动作接到 xiaozhi
     elder_ui_hooks_t hooks = {};
     hooks.set_emotion = OnSetEmotion;
     hooks.notify = OnNotify;
@@ -470,33 +418,5 @@ extern "C" void elder_bridge_start(void)
     ESP_LOGI(TAG, "elder 组件接入完成；离线提醒可用=%s",
              elder_time_synced() ? "已校时" : "未校时（依赖本地 RTC）");
 
-    // 9) 离线命令词：启动异步执行通道 + 把词表真正跑一遍并打出来。
-    //
-    // 9a) 先起执行通道。识别回调（音频任务）只往这里投递，
-    //     由独立任务执行 —— 理由见 elder_mn.c 的文件头注释。
-    if (elder_mn_init() != ESP_OK) {
-        ESP_LOGE(TAG, "离线命令词执行通道启动失败 —— 断网时只能用按键");
-    }
-
-    // 9b) 词表自检。
-    //
-    // 这么做有两个必要理由，缺一不可：
-    //  a) 可观测 —— 现场只要看这条日志就能确认「预置关键词」到底有没有烧进去，
-    //     不必去猜。医疗设备不允许「以为装好了其实没装」。
-    //  b) 保活 —— 链接器的 --gc-sections 会把未被引用的目标文件**整块裁掉**，
-    //     这里主动引用一次，防止词表被裁。
-    //
-    // 打印拼音是因为 MultiNet 注册用的是拼音那一份：现场老人说「吃过了」
-    // 设备没反应时，对着这条拼音排查比对着汉字有用。
-    {
-        int n = elder_cmd_word_count();
-        ESP_LOGI(TAG, "离线命令词已预置 %d 条：", n);
-        for (int i = 0; i < n; i++) {
-            const elder_cmd_word_t *w = elder_cmd_word_at(i);
-            if (w) ESP_LOGI(TAG, "  [%d] \"%s\" (%s) -> %s", i, w->phrase, w->pinyin, w->hint);
-        }
-        ESP_LOGI(TAG, "以上短语已由 esp-sr MultiNet 接管离线识别"
-                     "（见 main/audio/wake_words/custom_wake_word.cc）；"
-                     "识别不可靠时仍可用按键兜底（长按后 30 秒内短按）");
-    }
+    ESP_LOGI(TAG, "离线命令词已随上游回归移除（2026-10-20）：改用小智唤醒 + 对话确认");
 }

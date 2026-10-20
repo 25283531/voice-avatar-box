@@ -800,22 +800,8 @@ def main():
     wakenet_model_paths = []
     multinet_model_paths = []
     
-    # 1. Package wakenet models.
-    #    ★ 2026-10-20 本项目修改（elder-companion）：
-    #      上游这里只在 use_esp_wake_word / use_afe_wake_word 为真时才打包 wakenet。
-    #      但唤醒模式是 choice **三选一**（main/Kconfig.projbuild 的 choice WAKE_WORD_TYPE），
-    #      本项目为了「自定义唤醒词 + 离线服药命令词」必须选 CONFIG_USE_CUSTOM_WAKE_WORD=y
-    #      ⇒ 上游逻辑会**静默跳过** wakenet，即使 sdkconfig 里显式开了
-    #      CONFIG_SR_WN_WN9_NIHAOXIAOAN_TTS2=y，srmodels.bin 里也只有 multinet。
-    #      后果极难发现：配置自检全绿、编译成功，但真机上 WakeNet 引擎拿不到模型，
-    #      「两个引擎都保留」退化成纯 MultiNet（唤醒率明显变低），且没有任何报错。
-    #      ——实证：bce5054 的 generated_assets.bin 里搜不到任何 wn9_ 字样。
-    #      本项目由 AudioService::SetModelsList() 的 has_mn && has_wn → DualWakeWord
-    #      承接并存，故这里允许在自定义唤醒词模式下**额外**打包 wakenet，
-    #      前提是 sdkconfig 里显式开了某个 CONFIG_SR_WN_*（没开就不打包，行为不变）。
-    if (wake_word_config['use_esp_wake_word']
-            or wake_word_config['use_afe_wake_word']
-            or (wake_word_config['use_custom_wake_word'] and wakenet_model_names)):
+    # 1. Only package wakenet models if USE_ESP_WAKE_WORD=y or USE_AFE_WAKE_WORD=y
+    if wake_word_config['use_esp_wake_word'] or wake_word_config['use_afe_wake_word']:
         wakenet_model_paths = get_wakenet_model_paths(wakenet_model_names, args.esp_sr_model_path)
     elif wakenet_model_names:
         print(f"  Note: Found wakenet models {wakenet_model_names} but wake word type is not ESP/AFE, skipping")

@@ -210,48 +210,50 @@ def main() -> int:
         f"详见 sdkconfig.defaults 的注释段",
     )
 
-    wake = src.get("CONFIG_CUSTOM_WAKE_WORD", "")
-    display = src.get("CONFIG_CUSTOM_WAKE_WORD_DISPLAY", "")
-    # 判据只认**拼音词根**：汉字里没有拉丁串，
-    # 不能拿拉丁串去 display 里找（第一版就这么写的，必然假红）。
-    # 正确做法是查两件事各自是否**正确**，而不是要求二者「互相包含」——
-    # 拼音↔汉字一致是 Kconfig/编码层面的事实，这里只能验「是当前值」。
-    #
-    # 2026-10-20：产品未发布，唤醒词一次定死为「你好小安」（两个引擎都认真个词）。
-    ok_pinyin = wake.replace(" ", "") == "nihaoxiaoan"
-    ok_display = display.replace("，", "").replace(",", "").replace(" ", "") == "你好小安"
-    check(
-        "C2b 唤醒词是「你好，小安」（拼音与汉字都必须是当前值）",
-        ok_pinyin and ok_display,
-        f"{where}: 拼音={wake!r} 屏显={display!r}"
-        + ("" if ok_pinyin and ok_display
-           else "。⚠️ 与期望值不符 —— 最常见原因是 sdkconfig 残留"
-                "（kconfig 以已存在的 sdkconfig 为准，会静默覆盖 defaults）"),
+    # 2026-10-20 回归上游小智：唤醒词 = WakeNet「你好小智」（wn9_nihaoxiaozhi_tts）。
+    # 自定义 MultiNet 唤醒词（CONFIG_CUSTOM_WAKE_WORD / 「你好小安」）已整体删除。
+    # WakeNet 的唤醒词训练在模型里，选错模型 = 设备应答别的名字，而真机上
+    # 只表现为「喊它没反应 / 应答陌生称呼」，必须在这里钉死具体符号。
+    # 判据必须扫 **defaults 全家族**（含 sdkconfig.defaults.esp32s3），
+    # 不能只看 sdkconfig.defaults：wn9_nihaoxiaozhi_tts 是**上游自带**的，
+    # 写在 sdkconfig.defaults.esp32s3 里；set-target 时两个 defaults 叠加读取。
+    # 只看 sdkconfig.defaults 会永远假红（2026-10-20 实证）。
+    wn_in_defaults: list[str] = []
+    for dpath in sorted(XIAOZHI.glob("sdkconfig.defaults*")):
+        for lineno, raw in enumerate(
+            dpath.read_text(encoding="utf-8", errors="replace").splitlines(), 1
+        ):
+            s = raw.strip()
+            if s.startswith("#"):
+                continue
+            if re.match(r"CONFIG_SR_WN_WN9_NIHAOXIAOZHI_TTS=y\s*$", s):
+                wn_in_defaults.append(f"{dpath.name}:{lineno}")
+    wn_ok = (
+        src.get("CONFIG_SR_WN_WN9_NIHAOXIAOZHI_TTS", "n") == "y"
+        or bool(wn_in_defaults)
     )
-
-    # WakeNet 专用模型：唤醒词训练在模型里，选错模型 = 设备应答别的名字，
-    # 而真机上只表现为「喊它没反应 / 应答陌生称呼」，必须在这里钉死具体符号。
-    wn_ok = src.get("CONFIG_SR_WN_WN9_NIHAOXIAOAN_TTS2", "n") == "y"
     check(
-        "C2b2 WakeNet 唤醒模型是「你好小安」（wn9_nihaoxiaoan_tts2）",
+        "C2b2 WakeNet 唤醒模型是「你好小智」（wn9_nihaoxiaozhi_tts）",
         wn_ok,
-        f"{where} 里 CONFIG_SR_WN_WN9_NIHAOXIAOAN_TTS2="
-        f"{src.get('CONFIG_SR_WN_WN9_NIHAOXIAOAN_TTS2', '(未设置)')!r}；"
-        f"没开它 ⇒ 只剩 MultiNet 唤醒，召回明显变差",
+        (f"defaults 家族里已开：{wn_in_defaults}"
+         if wn_in_defaults else
+         f"{where} 里 CONFIG_SR_WN_WN9_NIHAOXIAOZHI_TTS="
+         f"{src.get('CONFIG_SR_WN_WN9_NIHAOXIAOZHI_TTS', '(未设置)')!r}，"
+         f"且 defaults 家族也没开 ⇒ 唤醒失效（上游默认开启，缺失多半是误删）"),
     )
 
     # 反向守卫：别的 wn9 模型被同时打开会抢唤醒词（AfeWakeWord 只认最后
     # 匹配到的 wn 模型）——「改了没生效」的另一种形态。
     other_wn = [
         k for k in src
-        if k.startswith("CONFIG_SR_WN_WN9") and k != "CONFIG_SR_WN_WN9_NIHAOXIAOAN_TTS2"
+        if k.startswith("CONFIG_SR_WN_WN9") and k != "CONFIG_SR_WN_WN9_NIHAOXIAOZHI_TTS"
         and src[k] == "y"
     ]
     check(
         "C2b3 没有别的 wn9 唤醒模型同时启用",
         not other_wn,
         f"{where} 里同时启用了 {other_wn} ⇒ 唤醒词可能被别的模型顶掉"
-        if other_wn else "只有 wn9_nihaoxiaoan_tts2 一个 wn9 模型",
+        if other_wn else "只有 wn9_nihaoxiaozhi_tts 一个 wn9 模型",
     )
 
     # 反向守卫之二：**defaults 全家族**（sdkconfig.defaults / .esp32s3 / .esp32p4 …）
@@ -261,7 +263,7 @@ def main() -> int:
     #
     # 为什么必须扫**全部变体**，而不是只看 sdkconfig.defaults：
     #   IDF 在 `idf.py set-target <target>` 时会把 sdkconfig.defaults 与
-    #   sdkconfig.defaults.<target> **叠加**读取（后者覆盖前者）。但两者设的是
+    #   sdkconfig.defaults.<target> **叠加**读取（后者覆盖前者）。若两者设的是
     #   **不同的符号**（小智 vs 小安）⇒ 不会互相覆盖，只会「两个都 y」，
     #   两个模型双双打进 srmodels.bin，用哪个取决于加载顺序。
     #   2026-10-20 CI 实证：上游自带的 sdkconfig.defaults.esp32s3 里就留着
@@ -278,7 +280,7 @@ def main() -> int:
             if s.startswith("#"):
                 continue
             m = re.match(r"(CONFIG_SR_WN_WN9\w*)=y\s*$", s)
-            if m and m.group(1) != "CONFIG_SR_WN_WN9_NIHAOXIAOAN_TTS2":
+            if m and m.group(1) != "CONFIG_SR_WN_WN9_NIHAOXIAOZHI_TTS":
                 wn_bad.append(f"{dpath.name}:{lineno} {m.group(1)}")
     check(
         "C2b4 defaults 全家族里没有别的 wn9 唤醒模型",
@@ -286,19 +288,23 @@ def main() -> int:
         f"这些位置还开着别的 wn9 唤醒模型：{wn_bad}。"
         f"⚠️ set-target 会把 sdkconfig.defaults 与 sdkconfig.defaults.<target> "
         f"叠加读取，两者设的是不同符号 ⇒ 不会互相覆盖，只会两个都 y。"
-        f"处置：把该行删掉（唤醒模型唯一真源 = sdkconfig.defaults 的 overlay 段）"
+        f"处置：把该行删掉（唤醒模型唯一真源 = 上游 sdkconfig.defaults.esp32s3 的 "
+        f"CONFIG_SR_WN_WN9_NIHAOXIAOZHI_TTS=y）"
         if wn_bad else
         f"扫了 {len(dflt_files)} 个 defaults 变体"
         f"（{', '.join(p.name for p in dflt_files)}），"
-        f"只有 wn9_nihaoxiaoan_tts2 一个 wn9 模型",
+        f"只有 wn9_nihaoxiaozhi_tts 一个 wn9 模型",
     )
 
+    # 自研双引擎/自定义唤醒词已删除（2026-10-20 回归上游）。若有人把
+    # MultiNet 自定义唤醒词或 dual_wake_word 又加回来，必须在这里吵出来：
+    # 否则「回归上游」会静默变回自研路径，且没有任何报错。
+    custom_wake = src.get("CONFIG_USE_CUSTOM_WAKE_WORD", "n") == "y"
     check(
-        "C2c 离线唤醒模型已选（mn7_cn）",
-        src.get("CONFIG_SR_MN_CN_MULTINET7_QUANT", "n") == "y",
-        f"{where} 里 CONFIG_SR_MN_CN_MULTINET7_QUANT="
-        f"{src.get('CONFIG_SR_MN_CN_MULTINET7_QUANT', '(未设置)')!r}；"
-        f"没开它则 srmodels.bin 不打包 ⇒ 离线唤醒与命令词双双失效",
+        "C2b5 未启用自定义 MultiNet 唤醒词（回归上游）",
+        not custom_wake,
+        f"{where} 里 CONFIG_USE_CUSTOM_WAKE_WORD=y ⇒ 又切回自研 MultiNet 唤醒，"
+        f"与「回归上游小智」的方向相反。处置：删掉该行并重跑 merge。",
     )
 
     part = src.get("CONFIG_PARTITION_TABLE_CUSTOM_FILENAME", "").strip('"')
@@ -359,28 +365,47 @@ def main() -> int:
         )
 
     # ------------------------------------------------------ C5 固件自检期望值
-    # config_report.c 里有两处**硬编码的期望值**（唤醒词屏显、目标芯片），
-    # 设备开机时逐条比对，不符就 ESP_LOGE。
-    # ⇒ 这里必须在编译期把它们与 sdkconfig.defaults 对齐校验：
-    # 改了 defaults 的唤醒词却忘了改 C 侧，真机每次开机都会误报 ERROR。
-    # 误报比不报更糟——老人现场的日志只有这一段，一直刷 ERROR 会让人
-    # 忽略后面真正的报错。
+    # config_report.c 里有一处**硬编码的期望唤醒词**（WakeNet 模型对应的汉字），
+    # 设备开机时比对，不符就 ESP_LOGE。
+    # 2026-10-20 回归上游小智后：期望值 = 「你好小智」，与 wn9_nihaoxiaozhi_tts 对应。
+    # ⇒ 编译期把 C 侧期望值与「模型符号」对齐校验，防止改了模型却忘了改 C 侧，
+    # 真机每次开机都误报 ERROR。误报比不报更糟——老人现场日志只有这一段。
     cfg_report = ROOT / "firmware" / "components" / "elder" / "src" / "config_report.c"
     try:
         csrc = cfg_report.read_text(encoding="utf-8")
-        m = re.search(r'#define\s+EXPECTED_WAKE_WORD_DISPLAY\s+"([^"]*)"', csrc)
-        expected_display = m.group(1) if m else None
-        defaults_display = defaults.get("CONFIG_CUSTOM_WAKE_WORD_DISPLAY", "")
-        # defaults 里带引号，read_kv 已剥掉；这里只需去掉标点后比对
+        m = re.search(r'#define\s+EXPECTED_WAKENET_WORD\s+"([^"]*)"', csrc)
+        expected_word = m.group(1) if m else None
         norm = lambda s: s.replace("，", "").replace(",", "").replace(" ", "")
         check(
-            "C5 固件开机自检的期望唤醒词与 sdkconfig.defaults 一致",
-            expected_display is not None
-            and norm(expected_display) == norm(defaults_display),
-            f"config_report.c 里 EXPECTED_WAKE_WORD_DISPLAY={expected_display!r}，"
-            f"sdkconfig.defaults 里 CONFIG_CUSTOM_WAKE_WORD_DISPLAY="
-            f"{defaults_display!r}。不一致时设备每次开机都会 ESP_LOGE 误报。",
-            fatal=expected_display is not None,
+            "C5 固件开机自检的期望唤醒词是「你好小智」",
+            expected_word is not None and norm(expected_word) == "你好小智",
+            f"config_report.c 里 EXPECTED_WAKENET_WORD={expected_word!r}，"
+            f"期望 '你好小智'（对应 wn9_nihaoxiaozhi_tts）。"
+            f"不一致时设备每次开机都会 ESP_LOGE 误报。",
+            fatal=expected_word is not None,
+        )
+        # 反向守卫：C 侧不得再残留自研旧唤醒词期望值（wn9_nihaoxiaoan / 你好小安）。
+        # 判据只查**期望值宏定义**，不查注释里的历史说明文字 —— 后者提到旧词是
+        # 为了记录「为什么删掉它」，不是残留。若将来 EXPECTED_WAKENET_WORD 又被
+        # 改回旧词，这里必须红。
+        stale_expected = (
+            expected_word is not None
+            and expected_word.replace("，", "").replace(" ", "") == "你好小安"
+        )
+        # 反向守卫之二：宏定义行里不得出现旧模型符号（NIHAOXIAOAN）。
+        # 只查**宏定义那一行**，不查整文件 —— 注释里保留旧符号是历史说明，不是残留。
+        define_line = next(
+            (ln for ln in csrc.splitlines()
+             if ln.lstrip().startswith("#define EXPECTED_WAKENET_WORD")),
+            "",
+        )
+        stale_define = "NIHAOXIAOAN" in define_line
+        check(
+            "C5b config_report.c 期望值未回退到自研旧唤醒词",
+            not stale_expected and not stale_define,
+            (f"宏定义行={define_line.strip()!r}，EXPECTED_WAKENET_WORD={expected_word!r} "
+             f"—— 回归上游后期望值应为「你好小智」")
+            if (stale_expected or stale_define) else "期望值仍是上游「你好小智」",
         )
     except Exception as exc:  # noqa: BLE001
         # 同 C3b：读不到判据本身 ≠ 判据不通过。报 WARN 会在 --strict 下拦 CI。
@@ -475,26 +500,20 @@ def main() -> int:
             fatal=True,
         )
 
-    # ------------------------------------------------------ 未绑定不跑 MultiNet
-    # 判据必须是 elder_sync_token_persisted()（直接读 NVS），不能用
-    # elder_net_has_token()（读内存）。开机顺序是 app.Start() 起 WakeWord
-    # 在前、elder_sync_init() 在后 2 秒 —— 用内存版会把**已绑定设备**判成
-    # 未绑定，MultiNet 永远不起。症状是「绑定后唤醒召回下降、离线服药确认
-    # 失灵」，而日志里一切正常，属于极难归因的一类。
-    dua = ROOT / "firmware" / "xiaozhi" / "main" / "audio" / "wake_words" / "dual_wake_word.cc"
-    if dua.exists():
-        dua_text = dua.read_text(encoding="utf-8", errors="ignore")
-        check(
-            "C9 MultiNet 启停判据用的是 NVS 版绑定状态（elder_sync_token_persisted）",
-            "elder_sync_token_persisted" in dua_text
-            and "elder_net_has_token" not in dua_text,
-            "dual_wake_word.cc 里找不到 elder_sync_token_persisted，或误用了"
-            " elder_net_has_token（读内存，开机时序上会把已绑定设备判成未绑定）"
-            if ("elder_sync_token_persisted" not in dua_text
-                or "elder_net_has_token" in dua_text)
-            else "判据正确：读 NVS 的持久化令牌，与初始化顺序无关",
-            fatal=True,
-        )
+    # ------------------------------------------------------ 双引擎/离线命令词已移除
+    # 2026-10-20 回归上游小智：dual_wake_word.cc 与 elder_cmd/elder_mn 全部删除。
+    # 这里守「删干净」：若有人把 dual_wake_word.cc 又加回来，必须吵出来，
+    # 否则回归会静默变回自研双引擎路径。
+    dual_src = ROOT / "firmware" / "xiaozhi" / "main" / "audio" / "wake_words" / "dual_wake_word.cc"
+    elder_cmd_h = ROOT / "firmware" / "components" / "elder" / "include" / "elder_cmd.h"
+    check(
+        "C9 自研双引擎与离线命令词已删除",
+        not dual_src.exists() and not elder_cmd_h.exists(),
+        f"仍存在：{[str(p) for p in (dual_src, elder_cmd_h) if p.exists()]} ⇒ "
+        f"与回归上游方向相反，处置：删除这些文件并重跑 merge"
+        if (dual_src.exists() or elder_cmd_h.exists())
+        else "dual_wake_word.cc 与 elder_cmd.h 均不存在（回归上游已落实）",
+    )
 
     # ------------------------------------------------------ 表情动图
     # 帧数据（anim_frames.bin）是**生成物但入库**，索引头（anim_emoji_index.h）

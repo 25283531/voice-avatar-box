@@ -135,6 +135,16 @@ esp_err_t elder_sync_enqueue_event(uint32_t server_id, time_t due_at,
  */
 esp_err_t elder_time_apply_server_time(const char *iso);
 
+/**
+ * @brief 开机恢复时钟：DS3231 → NVS 上次校时 epoch → 放弃（等联网）。
+ *
+ * **必须在 elder_reminder_init() 之前调用**，否则提醒引擎会先用 1970 跑一轮
+ * tick，虽然守卫会拦住，但日志里会出现误导性的"时钟不可信"告警。
+ *
+ * @return ESP_OK 表示时间已恢复；ESP_ERR_NOT_FOUND 表示无可用时间源。
+ */
+esp_err_t elder_time_restore_boot(void);
+
 /** 是否已至少校准过一次（未校准时提醒仍走本地 RTC，可能不准） */
 bool elder_time_synced(void);
 

@@ -7,25 +7,10 @@
 #include <esp_mn_iface.h>
 #include <esp_mn_models.h>
 #include <esp_mn_speech_commands.h>
-#include <esp_timer.h>
-#include <chrono>
 #include <cJSON.h>
 
-// elder 离线命令词：词表本体 + 异步投递通道（C 链接，见 elder_mn.h）。
-// 识别层只负责「听」和「转交」，不做分发 —— 分发要写 NVS，见 elder_mn.c 注释。
-#include "elder_cmd.h"
-#include "elder_mn.h"
 
 #define TAG "CustomWakeWord"
-
-namespace {
-
-/* elder 命令词的 action 标记，用来把「执行离线命令」与「唤醒」区分开。
- * 不是 command_id：id 由注册顺序决定，唤醒词占前 commands_.size() 个，
- * elder 词紧跟其后（见Initialize）。这里只需要一个可比较的标签。 */
-constexpr const char* kElderAction = "elder";
-
-}  // namespace
 
 
 CustomWakeWord::CustomWakeWord()
@@ -115,54 +100,6 @@ bool CustomWakeWord::Initialize(AudioCodec* codec, srmodel_list_t* models_list) 
         ParseWakenetModelConfig();
     }
 
-#ifdef CONFIG_ELDER_WAKE_ALIASES
-    /* 同义唤醒词（由 elder 组件的 Kconfig 注入，默认 "xiao an;..."）。
-     *
-     * 为什么需要：MultiNet 的召回率与短语长度强相关 —— 4 音节的
-     * 「ni hao xiao an」真机实测老人连喊 5 遍都常常不命中，而 2 音节的
-     * 「xiao an」明显好叫。多注册几条同义短语 = 多几次命中机会，
-     * 阈值不变（仍是 CONFIG_CUSTOM_WAKE_WORD_THRESHOLD），
-     * 命中任何一条都按主唤醒词的汉字上报，服务端/屏显看不出区别。
-     *
-     * WakeNet 那边没有等价手段：它的唤醒词是训练进模型里的，改不了字符串。 */
-    {
-#ifdef CONFIG_CUSTOM_WAKE_WORD_DISPLAY
-        const char* alias_display = CONFIG_CUSTOM_WAKE_WORD_DISPLAY;
-#else
-        const char* alias_display = "";
-#endif
-        std::string list = CONFIG_ELDER_WAKE_ALIASES;
-        size_t pos = 0;
-        int added = 0;
-        while (pos <= list.size()) {
-            size_t sep = list.find_first_of(";,", pos);
-            std::string one = (sep == std::string::npos)
-                                  ? list.substr(pos)
-                                  : list.substr(pos, sep - pos);
-            /* 手工 trim：Kconfig 里的字符串常带前后空格 */
-            size_t b = one.find_first_not_of(" \t");
-            size_t e = one.find_last_not_of(" \t");
-            one = (b == std::string::npos) ? std::string() : one.substr(b, e - b + 1);
-
-            if (!one.empty()) {
-                bool dup = false;
-                for (const auto& c : commands_) {
-                    if (c.command == one) { dup = true; break; }
-                }
-                if (!dup) {
-                    commands_.push_back({one, alias_display, "wake"});
-                    added++;
-                    ESP_LOGI(TAG, "同义唤醒词: \"%s\" → 屏显 \"%s\"", one.c_str(), alias_display);
-                }
-            }
-            if (sep == std::string::npos) break;
-            pos = sep + 1;
-        }
-        ESP_LOGI(TAG, "同义唤醒词共追加 %d 条（阈值仍为 %d%%）",
-                 added, (int)(threshold_ * 100));
-    }
-#endif
-
     if (models_ == nullptr || models_->num == -1) {
         ESP_LOGE(TAG, "Failed to initialize wakenet model");
         return false;
@@ -183,56 +120,12 @@ bool CustomWakeWord::Initialize(AudioCodec* codec, srmodel_list_t* models_list) 
     multinet_ = esp_mn_handle_from_name(mn_name_);
     multinet_model_data_ = multinet_->create(mn_name_, duration_);
     multinet_->set_det_threshold(multinet_model_data_, threshold_);
-
-    // 注册命令词。
-    //
-    // ⚠️ command_id 必须与 registered_ids_ 严格对齐：esp_mn_commands_add()
-    // 对不合法的短语 return ESP_ERR_INVALID_STATE 且**根本不进链表**，
-    // 但 command_id 是我们按顺序递增传进去的。若不记录实际注册成功的条目，
-    // 一旦有条短语被拒，后面所有 id 都会整体前移，
-    // Feed() 里 commands_[command_id - 1] 就会取到**别的短语** ——
-    // 对医疗设备来说这是「说 A 执行 B」，比不识别严重得多。
     esp_mn_commands_clear();
-    registered_ids_.clear();
-
-    int next_id = 1;
-    for (int i = 0; i < (int)commands_.size(); i++) {
-        if (esp_mn_commands_add(next_id, commands_[i].command.c_str()) == ESP_OK) {
-            registered_ids_.push_back({next_id, i});
-            next_id++;
-        } else {
-            ESP_LOGE(TAG, "命令词注册失败（短语无法被模型解析）: \"%s\"",
-                     commands_[i].command.c_str());
-        }
+    for (int i = 0; i < commands_.size(); i++) {
+        esp_mn_commands_add(i + 1, commands_[i].command.c_str());
     }
-
-    // elder 离线命令词：与唤醒词共用同一个 MultiNet 实例。
-    // 老人不需要先说唤醒词，直接说「吃过了」就该生效 —— 所以这里
-    // 把 elder 词表也塞进同一个识别网络，action 标成 "elder"
-    // 以便 Feed() 区分「唤醒」与「执行命令」。
-    int elder_ok = 0;
-    for (int i = 0; i < elder_cmd_word_count(); i++) {
-        const elder_cmd_word_t* w = elder_cmd_word_at(i);
-        if (w == nullptr) {
-            continue;
-        }
-        // commands_ 里存：command=拼音（注册用）、text=汉字短语（分发给 elder_cmd 用）
-        commands_.push_back({w->pinyin, w->phrase, kElderAction});
-        if (esp_mn_commands_add(next_id, w->pinyin) == ESP_OK) {
-            registered_ids_.push_back({next_id, (int)commands_.size() - 1});
-            next_id++;
-            elder_ok++;
-        } else {
-            // 注册失败就把它从 commands_ 里摘掉：留着会让 id 与下标错位
-            ESP_LOGE(TAG, "elder 命令词注册失败（模型无法解析该拼音）: \"%s\" -> \"%s\"",
-                     w->phrase, w->pinyin);
-            commands_.pop_back();
-        }
-    }
-    ESP_LOGI(TAG, "elder 离线命令词注册 %d/%d 条成功", elder_ok, elder_cmd_word_count());
-
     esp_mn_commands_update();
-
+    
     multinet_->print_active_speech_commands(multinet_model_data_);
     return true;
 }
@@ -250,18 +143,7 @@ void CustomWakeWord::Stop() {
 }
 
 void CustomWakeWord::Feed(const std::vector<int16_t>& data) {
-    /* 探针：先记「被跳过」次数。running_ 为 false 时下面会直接 return，
-     * 那种情况下 calls 不涨、skipped 涨 —— 一眼区分「没跑」与「跑了但认不出」。 */
     if (multinet_model_data_ == nullptr || !running_) {
-        mn_probe_skipped_++;
-        int64_t now_ms = esp_timer_get_time() / 1000;
-        if (now_ms - mn_probe_last_ms_ >= 2000) {
-            ESP_LOGW(TAG, "MultiNet 探针：引擎未运行（跳过 %u 帧，running=%d，data=%p）",
-                     (unsigned)mn_probe_skipped_, (int)running_.load(),
-                     (void*)multinet_model_data_);
-            mn_probe_skipped_ = 0;
-            mn_probe_last_ms_ = now_ms;
-        }
         return;
     }
 
@@ -281,56 +163,17 @@ void CustomWakeWord::Feed(const std::vector<int16_t>& data) {
     }
     
     if (mn_state == ESP_MN_STATE_DETECTING) {
-        /* 探针：detect 调用本身在跑（说明数据到了模型），2 秒汇总一次。 */
-        mn_probe_calls_++;
-        int64_t now_ms = esp_timer_get_time() / 1000;
-        if (now_ms - mn_probe_last_ms_ >= 2000) {
-            ESP_LOGI(TAG, "MultiNet 探针：detect 调用=%u 次/2s，累计命中=%d（正在识别）",
-                     (unsigned)mn_probe_calls_, mn_probe_detected_);
-            mn_probe_calls_ = 0;
-            mn_probe_last_ms_ = now_ms;
-        }
         return;
     } else if (mn_state == ESP_MN_STATE_DETECTED) {
-        mn_probe_detected_++;
-        mn_probe_calls_++;
         esp_mn_results_t *mn_result = multinet_->get_results(multinet_model_data_);
         for (int i = 0; i < mn_result->num && running_; i++) {
-            int id = mn_result->command_id[i];
-            ESP_LOGI(TAG, "Custom wake word detected: command_id=%d, string=%s, prob=%f",
-                    id, mn_result->string, mn_result->prob[i]);
-
-            // command_id → commands_ 下标必须查表，不能直接用 id-1：
-            // 见 Initialize() 里关于 registered_ids_ 的注释。
-            const Command* command = nullptr;
-            for (const auto& kv : registered_ids_) {
-                if (kv.first == id) {
-                    command = &commands_[kv.second];
-                    break;
-                }
-            }
-            if (command == nullptr) {
-                ESP_LOGW(TAG, "command_id=%d 不在注册表里，忽略（不应发生）", id);
-                continue;
-            }
-
-            if (command->action == kElderAction) {
-                // 离线命令词命中。非阻塞投递：elder_mn_post() 只做
-                // memcpy + xQueueSend，真正写 NVS 的活儿在独立任务里。
-                // 音频任务里绝不能等 —— 见 elder_mn.c 文件头注释。
-                // text 是汉字短语，正好是 elder_cmd_dispatch() 的匹配键。
-                if (!elder_mn_post(command->text.c_str())) {
-                    ESP_LOGW(TAG, "elder 命令词投递失败（队列满或未初始化），"
-                                  "本次识别作废，老人可改用按键: \"%s\"",
-                             command->text.c_str());
-                }
-                continue;
-            }
-
-            if (command->action == "wake") {
-                last_detected_wake_word_ = command->text;
+            ESP_LOGI(TAG, "Custom wake word detected: command_id=%d, string=%s, prob=%f", 
+                    mn_result->command_id[i], mn_result->string, mn_result->prob[i]);
+            auto& command = commands_[mn_result->command_id[i] - 1];
+            if (command.action == "wake") {
+                last_detected_wake_word_ = command.text;
                 running_ = false;
-
+                
                 if (wake_word_detected_callback_) {
                     wake_word_detected_callback_(last_detected_wake_word_);
                 }
@@ -402,15 +245,9 @@ void CustomWakeWord::EncodeWakeWordData() {
 
 bool CustomWakeWord::GetWakeWordOpus(std::vector<uint8_t>& opus) {
     std::unique_lock<std::mutex> lock(wake_word_mutex_);
-    /* 同 AfeWakeWord::GetWakeWordOpus：主任务同步调用，绝不能无超时等待。
-     * 编包任务出错（比如 running_ 在编码中途被停）时队列可能永远不填，
-     * 无超时的 wait 会把整个会话状态机挂死。 */
-    bool got = wake_word_cv_.wait_for(lock, std::chrono::milliseconds(1500),
-                                      [this]() { return !wake_word_opus_.empty(); });
-    if (!got) {
-        ESP_LOGW(TAG, "取唤醒音频超时（1.5s 无数据）→ 本次跳过，会话继续");
-        return false;
-    }
+    wake_word_cv_.wait(lock, [this]() {
+        return !wake_word_opus_.empty();
+    });
     opus.swap(wake_word_opus_.front());
     wake_word_opus_.pop_front();
     return !opus.empty();

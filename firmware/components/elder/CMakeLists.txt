@@ -7,8 +7,7 @@ idf_component_register(
         "src/ui.c"
         "src/net.c"
         "src/sync.c"
-        "src/elder_cmd.c"
-        "src/elder_mn.c"
+        "src/rtc.c"
         "src/config_report.c"
     INCLUDE_DIRS "include"
     REQUIRES
@@ -18,6 +17,8 @@ idf_component_register(
         esp_hw_support
         esp_driver_rmt
         esp_driver_gpio
+        # i2c_master_get_bus_handle / i2c_master_transmit（新 I2C 主机驱动，rtc.c）
+        esp_driver_i2c
         esp_http_client
         # esp_crt_bundle.h（证书包）在 mbedtls 组件里，必须显式声明：
         # 漏了它 net.c 直接 fatal error: esp_crt_bundle.h: No such file。

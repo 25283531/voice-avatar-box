@@ -137,6 +137,14 @@ esp_err_t elder_rgb_init(void)
 {
     if (g.ready) return ESP_OK;
 
+#if !ELDER_RGB_ENABLED
+    /* 原型期未接灯珠（CONFIG_ELDER_ENABLE_RGB=n 或 ELDER_RGB_GPIO=-1）。
+     * 返回 ESP_OK 而不是错误：少一颗灯不该让整个启动流程报错，
+     * 灯效相关的 request 会因为 g.ready=false 自动变成空操作。 */
+    ESP_LOGW(TAG, "未启用 WS2812（RGB 关闭或 GPIO=-1），灯效功能关闭");
+    return ESP_OK;
+#endif
+
     rmt_tx_channel_config_t ch = {
         .clk_src = RMT_CLK_SRC_DEFAULT,
         .gpio_num = ELDER_RGB_GPIO,

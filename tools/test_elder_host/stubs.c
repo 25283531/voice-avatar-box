@@ -1,4 +1,4 @@
-/* stubs.c —— 让 reminder.c / elder_cmd.c 能在宿主机上编译运行的桩。
+/* stubs.c —— 让 reminder.c 能在宿主机上编译运行的桩。
  *
  * reminder.c 的真实依赖：NVS 持久化、esp_timer 计时、FreeRTOS 任务、
  * RGB 指示灯。这里全部替换为「内存实现」，语义与固件一致到足以验证
@@ -109,7 +109,7 @@ void stub_time_set(time_t epoch) { s_fake_now = epoch; }
 void stub_time_advance(int64_t sec) { s_fake_now += (time_t)sec; }
 time_t stub_time_now(void) { return s_fake_now ? s_fake_now : (time_t)FAKE_BASE; }
 
-/* ⚠️ 必须劫持 libc 的 time()，否则 reminder.c / elder_cmd.c 里的
+/* ⚠️ 必须劫持 libc 的 time()，否则 reminder.c 里的
  *    time(NULL) 会读到真实系统时间，整套「到点触发」的断言全部失真
  *    （看起来能过，其实测的是运行测试那一秒的时刻）。
  *    做法：在本文件里直接定义 time()，链接器会用我们的定义覆盖 libc 的

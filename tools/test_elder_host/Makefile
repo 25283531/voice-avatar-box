@@ -2,7 +2,8 @@
 #
 # 为什么需要它
 # ------------
-# reminder.c / elder_cmd.c 是本仓唯一能在**宿主机**上编译的 elder 源码：
+# reminder.c 是本仓唯一能在**宿主机**上编译的 elder 源码（elder_cmd.c 已随
+# 2026-10-20 回归上游小智删除，离线命令词全删）：
 # 它们的依赖（NVS / esp_timer / FreeRTOS 任务 / RGB）都能用桩替换，于是
 # 「设备没有网络、只有本地时钟」这个最难在真机上复现的场景，可以在 CI 上
 # 几秒钟跑完 —— 不烧板子、不用真的等 15 分钟。
@@ -10,7 +11,7 @@
 # 覆盖的断言都对应医疗事故级的失效：
 #   T1  提醒时间存本地（NVS）        —— 断网重启后提醒还在
 #   T2  replace_all 不抹掉本地自建    —— 一次心跳同步不该让老人的服药提醒消失
-#   T3  断网新建 + 断网确认 + 确认方式 —— 命令词分发器全链路
+#   T3  （已删除）断网新建 + 断网确认 —— 2026-10-20 离线命令词全删
 #   T4  时钟不可信时不触发            —— 响错时间比不提醒更危险
 #   T5  本地日边界不错判              —— 08:00 不该被当成「新的一天」
 #   T6  跨天真的重置                  —— 第二天提醒仍要响（否则从此再不响）
@@ -61,7 +62,7 @@ STUBS    = stubs
 # 时间劫持在 stubs.c 里直接定义 time() 完成（不用 -Dtime=，那会连
 # <time.h> 自己的声明一起改名，反而编不过）。
 #
-# -D_POSIX_C_SOURCE=200809L 不是可选项：reminder.c / elder_cmd.c 用
+# -D_POSIX_C_SOURCE=200809L 不是可选项：reminder.c 用
 # localtime_r()，测试用 setenv()+tzset() 固定时区，这三个都是 **POSIX**
 # 而非 C99 标准函数。纯 -std=c99 下它们不会被声明，
 # gcc 会报 implicit-function-declaration（C99 起不再是合法隐式声明），
@@ -71,7 +72,7 @@ CFLAGS  ?= -std=c99 -D_POSIX_C_SOURCE=200809L \
            -I$(STUBS)/include -I$(ELDER)/include
 
 SRCS     = test_elder_host.c stubs.c \
-           $(ELDER)/src/elder_cmd.c $(ELDER)/src/reminder.c
+           $(ELDER)/src/reminder.c
 BUILD    = build
 
 .PHONY: all run clean

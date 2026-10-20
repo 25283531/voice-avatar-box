@@ -2,8 +2,6 @@
 #include "audio_service.h"
 
 #include <esp_log.h>
-#include <esp_timer.h>
-#include <chrono>
 #include <sstream>
 
 #define DETECTION_RUNNING_EVENT 1
@@ -77,34 +75,11 @@ bool AfeWakeWord::Initialize(AudioCodec* codec, srmodel_list_t* models_list) {
     afe_config->aec_init = codec_->input_reference();
     afe_config->aec_mode = AEC_MODE_SR_HIGH_PERF;
     afe_config->afe_perferred_core = 1;
-    /* 保持 1，别改成官方默认的 5。
-     * 2026-10-20 试过改成 5，结果唤醒后 56 秒里 AFE feed 环形缓冲溢出 1589 次
-     * —— 因为 afe_audio_processor.cc 里的 VC 型 AFE 也用默认优先级 5，
-     * 两条 AFE 抢同一个核，WakeNet 这条反而被饿住。
-     * 真正导致溢出的洞是 Feed() 在 Stop() 之后还在喂，已在 Feed() 里堵上，
-     * 优先级不是那里的解药。 */
     afe_config->afe_perferred_priority = 1;
     afe_config->memory_alloc_mode = AFE_MEMORY_ALLOC_MORE_PSRAM;
     
     afe_iface_ = esp_afe_handle_from_config(afe_config);
     afe_data_ = afe_iface_->create_from_config(afe_config);
-
-    /* 2026-10-20 加的保护：本工程**同时**启用了 MultiNet（双引擎唤醒），
-     * AFE 与 MultiNet 抢 PSRAM；一旦 AFE 建不起来（返回空），
-     * AudioDetectionTask 里第一句 afe_iface_->get_fetch_chunksize(afe_data_)
-     * 就是空指针解引用 ⇒ 开机即崩，而崩溃点在 AFE 内部，日志完全指不到配置。
-     * 另外 wake_words_ 为空说明模型包里根本没有 wn* 模型，
-     * AudioDetectionTask 用 wakenet_model_index-1 索引它同样会越界。
-     * ⇒ 这两种情况都必须在这里**返回 false**，让上层降级到只用 MultiNet。 */
-    if (afe_iface_ == nullptr || afe_data_ == nullptr || wake_words_.empty()) {
-        ESP_LOGE(TAG, "AFE/WakeNet 起不来（iface=%p data=%p 唤醒词数=%u）→ 降级",
-                 (void*)afe_iface_, (void*)afe_data_, (unsigned)wake_words_.size());
-        if (afe_iface_ != nullptr && afe_data_ != nullptr) {
-            afe_iface_->destroy(afe_data_);
-        }
-        afe_data_ = nullptr;
-        return false;
-    }
 
     xTaskCreate([](void* arg) {
         auto this_ = (AfeWakeWord*)arg;
@@ -134,19 +109,6 @@ void AfeWakeWord::Feed(const std::vector<int16_t>& data) {
     if (afe_data_ == nullptr) {
         return;
     }
-    /* 没在检测就别喂。
-     *
-     * AudioDetectionTask 只在 DETECTION_RUNNING_EVENT 置位时 fetch；
-     * 而唤醒命中后 Stop() 会清掉这一位（AEC 模式下唤醒后要让 AudioProcessor
-     * 接管音频），此后本类再 feed 就是「只进不出」——AFE 的 feed 环形缓冲
-     * 一圈圈被覆盖，日志刷屏：
-     *   W AFE: Ringbuffer of AFE(FEED) is full, Please use fetch() to read data
-     * 2026-10-20 实测一次唤醒后 56 秒内刷了 **1589 条**这种警告，同时
-     * AFE 还在无谓地跑 AEC/WakeNet 推理，白烧 CPU 挤占真正干活的
-     * AudioProcessor。这一行就是那个洞。 */
-    if ((xEventGroupGetBits(event_group_) & DETECTION_RUNNING_EVENT) == 0) {
-        return;
-    }
     afe_iface_->feed(afe_data_, data.data());
 }
 
@@ -169,23 +131,6 @@ void AfeWakeWord::AudioDetectionTask() {
         auto res = afe_iface_->fetch_with_delay(afe_data_, portMAX_DELAY);
         if (res == nullptr || res->ret_value == ESP_FAIL) {
             continue;;
-        }
-
-        /* 探针（2026-10-20 诊断「喊不醒」）：证明 AFE 出口**真的在出数据**。
-         * fetch 出现即说明 AEC/VAD/WakeNet 整条 pipeline 在跑；
-         * 若这里恒 0（且伴随 "Ringbuffer of AFE(FEED) is full"），
-         * 那就是喂进去的音频在 AFE 出口被吞掉了，与唤醒词模型无关。 */
-        {
-            static uint32_t fetch_cnt = 0;
-            static int64_t fetch_probe_ms = 0;
-            fetch_cnt++;
-            int64_t now_ms = esp_timer_get_time() / 1000;
-            if (now_ms - fetch_probe_ms >= 2000) {
-                ESP_LOGI(TAG, "WakeNet 探针：AFE fetch=%u 次/2s（每次 %d 帧），最近状态=%d",
-                         (unsigned)fetch_cnt, (int)fetch_size, (int)res->wakeup_state);
-                fetch_cnt = 0;
-                fetch_probe_ms = now_ms;
-            }
         }
 
         // Store the wake word data for voice recognition, like who is speaking
@@ -254,17 +199,9 @@ void AfeWakeWord::EncodeWakeWordData() {
 
 bool AfeWakeWord::GetWakeWordOpus(std::vector<uint8_t>& opus) {
     std::unique_lock<std::mutex> lock(wake_word_mutex_);
-    /* 必须带超时。这里是**主任务**在调用（Application::OnWakeWordDetected
-     * 里同步取包），无超时的 wait 一旦踩到「队列其实是空的」就永久挂住整个
-     * 会话状态机 —— 症状是设备能唤醒、WS 也连上，但永远不说话，
-     * 而且之后连唤醒都不再响应（状态机已死）。宁可丢这段唤醒音频，
-     * 也不能把主任务赔进去。 */
-    bool got = wake_word_cv_.wait_for(lock, std::chrono::milliseconds(1500),
-                                      [this]() { return !wake_word_opus_.empty(); });
-    if (!got) {
-        ESP_LOGW(TAG, "取唤醒音频超时（1.5s 无数据）→ 本次跳过，会话继续");
-        return false;
-    }
+    wake_word_cv_.wait(lock, [this]() {
+        return !wake_word_opus_.empty();
+    });
     opus.swap(wake_word_opus_.front());
     wake_word_opus_.pop_front();
     return !opus.empty();
