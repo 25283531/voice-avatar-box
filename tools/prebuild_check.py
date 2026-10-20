@@ -398,6 +398,43 @@ def main() -> int:
     except Exception as exc:  # noqa: BLE001
         check("C4 merge 注入完整", False, f"无法执行 merge --check: {exc}")
 
+    # ------------------------------------------------------ C6 emote 引擎已删除
+    # 2026-10-20 用户要求「emote 现在能调用吗？不能调用就删除」。
+    # 本产品固定走 LVGL 界面（SpiLcdDisplay），CONFIG_USE_EMOTE_MESSAGE_STYLE 恒 n
+    # ⇒ emote 引擎永远不会被调用，已连同源文件与三个依赖一起删掉。
+    #
+    # 为什么需要一条守卫：这三个依赖是上游模板带的，`idf.py` 只会下载、不会报错；
+    # 一旦有人「顺手补回依赖」，固件里就会重新出现一个没人调用的表情引擎
+    # （它没有整体 #if 保护，654 行全部生成目标码）。**失败方向必须是红**，
+    # 否则下次体积又悄悄涨回去且没人知道来源。
+    comp_yml = ROOT / "firmware" / "xiaozhi" / "main" / "idf_component.yml"
+    emote_src = ROOT / "firmware" / "xiaozhi" / "main" / "display" / "emote_display.cc"
+    if comp_yml.exists():
+        ytext = comp_yml.read_text(encoding="utf-8")
+        # 只看**生效的配置行**：注释里必然还会提到这三个名字（说明为什么删的），
+        # 那是文档不是依赖。判据必须是「这行会不会真被组件管理器读成依赖」。
+        effective = "\n".join(
+            line.split("#", 1)[0] for line in ytext.splitlines()
+        )
+        leftovers = [k for k in ("esp_emote_gfx", "image_player", "otto-emoji-gif")
+                     if k in effective]
+        check(
+            "C6 emote 引擎依赖没有回到 idf_component.yml",
+            not leftovers,
+            f"依赖清单里又出现 {leftovers} —— 产品走 LVGL，这些永远不会被调用"
+            if leftovers else "emote 三件套依赖均已移除（注释里的说明不算依赖）",
+        )
+        check(
+            "C6b emote 源文件已删除（不是仅移出编译）",
+            not emote_src.exists(),
+            f"{emote_src} 仍然存在；若确实要恢复 emote，必须同时改显示层依赖"
+            f"并打开 CONFIG_USE_EMOTE_MESSAGE_STYLE，不能只把文件放回来"
+            if emote_src.exists() else "emote_display.cc/.h 已从仓库删除",
+            fatal=emote_src.exists(),
+        )
+    else:
+        check("C6 emote 依赖清理", SKIP, f"找不到 {comp_yml}")
+
     # ------------------------------------------------------ 汇总
     failed = [r for r in results if not r[1] and r[3]]
     warned = [r for r in results if not r[1] and not r[3]]

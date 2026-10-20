@@ -16,13 +16,11 @@ set(SOURCES "audio/audio_codec.cc"
             "display/lcd_display.cc"
             "display/oled_display.cc"
             "display/lvgl_display/lvgl_display.cc"
-            # emote_display.cc 刻意**不编**：它没有整体条件编译保护（654 行都会
-            # 生成目标码），并且无条件 LV_FONT_DECLARE(BUILTIN_TEXT_FONT)，
-            # 会把表情引擎 gfx 和一份字体拖进 app 镜像。本项目固定用 LVGL
-            # （CONFIG_USE_EMOTE_MESSAGE_STYLE 恒为 n，见 sdkconfig.defaults 说明），
-            # 相关 include 已在 assets.cc / 板级文件里用 #if 包住。
-            # 真要改回 emote：把下面这行恢复，并打开 CONFIG_USE_EMOTE_MESSAGE_STYLE。
-            # "display/emote_display.cc"
+            # emote（表情引擎）已于 2026-10-20 **整体删除**（源文件、依赖都删了）。
+            # 用户问「现在能调用吗」——不能：本产品固定走 LVGL 界面
+            # （SpiLcdDisplay），CONFIG_USE_EMOTE_MESSAGE_STYLE 恒为 n，
+            # 而它没有整体条件编译保护（654 行都会生成目标码）。
+            # 真要恢复必须先改显示层依赖，不能只把这行加回来。
             "display/lvgl_display/emoji_collection.cc"
             "display/lvgl_display/lvgl_theme.cc"
             "display/lvgl_display/lvgl_font.cc"
