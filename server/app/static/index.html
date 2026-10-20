@@ -58,9 +58,17 @@
   .big-code{font:22px/1.4 ui-monospace,Consolas,monospace;letter-spacing:1px;
        background:#0f172a;color:#7dd3fc;padding:12px 16px;border-radius:8px;
        display:inline-block;margin:8px 0}
-  .bars{display:flex;align-items:flex-end;gap:6px;height:120px;padding-top:8px}
-  .bars .b{flex:1;background:var(--brand);border-radius:4px 4px 0 0;min-height:2px;position:relative}
-  .bars .x{text-align:center;font-size:11px;color:var(--muted);margin-top:4px}
+  /* 柱状图：高度由 track 撑满容器（flex:1），柱子用**百分比**高度自行缩放。
+     不再用「JS 算好像素高度」——那样一旦归一化基准取错数据集（曾把交互次数的
+     series 拿来当 token 的基准），柱高会算成几十万像素，从容器里向上溢出去，
+     直接盖住页面顶部的 header 与导航切换。百分比 + overflow:hidden 双保险，
+     任何数据量级下都不可能越界。 */
+  .bars{display:flex;align-items:flex-end;gap:6px;height:140px;padding-top:8px;overflow:hidden}
+  .bars .col{flex:1;min-width:0;display:flex;flex-direction:column;height:100%}
+  .bars .track{flex:1;min-height:0;display:flex;align-items:flex-end}
+  .bars .b{width:100%;background:var(--brand);border-radius:4px 4px 0 0;min-height:2px}
+  .bars .x{text-align:center;font-size:11px;color:var(--muted);margin-top:4px;
+        min-height:15px;line-height:15px;white-space:nowrap;overflow:hidden}
   .err{background:#fdeaea;color:var(--bad);padding:8px 12px;border-radius:6px;margin-bottom:10px}
   .mask{position:fixed;inset:0;background:rgba(15,23,42,.45);display:flex;
         align-items:flex-start;justify-content:center;padding:40px 16px;overflow:auto}
@@ -1085,9 +1093,12 @@
         <div v-if="stat" style="margin-top:14px">
           <div class="muted" style="font-size:12px;margin-bottom:4px">近 {{stat.series.length}} 天交互次数</div>
           <div class="bars">
-            <div v-for="p in stat.series" :key="p.date">
-              <div class="b" :style="{height:barHeight(p.total)+'px'}" :title="p.date+' 共 '+p.total+' 次'"></div>
-              <div class="x">{{p.date.slice(5)}}</div>
+            <div v-for="(p,i) in stat.series" :key="p.date" class="col">
+              <div class="track">
+                <div class="b" :style="{height:barPct(p.total,stat.series,'total')+'%'}"
+                     :title="p.date+' 共 '+p.total+' 次'"></div>
+              </div>
+              <div class="x">{{dayLabel(stat.series,i)}}</div>
             </div>
           </div>
         </div>
@@ -1145,10 +1156,12 @@
       <div class="card" v-if="usageSummary && (usageSummary.by_day||[]).length">
         <h2>近 {{usageSummary.by_day.length}} 天 tokens</h2>
         <div class="bars">
-          <div v-for="p in usageSummary.by_day" :key="p.date" style="flex:1">
-            <div class="b" :style="{height:barHeight(p.total_tokens)+'px'}"
-                 :title="p.date+' 共 '+p.total_tokens+' tokens'"></div>
-            <div class="x">{{p.date.slice(5)}}</div>
+          <div v-for="(p,i) in usageSummary.by_day" :key="p.date" class="col">
+            <div class="track">
+              <div class="b" :style="{height:barPct(p.total_tokens,usageSummary.by_day,'total_tokens')+'%'}"
+                   :title="p.date+' 共 '+p.total_tokens+' tokens'"></div>
+            </div>
+            <div class="x">{{dayLabel(usageSummary.by_day,i)}}</div>
           </div>
         </div>
       </div>
@@ -2384,9 +2397,29 @@ createApp({
       const p = n => String(n).padStart(2,'0');
       return d.getFullYear()+'-'+p(d.getMonth()+1)+'-'+p(d.getDate())+' '+p(d.getHours())+':'+p(d.getMinutes());
     },
-    barHeight(n){
-      const max = Math.max(1, ...(this.stat ? this.stat.series.map(s=>s.total) : [1]));
-      return Math.round(8 + (n / max) * 100);
+    /* 柱子高度百分比：**必须按本图表自己的数据集归一化**。
+       旧实现用 this.stat.series 当基准，token 页 stat 通常为 null ⇒ max=1 ⇒
+       柱高 = 8 + tokens*100 像素（几万 tokens 就是几百万像素），
+       从 120px 容器里向上溢出、盖住 header 与导航。改为：基准取传入的 list，
+       返回 0..100 的百分比，由 CSS 的 track 承接，永远不越界。 */
+    barPct(v, list, key){
+      const arr = Array.isArray(list) ? list : [];
+      let max = 0;
+      for (const it of arr){
+        const n = Number(key ? (it && it[key]) : it) || 0;
+        if (n > max) max = n;
+      }
+      const n = Number(v) || 0;
+      if (max <= 0 || n <= 0) return 0;      // 0 值靠 .b 的 min-height:2px 保留可见
+      return Math.max(1, Math.round(n / max * 100));
+    },
+    /* 日期标签抽稀：30 天全显会挤成一团。按末尾对齐抽稀，保证最新一天总有标签。 */
+    dayLabel(list, i){
+      const arr = Array.isArray(list) ? list : [];
+      const d = arr[i] && arr[i].date;
+      if (!d) return '';
+      const step = Math.max(1, Math.ceil(arr.length / 12));
+      return ((arr.length - 1 - i) % step === 0) ? String(d).slice(5) : '';
     },
     typeName(t){ return ['服药','日程','喝水','运动','自定义'][t] || '自定义'; },
     kindName(r){
