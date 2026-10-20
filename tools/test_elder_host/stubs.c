@@ -133,12 +133,17 @@ static int s_rgb_count;
 static int s_rgb_pending;
 static int s_rgb_escalate;
 static int s_rgb_done;
+/* 「只屏显不发声」的通知（未校时提示走这条）。单独计数，不并进 tone：
+ * 并进去的话「播了提示音」与「只是安静地在屏幕上说了句状态」无法区分，
+ * 而 T4 要钉的正是「时钟不可信时**不许响**，但**必须让人看见**」。 */
+static int s_notice_count;
 
 int  stub_tone_count(void) { return s_tone_count; }
 int  stub_rgb_count(void) { return s_rgb_count; }
 int  stub_rgb_pending_count(void) { return s_rgb_pending; }
 int  stub_rgb_escalate_count(void) { return s_rgb_escalate; }
 int  stub_rgb_done_count(void) { return s_rgb_done; }
+int  stub_notice_count(void) { return s_notice_count; }
 void stub_fx_reset(void)
 {
     s_tone_count = 0;
@@ -146,10 +151,17 @@ void stub_fx_reset(void)
     s_rgb_pending = 0;
     s_rgb_escalate = 0;
     s_rgb_done = 0;
+    s_notice_count = 0;
 }
 
 void elder_ui_play_tone(elder_tone_t tone) { (void)tone; s_tone_count++; }
 void elder_ui_announce(const char *t, elder_tone_t tone) { (void)t; (void)tone; s_tone_count++; }
+/* 只屏显、不发声：不增加 tone 计数（这正是它与 announce 的区别） */
+void elder_ui_notice(const char *t, const char *emotion)
+{
+    (void)emotion;
+    if (t && t[0]) s_notice_count++;
+}
 
 void elder_rgb_med_done(void) { s_rgb_count++; s_rgb_done++; }
 void elder_rgb_med_pending(void) { s_rgb_count++; s_rgb_pending++; }

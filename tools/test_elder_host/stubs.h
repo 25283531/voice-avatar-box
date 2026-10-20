@@ -48,6 +48,9 @@ int  stub_rgb_count(void);
 int  stub_rgb_pending_count(void);
 int  stub_rgb_escalate_count(void);
 int  stub_rgb_done_count(void);
+/* 「只屏显不发声」的通知次数（elder_ui_notice）。与 tone 分开计：
+ * 未校时提示必须**看得见但不响**，两者混在一起就测不出这条区分。 */
+int  stub_notice_count(void);
 void stub_fx_reset(void);
 
 /* 任务创建被丢弃（不启动死循环） */

@@ -398,6 +398,7 @@ from app.db import init_db
 from app import models
 from app.db import SessionLocal
 from app.main import _seed, _seed_migration
+from app.persona import catalog
 from app.schema_patch import run_all
 init_db(); run_all()
 _seed(); _seed_migration()      # 与 main.lifespan 完全同序
@@ -407,18 +408,28 @@ with SessionLocal() as db:      # ⚠️ 走 ORM，JSON 列才拿到 dict
           "guardrails": x.guardrails}
          for x in db.query(models.AIProvider).filter(
              models.AIProvider.kind == "").order_by(models.AIProvider.id).all()]
-print("###JSON###" + json.dumps(r, ensure_ascii=False, default=str))
+# 期望值由**被测实现之外的单一真源**给出：catalog.DEFAULT_PRESET_PROMPT。
+# 早期这里写的是字面量 `"小暖" in p`，2026-10-21 品牌改名小智后它就假红了 ——
+# 断言里出现任何「当前品牌名/文案」的字面量，改文案的人就得回来改测试，
+# 于是测试迟早会被顺手改成"永远绿"。改成与常量比对，改名不再影响本判据，
+# 而「seed 顺序错 → prompt 为空」这条鉴别力一分不减。
+print("###JSON###" + json.dumps(
+    {"rows": r, "expected_prompt": catalog.DEFAULT_PRESET_PROMPT},
+    ensure_ascii=False, default=str))
 '''
     rc, out = run_in_server(code, db)
     rep = last_json(out)
     if not check("T4 全新部署初始化跑通", rc == 0 and rep is not None, out[-500:]):
         return
-    preset = next((x for x in rep if x["record_type"] == "preset"), None)
-    check("T4 全新部署产出平台预设角色", preset is not None, str(len(rep)))
+    rows = rep.get("rows") if isinstance(rep, dict) else rep
+    expected = (rep.get("expected_prompt") if isinstance(rep, dict) else "") or ""
+    preset = next((x for x in rows if x["record_type"] == "preset"), None)
+    check("T4 全新部署产出平台预设角色", preset is not None, str(len(rows)))
     if preset:
-        p = preset.get("system_prompt") or ""
+        p = (preset.get("system_prompt") or "").strip()
         check("★ T4 平台预设角色**有人格**（seed 顺序正确的关键判据）",
-              len(p.strip()) > 20 and "小暖" in p, repr(p)[:60])
+              len(p) > 20 and p == expected.strip(),
+              f"实际 {p[:30]!r} / 期望 {expected.strip()[:30]!r}")
         tr = preset.get("traits")
         check("T4 预设角色带完整 traits（10 项，且是 dict 不是字符串）",
               isinstance(tr, dict) and len(tr) == 10,

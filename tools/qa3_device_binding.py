@@ -34,6 +34,31 @@ from smoke_ports import resolve_port
 ROOT = Path(__file__).resolve().parent.parent
 SERVER = ROOT / "server"
 PY = sys.executable
+
+
+def _preset_role_name() -> str:
+    """平台预设角色的名字，从**代码里的单一真源**取，不写字面量。
+
+    为什么绕开 `import app.persona.catalog`：那会连带执行
+    `app/persona/__init__.py`（进而拉进 compiler/models/sqlalchemy），
+    而这个脚本只需要一个字符串常量。用 importlib 直接按文件加载
+    catalog.py —— 它只依赖 stdlib，加载成本接近零。
+    2026-10-21 品牌改名（小暖→小智）时这里原本写死的字面量假红过一次。
+    """
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "_elder_catalog", SERVER / "app" / "persona" / "catalog.py")
+    mod = importlib.util.module_from_spec(spec)
+    # 必须先登记进 sys.modules 再 exec：catalog.py 里有 @dataclass，
+    # dataclasses 处理注解时要回头查 sys.modules[cls.__module__]，
+    # 没登记就会 AttributeError: 'NoneType' object has no attribute '__dict__'。
+    sys.modules[spec.name] = mod
+    spec.loader.exec_module(mod)          # type: ignore[union-attr]
+    return mod.PRESET_ROLE_NAME
+
+
+PRESET_ROLE_NAME = _preset_role_name()
+
 DB = Path(tempfile.gettempdir()) / f"qa3_dev_{os.getpid()}.db"
 # 默认端口统一由 tools/smoke_ports.py 托管（唯一真源）——
 # 早先各脚本各写一份端口，并行跑必然撞车（QA 亲历过一次：
@@ -225,9 +250,9 @@ def main() -> int:
                    {"username": "devu", "password": "test123456"})
         ua5 = t.get("access_token", "")
         n5 = agent_name_of(new_pk, ua5)
-        print(f"  存量设备 agent_name = {n5!r}（期望 '小暖（平台预设）'）")
+        print(f"  存量设备 agent_name = {n5!r}（期望 {PRESET_ROLE_NAME!r}）")
         ok("★ 存量设备（早于 preset）仍被正确回填",
-           n5 == "小暖（平台预设）", str(n5))
+           n5 == PRESET_ROLE_NAME, str(n5))
     finally:
         stop(proc)
 

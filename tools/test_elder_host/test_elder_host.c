@@ -12,6 +12,7 @@
  *   T9  NVS CRC 校验 —— 坏数据绝不能被当成有效提醒表
  *   T10 上电首 tick 不做跨天重置 —— 否则每次上电都产生一次假「漏服」
  *   T11 重启后不得二次响铃 —— 见 test_restart_no_refire 上方的失效链推演
+ *   T12 到点后很久才开机 —— 不补响、不升级，判 SKIPPED（与 T11-6 反向成对）
  *
  * 全程**没有任何网络调用**：这正是要验证的场景。
  */
@@ -278,11 +279,24 @@ static void test_untrusted_clock_guard(void)
 
     /* 推进 100 天，时间仍然不可信 */
     stub_time_advance(100LL * 86400);
+    stub_fx_reset();                     /* 只统计本次 tick 的副作用 */
     elder_reminder_tick_once();
     const elder_rmd_table_t *t = tbl();
     check("时钟不可信时不触发任何提醒",
           t && t->pending_today == 0 && t->done_today == 0,
           "响错时间的服药提醒比不提醒更危险");
+
+    /* 2026-10-21 补的两条：原来的实现**只打一条 ESP_LOGE**，
+     * 而老人看到的是**一切正常的待机屏** —— 当天一条都不会响却无人知晓。
+     * 所以「不响」必须配「让人看见」，且不能靠提示音（此刻多半离线，
+     * 突兀的响声只会吓人一跳）。 */
+    check("★未校时必须在屏幕上说明（光打日志等于没说）",
+          stub_notice_count() >= 1,
+          det("屏显 %d 次 —— 老人以为设备一切正常，实际当天所有提醒都不会响",
+              stub_notice_count()));
+    check("未校时提示只屏显、不发声",
+          stub_tone_count() == 0,
+          det("提示音 %d 次 —— 离线状态下突兀的响声只会吓人", stub_tone_count()));
 
     /* 校时之后恢复正常：受控时钟回到 07:00（可信），再推进到 08:00 */
     stub_time_set(1772665200L);
@@ -1331,7 +1345,22 @@ static void test_restart_catchup_still_rings(void)
           (tbl()->done_today & 1u) == 0,
           det("%s（响不等于吃）", dump_tbl(tbl())));
 
-    /* 补响之后 15 分钟仍要升级：开机 09:00 距 08:00 已 60 分钟 */
+    /* 2026-10-21 修正升级的计时基准：必须**从响铃算起**，不是从计划时刻算起。
+     *
+     * 旧判据是 `(now_min - due) >= 15`。本场景（计划 08:00、开机 09:00）
+     * 让它一上电就成立，于是 PENDING 刚设上、下一行就被推成 ESCALATED ——
+     * 子女端在设备刚说出「该吃药了」的**同一秒**收到「老人漏服」告警。
+     * 没人能在一秒内确认服药，这是构造性的假告警（产品侧认定为最坏失败模式）。
+     *
+     * 「补响不等于豁免升级」这条**意图原样保留**：响铃满 15 分钟仍无人确认，
+     * 照样升级。改的只是计时起点，不是要不要升级。 */
+    check("★补响的同一 tick 内不得直接判漏服（刚说完就报漏服 = 假告警）",
+          saw(0, ELDER_RMD_ESCALATED) == 0,
+          det("ESCALATED %d 次 —— 老人还没有任何机会确认就被判漏服",
+              saw(0, ELDER_RMD_ESCALATED)));
+
+    stub_time_advance(15 * 60);      /* 响铃后满 15 分钟，仍无人确认 */
+    elder_reminder_tick_once();
     check("补响后 15 分钟未确认必须升级为 ESCALATED（补响不等于豁免升级）",
           saw(0, ELDER_RMD_ESCALATED) >= 1,
           det("ESCALATED %d 次 —— 补响后免于升级 = 漏服药静默通过",
@@ -1352,6 +1381,83 @@ static void test_restart_catchup_still_rings(void)
           det("后续 tick 又触发了 %d 次 —— 反复响铃会持续骚扰老人",
               saw(0, ELDER_RMD_PENDING)));
     (void)pend_after;
+}
+
+/* =================================================================== */
+/* T12：到点后很久才开机 —— 不补响，也不谎报漏服（2026-10-21 新增）    */
+/* =================================================================== */
+/* 与 T11-6 是**一对反向断言**，中间那条线是 ELDER_RMD_STALE_MIN（60 分钟）：
+ *   T11-6  晚 60 分钟开机 —— 必须补响（别修成「永不响」）；
+ *   T12    晚 6 小时开机  —— 必须不响（别修成「六小时后叫人吃降压药」）。
+ * 只写一边就会把修复做偏。
+ *
+ * 为什么「晚 6 小时」必须不响：老人 14:00 才听到「该吃早上的药了」，
+ * 补服后与次日晨药间隔过近，低血压风险大于少提醒一次。
+ *
+ * 为什么「不许升级」：旧实现在这种情况下 now_min>=due 与 now_min-due>=15
+ * 在**同一个 tick** 里同时成立，PENDING 刚设上就被推成 ESCALATED，
+ * 子女端收到「老人漏服」告警 —— 而事实只是设备没开机。这是假告警，
+ * 也是这类产品最坏的失败模式之一。
+ *
+ * 为什么「要报 SKIPPED」：既不响也不报 = 静默吞掉一次提醒，同样不可接受。
+ * SKIPPED 在服务端（EventState.SKIPPED=4）已被排除在「待服药」之外，
+ * 子女端看到的是「这次没提醒」，而不是「漏服」。 */
+static void test_stale_skip_no_false_missed(void)
+{
+    printf("\n[T12] 到点后很久才开机：不补响、不升级，判 SKIPPED\n");
+    stub_nvs_init();
+    stub_time_set(1772661600L);      /* 06:00，可信时钟 */
+    rec_reset();
+    elder_reminder_init(rec_cb, NULL);
+
+    elder_rmd_item_t m = mk_med(8, 0, "早上的药", 0);
+    elder_reminder_add(&m);
+    check("前置：08:00 提醒已下发", tbl()->count == 1, det("%s", dump_tbl(tbl())));
+
+    /* 07:00 断电，14:00 才上电 —— 全程没有任何 tick */
+    stub_time_set(1772661600L + 8 * 3600);
+    rec_reset();
+    stub_fx_reset();
+    elder_reminder_init(rec_cb, NULL);       /* 14:00 开机 */
+    elder_reminder_tick_once();
+
+    check("★过期 6 小时不得补响（补服会与次日晨药过近）",
+          saw(0, ELDER_RMD_PENDING) == 0,
+          det("PENDING %d 次 —— 六小时后叫老人吃降压药，比漏一次更危险",
+              saw(0, ELDER_RMD_PENDING)));
+    check("过期项不得升级为 ESCALATED（不许谎报漏服）",
+          saw(0, ELDER_RMD_ESCALATED) == 0,
+          det("ESCALATED %d 次 —— 子女端会收到「老人漏服」，而事实只是没开机",
+              saw(0, ELDER_RMD_ESCALATED)));
+    check("过期项必须判 SKIPPED（让子女端知道「这次没提醒」而非「漏服」）",
+          saw(0, ELDER_RMD_SKIPPED) >= 1,
+          det("SKIPPED %d 次 —— 既不响也不报 = 静默吞掉一次提醒",
+              saw(0, ELDER_RMD_SKIPPED)));
+    check("过期项不得点亮红灯待确认",
+          (tbl()->pending_today & 1u) == 0, det("%s", dump_tbl(tbl())));
+    check("过期项不得被记成已服用",
+          (tbl()->done_today & 1u) == 0,
+          det("%s（跳过不等于吃了）", dump_tbl(tbl())));
+
+    /* 跳过只判定一次：后续 tick 不得反复上报 */
+    stub_time_advance(60);
+    rec_reset();
+    elder_reminder_tick_once();
+    check("过期判定只发生一次（不得每个 tick 都重报）",
+          saw(0, ELDER_RMD_SKIPPED) == 0,
+          det("后续 tick 又判了 %d 次", saw(0, ELDER_RMD_SKIPPED)));
+
+    /* 跳过是「当天作废」，不是「从此不再提醒」—— 第二天必须照常响。
+     * 这条守的是把修复做过头的方向：fired_today 位若不清，老人从此失声。 */
+    stub_time_set(1772661600L + 24 * 3600);   /* 次日 06:00 */
+    elder_reminder_tick_once();
+    stub_time_advance(2 * 3600);              /* 次日 08:00 */
+    rec_reset();
+    elder_reminder_tick_once();
+    check("★跳过只作废当天，次日 08:00 必须照常响",
+          saw(0, ELDER_RMD_PENDING) >= 1,
+          det("PENDING %d 次 —— 一次跳过变成永久失声，是更坏的事故",
+              saw(0, ELDER_RMD_PENDING)));
 }
 
 int main(void)
@@ -1378,6 +1484,7 @@ int main(void)
     test_legacy_blob_upgrade();
     test_replace_all_recomputes_fired();
     test_restart_catchup_still_rings();
+    test_stale_skip_no_false_missed();
 
     printf("\n=== %d 通过 / %d 失败 ===\n", g_pass, g_fail);
     return g_fail ? 1 : 0;
