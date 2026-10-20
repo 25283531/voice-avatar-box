@@ -1,6 +1,7 @@
 #include "dual_wake_word.h"
 
 #include <esp_log.h>
+#include <esp_timer.h>
 
 #include <utility>
 
@@ -88,10 +89,69 @@ void DualWakeWord::FeedOne(WakeWord* engine, Framer& framer, const std::vector<i
 }
 
 void DualWakeWord::Feed(const std::vector<int16_t>& data) {
-    if (wakenet_ready_) {
-        FeedOne(wakenet_.get(), wn_framer_, data);
+    /* ── 音频通路探针（2026-10-20）────────────────────────────────
+     * 症状是「喊不醒、但初始化全绿」，这种题只能在数据通路上取证：
+     * 初始化日志能证明模型加载了、pipeline 建好了，却证明不了
+     * **麦克风里到底有没有声音**、以及 **AEC 有没有把语音当回声消掉**。
+     *
+     * 每 2 秒打一行：mic 通道与 ref（回采）通道的峰值、各自喂了多少帧。
+     * 判据：
+     *   · mic 峰值恒 0        → I2S/麦克风没数据（硬件或 codec 配置）
+     *   · mic 正常 ref 也正常 → AEC 配置可能把语音消掉了（ref 应是"播放出去的"，
+     *                           静止时也该有噪声底，安静时两路都接近 0 才正常）
+     *   · 两路都正常          → 问题在模型侧（阈值/命令表/引擎竞争）
+     * 只在 debug 级别以下不输出会把日志撑爆，所以固定 2s 一次、单行。 */
+    if (!data.empty()) {
+        size_t n = data.size();
+        int16_t mic_peak = 0, ref_peak = 0;
+        for (size_t i = 0; i < n; ++i) {
+            int16_t v = data[i] < 0 ? (int16_t)(-data[i]) : data[i];
+            if (channels_ >= 2) {
+                if ((i & 1) == 0) { if (v > mic_peak) mic_peak = v; }
+                else              { if (v > ref_peak) ref_peak = v; }
+            } else if (v > mic_peak) {
+                mic_peak = v;
+            }
+        }
+        if (mic_peak > probe_mic_peak_) probe_mic_peak_ = mic_peak;
+        if (ref_peak > probe_ref_peak_) probe_ref_peak_ = ref_peak;
+        probe_frames_++;
+
+        int64_t now_ms = esp_timer_get_time() / 1000;
+        if (now_ms - probe_last_ms_ >= 2000) {
+            ESP_LOGI(TAG, "音频探针：mic峰值=%d ref峰值=%d 本周期帧=%u "
+                          "(wn帧=%u mn帧=%u 唤醒检测=%s/%s)",
+                     (int)probe_mic_peak_, (int)probe_ref_peak_,
+                     (unsigned)probe_frames_,
+                     (unsigned)wn_fed_, (unsigned)mn_fed_,
+                     wakenet_ready_ ? "on" : "off",
+                     mn_framer_.chunk ? "on" : "off");
+            probe_mic_peak_ = 0;
+            probe_ref_peak_ = 0;
+            probe_frames_ = 0;
+            wn_fed_ = 0;
+            mn_fed_ = 0;
+            probe_last_ms_ = now_ms;
+        }
     }
-    FeedOne(multinet_.get(), mn_framer_, data);
+
+    if (wakenet_ready_) {
+        size_t before = wn_framer_.buf.size();
+        FeedOne(wakenet_.get(), wn_framer_, data);
+        /* FeedOne 内部按 chunk 切帧，切了几帧 = 缓冲缩小量 / 一帧样本数 */
+        size_t need = wn_framer_.chunk * channels_;
+        if (need > 0 && wn_framer_.buf.size() < before) {
+            wn_fed_ += (uint32_t)((before - wn_framer_.buf.size()) / need);
+        }
+    }
+    {
+        size_t before = mn_framer_.buf.size();
+        FeedOne(multinet_.get(), mn_framer_, data);
+        size_t need = mn_framer_.chunk * channels_;
+        if (need > 0 && mn_framer_.buf.size() < before) {
+            mn_fed_ += (uint32_t)((before - mn_framer_.buf.size()) / need);
+        }
+    }
 }
 
 void DualWakeWord::OnWakeWordDetected(std::function<void(const std::string&)> callback) {

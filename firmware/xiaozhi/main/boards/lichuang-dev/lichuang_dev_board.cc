@@ -14,6 +14,8 @@
 
 #include <esp_log.h>
 #include <esp_lcd_panel_vendor.h>
+#include <cstring>
+#include <cstdio>
 // FreeRTOS.h：InitializeCamera() 里的 i2c_master_probe() 第三个参数是 **tick**，
 // 要用 pdMS_TO_TICKS() 换算。显式包含，别去赌哪个间接头文件先把它带进来。
 #include <freertos/FreeRTOS.h>
@@ -339,15 +341,42 @@ private:
          * 用 i2c_master_probe 做 0 字节写、看有没有 ACK，与 SCCB 建链时
          * 的行为一致：连地址都不 ACK 的器件，后面 esp_video 的 detect
          * 必然失败。本仓其余板（atom/echoear/kevin-c3）也是这个用法。 */
-        esp_err_t probe_err = i2c_master_probe(i2c_bus_, CAMERA_SCCB_ADDR, pdMS_TO_TICKS(100));
+        esp_err_t probe_err = ESP_FAIL;
+        /* 探 3 次、每次间隔 100ms：有些摄像头模组上电到 SCCB 可应答要 100~300ms，
+         * 单次探测会把「刚上电还没醒」误判成「没接」—— 这个错误方向最糟：
+         * 用户以为接好了、固件却永远不启用，两边都找不到原因。 */
+        for (int attempt = 0; attempt < 3; ++attempt) {
+            probe_err = i2c_master_probe(i2c_bus_, CAMERA_SCCB_ADDR, pdMS_TO_TICKS(100));
+            if (probe_err == ESP_OK) {
+                break;
+            }
+            vTaskDelay(pdMS_TO_TICKS(100));
+        }
         if (probe_err != ESP_OK) {
+            /* 探不到时把 I2C 总线上**实际有谁**打出来。
+             * 这一行是「摄像头到底接没接」的唯一可判据：
+             *   · 列表里没有任何 0x21/0x42 之类 ⇒ 模组没插 / 没供电 / 排线反了
+             *   · 列表里有陌生地址            ⇒ 接了但不是 GC0308（换型号要改驱动）
+             * 没有它，用户只能看到一句"未检测到"，无从下手。 */
+            char found[96] = {0};
+            int n = 0;
+            for (uint8_t addr = 0x08; addr < 0x78 && n < 12; ++addr) {
+                if (i2c_master_probe(i2c_bus_, addr, pdMS_TO_TICKS(20)) == ESP_OK) {
+                    char one[8];
+                    snprintf(one, sizeof(one), "%s0x%02X", n ? " " : "", addr);
+                    strncat(found, one, sizeof(found) - strlen(found) - 1);
+                    n++;
+                }
+            }
             ESP_LOGW(TAG, "未检测到摄像头（GC0308 @ 0x%02X，err=0x%x）→ 跳过初始化。"
-                          "现在没接摄像头时这是**正常的**；接上排线后重启即可自动启用，"
-                          "不需要改固件。DVP 的 11 个 IO 也不会被占用。",
-                     CAMERA_SCCB_ADDR, probe_err);
+                          "I2C 总线上的器件：[%s]（共 %d 个）。"
+                          "没接摄像头时这是**正常的**；接上排线后重启即可自动启用，"
+                          "不需要改固件，DVP 的 11 个 IO 也不会被占用。",
+                     CAMERA_SCCB_ADDR, probe_err, n ? found : "无", n);
             camera_ = nullptr;   // GetCamera() 返回 nullptr ⇒ MCP 不注册 take_photo
             return;
         }
+        ESP_LOGI(TAG, "检测到摄像头（GC0308 @ 0x%02X）→ 初始化 DVP 视频通路", CAMERA_SCCB_ADDR);
 
         static esp_cam_ctlr_dvp_pin_config_t dvp_pin_config = {
             .data_width = CAM_CTLR_DATA_WIDTH_8,

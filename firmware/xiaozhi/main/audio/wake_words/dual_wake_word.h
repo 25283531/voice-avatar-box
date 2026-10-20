@@ -77,6 +77,15 @@ private:
     std::atomic<int> fired_{0};
     std::function<void(const std::string&)> wake_word_detected_callback_;
     std::string last_word_;
+
+    /* 音频通路探针（诊断「喊不醒」用，见 .cc 里 Feed() 的注释）。
+     * 纯观测，不参与任何判定，也不改变喂数据的行为。 */
+    int64_t probe_last_ms_ = 0;
+    int16_t probe_mic_peak_ = 0;
+    int16_t probe_ref_peak_ = 0;
+    uint32_t probe_frames_ = 0;
+    uint32_t wn_fed_ = 0;
+    uint32_t mn_fed_ = 0;
 };
 
 #endif  // DUAL_WAKE_WORD_H
