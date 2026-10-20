@@ -679,10 +679,17 @@ static void test_nvs_crc_rejects_corrupt(void)
           g_trans_n == 0 && tbl()->count == 0,
           det("tick 后 count=%u，状态转移 %d 次", tbl()->count, g_trans_n));
 
+    /* 重新下发的这条**刻意定在 10:00**，不用原来的 08:00：
+     * 本用例要测的是「坏表被丢弃后引擎还能不能正常触发」，不是「过期补响」。
+     * 2026-10-21 起，过期超过 ELDER_RMD_STALE_MIN（60 分钟）按设计**不补响**
+     * （判 SKIPPED，见 T12）。此时钟已在 09:00，若仍用 08:00，这里测到的
+     * 就会是过期跳过逻辑，而不是「引擎有没有被坏表卡死」——
+     * 断言会红，但红的原因跟本用例要守的东西无关。 */
+    elder_rmd_item_t b = mk_med(10, 0, "早上的药", 0);
     check("重新下发提醒后引擎恢复正常",
-          elder_reminder_add(&a) == ESP_OK && tbl()->count == 1,
+          elder_reminder_add(&b) == ESP_OK && tbl()->count == 1,
           det("%s", dump_tbl(tbl())));
-    stub_time_advance(3600);         /* 10:00，已过 08:00 */
+    stub_time_advance(3600);         /* 10:00 到点 */
     elder_reminder_tick_once();
     check("重新下发后到点仍会触发（丢弃坏表没有把引擎卡死）",
           (tbl()->pending_today & 1u) != 0,
