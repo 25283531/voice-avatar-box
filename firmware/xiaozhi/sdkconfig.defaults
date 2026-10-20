@@ -22,6 +22,14 @@ CONFIG_FREERTOS_USE_STATS_FORMATTING_FUNCTIONS=y
 CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
 CONFIG_MBEDTLS_DYNAMIC_BUFFER=y
 CONFIG_MBEDTLS_SSL_KEEP_PEER_CERTIFICATE=n
+# 证书包是**硬依赖**，显式钉住，不靠 IDF 的隐式默认：
+#   - OTA / WS 走 esp-ml307 的 esp_ssl.cc（crt_bundle_attach）
+#   - 心跳 /api/device/sync 走 components/elder/src/net.c（同上）
+# 少了它，https://152.136.230.132 在 esp-tls 建连前就报
+# "No server verification option set in esp_tls_cfg_t structure"。
+# 2026-10-20 真机事故就卡在这里，症状是「能说话、后台永远离线」。
+CONFIG_MBEDTLS_CERTIFICATE_BUNDLE=y
+CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_DEFAULT_FULL=y
 CONFIG_ESP_WIFI_IRAM_OPT=n
 CONFIG_ESP_WIFI_RX_IRAM_OPT=n
 CONFIG_ESP_WIFI_DYNAMIC_RX_MGMT_BUFFER=y

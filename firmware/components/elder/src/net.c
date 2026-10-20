@@ -7,6 +7,7 @@
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "esp_http_client.h"
+#include "esp_crt_bundle.h"
 
 static const char *TAG = "elder.net";
 
@@ -130,6 +131,16 @@ static esp_err_t perform(esp_http_client_method_t method, const char *path,
         /* 不要 keep-alive：老人设备长时间离线，连接池反而增加出错面 */
         .keep_alive_enable = false,
         .buffer_size = 2048,
+        /* 🔴 必须挂证书包（2026-10-20，真机 COM10 实证）：
+         * 后端是 https://152.136.230.132，本结构体若不填任何 cert 相关字段，
+         * esp-tls 会在建连前就报
+         *   "No server verification option set in esp_tls_cfg_t structure"
+         *   → ESP_ERR_MBEDTLS_SSL_SETUP_FAILED → HTTP_CLIENT 连接失败
+         * ⇒ **所有 /api/device/sync 心跳永久失败**，设备恒离线，而 OTA 走
+         * 另一条 HttpClient（esp-ml307 的 esp_ssl.cc:35 已挂 crt_bundle）
+         * 一切正常 —— 这正是「能连上能说话、后台永远离线」的最后一环。
+         * 不要改成 skip_cert：那等于对 IP 直连放手，MAC 即身份的场景下不可接受。 */
+        .crt_bundle_attach = esp_crt_bundle_attach,
     };
 
     esp_http_client_handle_t cli = esp_http_client_init(&cfg);
