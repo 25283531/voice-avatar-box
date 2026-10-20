@@ -1984,19 +1984,35 @@ curl -s http://<host>:8064/api/health/scheduler
 
 ### 8.1 SQLite（默认形态）
 
-**必须先停服务再复制文件**，否则可能拷到写了一半的库（SQLite 有 WAL，热拷有风险）。
+**库跑在 WAL 模式**（`app/db.py::apply_sqlite_pragmas`，2026-10-20 起）。
+WAL 下库旁边会有 `elder.db-wal` / `elder.db-shm`，**还没 checkpoint 的事务只在 -wal 里**
+—— 直接 `cp elder.db` 会静默丢最近的事务（文件大小看着正常，数据却是旧的）。
+
+**推荐：不停服在线备份**（SQLite 官方 backup API，拷出来的一定是一致快照）：
 
 ```bash
-# 备份
-docker compose stop elder-server
-docker run --rm -v server_elder-data:/data -v "$PWD:/backup" busybox \
-  cp /data/elder.db /backup/elder.db.$(date +%Y%m%d)
-docker compose start elder-server
+docker exec elder-server python -c "
+import sqlite3
+src=sqlite3.connect('/data/elder.db'); dst=sqlite3.connect('/data/backup.db')
+src.backup(dst); dst.close(); src.close()"
+docker cp elder-server:/data/backup.db ./elder.db.$(date +%Y%m%d-%H%M%S)
+```
 
-# 恢复（同样先停服）
+**或者停服后整目录拷**（要连 `-wal` / `-shm` 一起，只拷主文件不够）：
+
+```bash
 docker compose stop elder-server
 docker run --rm -v server_elder-data:/data -v "$PWD:/backup" busybox \
-  cp /backup/elder.db.20261015 /data/elder.db
+  sh -c 'cp /data/elder.db* /backup/'
+docker compose start elder-server
+```
+
+**恢复**（同样先停服；恢复后要把旧的 `-wal`/`-shm` 删掉，否则会和主文件对不上）：
+
+```bash
+docker compose stop elder-server
+docker run --rm -v server_elder-data:/data -v "$PWD:/backup" busybox \
+  sh -c 'rm -f /data/elder.db-wal /data/elder.db-shm && cp /backup/elder.db.20261015 /data/elder.db'
 docker compose start elder-server
 ```
 

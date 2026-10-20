@@ -2,10 +2,11 @@
 from __future__ import annotations
 
 import logging
+import os
 import time
 from pathlib import Path
 
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine, event, text
 from sqlalchemy.engine import make_url
 from sqlalchemy.orm import DeclarativeBase, sessionmaker
 
@@ -14,6 +15,56 @@ from .config import DATABASE_URL, DB_ECHO, DB_POOL_PRE_PING, DB_WAIT_SEC
 log = logging.getLogger(__name__)
 
 _is_sqlite = DATABASE_URL.startswith("sqlite")
+
+# SQLite 写锁等待预算（毫秒）。
+# ⚠️ 刻意**不复用** config.DB_WAIT_SEC：那个是「等数据库服务启动」的预算（180s），
+# 和「等一把行锁」完全是两件事。同一个名字被两处解释，就是本项目最贵的教训
+# （见 MEMORY 里「同一事实两份真源」）。默认 15s：比一次 LLM 调用短，
+# 又能盖住一次 TTS 合成的持有窗口。
+SQLITE_BUSY_TIMEOUT_MS = int(os.getenv("ELDER_DB_BUSY_TIMEOUT_MS", "15000"))
+
+
+def _sqlite_is_memory() -> bool:
+    try:
+        return (make_url(DATABASE_URL).database or ":memory:") in (":memory:", "")
+    except Exception:  # noqa: BLE001  连接串异常交给 create_engine 报错
+        return False
+
+
+def apply_sqlite_pragmas(dbapi_conn, busy_timeout_ms: int | None = None) -> None:
+    """把 SQLite 连接调成「读写能共存」的形态（2026-10-20 生产事故）。
+
+    事故现象（真机同一分钟内的日志）：老人说话时
+        UPDATE devices SET last_seen_at=? ...   -> 500 database is locked
+        埋点写入失败（不影响本轮对话）：database is locked
+    ⇒ 心跳 500（后台看着像离线）、用量/记忆写不进去。**功能在跑，账本全丢。**
+
+    根因不是「写得太多」，而是 **SQLite 默认的 rollback-journal 模式**：
+    只要有一个连接开着**读事务**，写事务就永远拿不到锁，等到 busy_timeout
+    （python sqlite3 默认 5s）就抛 `database is locked`。语音回合里
+    ASR/TTS/LLM 每段都是秒级网络等待，读事务自然长时间挂着 —— 这在本项目
+    拓扑下是常态，不是偶发。
+
+    修法（两条缺一不可）：
+      1. ``journal_mode=WAL``：读不再阻塞写，写也不再阻塞读（写写仍互斥，
+         但写事务只剩业务自身的毫秒级窗口）；
+      2. ``busy_timeout``：给 WAL 下仍然存在的写写竞争留足重试预算，
+         而不是 5 秒就放弃。
+    ``synchronous=NORMAL``：WAL 下的推荐值，掉电最多丢最后一个事务，
+    换来的是不再每次 commit 都 fsync —— 老人设备的写入频率不需要 FULL。
+
+    ⚠️ 由此带来的**运维后果**：库旁边会多出 ``-wal`` / ``-shm`` 两个文件，
+    **直接 cp elder.db 备份会漏掉尚未 checkpoint 的事务**。备份必须走
+    ``sqlite3.Connection.backup()`` 或 ``VACUUM INTO``（deploy 步骤已同步改）。
+    """
+    cur = dbapi_conn.cursor()
+    try:
+        if not _sqlite_is_memory():
+            cur.execute("PRAGMA journal_mode=WAL")
+            cur.execute("PRAGMA synchronous=NORMAL")
+        cur.execute(f"PRAGMA busy_timeout={int(busy_timeout_ms or SQLITE_BUSY_TIMEOUT_MS)}")
+    finally:
+        cur.close()
 
 
 def _ensure_sqlite_parent_dir() -> None:
@@ -71,8 +122,19 @@ engine = create_engine(
     # FastAPI 的请求可能落在任意线程上，而 sqlite3 默认只允许创建连接的那个线程使用，
     # 不关掉这个检查就会报 `sqlite3.ProgrammingError: SQLite objects created in a
     # thread can only be used in that same thread`。
-    **({"connect_args": {"check_same_thread": False}} if _is_sqlite else {}),
+    # ``timeout`` 是 sqlite3 的 busy_timeout（秒），和下面 connect 事件里的
+    # PRAGMA busy_timeout 同一个东西、同一个来源 —— 传两份只为两条路径都生效
+    # （事件里的 PRAGMA 也会覆盖它）。
+    **({"connect_args": {"check_same_thread": False,
+                         "timeout": SQLITE_BUSY_TIMEOUT_MS / 1000.0}} if _is_sqlite else {}),
 )
+
+if _is_sqlite:
+    # 每条新连接都要过一遍 PRAGMA：journal_mode 写进库文件（一次即持久），
+    # 但 busy_timeout 是**连接级**的，漏一条连接就退化成默认 5s。
+    @event.listens_for(engine, "connect")
+    def _sqlite_connect_pragmas(dbapi_conn, _record):  # noqa: ANN001
+        apply_sqlite_pragmas(dbapi_conn)
 
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, expire_on_commit=False)
 

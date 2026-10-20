@@ -113,6 +113,16 @@ jobs:
       - name: 设备 pk 复用 / 旧 token 复活冒烟（P0，含 WS 侧与从属行）
         run: python tools/run_smoke.py logs/smoke_smoke_pk_reuse.log python tools/smoke_pk_reuse.py
 
+      # P0：SQLite 默认 rollback-journal 下「一个读事务挂住 ⇒ 所有写事务失败」。
+      # 2026-10-20 生产实证：老人说话的同一分钟里
+      #   UPDATE devices SET last_seen_at=?  -> 500 database is locked（后台看着像离线）
+      #   埋点写入失败（不影响本轮对话）      -> 用量/记忆账本静默丢失
+      # 语音回合里 ASR/LLM/TTS 每段都是秒级网络等待，读事务长挂是**常态**。
+      # 这条用例自带反向自检：退回 rollback-journal 必须真的抛 locked，
+      # 否则说明用例没观察到竞争，正例的绿没有证明力。
+      - name: SQLite 并发冒烟（读事务不得饿死写事务，含反向自检）
+        run: python tools/run_smoke.py logs/smoke_smoke_sqlite_concurrency.log python tools/smoke_sqlite_concurrency.py
+
       # 求助邮箱**不许写死**：解析顺序 env → 管理端 SMTP（notify_to → from_addr）→ 空串。
       # 之前写死的 support@voice.250886.xyz 指向一个不可达域名，而已登录页的
       # 「忘记用户名 › 发邮件给管理员」是忘记用户名后**唯一**能解绑设备的通道。
