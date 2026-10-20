@@ -196,6 +196,29 @@ jobs:
           if '%s\n激活码 %s'.encode() in data:
               sys.exit('固件里仍有旧的 ShowNotification 格式串 ⇒ 注入副本是旧版')
           print(f'产物自检通过：{bins[0]} {len(data)} bytes')
+
+          # ---- 双引擎唤醒模型必须**真在产物里**（2026-10-20 加）----
+          # 为什么不能只查配置：build_default_assets.py 里 wakenet 的打包条件是
+          #   use_esp_wake_word or use_afe_wake_word
+          # 而本项目为了自定义唤醒词+离线命令词必须选 CONFIG_USE_CUSTOM_WAKE_WORD=y，
+          # 于是 wakenet 被**静默跳过** —— CONFIG_SR_WN_WN9_NIHAOXIAOAN_TTS2=y 照样
+          # 出现在 sdkconfig、prebuild_check 的 C2b2/C2b3/C2b4 全部 PASS，但
+          # srmodels.bin 里一个 wn9 都没有。真机症状：WakeNet 引擎拿不到模型，
+          # 「两个引擎都保留」退化成纯 MultiNet（唤醒率明显变低），且没有任何报错。
+          # 所以这里只能认产物：assets 里必须同时出现 mn7_cn 与 wn9_nihaoxiaoan。
+          assets = sorted(pathlib.Path('build').rglob('generated_assets.bin'))
+          if not assets:
+              sys.exit('找不到 build/**/generated_assets.bin ⇒ 无从校验唤醒模型')
+          adata = assets[0].read_bytes()
+          for pat, why in ((b'mn7_cn', 'MultiNet（自定义唤醒词 + 离线服药命令词）'),
+                           (b'wn9_nihaoxiaoan', 'WakeNet「你好小安」唤醒模型')):
+              if pat not in adata:
+                  sys.exit(
+                      f'assets 里检索不到 {pat.decode()} ⇒ {why}没被打包进去。'
+                      f'注意：这不是编译失败，是配置自检全绿但引擎拿不到模型。'
+                  )
+          print(f'双引擎模型自检通过：{assets[0].name} 同时含 mn7_cn 与 wn9_nihaoxiaoan'
+                f'（{len(adata)} bytes）')
           PY
 
       - name: 校验 OTA 地址指向本项目服务端
