@@ -224,7 +224,18 @@ CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions/v2/16m.csv"
 CONFIG_USE_CUSTOM_WAKE_WORD=y
 CONFIG_CUSTOM_WAKE_WORD="ni hao xiao nuan"
 CONFIG_CUSTOM_WAKE_WORD_DISPLAY="你好，小暖"
-CONFIG_CUSTOM_WAKE_WORD_THRESHOLD=20
+# 唤醒阈值 20 → 12（2026-10-20）。
+# 真机实证（COM10 连抓 4 分钟）：老人连喊多遍，串口**零** `Custom wake word
+# detected` 行 —— 不是"偶尔不灵"，是基本不命中。
+# 注意 CustomWakeWord 是**纯 MultiNet**（不经过 WakeNet），通用中文命令词模型
+# 对「你好小暖」这种非预设短语本来就弱；阈值属保守下调，再低会把日常对话
+# 误当唤醒，而误唤醒比"喊两遍"更烦。若仍不灵，按 BOOT 键（短按 ToggleChatState）。
+#
+# ⚠️ 这个值是**唯一真源**：sdkconfig.defaults 里同名项由本 overlay 注入生成。
+#    直接去改生成出来的 sdkconfig.defaults 会在下次 merge 时被覆盖回 20 ——
+#    2026-10-20 已实际踩到（本地改成 12，跑一次 merge 就变回 20），
+#    而 merge 的输出还是"已是最新"，看不出发生过覆盖。
+CONFIG_CUSTOM_WAKE_WORD_THRESHOLD=12
 # mn7_cn：官方推荐（S3/P4），比 mn6_cn 小约 1MB。
 # 模型 2671229 字节 + fst 9648 字节 = 2680877 字节，进 assets 分区。
 CONFIG_SR_MN_CN_MULTINET7_QUANT=y

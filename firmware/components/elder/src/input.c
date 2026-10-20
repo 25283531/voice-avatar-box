@@ -128,7 +128,13 @@ esp_err_t elder_input_init(elder_key_cb_t cb, void *ctx)
     };
     ESP_ERROR_CHECK(gpio_config(&io));
 
-    xTaskCreatePinnedToCore(input_task, "elder_input", 2560, NULL, 6, &g.task, 1);
+    /* 栈从 2560 → 4096：emit() 是**同步**调用 elder.bridge::OnKey 的，
+     * 那条 switch 里会跑 UI 状态切换 + 提示音 + RGB 请求 + 日志格式化，
+     * 2560 字节在 SOS 路径上实测被撑爆（2026-10-20，见 elder_bridge.cc
+     * 里 ELDER_KEY_EV_SOS 分支的串口原文）。
+     * ⚠️ 但**不要**指望靠加栈来扛 HTTPS：联网上报必须留在独立任务里，
+     * 这里只覆盖"纯本地、几百字节"的那部分调用。 */
+    xTaskCreatePinnedToCore(input_task, "elder_input", 4096, NULL, 6, &g.task, 1);
     ESP_LOGI(TAG, "key on GPIO%d ready (long-press armed after %dms)",
              ELDER_KEY_SOS, ELDER_KEY_BOOT_GUARD_MS);
     return ESP_OK;

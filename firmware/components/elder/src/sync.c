@@ -15,6 +15,7 @@
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/queue.h"
 #include "freertos/event_groups.h"
 
 #include "elder_net.h"
@@ -59,7 +60,20 @@ static struct {
     char              fw_version[32];
     char              hw_model[24];
     bool              time_synced;
+    /* 交互统计的异步投递队列（见 elder_sync_report_interaction 的注释）。
+     * 为什么必须异步：这个函数被 SOS、服药确认、提醒超时三条路径同步调用，
+     * 而它们分别跑在 elder_input(4096/原 2560)、elder_rmd(3072) 这些**小栈任务**里；
+     * 函数体里是 HTTPS + TLS 握手，栈需求 10KB 量级。 */
+    QueueHandle_t     report_q;
+    TaskHandle_t      report_task;
 } g;
+
+#define ELDER_REPORT_Q_LEN 8
+
+typedef struct {
+    uint8_t kind;
+    int     duration_ms;
+} report_t;
 
 #define ELDER_SYNC_EV_NOW (1 << 0)
 
@@ -458,21 +472,62 @@ void elder_sync_on_reminder_state(const elder_rmd_item_t *item, elder_rmd_state_
     }
 }
 
-esp_err_t elder_sync_report_interaction(elder_interaction_kind_t kind, int duration_ms)
+/* 真正发 HTTP 的那一段（阻塞，只能在 report_task 里跑）。 */
+static void report_interaction_blocking(elder_interaction_kind_t kind, int duration_ms)
 {
     if (!elder_net_is_online()) {
         ESP_LOGD(TAG, "离线，交互统计 kind=%d 暂不上报", (int)kind);
-        return ESP_ERR_INVALID_STATE;
+        return;
     }
     cJSON *root = cJSON_CreateObject();
     cJSON_AddNumberToObject(root, "kind", (double)kind);
     cJSON_AddNumberToObject(root, "duration_ms", (double)duration_ms);
     char *body = cJSON_PrintUnformatted(root);
     cJSON_Delete(root);
-    if (!body) return ESP_ERR_NO_MEM;
-    esp_err_t err = elder_net_post("/api/device/interactions", body, NULL, NULL, NULL);
+    if (!body) return;
+    elder_net_post("/api/device/interactions", body, NULL, NULL, NULL);
     cJSON_free(body);
-    return err;
+}
+
+/* 交互上报 worker：唯一允许跑 HTTPS 的地方，栈 12KB（TLS 握手够用）。 */
+static void report_worker(void *)
+{
+    report_t r;
+    while (xQueueReceive(g.report_q, &r, portMAX_DELAY) == pdTRUE) {
+        report_interaction_blocking((elder_interaction_kind_t)r.kind, r.duration_ms);
+    }
+}
+
+esp_err_t elder_sync_report_interaction(elder_interaction_kind_t kind, int duration_ms)
+{
+    /* 🔴 只入队，**绝不在这里发 HTTP**（2026-10-20 真机实证）。
+     *
+     * 这个函数有三个调用点，全部跑在小栈任务里：
+     *   elder_bridge.cc  SOS          → elder_input 任务（input.c，原 2560 字节）
+     *   sync.c           服药确认 DONE → elder_rmd 任务（reminder.c，3072 字节）
+     *   sync.c           提醒超时     → 同上
+     * 而函数体是 elder_net_post()（HTTPS + TLS 握手，栈需求 10KB 量级）。
+     *
+     * 串口原文（长按 8 秒触发 SOS 后立刻）：
+     *   E (21813) elder.bridge: SOS：本地告警 + 联网后上报
+     *   ***ERROR*** A stack overflow in task elder_input has been detected.
+     *   rst:0xc (RTC_SW_CPU_RST)
+     * ⇒ **老人按下 SOS，设备重启，求助根本没发出去**；服药确认那条路径同理
+     *   （而且它比 SOS 更常触发）。
+     *
+     * 所以这里改成投队列入队（非阻塞、几十字节栈），由 report_task 慢慢发。
+     * 顺带修掉"输入任务被 HTTP 阻塞到 8 秒超时"这个第二毛病。
+     *
+     * 返回 ESP_OK 只代表"已排队"，不代表已送达 —— 调用方本来就都不检查返回值；
+     * 离线时由 worker 丢弃并打 DEBUG 日志，与旧行为一致。 */
+    if (!g.report_q) return ESP_ERR_INVALID_STATE;
+    report_t r = { .kind = (uint8_t)kind, .duration_ms = duration_ms };
+    if (xQueueSend(g.report_q, &r, 0) != pdTRUE) {
+        /* 队列满就丢并留日志：宁可少一条统计，也不能阻塞按键/提醒任务 */
+        ESP_LOGW(TAG, "交互上报队列满，丢弃 kind=%d", (int)kind);
+        return ESP_ERR_NO_MEM;
+    }
+    return ESP_OK;
 }
 
 /* ---------------------------------------------------------------- 本地自建提醒上报 */
@@ -859,6 +914,17 @@ esp_err_t elder_sync_start(void)
 {
     if (g.started) return ESP_OK;
     if (!g.ev && !(g.ev = xEventGroupCreate())) return ESP_ERR_NO_MEM;
+
+    /* 交互上报队列 + worker（见 elder_sync_report_interaction 的注释）。
+     * 必须在 elder_net_start 之前就绪 —— SOS 可能在联网完成前被按下，
+     * 那时入队会失败并丢一条统计，但**设备不会崩**，这是有意的取舍。 */
+    if (!g.report_q && !(g.report_q = xQueueCreate(ELDER_REPORT_Q_LEN, sizeof(report_t)))) {
+        return ESP_ERR_NO_MEM;
+    }
+    if (!g.report_task &&
+        xTaskCreatePinnedToCore(report_worker, "elder_report", 12288, NULL, 3, &g.report_task, 1) != pdPASS) {
+        return ESP_ERR_NO_MEM;
+    }
 
     /* 栈 6KB：cJSON 解析 + 24KB 响应缓冲（分配在堆） */
     if (xTaskCreatePinnedToCore(sync_task, "elder_sync", 6144, NULL, 4, &g.task, 1) != pdPASS) {

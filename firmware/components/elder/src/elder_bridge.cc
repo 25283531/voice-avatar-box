@@ -259,6 +259,19 @@ void OnKey(elder_key_event_t ev, void *ctx)
         elder_ui_set_state(ELDER_UI_ALARM, 0);
         elder_ui_play_tone(ELDER_TONE_VIBRATION);
         elder_rgb_request(ELDER_RGB_PRIO_ALARM, ELDER_FX_BLINK_FAST, 0xFF0000, 60000);
+        /* 这里的调用现在是**安全的**，前提是 sync.c 里
+         * elder_sync_report_interaction() 已改成"只入队、不发 HTTP"。
+         *
+         * 2026-10-20 真机实证（改之前）：长按 8 秒触发 SOS 后串口立刻
+         *   E (21813) elder.bridge: SOS：本地告警 + 联网后上报
+         *   ***ERROR*** A stack overflow in task elder_input has been detected.
+         *   rst:0xc (RTC_SW_CPU_RST)
+         * 因为本回调是 elder_input 任务**同步**调用的（input.c:45 `g.cb(ev,g.ctx)`），
+         * 而那时函数体里是 HTTPS + TLS，栈需求 10KB 量级，任务栈只有 2560。
+         * ⇒ 老人按下 SOS，设备重启，**求助根本没发出去**。
+         *
+         * ⚠️ 不要把 HTTPS 再搬回 sync.c 的这个函数里 —— 它还有两个调用点
+         * （服药确认、提醒超时）也都跑在 elder_rmd 的 3072 栈上。 */
         elder_sync_report_interaction(ELDER_IT_SOS, 0);
         break;
 
