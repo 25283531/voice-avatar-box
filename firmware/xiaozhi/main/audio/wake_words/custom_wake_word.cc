@@ -8,6 +8,7 @@
 #include <esp_mn_models.h>
 #include <esp_mn_speech_commands.h>
 #include <esp_timer.h>
+#include <chrono>
 #include <cJSON.h>
 
 // elder 离线命令词：词表本体 + 异步投递通道（C 链接，见 elder_mn.h）。
@@ -401,9 +402,15 @@ void CustomWakeWord::EncodeWakeWordData() {
 
 bool CustomWakeWord::GetWakeWordOpus(std::vector<uint8_t>& opus) {
     std::unique_lock<std::mutex> lock(wake_word_mutex_);
-    wake_word_cv_.wait(lock, [this]() {
-        return !wake_word_opus_.empty();
-    });
+    /* 同 AfeWakeWord::GetWakeWordOpus：主任务同步调用，绝不能无超时等待。
+     * 编包任务出错（比如 running_ 在编码中途被停）时队列可能永远不填，
+     * 无超时的 wait 会把整个会话状态机挂死。 */
+    bool got = wake_word_cv_.wait_for(lock, std::chrono::milliseconds(1500),
+                                      [this]() { return !wake_word_opus_.empty(); });
+    if (!got) {
+        ESP_LOGW(TAG, "取唤醒音频超时（1.5s 无数据）→ 本次跳过，会话继续");
+        return false;
+    }
     opus.swap(wake_word_opus_.front());
     wake_word_opus_.pop_front();
     return !opus.empty();

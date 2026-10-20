@@ -182,7 +182,11 @@ size_t DualWakeWord::GetFeedSize() {
 }
 
 void DualWakeWord::EncodeWakeWordData() {
+    /* 先把「这次编码属于哪个引擎」锁死，后面取包只认这个快照。
+     * 详见头文件里 encode_who_ 的注释：直接读 fired_ 会踩到
+     * 「编码进 A、却去 B 取」⇒ 永久阻塞。 */
     int who = fired_.load();
+    encode_who_ = who;
     if (who == 1 && wakenet_ready_) {
         wakenet_->EncodeWakeWordData();
     } else if (multinet_) {
@@ -191,7 +195,7 @@ void DualWakeWord::EncodeWakeWordData() {
 }
 
 bool DualWakeWord::GetWakeWordOpus(std::vector<uint8_t>& opus) {
-    int who = fired_.load();
+    int who = encode_who_.load();
     if (who == 1 && wakenet_ready_) {
         return wakenet_->GetWakeWordOpus(opus);
     }

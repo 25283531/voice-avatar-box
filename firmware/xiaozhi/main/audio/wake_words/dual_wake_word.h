@@ -80,6 +80,18 @@ private:
      * EncodeWakeWordData()/GetWakeWordOpus() 必须**委托给同一个引擎**，
      * 否则 GetWakeWordOpus() 会等在另一个引擎的 condition_variable 上永不返回。 */
     std::atomic<int> fired_{0};
+
+    /* EncodeWakeWordData() 那一刻的 fired_ 快照，GetWakeWordOpus() 只认它。
+     *
+     * 为什么不能直接用 fired_：从唤醒到取包之间隔着 OpenAudioChannel()，
+     * 那是一次 TLS+WS 建连，实测 2~4 秒。这段时间里**另一个引擎完全可能
+     * 再命中一次**唤醒词并把 fired_ 改掉，于是「编码进 A 的队列、
+     * 却去 B 的队列取」——B 的队列是空的，而两个引擎的 GetWakeWordOpus()
+     * 都在 condition_variable 上无超时地 wait ⇒ **主任务永久阻塞**。
+     * 现场表现（2026-10-20 串口实测）：设备能唤醒、WS 也连上了、
+     * 服务端日志显示「语音会话开始」，但设备侧从此没有任何协议日志，
+     * 永远不进 listening、不录音、不回话。用户感知就是「唤不醒、无应答」。 */
+    std::atomic<int> encode_who_{0};
     std::function<void(const std::string&)> wake_word_detected_callback_;
     std::string last_word_;
 
