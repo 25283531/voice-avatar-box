@@ -157,6 +157,13 @@ class VoiceSession:
 
         self._t0: float = 0.0               # 本轮 listen start 时刻
 
+        # ---- 服务端 → 设备 MCP 工具通道（JSON-RPC 2.0）----
+        # 键是 JSON-RPC id（**必须是整数**：固件 mcp_server.cc 的
+        # ParseMessage 用 cJSON_IsNumber 校验 id，字符串 id 会被直接丢弃），
+        # 值是等回包的 Future。见 call_device_tool()。
+        self._mcp_pending: dict[int, asyncio.Future] = {}
+        self._mcp_seq: int = 0
+
     # ================================================================ 生命周期
     async def run(self) -> None:
         """主循环：鉴权 → hello → 收帧/收 JSON，直到连接断开。
@@ -311,6 +318,46 @@ class VoiceSession:
         import json
         await self.ws.send_text(json.dumps(obj, ensure_ascii=False))
 
+    async def call_device_tool(self, name: str, arguments: dict[str, Any] | None = None,
+                               timeout: float = 3.0) -> Any:
+        """调用设备侧的一个 MCP 工具，等它回包。
+
+        设备是 MCP server（`initialize` / `tools/list` / `tools/call` 都由
+        ``main/mcp_server.cc`` 实现），服务端只是 client。这条通道原先
+        完全没建：``_on_json`` 收到设备的 mcp 消息只打 debug 就丢掉，
+        所以「老人说吃过了 → 设备确认服药」这个闭环是断的。
+
+        ⚠️ id 必须是**整数**：固件 ``McpServer::ParseMessage`` 对 id 做
+        ``cJSON_IsNumber`` 校验，字符串 id 会打一条 "Invalid id" 然后
+        直接 return，服务端只会看到超时 —— 这类失败在日志里长得像
+        「设备没响应」，极难查。回包时固件用 ``std::to_string(id_int)``
+        原样带回，所以按 int 建索引是安全的。
+
+        超时抛 ``TimeoutError``（而不是返回 None）：调用方必须能区分
+        「设备明确答了 false」和「设备没答上来」，前者是业务结果，
+        后者要提示老人改用按键。
+        """
+        self._mcp_seq += 1
+        rid = self._mcp_seq
+        fut: asyncio.Future = asyncio.get_running_loop().create_future()
+        self._mcp_pending[rid] = fut
+        try:
+            await self._send_json({
+                "type": "mcp",
+                "payload": {
+                    "jsonrpc": "2.0",
+                    "id": rid,
+                    "method": "tools/call",
+                    "params": {"name": name, "arguments": arguments or {}},
+                },
+            })
+            # 设备侧工具回调是同步跑的（取药提醒确认只改内存 + 落 NVS），
+            # 3 秒足够；再长说明设备掉线或 WS 卡住，早点失败好让 LLM
+            # 换一条话术（「你按一下设备上的按键」）。
+            return await asyncio.wait_for(fut, timeout)
+        finally:
+            self._mcp_pending.pop(rid, None)
+
     async def _send_audio(self, payload: bytes) -> None:
         """发一帧下行音频，按协商的 Protocol-Version 封帧。
 
@@ -463,12 +510,20 @@ class VoiceSession:
         elif mtype == "abort":
             self._on_abort(obj)
         elif mtype == "mcp":
-            # 设备本地工具通道（JSON-RPC 2.0，设备当 MCP server）。我们的
-            # 提醒数据在服务端，工具调用走服务端 function calling 路线
-            # （见模块 docstring 与 tools.py），与本消息无关：只记 debug
-            # 日志并忽略，不返回任何响应。
-            log.debug("忽略 mcp 消息（设备本地工具通道，与服务端工具调用无关）：%r",
-                      str(obj.get("payload"))[:200])
+            # 设备本地工具通道（JSON-RPC 2.0，设备当 MCP server）。
+            # 两种来源要分清，不能一律丢弃：
+            #  1. 我们主动下发 tools/call 的**回包** → 按 id 唤醒等待的
+            #     Future（见 call_device_tool）。丢掉它会让服药确认永远超时。
+            #  2. 设备主动发的通知（如 tools/list_changed）→ 目前没有消费者，
+            #     记 debug 即可。
+            payload = obj.get("payload")
+            if isinstance(payload, dict):
+                rid = payload.get("id")
+                fut = self._mcp_pending.get(rid) if isinstance(rid, int) else None
+                if fut is not None and not fut.done():
+                    fut.set_result(payload)
+                    return
+            log.debug("忽略无人等待的 mcp 消息：%r", str(payload)[:200])
         else:
             log.debug("忽略未知消息类型 %r", mtype)
 
@@ -861,7 +916,28 @@ class VoiceSession:
 
         def _run() -> dict[str, Any]:
             with SessionLocal() as db:
-                return execute_tool(db, self.dev.id, name, raw_args)
+                return execute_tool(db, self.dev.id, name, raw_args,
+                                    device_call=_device_call)
+
+        # execute_tool 是同步函数、跑在线程池里（见下）。要它发起「服务端→
+        # 设备」的 MCP 往返，只能从这个**工作线程**把协程丢回事件循环：
+        #  - 直接 asyncio.run() 会新建一个 loop，而 WS 连接绑在原来的 loop 上，
+        #    send_text 必然抛 "attached to a different loop"；
+        #  - 不能用 asyncio.run_coroutine_threadsafe 之外的「伪同步」写法，
+        #    因为回包要靠原 loop 上的收包任务（run() 里那个 while 循环）
+        #    才会被处理，loop 一旦被这个线程占住就是死锁。
+        # run_coroutine_threadsafe 只是投递 + 阻塞本线程，事件循环照常转，
+        # 收包任务能把回包塞进 Future。
+        loop = asyncio.get_running_loop()
+
+        def _device_call(tool_name: str,
+                         arguments: dict[str, Any] | None = None,
+                         timeout: float = 3.0) -> Any:
+            fut = asyncio.run_coroutine_threadsafe(
+                self.call_device_tool(tool_name, arguments, timeout), loop)
+            # 多等 1 秒：让 call_device_tool 内部的 wait_for 先超时，
+            # 这样日志里报的是「设备没响应」而不是「future 取结果超时」。
+            return fut.result(timeout + 1.0)
 
         try:
             return await run_in_threadpool(_run)

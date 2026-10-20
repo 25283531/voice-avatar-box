@@ -229,11 +229,15 @@ int FirstUndoneMedicine()
     return -1;
 }
 
-void ConfirmMedicine(int idx)
+/* method 区分「按键确认」与「语音确认」（ELDER_CFM_BUTTON / ELDER_CFM_VOICE）。
+ * 这个值会随回执上报服务端，子女端据此区分「老人自己按的」还是「跟小智说的」，
+ * 所以两条路不能都填 BUTTON —— 否则事后无法判断确认的真实来源。 */
+void ConfirmMedicine(int idx, uint8_t method)
 {
     if (idx < 0) return;
-    ESP_LOGI(TAG, "按键确认服药：提醒 #%d", idx);
-    elder_reminder_confirm((uint8_t)idx);
+    ESP_LOGI(TAG, "%s确认服药：提醒 #%d",
+             method == ELDER_CFM_VOICE ? "语音" : "按键", idx);
+    elder_reminder_confirm_ex((uint8_t)idx, method);
     elder_input_close_confirm_window();
     s_arming_id = -1;
 }
@@ -265,7 +269,7 @@ void OnKey(elder_key_event_t ev, void *ctx)
         }
 
         if (idx >= 0) {
-            ConfirmMedicine(idx);
+            ConfirmMedicine(idx, ELDER_CFM_BUTTON);
         } else {
             /* 没有待确认提醒时，短按复用为「开始/停止对话」 */
             app.ToggleChatState();
@@ -318,6 +322,35 @@ void OnDeviceStateChanged(DeviceState prev, DeviceState cur)
 }
 
 }  // namespace
+
+/* ------------------------------------------------------- 语音确认（MCP 工具） */
+
+/* 老人对小智说「我吃过了」→ 服务端 LLM 调 confirm_reminder 工具 →
+ * WS 下发 {"type":"mcp","payload":{"method":"tools/call",
+ * "params":{"name":"self.elder.confirm_reminder"}}} →
+ * mcp_server.cc 的 lambda 调到这里。
+ *
+ * 为什么必须有这个入口（2026-10-21）：
+ *   elder_reminder_confirm() 原先**只有一个**调用点，在按键回调里。按键已
+ *   迁到 GPIO11 且原型期没接线，离线命令词也已随上游回归删除 ⇒ 提醒响完
+ *   没有任何办法确认 ⇒ 15 分钟后升级 ESCALATED ⇒ 回执 ELDER_EV_MISSED ⇒
+ *   子女端每条提醒都收到「老人漏服」的假告警。这条通道是把闭环接回来。
+ *
+ * 与按键**共用** FirstUndoneMedicine() 判据：两条路若各写一套，
+ * 会出现「按键确认第 1 条、语音确认第 3 条」的错乱。
+ *
+ * 返回：0 = 确认成功；-1 = 当前没有待确认的服药提醒（不是错误，
+ *       老人可能只是顺口说了句「吃过了」，此时不要让 LLM 报错）。 */
+extern "C" int elder_confirm_pending_medicine(void)
+{
+    int idx = FirstUndoneMedicine();
+    if (idx < 0) {
+        ESP_LOGW(TAG, "语音确认请求：当前没有待确认的服药提醒，忽略");
+        return -1;
+    }
+    ConfirmMedicine(idx, ELDER_CFM_VOICE);
+    return 0;
+}
 
 /* ---------------------------------------------------------------- 入口 */
 

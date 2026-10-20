@@ -295,6 +295,13 @@ jobs:
       - name: 设备绑定归属（重启不被绑上平台预设）
         # 经 run_smoke 落盘：红灯时日志进 artifact（见末尾「失败诊断」步骤）
         run: python tools/run_smoke.py logs/smoke_qa3_device_binding.log python tools/qa3_device_binding.py
+      # 服务端 → 设备 MCP 工具通道（服药确认走的就是它）。
+      # 为什么必须在 CI 跑：这条链路的失效形态统一是「设备没反应」——
+      # 超时、id 类型写错、结果解析写错，三种原因在日志里长得一模一样。
+      # 本脚本用假 WS 把「下发 tools/call → 回包 → 唤醒 Future → 翻译成
+      # LLM 话术」三层一次跑通，不连真设备、不占端口。
+      - name: MCP 工具通道 + 服药确认
+        run: python tools/run_smoke.py logs/smoke_mcp_confirm.log python tools/test_mcp_confirm.py
       # 会员制遗留五张表必须**真的**被删掉。
       # 这条门禁是补 875b38c 留下的洞：当时删表函数整个被掏空，全仓 CI 依然全绿
       # （qa3_migration 的老库 DDL 根本不建这五张表，删表分支恒为空操作）。

@@ -129,6 +129,21 @@ TOOL_DEFS: list[dict[str, Any]] = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "confirm_reminder",
+            "description": (
+                "确认老人刚刚完成了当前提醒事项（最常见的是已吃服药提醒）。"
+                "老人听到提醒后说「我吃过了」「吃完了」「已经吃了」「药吃了」时"
+                "**必须**调用本工具，不能只口头答应 —— 不调用的话设备侧不会"
+                "记下确认，15 分钟后会把这条提醒判成「漏服」并通知家属。"
+                "无参数。返回 false 表示当前没有待确认的提醒，此时用一句话"
+                "自然回应即可，不要说「失败了」。"
+            ),
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
 ]
 
 #: 工具执行出错时喂回 LLM 的 JSON 里，need_clarify=True 表示"必须让老人澄清"。
@@ -479,11 +494,18 @@ def _describe_reminder(r: models.Reminder) -> str:
 
 
 def execute_tool(db: Any, device_pk: int, name: str,
-                 arguments: str | dict[str, Any]) -> dict[str, Any]:
+                 arguments: str | dict[str, Any],
+                 device_call: Any = None) -> dict[str, Any]:
     """执行一个工具，返回**可 JSON 序列化**的结果（喂回 LLM 的 tool 消息）。
 
     任何异常都不抛给调用方：工具失败的后果是"这次没办成 + 一句老人听得懂
     的话"，不是会话崩溃。
+
+    ``device_call(name, arguments, timeout)`` 是可选的「服务端 → 设备」同步
+    回调，由 session 层注入（它内部用 run_coroutine_threadsafe 桥回事件
+    循环，因为本函数跑在线程池里）。只有需要设备配合的工具才用得上：
+    目前是 ``confirm_reminder``。传 None 时该类工具返回"通道不可用"，
+    而不是抛异常 —— 这样单测可以不带设备直接跑。
     """
     try:
         args = arguments if isinstance(arguments, dict) else json.loads(arguments or "{}")
@@ -502,10 +524,73 @@ def execute_tool(db: Any, device_pk: int, name: str,
             return _delete_reminder(db, device_pk, args)
         if name == "toggle_reminder":
             return _toggle_reminder(db, device_pk, args)
+        if name == "confirm_reminder":
+            return _confirm_reminder(db, device_pk, device_call)
         return {"ok": False, "message": f"没有叫「{name}」的工具"}
     except Exception as exc:  # noqa: BLE001  兜底：工具失败不崩会话
         log.warning("工具 %s 执行失败：%s: %s", name, type(exc).__name__, exc)
         return {"ok": False, "message": "操作没成功，请老人稍后再试"}
+
+
+def _confirm_reminder(db: Any, device_pk: int, device_call: Any) -> dict[str, Any]:
+    """让设备确认「老人刚完成了当前提醒」。
+
+    状态在**设备**上（提醒引擎跑在 NVS 里，断网也要能响），所以这里不能
+    只改数据库 —— 必须经 MCP 通道下发 tools/call，由固件
+    ``elder_confirm_pending_medicine()`` 改状态并回执，服务端再收到
+    ``state=CONFIRMED`` 才落库。只改 DB 的写法会造成「服务端显示已确认、
+    设备还在响铃」，是最坏的假象。
+
+    失败语义要分清（LLM 拿到的话术不同）：
+      - 设备明确答 false → 没有待确认的提醒，正常回应，**不要说失败**；
+      - 超时 / 通道不可用 → 让老人改按设备上的按键。
+    """
+    if device_call is None:
+        log.warning("confirm_reminder：没有设备通道（device_call=None）")
+        return {"ok": False, "message": "现在连不上设备，请让老人按一下设备上的按键确认"}
+
+    try:
+        payload = device_call("self.elder.confirm_reminder", {}, 3.0)
+    except TimeoutError:
+        log.warning("confirm_reminder：设备 3 秒内没回包")
+        return {"ok": False, "message": "设备没有响应，请让老人按一下设备上的按键确认"}
+    except Exception as exc:  # noqa: BLE001  设备离线/WS 已断
+        log.warning("confirm_reminder：下发失败 %s: %s", type(exc).__name__, exc)
+        return {"ok": False, "message": "现在连不上设备，请让老人按一下设备上的按键确认"}
+
+    if not isinstance(payload, dict):
+        return {"ok": False, "message": "设备返回的内容看不懂，请让老人按一下设备上的按键确认"}
+
+    err = payload.get("error")
+    if err:
+        msg = err.get("message") if isinstance(err, dict) else str(err)
+        log.warning("confirm_reminder：设备报错 %s", msg)
+        return {"ok": False, "message": "设备说没办成，请让老人按一下设备上的按键确认"}
+
+    result = payload.get("result")
+    # 固件 tools/call 的成功返回形如
+    # {"content":[{"type":"text","text":"true"}],"isError":false}；
+    # 这里做宽松判定：只要不是明确的 false / isError，就算确认成功。
+    if isinstance(result, dict) and result.get("isError"):
+        return {"ok": False, "message": "设备说没办成，请让老人按一下设备上的按键确认"}
+
+    confirmed = True
+    if isinstance(result, dict):
+        for item in (result.get("content") or []):
+            if isinstance(item, dict) and str(item.get("text", "")).strip().lower() == "false":
+                confirmed = False
+                break
+    elif result is False:
+        confirmed = False
+
+    if not confirmed:
+        log.info("confirm_reminder：设备答 false（当前没有待确认提醒）")
+        return {"ok": True, "confirmed": False,
+                "message": "现在没有等着确认的提醒，用一句话自然回应老人即可，不要说失败"}
+
+    log.info("confirm_reminder：设备已确认（device_pk=%s）", device_pk)
+    return {"ok": True, "confirmed": True,
+            "message": "已确认，用一句话告诉老人「记下了」，不要多说"}
 
 
 def _create_reminder(db: Any, device_pk: int, args: dict[str, Any]) -> dict[str, Any]:

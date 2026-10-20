@@ -20,6 +20,7 @@
 
 #include "elder_reminder.h"
 #include "elder_ui.h"
+#include "elder_sync.h"   /* ELDER_CFM_VOICE：T13 要断言确认方式不被写成 BUTTON */
 
 #include <stdarg.h>
 #include <stddef.h>
@@ -1467,6 +1468,123 @@ static void test_stale_skip_no_false_missed(void)
               saw(0, ELDER_RMD_PENDING)));
 }
 
+/* ---- T13：语音确认（服务端 MCP 工具 → elder_confirm_pending_medicine）----
+ *
+ * 这条链路在 2026-10-21 之前是**断的**：elder_reminder_confirm() 只有一个
+ * 调用点，在按键回调里；按键迁到 GPIO11 后原型期没接线，离线命令词也已
+ * 随上游回归删除 ⇒ 提醒响完没有任何确认手段 ⇒ 15 分钟后升级 ESCALATED ⇒
+ * 回执 ELDER_EV_MISSED ⇒ 子女端每条提醒都收到「老人漏服」的假告警。
+ *
+ * 宿主测试能覆盖的是**状态机这一半**：确认必须落 DONE、此后不得再升级、
+ * 确认方式必须是 VOICE 而不是 BUTTON（否则子女端分不清「老人自己按的」
+ * 还是「跟小智说的」）。MCP 传输那半边（tools/call → mcp_server 的 lambda）
+ * 在 xiaozhi 的 C++ 里，宿主环境编不了，由真机验收清单覆盖。
+ */
+static void test_voice_confirm_no_false_missed(void)
+{
+    printf("\n[T13] 语音确认：落 DONE、记 VOICE 来源、此后不得再报漏服\n");
+    stub_nvs_init();
+    stub_time_set(1772661600L);      /* 06:00，可信时钟 */
+    rec_reset();
+    elder_reminder_init(rec_cb, NULL);
+
+    elder_rmd_item_t m = mk_med(8, 0, "降压药", 0);
+    elder_reminder_add(&m);
+    stub_time_advance(2 * 3600);     /* 08:00 到点 */
+    rec_reset();
+    elder_reminder_tick_once();
+    check("前置：08:00 已响（PENDING）",
+          saw(0, ELDER_RMD_PENDING) >= 1,
+          det("PENDING %d 次", saw(0, ELDER_RMD_PENDING)));
+
+    /* 老人对小智说「我吃过了」→ 服务端 tools/call → 固件走这里 */
+    check("语音确认返回 OK",
+          elder_reminder_confirm_ex(0, ELDER_CFM_VOICE) == ESP_OK, NULL);
+    check("★确认方式必须是 VOICE（不能记成 BUTTON）",
+          elder_reminder_last_confirm_method() == ELDER_CFM_VOICE,
+          det("记成 %u —— 子女端会误判成「老人自己按的」",
+              (unsigned)elder_reminder_last_confirm_method()));
+    check("确认后必须落 DONE 且清掉红灯待确认",
+          saw(0, ELDER_RMD_DONE) >= 1 && (tbl()->pending_today & 1u) == 0,
+          det("%s", dump_tbl(tbl())));
+    check("确认后必须记成今天已服用",
+          (tbl()->done_today & 1u) != 0, det("%s", dump_tbl(tbl())));
+
+    /* 最关键的一条：确认过之后，15 分钟的升级扫描不得再判漏服 */
+    stub_time_advance(20 * 60);
+    rec_reset();
+    elder_reminder_tick_once();
+    check("★确认后再过 20 分钟不得升级 ESCALATED",
+          saw(0, ELDER_RMD_ESCALATED) == 0,
+          det("ESCALATED %d 次 —— 老人明明确认过，家属仍收到「漏服」",
+              saw(0, ELDER_RMD_ESCALATED)));
+
+    /* 固件侧 elder_confirm_pending_medicine() 用 FirstUndoneMedicine() 守卫，
+     * 正常不会传越界 id；这里钉住底层契约：越界 id 必须被拒，且不得把
+     * 任何一条提醒的状态搅乱。 */
+    check("确认越界 id 必须返回 NOT_FOUND（不得静默成功）",
+          elder_reminder_confirm_ex(5, ELDER_CFM_VOICE) == ESP_ERR_NOT_FOUND,
+          NULL);
+    check("越界确认不得污染已有提醒的完成位",
+          (tbl()->done_today & 1u) != 0, det("%s", dump_tbl(tbl())));
+}
+
+/* ---- T14：晚开机（但没到过期阈值）不得一响就判漏服 ----
+ *
+ * 场景：08:00 的药，设备 08:50 才开机（路由器断了 50 分钟、或老人早上
+ * 出门没带设备）。设备这时**要补响** —— 这是 T11-6 守的方向。
+ * 但如果升级计时拿**计划时刻 due** 当基准，`now_min - due = 50 >= 15`
+ * 会在**响铃的同一个 tick** 里直接判 ESCALATED：老人刚听到「该吃药了」，
+ * 家属手机上已经弹出「漏服」，老人连 15 分钟的确认时间都没有。
+ *
+ * 修复把基准换成**响铃时刻** pending_since_us。本测试专门钉它：
+ * 把 reminder.c 的 overdue 判据改回 `(now_min - due) >= 15`，这里必须变红。
+ *
+ * 为什么 T11-6 和 T12 都抓不到这个回归（当初正是因此漏掉）：
+ *   T11-6 在 due 整点触发，now_min-due == 0，新旧判据都不升级；
+ *   T12  走的是 SKIPPED 分支，根本到不了升级逻辑。
+ */
+static void test_late_boot_no_instant_escalate(void)
+{
+    printf("\n[T14] 晚开机 50 分钟：要补响，但不得一响就判漏服\n");
+    stub_nvs_init();
+    stub_time_set(1772661600L);      /* 06:00 */
+    rec_reset();
+    elder_reminder_init(rec_cb, NULL);
+
+    elder_rmd_item_t m = mk_med(8, 0, "降压药", 0);
+    elder_reminder_add(&m);
+
+    stub_time_set(1772661600L + 2 * 3600 + 50 * 60);   /* 08:50 开机 */
+    rec_reset();
+    elder_reminder_tick_once();
+    check("晚开机 50 分钟仍要补响（否则老人彻底漏服）",
+          saw(0, ELDER_RMD_PENDING) >= 1,
+          det("PENDING %d 次 —— 修成「不补响」是另一个方向的漏服事故",
+              saw(0, ELDER_RMD_PENDING)));
+    check("★响铃同一个 tick 内不得判 ESCALATED",
+          saw(0, ELDER_RMD_ESCALATED) == 0,
+          det("ESCALATED %d 次 —— 老人刚听到提醒，家属已收到「漏服」",
+              saw(0, ELDER_RMD_ESCALATED)));
+
+    /* 15 分钟窗口要从**响铃**起算，不是从 08:00 起算 */
+    stub_time_advance(14 * 60);
+    rec_reset();
+    elder_reminder_tick_once();
+    check("响铃后 14 分钟仍未升级（窗口没走完）",
+          saw(0, ELDER_RMD_ESCALATED) == 0,
+          det("ESCALATED %d 次 —— 提前升级等于缩短老人确认时间",
+              saw(0, ELDER_RMD_ESCALATED)));
+
+    stub_time_advance(2 * 60);
+    rec_reset();
+    elder_reminder_tick_once();
+    check("★响铃后满 15 分钟必须升级（该报警时不能哑）",
+          saw(0, ELDER_RMD_ESCALATED) >= 1,
+          det("ESCALATED %d 次 —— 一直不升级则「人要介入」的信号彻底失效",
+              saw(0, ELDER_RMD_ESCALATED)));
+}
+
 int main(void)
 {
     /* 时区必须与固件一致（elder_bridge.cc 同样固定 CST-8）：
@@ -1492,6 +1610,8 @@ int main(void)
     test_replace_all_recomputes_fired();
     test_restart_catchup_still_rings();
     test_stale_skip_no_false_missed();
+    test_voice_confirm_no_false_missed();
+    test_late_boot_no_instant_escalate();
 
     printf("\n=== %d 通过 / %d 失败 ===\n", g_pass, g_fail);
     return g_fail ? 1 : 0;

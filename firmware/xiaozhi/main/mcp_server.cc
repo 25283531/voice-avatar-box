@@ -20,6 +20,12 @@
 
 #define TAG "MCP"
 
+// >>> BEGIN elder-companion overlay（由本 fork 维护，勿随上游合并覆盖）>>>
+// 老人服药确认：由 elder 组件导出（定义在 components/elder/src/elder_bridge.cc）。
+// 项目里 elder 没有对外头文件，沿用 main.cc 的裸 extern "C" 声明模式。
+extern "C" int elder_confirm_pending_medicine(void);
+// <<< END elder-companion overlay <<<
+
 McpServer::McpServer() {
 }
 
@@ -120,6 +126,32 @@ void McpServer::AddCommonTools() {
             });
     }
 #endif
+
+    // >>> BEGIN elder-companion overlay >>>
+    // 老人服药确认。放在**最后**注册：前面那些工具的 JSON 顺序保持不变，
+    // 服务端 prompt 的前缀缓存不会被这次新增打掉。
+    //
+    // 为什么用 MCP 工具而不是本地命令词：离线命令词已随上游回归删除
+    // （2026-10-20 决策），而按键迁到 GPIO11 后原型期没接线 —— 不加这条，
+    // 老人听到提醒后**没有任何确认手段**，15 分钟后固件会升级成 ESCALATED
+    // 并回执 MISSED，子女端每条提醒都收到「漏服」假告警。
+    //
+    // 返回 false 不是错误：老人可能只是顺口说「吃过了」，此时没有待确认
+    // 提醒，工具如实返回 false，让 LLM 用一句话圆过去即可。
+    AddTool("self.elder.confirm_reminder",
+        "Confirm that the elderly user has just completed the current reminder "
+        "(for example, has taken their medicine).\n"
+        "Call this tool when the user says things like \"我吃过了\", \"吃完了\", "
+        "\"已经吃了\", \"药吃了\" in response to a medicine reminder.\n"
+        "Return:\n"
+        "  true if a pending reminder was confirmed; false if there is nothing "
+        "pending (in that case just reply naturally, do not report an error).",
+        PropertyList(),
+        [](const PropertyList& properties) -> ReturnValue {
+            (void)properties;
+            return elder_confirm_pending_medicine() == 0;
+        });
+    // <<< END elder-companion overlay <<<
 
     // Restore the original tools list to the end of the tools list
     tools_.insert(tools_.end(), original_tools.begin(), original_tools.end());
