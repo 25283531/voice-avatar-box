@@ -67,11 +67,14 @@ void AfeAudioProcessor::Initialize(AudioCodec* codec, int frame_duration_ms, srm
     afe_iface_ = esp_afe_handle_from_config(afe_config);
     afe_data_ = afe_iface_->create_from_config(afe_config);
     
-    xTaskCreate([](void* arg) {
+    /* 钉 core 1：AFE（AEC + 重采样）是纯计算任务，和 audio_input 放同一个核
+     * 可以避免两核之间来回同步 PCM 缓冲（audio_input 也在 core 1）。
+     * 原先用 xTaskCreate（tskNO_AFFINITY），实测落在 core 0，与 WiFi 抢核。 */
+    xTaskCreatePinnedToCore([](void* arg) {
         auto this_ = (AfeAudioProcessor*)arg;
         this_->AudioProcessorTask();
         vTaskDelete(NULL);
-    }, "audio_communication", 4096, this, 3, NULL);
+    }, "audio_communication", 4096, this, 3, NULL, 1);
 }
 
 AfeAudioProcessor::~AfeAudioProcessor() {

@@ -13,6 +13,7 @@
 #include <cstring>
 #include <esp_log.h>
 #include <esp_system.h>
+#include <esp_timer.h>
 #include <nvs.h>
 #include <cJSON.h>
 #include <driver/gpio.h>
@@ -54,10 +55,17 @@ static const char* ResetReasonName(esp_reset_reason_t r) {
 
 static char s_reset_reason[64] = "未知";
 static uint32_t s_boot_count = 0;
+/* 开机时刻（esp_timer 微秒）。**必须独立记录，不能复用 clock_ticks_**：
+ * clock_ticks_ 在 SetDeviceState() 里每次状态切换都清零（idle→connecting→listening
+ * 唤醒一次就清两次），拿它当「已运行秒数」会把唤醒后的日志打成「已运行=10s」，
+ * 与真实运行时间矛盾 —— 2026-10-20 就因此把「没重启」误判成「重启了一次」。
+ * esp_timer 是单调时钟，不随状态机变化，才是运行时长的正确来源。 */
+static int64_t s_boot_us = 0;
 
 /* 只在开机调一次：解码复位原因 + 累加启动次数（存 NVS，跨重启可累计）。
  * 启动次数是判断「偶发重启」还是「重启循环」的关键证据。 */
 static void BootDiagInit() {
+    s_boot_us = esp_timer_get_time();
     snprintf(s_reset_reason, sizeof(s_reset_reason), "%s",
              ResetReasonName(esp_reset_reason()));
 
@@ -687,10 +695,12 @@ void Application::MainEventLoop() {
                 SystemInfo::PrintHeapStats();
                 /* 前 120 秒把复位原因重打一遍：自发重启时 USB 会重新枚举，
                  * 开机头 16 秒的串口日志在主机侧整段丢失（见文件顶部说明）。
-                 * 只重打 120 秒是为了不让它变成长跑噪声 —— 够覆盖任何抓取窗口。 */
-                if (clock_ticks_ <= 120) {
+                 * 只重打 120 秒是为了不让它变成长跑噪声 —— 够覆盖任何抓取窗口。
+                 * 时长用 s_boot_us 算（esp_timer 单调），不用 clock_ticks_（会被状态切换清零）。 */
+                int up_s = (int)((esp_timer_get_time() - s_boot_us) / 1000000LL);
+                if (up_s <= 120) {
                     ESP_LOGW("BootDiag", "复位原因=%s 累计启动=%u 次 已运行=%ds 当前空闲堆=%u 最小空闲堆=%u",
-                             s_reset_reason, (unsigned)s_boot_count, clock_ticks_,
+                             s_reset_reason, (unsigned)s_boot_count, up_s,
                              (unsigned)esp_get_free_heap_size(),
                              (unsigned)esp_get_minimum_free_heap_size());
                 }

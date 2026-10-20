@@ -82,11 +82,21 @@ void AudioService::Start() {
 
 #if CONFIG_USE_AUDIO_PROCESSOR
     /* Start the audio input task */
+    /* 钉在 core 1，不是 core 0（2026-10-20 实测修正）。
+     *
+     * 原实现钉 core 0、优先级 8。core 0 上同时还跑着 WiFi 协议栈、主循环、
+     * Opus 编码，而 core 1 全程 IDLE1 —— 实测唤醒后立刻出现：
+     *     E task_wdt: CPU 0: audio_input / CPU 1: IDLE1
+     *     - IDLE0 (CPU 0) 未喂狗
+     * 两个后果都指向同一处：IDLE0 被饿死（看门狗每 10 秒报一次），以及
+     * Opus 编码拿不到 CPU（`Encode wake word opus 66 packets in 853 ms`，
+     * 正常应 <100ms）⇒ 首句回答延迟数秒。
+     * 音频是实时任务，优先级必须高，但**不该和 WiFi 抢同一个核**。 */
     xTaskCreatePinnedToCore([](void* arg) {
         AudioService* audio_service = (AudioService*)arg;
         audio_service->AudioInputTask();
         vTaskDelete(NULL);
-    }, "audio_input", 2048 * 3, this, 8, &audio_input_task_handle_, 0);
+    }, "audio_input", 2048 * 3, this, 8, &audio_input_task_handle_, 1);
 
     /* Start the audio output task */
     xTaskCreate([](void* arg) {
@@ -96,11 +106,12 @@ void AudioService::Start() {
     }, "audio_output", 2048 * 2, this, 4, &audio_output_task_handle_);
 #else
     /* Start the audio input task */
-    xTaskCreate([](void* arg) {
+    /* 同上面的理由：钉 core 1，避免与 core 0 上的 WiFi 协议栈抢核。 */
+    xTaskCreatePinnedToCore([](void* arg) {
         AudioService* audio_service = (AudioService*)arg;
         audio_service->AudioInputTask();
         vTaskDelete(NULL);
-    }, "audio_input", 2048 * 2, this, 8, &audio_input_task_handle_);
+    }, "audio_input", 2048 * 2, this, 8, &audio_input_task_handle_, 1);
 
     /* Start the audio output task */
     xTaskCreate([](void* arg) {
