@@ -58,7 +58,7 @@ def utcnow() -> datetime:
 #   record_type in ('config', 'preset') => owner_id IS NULL
 #   record_type == 'role'              => owner_id IS NOT NULL
 RECORD_TYPE_CONFIG = "config"   # 平台 LLM/TTS/ASR 配置：参与下发与导出
-RECORD_TYPE_PRESET = "preset"   # 平台预设角色（小暖）：仅管理员可写
+RECORD_TYPE_PRESET = "preset"   # 平台预设角色（小智）：仅管理员可写
 RECORD_TYPE_ROLE = "role"       # 用户原创 / 派生角色：owner 本人或管理员可写
 RECORD_TYPES = (RECORD_TYPE_CONFIG, RECORD_TYPE_PRESET, RECORD_TYPE_ROLE)
 
@@ -270,7 +270,7 @@ class AIProvider(Base):
 
       * ``config``  一条真实可调用的平台配置（kind ∈ model_catalog.KIND_LIST），
         参与 /api/device/sync 的下发与 /api/providers/export/xiaozhi 的导出；
-      * ``preset``  平台预设角色（小暖），由代码 seed，**仅管理员可写**；
+      * ``preset``  平台预设角色（小智），由代码 seed，**仅管理员可写**；
       * ``role``    用户原创或派生的角色，**owner 本人**（或管理员）可写。
 
     ⚠️ 决策变更（docs/架构设计-角色模型与人格能力.md §0/§1.2）：人格从 Avatar

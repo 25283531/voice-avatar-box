@@ -299,7 +299,7 @@ NEW_COLUMNS: Final[list[tuple[str, str, str, str]]] = [
      "VARCHAR(32) DEFAULT ''"),
     # ---- avatars：形象归属与软删（架构 §4.2）----
     # 默认 'preset'：老库里已有的形象全是平台 seed 出来的，
-    # 归为 preset 时普通用户仍可读（家属需要能看到小暖长什么样），
+    # 归为 preset 时普通用户仍可读（家属需要能看到小智长什么样），
     # 只是改不动 —— 这是安全侧的选择。
     ("avatars", "record_type", "VARCHAR(16) DEFAULT 'preset'", "VARCHAR(16) DEFAULT 'preset'"),
     ("avatars", "owner_id", "INTEGER", "INT NULL"),

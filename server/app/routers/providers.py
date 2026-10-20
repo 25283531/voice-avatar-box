@@ -208,7 +208,7 @@ def _edge_available() -> bool:
 
 
 @router.get("/catalog/voice-preview")
-def voice_preview(voice: str, text: str = "您好，我是小暖。",
+def voice_preview(voice: str, text: str = "您好，我是小智。",
                   user: models.User = Depends(get_current_user)):
     """合成一段**试听音频**，让用户挑音色时能先听再选。
 
@@ -241,7 +241,7 @@ def voice_preview(voice: str, text: str = "您好，我是小暖。",
         )
     # 限长：这是「试听」，不是「把 TTS 当免费下载器」。
     # 不限的话任何登录用户都能拿它做免费 TTS 服务。
-    snippet = (text or "").strip()[:60] or "您好，我是小暖。"
+    snippet = (text or "").strip()[:60] or "您好，我是小智。"
     try:
         pcm = tts_edge.synth_pcm(snippet, voice)
     except Exception as exc:  # noqa: BLE001

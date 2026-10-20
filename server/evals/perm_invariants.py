@@ -177,7 +177,7 @@ def _http_status(fn: Callable[[], Any]) -> int:
 
 
 # ================================================================ ok_contract_v2
-# PRD §11.1 线框里派生角色旁常驻「基于平台『小暖』· N 处改动」。
+# PRD §11.1 线框里派生角色旁常驻「基于平台『小智』· N 处改动」。
 # 「N 处改动」这个数字就是 changed_count，它错了用户就会看到错误的对��。
 DIFF_REQUIRED_ITEM_FIELDS = ("field", "label", "parent_value", "current_value",
                             "changed")

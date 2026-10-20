@@ -62,6 +62,20 @@ DEFAULT_PASSWORD_ALERT_MARKER = "ELDER-DEFAULT-PASSWORD-ALERT"
 #: 一次性轮换已执行，形如 ``ELDER-ADMIN-PASSWORD-ROTATED user=admin``
 PASSWORD_ROTATED_MARKER = "ELDER-ADMIN-PASSWORD-ROTATED"
 
+#: 平台预设角色历史上用过的默认名。2026-10-20 品牌统一为「小智」后，
+#: ``_seed()`` 会把这些名字**迁移**成 ``catalog.PRESET_ROLE_NAME``。
+#: 只认这几个字符串，运营改过的名字一律不动（见 _seed 里的迁移注释）。
+_LEGACY_PRESET_NAMES: frozenset[str] = frozenset({
+    "小暖（平台预设）",
+    "小暖（默认）",
+    "小暖",
+})
+#: 默认形象历史上的名字，迁移规则同上（``eaf_pack_name`` 是素材标识，**不改**）
+_LEGACY_AVATAR_NAMES: frozenset[str] = frozenset({
+    "小暖（默认）",
+    "小暖",
+})
+
 
 def _seed_admin_password() -> tuple[str, bool]:
     """种子管理员的初始口令，返回 ``(口令, 是否由本进程随机生成)``。
@@ -109,13 +123,13 @@ def _as_utc(dt: datetime | None) -> datetime | None:
 
 
 def _seed() -> None:
-    """首次启动写入种子数据：默认管理员 + 平台预设角色（小暖）+ 纯形象。
+    """首次启动写入种子数据：默认管理员 + 平台预设角色（小智）+ 纯形象。
 
     ⚠️ 角色与形象的关系（架构 §7.1）：人格住在 ``ai_providers`` 的一行
     ``record_type='preset'`` 里；``Avatar`` 只剩"长什么样"。
 
     预设角色与种子形象都做成**幂等 upsert**，而不是"表为空才写"：
-    运营在小暖的 traits 上做的微调，不该被一次重启悄悄抹掉。
+    运营在小智的 traits 上做的微调，不该被一次重启悄悄抹掉。
     """
     from . import models
     from .persona import catalog, guardrails
@@ -157,6 +171,22 @@ def _seed() -> None:
         preset = db.scalar(
             select(models.AIProvider).where(models.AIProvider.kind == "")
             .order_by(models.AIProvider.id).limit(1))
+        # ---- 品牌改名迁移：旧名（小暖）→ 小智（2026-10-20）----
+        # 只动**平台预设自己那一行**。三个判据必须同时成立：
+        #   record_type == preset   —— 不是历史角色（历史角色改成预设会让它
+        #                              突然变成全平台可见且只读）；
+        #   owner_id is None        —— 不是某个家属自建的角色；
+        #   name 命中旧默认名       —— 运营改过名的不动，那是他的品牌决策。
+        # 少任何一条都可能改到用户数据，而改名是不可逆的。
+        if (preset is not None
+                and preset.name in _LEGACY_PRESET_NAMES
+                and preset.record_type == models.RECORD_TYPE_PRESET
+                and preset.owner_id is None):
+            log.info("seed: 平台预设角色改名「%s」→「%s」（品牌统一为小智）",
+                     preset.name, catalog.PRESET_ROLE_NAME)
+            preset.name = catalog.PRESET_ROLE_NAME
+            db.flush()
+
         if preset is None:
             preset = models.AIProvider(
                 name=catalog.PRESET_ROLE_NAME,
@@ -195,9 +225,19 @@ def _seed() -> None:
         # ---- 纯形象（只管外观/灯效/默认音色）----
         av = db.scalar(select(Avatar).where(Avatar.deleted_at.is_(None))
                        .order_by(Avatar.id).limit(1))
+
+        # 品牌改名迁移（形象侧，判据与角色侧一致）。注意 eaf_pack_name
+        # 保持 "xiaonuan" 不动 —— 那是素材包目录名，改了会加载不到序列帧。
+        if (av is not None and av.name in _LEGACY_AVATAR_NAMES
+                and av.record_type == models.RECORD_TYPE_PRESET
+                and av.owner_id is None):
+            log.info("seed: 默认形象改名「%s」→「小智（默认）」", av.name)
+            av.name = "小智（默认）"
+            db.flush()
+
         if av is None:
             av = Avatar(
-                name="小暖（默认）",
+                name="小智（默认）",
                 description="温和陪伴风格，语速偏慢，适合老年用户",
                 record_type=models.RECORD_TYPE_PRESET,
                 owner_id=None,

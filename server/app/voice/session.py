@@ -786,7 +786,7 @@ class VoiceSession:
         # 会话内历史：**只在本轮成功拿到回复后**才追加。失败轮不进历史，
         # 否则下一轮的上下文里会有一条没有回复的 user 消息，
         # 模型会以为用户的话被忽略了。工具轮的中间文本不进历史 ——
-        # 4 轮窗口很紧，留给"老人问/小暖答"更有价值。
+        # 4 轮窗口很紧，留给"老人问/小智答"更有价值。
         self._history.append({"role": "user", "content": utterance})
         self._history.append({"role": "assistant", "content": reply})
 

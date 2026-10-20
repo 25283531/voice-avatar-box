@@ -621,7 +621,7 @@ def build_persona_prompt(db, user_id: int, agent_id: int | None,
 def merge_profiles(db, user_id: int, agent_id: int | None) -> dict[str, Any]:
     """合并 L1（全局）与 L2（角色级）两层画像，供人格编译器使用。
 
-    为什么要两层：家属可能对「小暖这个角色」有特殊交代（L2），也可能只是
+    为什么要两层：家属可能对「小智这个角色」有特殊交代（L2），也可能只是
     笼统地说"说话轻一点"（L1）。角色模型落地后这个区分才有意义 ——
     换角色就该换一份语气，而"这个人本身的说话习惯"应当跨角色共享。
 
