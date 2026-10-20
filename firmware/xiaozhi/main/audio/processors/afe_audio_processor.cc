@@ -69,12 +69,18 @@ void AfeAudioProcessor::Initialize(AudioCodec* codec, int frame_duration_ms, srm
     
     /* 钉 core 1：AFE（AEC + 重采样）是纯计算任务，和 audio_input 放同一个核
      * 可以避免两核之间来回同步 PCM 缓冲（audio_input 也在 core 1）。
-     * 原先用 xTaskCreate（tskNO_AFFINITY），实测落在 core 0，与 WiFi 抢核。 */
+     * 原先用 xTaskCreate（tskNO_AFFINITY），实测落在 core 0，与 WiFi 抢核。
+     *
+     * 栈 4096→8192：fetch_with_delay 里跑 AEC/NS 神经网络推理 + VAD + 回调，
+     * 是重计算深调用链。实测 4KB 时 audio_communication 起不来/栈溢出，
+     * 表现是「AFE Ringbuffer of AFE(FEED) is full」狂刷（fetch 没在消费）、
+     * 服务端收到 0ms 语音、唤醒后永远没答复（2026-10-20 实测）。
+     * 与 elder_rmd 栈溢出同病根：重计算任务配了过小栈。 */
     xTaskCreatePinnedToCore([](void* arg) {
         auto this_ = (AfeAudioProcessor*)arg;
         this_->AudioProcessorTask();
         vTaskDelete(NULL);
-    }, "audio_communication", 4096, this, 3, NULL, 1);
+    }, "audio_communication", 8192, this, 3, NULL, 1);
 }
 
 AfeAudioProcessor::~AfeAudioProcessor() {
@@ -93,6 +99,12 @@ size_t AfeAudioProcessor::GetFeedSize() {
 
 void AfeAudioProcessor::Feed(std::vector<int16_t>&& data) {
     if (afe_data_ == nullptr) {
+        return;
+    }
+    /* Stop() 后 fetch 循环停了，若继续 feed 会让 AFE Ringbuffer 灌满
+     * （实测「Ringbuffer of AFE(FEED) is full」狂刷）。feed 与 fetch 必须
+     * 同启同停：未运行时不灌，保持两侧对称。 */
+    if (!IsRunning()) {
         return;
     }
     afe_iface_->feed(afe_data_, data.data());
