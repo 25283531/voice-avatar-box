@@ -18,7 +18,7 @@ CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC=y
 
 CONFIG_SLAVE_IDF_TARGET_ESP32C6=y
 
-CONFIG_SR_WN_WN9_NIHAOXIAOZHI_TTS=y
+# 唤醒模型不在这里选：唯一真源 = sdkconfig.defaults 的 elder-companion overlay 段。
 
 CONFIG_IDF_EXPERIMENTAL_FEATURES=y
 

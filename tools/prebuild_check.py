@@ -254,6 +254,45 @@ def main() -> int:
         if other_wn else "只有 wn9_nihaoxiaoan_tts2 一个 wn9 模型",
     )
 
+    # 反向守卫之二：**defaults 全家族**（sdkconfig.defaults / .esp32s3 / .esp32p4 …）
+    #
+    # 为什么不并进 C2b3：判据对象不同。C2b3 查的是 sdkconfig ——「此刻编译真正
+    # 读的那份」；这条查的是 defaults 家族 ——「下次重新生成时会不会又退回去」。
+    #
+    # 为什么必须扫**全部变体**，而不是只看 sdkconfig.defaults：
+    #   IDF 在 `idf.py set-target <target>` 时会把 sdkconfig.defaults 与
+    #   sdkconfig.defaults.<target> **叠加**读取（后者覆盖前者）。但两者设的是
+    #   **不同的符号**（小智 vs 小安）⇒ 不会互相覆盖，只会「两个都 y」，
+    #   两个模型双双打进 srmodels.bin，用哪个取决于加载顺序。
+    #   2026-10-20 CI 实证：上游自带的 sdkconfig.defaults.esp32s3 里就留着
+    #   CONFIG_SR_WN_WN9_NIHAOXIAOZHI_TTS=y。当时 C2b3 在 CI 上红、本地（把
+    #   sdkconfig 删了）却绿 —— 正是「按环境分叉的假绿」，故把判据前移到
+    #   defaults 家族，让本地和 CI 走**同一条路径**。
+    wn_bad: list[str] = []
+    dflt_files = sorted(XIAOZHI.glob("sdkconfig.defaults*"))
+    for dpath in dflt_files:
+        for lineno, raw in enumerate(
+            dpath.read_text(encoding="utf-8", errors="replace").splitlines(), 1
+        ):
+            s = raw.strip()
+            if s.startswith("#"):
+                continue
+            m = re.match(r"(CONFIG_SR_WN_WN9\w*)=y\s*$", s)
+            if m and m.group(1) != "CONFIG_SR_WN_WN9_NIHAOXIAOAN_TTS2":
+                wn_bad.append(f"{dpath.name}:{lineno} {m.group(1)}")
+    check(
+        "C2b4 defaults 全家族里没有别的 wn9 唤醒模型",
+        not wn_bad,
+        f"这些位置还开着别的 wn9 唤醒模型：{wn_bad}。"
+        f"⚠️ set-target 会把 sdkconfig.defaults 与 sdkconfig.defaults.<target> "
+        f"叠加读取，两者设的是不同符号 ⇒ 不会互相覆盖，只会两个都 y。"
+        f"处置：把该行删掉（唤醒模型唯一真源 = sdkconfig.defaults 的 overlay 段）"
+        if wn_bad else
+        f"扫了 {len(dflt_files)} 个 defaults 变体"
+        f"（{', '.join(p.name for p in dflt_files)}），"
+        f"只有 wn9_nihaoxiaoan_tts2 一个 wn9 模型",
+    )
+
     check(
         "C2c 离线唤醒模型已选（mn7_cn）",
         src.get("CONFIG_SR_MN_CN_MULTINET7_QUANT", "n") == "y",

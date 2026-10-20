@@ -21,7 +21,15 @@ CONFIG_MBEDTLS_DYNAMIC_FREE_CONFIG_DATA=y
 CONFIG_ESP32S3_INSTRUCTION_CACHE_32KB=y
 CONFIG_ESP32S3_DATA_CACHE_LINE_64B=y
 
-CONFIG_SR_WN_WN9_NIHAOXIAOZHI_TTS=y
+# 唤醒模型（WakeNet9）**不在这里选** —— 唯一真源是 sdkconfig.defaults 的
+# elder-companion overlay 段里的 CONFIG_SR_WN_WN9_NIHAOXIAOAN_TTS2=y。
+#
+# 这里原来有一行上游自带的 CONFIG_SR_WN_WN9_NIHAOXIAOZHI_TTS=y，2026-10-20 删掉。
+# 原因：IDF 在 set-target <target> 时会把 sdkconfig.defaults 与
+# sdkconfig.defaults.<target> **叠加**读取（后者覆盖前者），但两者设的是
+# **不同的符号**（小智 vs 小安）⇒ 两个 wn9 模型同时为 y 并双双打进
+# srmodels.bin，唤醒词由加载顺序决定，真机表现为「喊它不应答 / 应答陌生称呼」。
+# 换唤醒词时若只改 sdkconfig.defaults，这一行会把它悄悄顶掉，且没有任何报错。
 
 CONFIG_ESP_SYSTEM_EVENT_TASK_STACK_SIZE=4096
 
