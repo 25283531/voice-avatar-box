@@ -11,6 +11,7 @@
 #if CONFIG_IDF_TARGET_ESP32S3 || CONFIG_IDF_TARGET_ESP32P4
 #include "wake_words/afe_wake_word.h"
 #include "wake_words/custom_wake_word.h"
+#include "wake_words/dual_wake_word.h"
 #else
 #include "wake_words/esp_wake_word.h"
 #endif
@@ -653,9 +654,18 @@ void AudioService::SetModelsList(srmodel_list_t* models_list) {
     models_list_ = models_list;
 
 #if CONFIG_IDF_TARGET_ESP32S3 || CONFIG_IDF_TARGET_ESP32P4
-    if (esp_srmodel_filter(models_list_, ESP_MN_PREFIX, NULL) != nullptr) {
+    /* 模型包里**同时**有 MultiNet(mn*) 和 WakeNet(wn*) 时用双引擎：
+     *   WakeNet  → 专用唤醒词（召回高、带 AEC，可在播报时打断）
+     *   MultiNet → 自定义唤醒词「你好，小安」+ 离线服药命令词
+     * 2026-10-20 用户拍板「两个都保留」。只有一个模型时行为与上游一致。 */
+    bool has_mn = esp_srmodel_filter(models_list_, ESP_MN_PREFIX, NULL) != nullptr;
+    bool has_wn = esp_srmodel_filter(models_list_, ESP_WN_PREFIX, NULL) != nullptr;
+    if (has_mn && has_wn) {
+        wake_word_ = std::make_unique<DualWakeWord>();
+        ESP_LOGI(TAG, "检测到 MultiNet + WakeNet 两套模型 → 双引擎唤醒");
+    } else if (has_mn) {
         wake_word_ = std::make_unique<CustomWakeWord>();
-    } else if (esp_srmodel_filter(models_list_, ESP_WN_PREFIX, NULL) != nullptr) {
+    } else if (has_wn) {
         wake_word_ = std::make_unique<AfeWakeWord>();
     } else {
         wake_word_ = nullptr;
@@ -679,7 +689,17 @@ void AudioService::SetModelsList(srmodel_list_t* models_list) {
 
 bool AudioService::IsAfeWakeWord() {
 #if CONFIG_IDF_TARGET_ESP32S3 || CONFIG_IDF_TARGET_ESP32P4
-    return wake_word_ != nullptr && dynamic_cast<AfeWakeWord*>(wake_word_.get()) != nullptr;
+    if (auto* afe = dynamic_cast<AfeWakeWord*>(wake_word_.get())) {
+        (void)afe;
+        return true;
+    }
+    /* 双引擎里含 WakeNet/AFE ⇒ 同样具备「播报时还能听见唤醒词」的能力。
+     * 这个返回值唯一用途是 application.cc 在 speaking 态决定要不要继续开唤醒检测，
+     * 返回 false 会让老人在设备说话时喊它没反应。 */
+    if (auto* dual = dynamic_cast<DualWakeWord*>(wake_word_.get())) {
+        return dual->HasWakenet();
+    }
+    return false;
 #else
     return false;
 #endif

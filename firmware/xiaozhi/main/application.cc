@@ -549,8 +549,13 @@ void Application::Start() {
         std::string message = std::string(Lang::Strings::VERSION) + ota.GetCurrentVersion();
         display->ShowNotification(message.c_str());
         display->SetChatMessage("system", "");
-        // Play the success sound to indicate the device is ready
-        audio_service_.PlaySound(Lang::Sounds::OGG_SUCCESS);
+        /* 2026-10-20 去掉开机「叮咚」（原 audio_service_.PlaySound(OGG_SUCCESS)）。
+         * 用户原话：「设备一直在隔一会叮咚一声，实际场景下这个声音很烦人」。
+         * 这声「叮咚」就是这条 —— 每次协议起来都会响一次。它本来是「设备就绪」
+         * 提示，但就绪状态屏上已经有字了，而老人家里每重启一次就多一声响，
+         * 反而像故障。**提醒/服药到点的提示音不要动**（那是功能，不是噪声），
+         * 只去掉「开机成功」这一类无信息量的声音。 */
+        ESP_LOGI(TAG, "设备就绪（不再播开机提示音，见本行上方注释）");
     }
 }
 

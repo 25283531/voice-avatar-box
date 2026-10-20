@@ -38,11 +38,24 @@ static const char *TAG = "elder.cfg";
  * 想临时绕过（例如做对照实验）可编译时 -DEXPECTED_WAKE_WORD_DISPLAY=\"xxx\"。
  */
 #ifndef EXPECTED_WAKE_WORD_DISPLAY
-#define EXPECTED_WAKE_WORD_DISPLAY "你好，小暖"
+#define EXPECTED_WAKE_WORD_DISPLAY "你好，小安"
 #endif
 
 #ifndef EXPECTED_IDF_TARGET
 #define EXPECTED_IDF_TARGET "esp32s3"
+#endif
+
+/* ── WakeNet 唤醒词（2026-10-20 起启用）──────────────────────────────────
+ * WakeNet 的唤醒词**训练在模型里**，Kconfig 只能选模型、不能选字符串，
+ * 所以「实际生效的是哪个词」完全取决于打开了哪个 CONFIG_SR_WN_*。
+ * 本段把「实际选中的模型」核对成它对应的唤醒词再打日志：
+ * 选错模型（比如手滑选成别的名字的 wn9）时，串口第一屏就能看出来，
+ * 不用去猜模型名 —— 那种错误在真机上只表现为「设备对别人家的名字应答」。
+ * 主通路 = wn9_nihaoxiaoan_tts2（「你好小安」），挑它的理由见
+ * tools/merge_to_xiaozhi.py 的 SDKCONFIG_OVERLAY 注释。
+ * 两个引擎认同一个词：MultiNet 那边由 CONFIG_CUSTOM_WAKE_WORD 配成同一个。 */
+#ifndef EXPECTED_WAKENET_WORD
+#define EXPECTED_WAKENET_WORD "你好小安"
 #endif
 
 static bool str_eq(const char *a, const char *b)
@@ -64,7 +77,7 @@ static void report_wake_word(void)
     const char *pinyin = CONFIG_CUSTOM_WAKE_WORD;
     const char *display = CONFIG_CUSTOM_WAKE_WORD_DISPLAY;
 
-    ESP_LOGI(TAG, "唤醒词 拼音=[%s] 屏显=[%s] 阈值=%d",
+    ESP_LOGI(TAG, "MultiNet 唤醒词 拼音=[%s] 屏显=[%s] 阈值=%d（同时承载离线命令词）",
              pinyin, display, CONFIG_CUSTOM_WAKE_WORD_THRESHOLD);
 
     if (!str_eq(display, EXPECTED_WAKE_WORD_DISPLAY)) {
@@ -86,6 +99,31 @@ static void report_wake_word(void)
     if (threshold <= 0 || threshold > 100) {
         ESP_LOGE(TAG, "唤醒词阈值越界：%d（应为 1..100）", threshold);
     }
+}
+
+/*
+ * WakeNet 自检：确认「专用唤醒模型」真的编进来了，且是我们挑的那一个。
+ *
+ * 判据是**具体符号**，不是「有打开任何一个 wn9」——只有具体符号能挡住
+ * 「手滑选回你好小智」这种改动，而那种错误在真机上表现为「设备对别人家的
+ * 名字应答」，不听串口根本发现不了。
+ */
+static void report_wakenet(void)
+{
+#if defined(CONFIG_SR_WN_WN9_NIHAOXIAOAN_TTS2)
+    ESP_LOGI(TAG, "WakeNet 唤醒词=[%s]（专用模型 wn9_nihaoxiaoan_tts2，主唤醒通路）",
+             EXPECTED_WAKENET_WORD);
+#else
+    ESP_LOGE(TAG, "WakeNet 未启用（缺 CONFIG_SR_WN_WN9_NIHAOXIAOAN_TTS2）⇒ "
+                  "唤醒只剩 MultiNet，召回会明显变差；请检查 sdkconfig 是否残留");
+#endif
+
+    /* 反向守卫：别的 wn9 模型被同时打开时会抢唤醒词（AfeWakeWord 只认最后一个
+     * 匹配到的 wn 模型），这是「改了没生效」的另一种形态，必须吵出来。 */
+#if defined(CONFIG_SR_WN_WN9_NIHAOXIAOZHI_TTS) || defined(CONFIG_SR_WN_WN9_XIAOAITONGXUE)
+    ESP_LOGE(TAG, "检测到其它 wn9 唤醒模型被同时启用（你好小智/小爱同学）⇒ "
+                  "设备可能应答错误的唤醒词，请只保留 wn9_nihaoxiaoan_tts2");
+#endif
 }
 
 /*
@@ -129,6 +167,7 @@ void elder_config_report(void)
     ESP_LOGI(TAG, "===== elder 开机自检（编译期实际生效值）=====");
     report_target();
     report_wake_word();
+    report_wakenet();
     report_display_style();
 
     /* 分区/OTA 这类宏在部分板型下不存在，用 #ifdef 包起来，

@@ -113,6 +113,54 @@ bool CustomWakeWord::Initialize(AudioCodec* codec, srmodel_list_t* models_list) 
         ParseWakenetModelConfig();
     }
 
+#ifdef CONFIG_ELDER_WAKE_ALIASES
+    /* 同义唤醒词（由 elder 组件的 Kconfig 注入，默认 "xiao an;..."）。
+     *
+     * 为什么需要：MultiNet 的召回率与短语长度强相关 —— 4 音节的
+     * 「ni hao xiao an」真机实测老人连喊 5 遍都常常不命中，而 2 音节的
+     * 「xiao an」明显好叫。多注册几条同义短语 = 多几次命中机会，
+     * 阈值不变（仍是 CONFIG_CUSTOM_WAKE_WORD_THRESHOLD），
+     * 命中任何一条都按主唤醒词的汉字上报，服务端/屏显看不出区别。
+     *
+     * WakeNet 那边没有等价手段：它的唤醒词是训练进模型里的，改不了字符串。 */
+    {
+#ifdef CONFIG_CUSTOM_WAKE_WORD_DISPLAY
+        const char* alias_display = CONFIG_CUSTOM_WAKE_WORD_DISPLAY;
+#else
+        const char* alias_display = "";
+#endif
+        std::string list = CONFIG_ELDER_WAKE_ALIASES;
+        size_t pos = 0;
+        int added = 0;
+        while (pos <= list.size()) {
+            size_t sep = list.find_first_of(";,", pos);
+            std::string one = (sep == std::string::npos)
+                                  ? list.substr(pos)
+                                  : list.substr(pos, sep - pos);
+            /* 手工 trim：Kconfig 里的字符串常带前后空格 */
+            size_t b = one.find_first_not_of(" \t");
+            size_t e = one.find_last_not_of(" \t");
+            one = (b == std::string::npos) ? std::string() : one.substr(b, e - b + 1);
+
+            if (!one.empty()) {
+                bool dup = false;
+                for (const auto& c : commands_) {
+                    if (c.command == one) { dup = true; break; }
+                }
+                if (!dup) {
+                    commands_.push_back({one, alias_display, "wake"});
+                    added++;
+                    ESP_LOGI(TAG, "同义唤醒词: \"%s\" → 屏显 \"%s\"", one.c_str(), alias_display);
+                }
+            }
+            if (sep == std::string::npos) break;
+            pos = sep + 1;
+        }
+        ESP_LOGI(TAG, "同义唤醒词共追加 %d 条（阈值仍为 %d%%）",
+                 added, (int)(threshold_ * 100));
+    }
+#endif
+
     if (models_ == nullptr || models_->num == -1) {
         ESP_LOGE(TAG, "Failed to initialize wakenet model");
         return false;

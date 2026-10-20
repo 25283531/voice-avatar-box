@@ -10,22 +10,28 @@ extern "C" {
 #endif
 
 /*
- * 服药/提醒确认输入：单键三段式手势
- *   长按 >=3s  → 设备提示「松开后，30 秒内再短按一次确认」
- *   松开       → 进入 30s 确认窗口
- *   窗口内短按 → 确认完成
- *   窗口超时   → 回到未确认态（红灯保持）
+ * 服药/提醒确认输入：这个按键**只干两件事**（2026-10-20 用户拍板）
+ *   1) 服药确认（主用途）
+ *        · 提醒响铃期间（ELDER_UI_REMINDER）短按        → 直接确认「已服药」
+ *        · 长按 >=3s 后松开 → 30s 窗口内再短按           → 确认（不在响铃时也能用）
+ *   2) 没有待确认提醒时，短按复用为「开始/结束对话」
+ *
+ * ⚠️ SOS（长按 8 秒求助）**已删除**。原因不是功能不好，而是它在这台设备上
+ *    有真实危害：长按路径同步跑联网上报，2560 字节的输入任务栈被撑爆
+ *    （`***ERROR*** A stack overflow in task elder_input`），设备直接重启，
+ *    求助反而发不出去；而聊天机器人场景里「按着说话」比「长按求救」常用得多。
  *
  * 设计约束：立创板 BOOT(GPIO0) 上电 3s 内长按会进 USB 下载模式，
  * 因此使能时间由 ELDER_KEY_BOOT_GUARD_MS 控制，由本模块内部延迟使能。
+ * 另外 GPIO0 会被板上自动下载电路拉低（USB 无主机时），
+ * 所以本模块只认「先松开、再按下」的边沿，长时间低电平判为卡住并忽略。
  */
 
 typedef enum {
     ELDER_KEY_EV_NONE = 0,
     ELDER_KEY_EV_SHORT,        /* 单击 */
     ELDER_KEY_EV_LONG_HOLD,    /* 长按达标（仍按住） */
-    ELDER_KEY_EV_RELEASE,      /* 长按后松开 */
-    ELDER_KEY_EV_SOS           /* 长按 >=8s：求助（与确认手势区分） */
+    ELDER_KEY_EV_RELEASE       /* 长按后松开 */
 } elder_key_event_t;
 
 typedef void (*elder_key_cb_t)(elder_key_event_t ev, void *ctx);

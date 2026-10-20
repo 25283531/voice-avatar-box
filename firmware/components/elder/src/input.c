@@ -10,10 +10,10 @@
 static const char *TAG = "elder.input";
 
 #define LONG_HOLD_MS        3000    /* 长按达标：3s（用户指定） */
-#define SOS_HOLD_MS         8000    /* 再长一些判为求助 */
 #define CONFIRM_WINDOW_MS   30000   /* 松开后 30s 内短按有效（用户指定） */
 #define DEBOUNCE_MS         30
 #define POLL_MS             20
+#define STUCK_MS            20000   /* 连续低电平超过 20s ⇒ 判为引脚被拉低/按键卡住 */
 
 static struct {
     elder_key_cb_t cb;
@@ -22,8 +22,26 @@ static struct {
     int64_t        press_start_us;
     bool           pressed;
     bool           long_fired;
-    bool           sos_fired;
     int64_t        window_deadline_us;
+
+    /* ---- 反向守卫（2026-10-20 真机事故的补丁）----
+     *
+     * 事实链：设备每 21.8 秒重启一次，串口原文
+     *     I (16808) elder.input: long hold 3s reached
+     *     W (21808) elder.input: SOS hold 8s
+     *     ***ERROR*** A stack overflow in task elder_input has been detected.
+     *     rst:0xc (RTC_SW_CPU_RST)
+     * 而**没有人按过**这个键：GPIO0 是 BOOT 脚，板上自动下载电路把它和 CH340 的
+     * DTR/RTS 三极管接在一起，USB 线插着但没有主机 / 串口被打开时，IO0 会被
+     * 持续拉低。旧代码在「启动 3s 后」直接看电平，于是把「引脚一直是低」
+     * 当成「老人一直按着」，到点就进长按流程。
+     *
+     * ⇒ 判据改成**边沿**而不是电平：没见过一次「确认过的释放」（高电平）之前，
+     *   任何低电平都不算按压；连续低超过 STUCK_MS 直接判定卡住，直到真的松开。 */
+    bool           released_seen;
+    int64_t        low_since_us;
+    bool           stuck;
+
     TaskHandle_t   task;
 } g;
 
@@ -43,6 +61,33 @@ static bool key_down(void)
 static void emit(elder_key_event_t ev)
 {
     if (g.cb) g.cb(ev, g.ctx);
+}
+
+/* 电平跟踪：维护 released_seen / stuck 两个判据。
+ * 返回 true 表示「这个低电平可以被当成一次真实按压的起点」。 */
+static bool track_level(bool stable_down)
+{
+    if (stable_down) {
+        if (g.low_since_us == 0) {
+            g.low_since_us = now_us();
+        } else if (!g.stuck && (now_us() - g.low_since_us) > (STUCK_MS * 1000LL)) {
+            g.stuck = true;
+            ESP_LOGW(TAG, "GPIO%d 持续低电平 %.0fs → 判为按键卡住/被自动下载电路拉低，"
+                          "本次按压不予采信（松开后自动恢复）",
+                     ELDER_KEY_SOS, (now_us() - g.low_since_us) / 1e6);
+            /* 卡住时必须把进行中的按压状态清掉，否则松开时会误发 RELEASE */
+            g.pressed = false;
+            g.long_fired = false;
+        }
+    } else {
+        g.low_since_us = 0;
+        if (g.stuck) {
+            g.stuck = false;
+            ESP_LOGI(TAG, "按键回到释放状态，恢复检测");
+        }
+        g.released_seen = true;
+    }
+    return g.released_seen && !g.stuck;
 }
 
 static void input_task(void *arg)
@@ -73,23 +118,22 @@ static void input_task(void *arg)
             continue;
         }
 
+        bool acceptable = track_level(stable_down);
+
         if (stable_down && !g.pressed) {
-            g.pressed = true;
-            g.press_start_us = now_us();
-            g.long_fired = false;
-            g.sos_fired = false;
-            ESP_LOGD(TAG, "press start");
+            if (acceptable) {
+                g.pressed = true;
+                g.press_start_us = now_us();
+                g.long_fired = false;
+                ESP_LOGD(TAG, "press start");
+            }
+            /* acceptable=false（开机就是低 / 已判卡住）⇒ 连按压起点都不记 */
         } else if (stable_down && g.pressed) {
             int64_t held = now_us() - g.press_start_us;
-            if (!g.long_fired && held >= LONG_HOLD_MS * 1000LL) {
+            if (!g.long_fired && held >= (LONG_HOLD_MS * 1000LL)) {
                 g.long_fired = true;
                 ESP_LOGI(TAG, "long hold 3s reached");
                 emit(ELDER_KEY_EV_LONG_HOLD);
-            }
-            if (!g.sos_fired && held >= SOS_HOLD_MS * 1000LL) {
-                g.sos_fired = true;
-                ESP_LOGW(TAG, "SOS hold 8s");
-                emit(ELDER_KEY_EV_SOS);
             }
         } else if (!stable_down && g.pressed) {
             int64_t held = now_us() - g.press_start_us;
@@ -97,7 +141,7 @@ static void input_task(void *arg)
             if (g.long_fired) {
                 ESP_LOGI(TAG, "release after long hold (%.1fs)", held / 1e6);
                 emit(ELDER_KEY_EV_RELEASE);
-            } else if (!g.sos_fired) {
+            } else {
                 ESP_LOGI(TAG, "short press (%.0fms)", held / 1e3);
                 emit(ELDER_KEY_EV_SHORT);
             }
@@ -128,12 +172,15 @@ esp_err_t elder_input_init(elder_key_cb_t cb, void *ctx)
     };
     ESP_ERROR_CHECK(gpio_config(&io));
 
-    /* 栈从 2560 → 4096：emit() 是**同步**调用 elder.bridge::OnKey 的，
-     * 那条 switch 里会跑 UI 状态切换 + 提示音 + RGB 请求 + 日志格式化，
-     * 2560 字节在 SOS 路径上实测被撑爆（2026-10-20，见 elder_bridge.cc
-     * 里 ELDER_KEY_EV_SOS 分支的串口原文）。
-     * ⚠️ 但**不要**指望靠加栈来扛 HTTPS：联网上报必须留在独立任务里，
-     * 这里只覆盖"纯本地、几百字节"的那部分调用。 */
+    /* 开机就把 GPIO0 的真实电平打出来。
+     * 这条日志是排查「设备莫名重启 / 莫名叮咚」的第一现场证据 ——
+     * 若这里是 0 且之后从没变成 1，说明是自动下载电路在拉低，不是老人按键。 */
+    ESP_LOGI(TAG, "GPIO%d 初始电平=%d（1=松开，0=被拉低/按住）",
+             ELDER_KEY_SOS, gpio_get_level(ELDER_KEY_SOS));
+
+    /* 栈 4096：emit() 是**同步**调用 elder.bridge::OnKey 的，那条 switch 里会跑
+     * UI 状态切换 + 提示音 + 日志格式化。2560 字节实测被撑爆过（2026-10-20）。
+     * ⚠️ 但**不要**指望靠加栈来扛 HTTPS：联网上报必须留在独立任务里。 */
     xTaskCreatePinnedToCore(input_task, "elder_input", 4096, NULL, 6, &g.task, 1);
     ESP_LOGI(TAG, "key on GPIO%d ready (long-press armed after %dms)",
              ELDER_KEY_SOS, ELDER_KEY_BOOT_GUARD_MS);
@@ -142,7 +189,7 @@ esp_err_t elder_input_init(elder_key_cb_t cb, void *ctx)
 
 bool elder_input_open_confirm_window(void)
 {
-    g.window_deadline_us = now_us() + CONFIRM_WINDOW_MS * 1000LL;
+    g.window_deadline_us = now_us() + (CONFIRM_WINDOW_MS * 1000LL);
     ESP_LOGI(TAG, "confirm window opened: %ds", CONFIRM_WINDOW_MS / 1000);
     return true;
 }

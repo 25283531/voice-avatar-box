@@ -38,7 +38,7 @@ void WifiBoard::EnterWifiConfigMode() {
 
     auto& wifi_ap = WifiConfigurationAp::GetInstance();
     wifi_ap.SetLanguage(Lang::CODE);
-    // 配网热点名前缀。成品叫「小暖」，热点要跟产品名对得上 —— 老人拿手机
+    // 配网热点名前缀。成品叫「小安」，热点要跟产品名对得上 —— 老人拿手机
     // 搜 WiFi 时看到的是 XiaoNuan-XXXX，而不是上游项目的小智。
     //
     // ⚠️ **全仓只改这一处**。main/ 下其余的 "Xiaozhi" 全是**上游标识**，
@@ -52,7 +52,7 @@ void WifiBoard::EnterWifiConfigMode() {
     //   * wn9_nihaoxiaozhi_tts —— 上游 assets 里的 WakeNet9 模型文件名
     //     （本项目已改用 MultiNet mn7_cn，该模型不参与构建，但文件名是
     //     上游资产标识，不能动）；
-    //   * 唤醒词本身 2026-10-18 用户拍板改为「你好，小暖」
+    //   * 唤醒词本身 2026-10-18 用户拍板改为「你好，小安」
     //     （CONFIG_CUSTOM_WAKE_WORD，见 merge_to_xiaozhi.py）；
     //   * XiaozhiStatus（atk-dnesp32s3-box0，另一块板的状态枚举变量名）。
     //

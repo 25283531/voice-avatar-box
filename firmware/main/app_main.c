@@ -101,13 +101,11 @@ static void on_key(elder_key_event_t ev, void *ctx)
         break;
     }
 
-    case ELDER_KEY_EV_SOS:
-        ESP_LOGE(TAG, "SOS 按下（联网后补发子女端）");
-        elder_ui_set_state(ELDER_UI_ALARM, 0);
-        elder_ui_play_tone(ELDER_TONE_VIBRATION);
-        elder_rgb_request(ELDER_RGB_PRIO_ALARM, ELDER_FX_BLINK_FAST, 0xFF0000, 60000);
-        elder_sync_report_interaction(ELDER_IT_SOS, 0);
-        break;
+    /* 已删除 SOS 分支（2026-10-20 用户拍板）：按键职责改为纯服药确认，
+     * elder_key_event_t 里也不再有 ELDER_KEY_EV_SOS —— 这里不要再写
+     * `case ELDER_KEY_EV_SOS:`，枚举里已经没有这个名字，写了编译不过。
+     * 想改回 SOS 必须先读 elder_input.h 头注释（当年是长按同步跑 HTTPS
+     * 把 2560 字节的输入任务栈撑爆，设备重启、求助根本没发出去）。 */
 
     default:
         break;

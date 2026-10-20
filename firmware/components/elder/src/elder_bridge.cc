@@ -213,67 +213,85 @@ void OnReminder(const elder_rmd_item_t *item, elder_rmd_state_t st, void *ctx)
 
 /* ---------------------------------------------------------------- 按键 */
 
+/* 找第一条「今天还没确认」的服药提醒。
+ * 返回下标，没有则 -1。抽成函数的原因：短按直接确认、长按挂窗口两条路
+ * 必须用**同一套判据**，否则会出现「长按能确认、短按确认到别的条」。 */
+int FirstUndoneMedicine()
+{
+    const elder_rmd_table_t *tbl = nullptr;
+    if (elder_reminder_list(&tbl) != ESP_OK || tbl == nullptr) {
+        return -1;
+    }
+    for (uint8_t i = 0; i < tbl->count && i < ELDER_REMINDER_MAX; i++) {
+        if (tbl->items[i].type != ELDER_RMD_TYPE_MEDICINE) continue;
+        if (!tbl->items[i].enabled) continue;
+        if (tbl->done_today & (1u << i)) continue;   /* 已完成的不必再确认 */
+        return (int)i;
+    }
+    return -1;
+}
+
+void ConfirmMedicine(int idx)
+{
+    if (idx < 0) return;
+    ESP_LOGI(TAG, "按键确认服药：提醒 #%d", idx);
+    elder_reminder_confirm((uint8_t)idx);
+    elder_input_close_confirm_window();
+    s_arming_id = -1;
+}
+
+/* 这个按键**只做服药确认**（2026-10-20 用户拍板：SOS 取消）：
+ *   提醒响铃期间（ELDER_UI_REMINDER）短按 → 直接确认，不需要任何前置手势；
+ *   确认窗口内短按                   → 确认长按挂起的那一条；
+ *   其余情况短按                     → 退化成「开始/结束对话」。
+ * SOS 分支已删除，原因见 elder_input.h 头注释（长按同步跑联网上报把栈撑爆，
+ * 设备重启，求助根本发不出去）。**不要把 HTTPS 放回这个回调里** ——
+ * 它是 elder_input 任务同步调用的，栈只有 4096。 */
 void OnKey(elder_key_event_t ev, void *ctx)
 {
     (void)ctx;
     auto &app = Application::GetInstance();
 
     switch (ev) {
-    case ELDER_KEY_EV_SHORT:
+    case ELDER_KEY_EV_SHORT: {
+        int idx = -1;
         if (elder_input_confirm_window_active() && s_arming_id >= 0) {
-            ESP_LOGI(TAG, "按键确认：提醒 #%d 已完成", s_arming_id);
-            elder_reminder_confirm((uint8_t)s_arming_id);
-            elder_input_close_confirm_window();
-            s_arming_id = -1;
-        } else {
-            // 没有待确认提醒时，短按复用为「开始/停止对话」
-            app.ToggleChatState();
-        }
-        break;
-
-    case ELDER_KEY_EV_LONG_HOLD:
-        ESP_LOGI(TAG, "请松开按键，30 秒内再短按一次确认");
-        break;
-
-    case ELDER_KEY_EV_RELEASE: {
-        // 取第一条「未完成」的提醒挂起确认
-        const elder_rmd_table_t *tbl = nullptr;
-        if (elder_reminder_list(&tbl) == ESP_OK && tbl) {
-            for (uint8_t i = 0; i < tbl->count && i < ELDER_REMINDER_MAX; i++) {
-                if (tbl->items[i].type != ELDER_RMD_TYPE_MEDICINE) continue;
-                if (!tbl->items[i].enabled) continue;
-                // 已完成的不必再确认
-                if (tbl->done_today & (1u << i)) continue;
-                s_arming_id = (int)i;
-                elder_input_open_confirm_window();
-                elder_reminder_arm_confirm(i);
-                ESP_LOGI(TAG, "进入确认窗口：#%d %s", i, tbl->items[i].label);
-                break;
+            idx = s_arming_id;
+        } else if (elder_ui_get_state() == ELDER_UI_REMINDER) {
+            /* 老人听到「该吃药了」，直接按一下就行 —— 这是本按键的主用途 */
+            idx = FirstUndoneMedicine();
+            if (idx >= 0) {
+                elder_input_open_confirm_window();   /* 让界面立刻进确认态 */
+                s_arming_id = idx;
             }
+        }
+
+        if (idx >= 0) {
+            ConfirmMedicine(idx);
+        } else {
+            /* 没有待确认提醒时，短按复用为「开始/停止对话」 */
+            app.ToggleChatState();
         }
         break;
     }
 
-    case ELDER_KEY_EV_SOS:
-        ESP_LOGE(TAG, "SOS：本地告警 + 联网后上报");
-        elder_ui_set_state(ELDER_UI_ALARM, 0);
-        elder_ui_play_tone(ELDER_TONE_VIBRATION);
-        elder_rgb_request(ELDER_RGB_PRIO_ALARM, ELDER_FX_BLINK_FAST, 0xFF0000, 60000);
-        /* 这里的调用现在是**安全的**，前提是 sync.c 里
-         * elder_sync_report_interaction() 已改成"只入队、不发 HTTP"。
-         *
-         * 2026-10-20 真机实证（改之前）：长按 8 秒触发 SOS 后串口立刻
-         *   E (21813) elder.bridge: SOS：本地告警 + 联网后上报
-         *   ***ERROR*** A stack overflow in task elder_input has been detected.
-         *   rst:0xc (RTC_SW_CPU_RST)
-         * 因为本回调是 elder_input 任务**同步**调用的（input.c:45 `g.cb(ev,g.ctx)`），
-         * 而那时函数体里是 HTTPS + TLS，栈需求 10KB 量级，任务栈只有 2560。
-         * ⇒ 老人按下 SOS，设备重启，**求助根本没发出去**。
-         *
-         * ⚠️ 不要把 HTTPS 再搬回 sync.c 的这个函数里 —— 它还有两个调用点
-         * （服药确认、提醒超时）也都跑在 elder_rmd 的 3072 栈上。 */
-        elder_sync_report_interaction(ELDER_IT_SOS, 0);
+    case ELDER_KEY_EV_LONG_HOLD:
+        /* 长按只是**提示**，真正的挂起在松开时做（见 RELEASE） */
+        ESP_LOGI(TAG, "请松开按键，30 秒内再短按一次确认");
         break;
+
+    case ELDER_KEY_EV_RELEASE: {
+        int idx = FirstUndoneMedicine();
+        if (idx >= 0) {
+            s_arming_id = idx;
+            elder_input_open_confirm_window();
+            elder_reminder_arm_confirm((uint8_t)idx);
+            ESP_LOGI(TAG, "进入确认窗口：#%d", idx);
+        } else {
+            ESP_LOGI(TAG, "长按松开，但没有待确认的服药提醒 → 不进入确认窗口");
+        }
+        break;
+    }
 
     default:
         break;

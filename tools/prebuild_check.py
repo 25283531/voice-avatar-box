@@ -212,20 +212,46 @@ def main() -> int:
 
     wake = src.get("CONFIG_CUSTOM_WAKE_WORD", "")
     display = src.get("CONFIG_CUSTOM_WAKE_WORD_DISPLAY", "")
-    # 判据只认**拼音词根**：汉字里没有「xiao nuan」这种拉丁串，
-    # 不能拿拉丁串去 display 里找（第一版就这么写的，必然假红：
-    # 「你好，小暖」里永远找不到 "xiao nuan"）。
+    # 判据只认**拼音词根**：汉字里没有拉丁串，
+    # 不能拿拉丁串去 display 里找（第一版就这么写的，必然假红）。
     # 正确做法是查两件事各自是否**正确**，而不是要求二者「互相包含」——
-    # 拼音↔汉字一致是 Kconfig/编码层面的事实，这里只能验「不是旧值」。
-    ok_pinyin = wake.replace(" ", "") == "nihaoxiaonuan"
-    ok_display = display.replace("，", "").replace(",", "").replace(" ", "") == "你好小暖"
+    # 拼音↔汉字一致是 Kconfig/编码层面的事实，这里只能验「是当前值」。
+    #
+    # 2026-10-20：产品未发布，唤醒词一次定死为「你好小安」（两个引擎都认真个词）。
+    ok_pinyin = wake.replace(" ", "") == "nihaoxiaoan"
+    ok_display = display.replace("，", "").replace(",", "").replace(" ", "") == "你好小安"
     check(
-        "C2b 唤醒词是「你好，小暖」（拼音与汉字都必须是新值）",
+        "C2b 唤醒词是「你好，小安」（拼音与汉字都必须是当前值）",
         ok_pinyin and ok_display,
         f"{where}: 拼音={wake!r} 屏显={display!r}"
         + ("" if ok_pinyin and ok_display
-           else "。⚠️ 仍是旧唤醒词「你好小智」—— 改了 defaults 但 sdkconfig "
-                "残留时最常见（kconfig 以已存在的 sdkconfig 为准）"),
+           else "。⚠️ 与期望值不符 —— 最常见原因是 sdkconfig 残留"
+                "（kconfig 以已存在的 sdkconfig 为准，会静默覆盖 defaults）"),
+    )
+
+    # WakeNet 专用模型：唤醒词训练在模型里，选错模型 = 设备应答别的名字，
+    # 而真机上只表现为「喊它没反应 / 应答陌生称呼」，必须在这里钉死具体符号。
+    wn_ok = src.get("CONFIG_SR_WN_WN9_NIHAOXIAOAN_TTS2", "n") == "y"
+    check(
+        "C2b2 WakeNet 唤醒模型是「你好小安」（wn9_nihaoxiaoan_tts2）",
+        wn_ok,
+        f"{where} 里 CONFIG_SR_WN_WN9_NIHAOXIAOAN_TTS2="
+        f"{src.get('CONFIG_SR_WN_WN9_NIHAOXIAOAN_TTS2', '(未设置)')!r}；"
+        f"没开它 ⇒ 只剩 MultiNet 唤醒，召回明显变差",
+    )
+
+    # 反向守卫：别的 wn9 模型被同时打开会抢唤醒词（AfeWakeWord 只认最后
+    # 匹配到的 wn 模型）——「改了没生效」的另一种形态。
+    other_wn = [
+        k for k in src
+        if k.startswith("CONFIG_SR_WN_WN9") and k != "CONFIG_SR_WN_WN9_NIHAOXIAOAN_TTS2"
+        and src[k] == "y"
+    ]
+    check(
+        "C2b3 没有别的 wn9 唤醒模型同时启用",
+        not other_wn,
+        f"{where} 里同时启用了 {other_wn} ⇒ 唤醒词可能被别的模型顶掉"
+        if other_wn else "只有 wn9_nihaoxiaoan_tts2 一个 wn9 模型",
     )
 
     check(

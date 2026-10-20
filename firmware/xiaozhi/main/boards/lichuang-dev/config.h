@@ -27,15 +27,30 @@
 
 #define DISPLAY_WIDTH   320
 #define DISPLAY_HEIGHT  240
-// 2026-10-20 改回**横屏 320x240**（用户拍板：老人看得惯横屏，竖屏上下留白太多）。
-// 原值是 MIRROR_X=true / SWAP_XY=true ⇒ 屏交换 x/y 变成逻辑 240x320 竖屏。
-// 去掉 swap 后 LVGL 逻辑分辨率就是 320x240；mirror 一并关掉取屏的原生方向
-// （ST7789 320x240 模组原生即正向，原来的 mirror_x 是为了配竖屏坐标系）。
-// ⚠️ 触摸的 swap/mirror/x_max/y_max 必须同步改，见 lichuang_dev_board.cc:InitializeTouch，
-//    否则画面正了、点哪儿都偏。
-#define DISPLAY_MIRROR_X false
+/* ⚠️⚠️ 这三个宏**不是**「横屏 / 竖屏」开关，是面板的**坐标变换**。
+ *
+ * 2026-10-20 第二次踩坑记录（用户报「图标跑到左上、WiFi 跑到左下、背景伪花屏」）：
+ *   上一版把 SWAP_XY 改成了 false（以为「关掉交换 = 横屏」），真机立刻花屏。
+ *   真因：这块屏的**面板原生方向是竖屏 240x320**（ST7789 的 GRAM 是 240 列 x 320 行），
+ *   官方 BSP（wiki.lckfb.com lcd-display 一节）必须
+ *       esp_lcd_panel_swap_xy(panel, true);
+ *       esp_lcd_panel_mirror(panel, true, false);
+ *   才能得到**逻辑横屏 320x240**。
+ *   ST7789 的 MV 位（swap_xy 写的就是 MADCTL.MV）交换行列后，CASET 才允许 0..319；
+ *   一旦 MV=0，我们按 320 宽去写一个只有 240 列的窗口 ⇒ 每行溢出 80px 把下一行顶歪
+ *   ⇒ 整幅图斜切（＝用户看到的「伪花屏」＋元素满屏乱跑）。
+ *   IDF 的 st7789 驱动**只改 MADCTL，不做软件换坐标**（esp_lcd_panel_st7789.c），
+ *   所以这里写错，画出来的每个区域都会真歪。
+ *
+ * ⇒ 结论（与立创官方 BSP 逐字一致，改之前先读这段）：
+ *   DISPLAY_WIDTH/HEIGHT  永远是**逻辑**分辨率（横屏 320x240）；
+ *   SWAP_XY=true + MIRROR_X=true 才是「按键朝上、外扩口朝下」的正向横屏。
+ *   触摸侧必须同步：x_max/y_max 对调 + flags{swap_xy=1, mirror_x=1, mirror_y=0}，
+ *   见 lichuang_dev_board.cc:InitializeTouch（那边注释同样重要）。
+ */
+#define DISPLAY_MIRROR_X true
 #define DISPLAY_MIRROR_Y false
-#define DISPLAY_SWAP_XY false
+#define DISPLAY_SWAP_XY true
 
 #define DISPLAY_OFFSET_X  0
 #define DISPLAY_OFFSET_Y  0

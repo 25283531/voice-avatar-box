@@ -50,4 +50,20 @@ menu "老人陪伴 & 提醒助手 (Elder Companion)"
             打开后首次启动会写入两条演示提醒，方便无后端时验证链路。
             正式部署请关闭，避免与后端下发的规则冲突。
 
+    config ELDER_WAKE_ALIASES
+        string "唤醒词同义短语（拼音，分号分隔；只对 MultiNet 有效）"
+        default "xiao nuan"
+        help
+            除了主唤醒词（CONFIG_CUSTOM_WAKE_WORD="ni hao xiao nuan"）之外，
+            再注册几条**同义**短语。老人嘴里的叫法不止一种，而 MultiNet 的
+            召回率和短语长度强相关 —— 「xiao nuan」（2 音节）比
+            「ni hao xiao nuan」（4 音节）好叫得多，实测前者命中率明显更高。
+
+            多条短语共用同一个阈值（CONFIG_CUSTOM_WAKE_WORD_THRESHOLD），
+            命中任何一条都等同唤醒，屏显/上报统一用主唤醒词的汉字。
+            分号或逗号分隔；留空则不追加。
+
+            注意：这些短语只在 MultiNet 引擎里生效。WakeNet 的唤醒词是
+            训练进模型里的，改不了字符串（esp-sr 自带的 wn9 模型没有「你好小暖」）。
+
 endmenu

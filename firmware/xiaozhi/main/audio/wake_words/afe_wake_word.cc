@@ -81,6 +81,23 @@ bool AfeWakeWord::Initialize(AudioCodec* codec, srmodel_list_t* models_list) {
     afe_iface_ = esp_afe_handle_from_config(afe_config);
     afe_data_ = afe_iface_->create_from_config(afe_config);
 
+    /* 2026-10-20 加的保护：本工程**同时**启用了 MultiNet（双引擎唤醒），
+     * AFE 与 MultiNet 抢 PSRAM；一旦 AFE 建不起来（返回空），
+     * AudioDetectionTask 里第一句 afe_iface_->get_fetch_chunksize(afe_data_)
+     * 就是空指针解引用 ⇒ 开机即崩，而崩溃点在 AFE 内部，日志完全指不到配置。
+     * 另外 wake_words_ 为空说明模型包里根本没有 wn* 模型，
+     * AudioDetectionTask 用 wakenet_model_index-1 索引它同样会越界。
+     * ⇒ 这两种情况都必须在这里**返回 false**，让上层降级到只用 MultiNet。 */
+    if (afe_iface_ == nullptr || afe_data_ == nullptr || wake_words_.empty()) {
+        ESP_LOGE(TAG, "AFE/WakeNet 起不来（iface=%p data=%p 唤醒词数=%u）→ 降级",
+                 (void*)afe_iface_, (void*)afe_data_, (unsigned)wake_words_.size());
+        if (afe_iface_ != nullptr && afe_data_ != nullptr) {
+            afe_iface_->destroy(afe_data_);
+        }
+        afe_data_ = nullptr;
+        return false;
+    }
+
     xTaskCreate([](void* arg) {
         auto this_ = (AfeWakeWord*)arg;
         this_->AudioDetectionTask();

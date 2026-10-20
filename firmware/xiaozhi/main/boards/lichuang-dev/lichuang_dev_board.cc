@@ -181,13 +181,16 @@ private:
      *     ESP_LVGL_PORT_TOUCH_COMPONENT，本工程有 esp_lcd_touch 依赖，必然命中。
      *
      * ★ **坐标映射已核对正确，不要"顺手改"**：
-     *   屏是 320x240 物理、swap_xy=true ⇒ LVGL 建出来是 320x240 再转 90°
-     *   （逻辑 240x320）。而 LVGL 9 的 indev_pointer_proc()（lv_indev.c:695）
-     *   会**自己**按 disp->rotation 把触摸坐标旋一遍，所以它要求驱动上报的是
-     *   **屏的原生帧**（320x240）。
-     *   本函数给的是 x_max=DISPLAY_HEIGHT(240) / y_max=DISPLAY_WIDTH(320)，
-     *   再经 esp_lcd_touch.c:84-106 的软件调整（mirror_x 取反 + swap_x交换）
-     *   ⇒ 最终上报 (x∈[0,320), y∈[0,240))，正是屏的原生帧。✔
+     *   面板原生是**竖屏 240x320**；`esp_lcd_panel_swap_xy(true)` 把 ST7789 的
+     *   MADCTL.MV 置起来，CASET 才能寻址 320 列 ⇒ 逻辑横屏 320x240。
+     *   esp_lvgl_port 只把 swap/mirror 透传给面板（sw_rotate=0 时不改 LVGL 的
+     *   rotation），所以 LVGL 侧始终是 320x240，indev 要求驱动上报的也是
+     *   **逻辑横屏帧** (x∈[0,320), y∈[0,240))。
+     *   本函数给 x_max=DISPLAY_HEIGHT(240) / y_max=DISPLAY_WIDTH(320) + flags
+     *   swap_xy=1/mirror_x=1/mirror_y=0，经 esp_lcd_touch 的软件调整后上报的
+     *   正是这个逻辑帧。✔
+     *   ⚠️ 2026-10-20 反例：把 swap_xy 关掉试图"改成横屏"，结果整屏斜切花屏
+     *      —— 因为 MV=0 时面板只有 240 列可寻址。方向不是这么改的，见 config.h。
      *
      * ★ **与"屏幕无显示"的依赖关系（重要，别让两个改动打架）**：
      *   下面要用 lv_display_get_default()，它只在**LVGL 的 display 被创建之后**
@@ -204,12 +207,17 @@ private:
          * 运气好 assert 崩掉重启，运气不好 assert 通过、拿着野指针往下走。 */
         esp_lcd_touch_handle_t tp = nullptr;
         esp_lcd_touch_config_t tp_cfg = {
-            // 2026-10-20 随显示一起改横屏：显示不再 swap_xy ⇒ 驱动上报的就是
-            // 屏原生帧 (320x240)，触摸这边也必须停止交换，x/y 上限跟着对调。
-            // 保持 sync：config.h 里 DISPLAY_SWAP_XY / DISPLAY_MIRROR_X 改了几处，
-            // 这里就要改几处，否则"画面对了、点哪儿都偏"。
-            .x_max = DISPLAY_WIDTH,
-            .y_max = DISPLAY_HEIGHT,
+            /* 2026-10-20 第二次修正：显示回到「面板原生竖屏 + swap_xy」后，
+             * 触摸也必须回到同一套坐标（与 config.h 的 SWAP_XY/MIRROR_X 一一对应）。
+             *
+             * 为什么是 x_max=HEIGHT / y_max=WIDTH：esp_lcd_touch 的 x_max/y_max
+             * 描述的是**面板原生帧**（240 宽 x 320 高），协议层再按 flags 换成
+             * 逻辑横屏 (320x240) 上报给 LVGL。写反了现象是「画面对、点哪儿都偏」。
+             *
+             * 判断依据（不要再靠猜）：立创官方 BSP 与本文件 InitializeSt7789Display
+             * 用的是同一组 esp_lcd_panel_swap_xy(true)+mirror(true,false)。 */
+            .x_max = DISPLAY_HEIGHT,
+            .y_max = DISPLAY_WIDTH,
             .rst_gpio_num = GPIO_NUM_NC, // Shared with LCD reset
             .int_gpio_num = GPIO_NUM_NC, // NC => 轮询模式，见 lvgl_port_add_touch
             .levels = {
@@ -217,8 +225,8 @@ private:
                 .interrupt = 0,
             },
             .flags = {
-                .swap_xy = 0,
-                .mirror_x = 0,
+                .swap_xy = 1,
+                .mirror_x = 1,
                 .mirror_y = 0,
             },
         };

@@ -217,19 +217,23 @@ CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions/v2/16m.csv"
 # 离线语音命令词（esp-sr MultiNet）。切到 USE_CUSTOM_WAKE_WORD 是必须的：
 # build_default_assets.py 只在这个开关打开时才把 multinet 模型打进 assets，
 # 且 audio_service.cc SetModelsList() 见到 mn* 模型就改用 CustomWakeWord。
-# 唤醒词 2026-10-18 用户拍板改为「你好，小暖」（原「你好小智」）。
+#
+# 唤醒词 = **「你好小安」**（2026-10-20 用户拍板，产品未发布，统一改名）。
+# 只用一个名字：WakeNet（专用模型）与 MultiNet（命令词引擎）都认「你好小安」，
+# MultiNet 另外多注册一条 2 音节短名「小安」提高召回。
 # ⚠️ 拼音↔汉字必须同步改：MultiNet 的注册键是拼音串，DISPLAY 只影响屏显；
 #    改了拼音忘改汉字（或反之）会出现「喊 A 显示 B」的割裂。
 # Kconfig 要求中文写拼音、空格分隔。
 CONFIG_USE_CUSTOM_WAKE_WORD=y
-CONFIG_CUSTOM_WAKE_WORD="ni hao xiao nuan"
-CONFIG_CUSTOM_WAKE_WORD_DISPLAY="你好，小暖"
+CONFIG_CUSTOM_WAKE_WORD="ni hao xiao an"
+CONFIG_CUSTOM_WAKE_WORD_DISPLAY="你好，小安"
 # 唤醒阈值 20 → 12（2026-10-20）。
 # 真机实证（COM10 连抓 4 分钟）：老人连喊多遍，串口**零** `Custom wake word
 # detected` 行 —— 不是"偶尔不灵"，是基本不命中。
 # 注意 CustomWakeWord 是**纯 MultiNet**（不经过 WakeNet），通用中文命令词模型
-# 对「你好小暖」这种非预设短语本来就弱；阈值属保守下调，再低会把日常对话
-# 误当唤醒，而误唤醒比"喊两遍"更烦。若仍不灵，按 BOOT 键（短按 ToggleChatState）。
+# 对自定义短语本来就弱；阈值属保守下调，再低会把日常对话误当唤醒，
+# 而误唤醒比"喊两遍"更烦。现在主通路已换成 WakeNet「你好小安」（见下），
+# 这条 MultiNet 只作为兜底 + 承载离线服药命令词。
 #
 # ⚠️ 这个值是**唯一真源**：sdkconfig.defaults 里同名项由本 overlay 注入生成。
 #    直接去改生成出来的 sdkconfig.defaults 会在下次 merge 时被覆盖回 20 ——
@@ -239,6 +243,26 @@ CONFIG_CUSTOM_WAKE_WORD_THRESHOLD=12
 # mn7_cn：官方推荐（S3/P4），比 mn6_cn 小约 1MB。
 # 模型 2671229 字节 + fst 9648 字节 = 2680877 字节，进 assets 分区。
 CONFIG_SR_MN_CN_MULTINET7_QUANT=y
+# --- WakeNet（专用唤醒网络）：唤醒词「你好小安」 ---
+#
+# 为什么是「你好小安」：**WakeNet 的唤醒词训练在模型里，改不了字符串**，
+# esp-sr 自带的中文 wn9 里没有我们最初起的那个名字。可选集里挑「你好小安」：
+#   1) 4 音节、节奏规整，老人喊起来顺口；
+#   2) 「安」= 平安/安心，符合陪伴看护的调性；
+#   3) 不和常见家居品牌撞（「小爱同学」会和米家设备抢唤醒）；
+#   4) 家庭日常对话里几乎不出现「你好小安」⇒ 误唤醒低。
+# 可选（esp-sr 自带，仅供参考）：你好小智 / 小爱同学 / 你好喵伴 / 你好小益 / 你好小鑫 …
+# 绝不用「你好小智」顶上：那是别人家的名字，设备会应答一个没人叫的称呼。
+#
+# 于是形成两条唤醒通路（这是「两个引擎都保留」的落地方式）：
+#   · WakeNet 「你好小安」    —— 主通路，专用模型召回高，且带 AEC，播报时也能打断；
+#   · MultiNet 「你好，小安」+「小安」 —— 兜底通路，同时承载 9 条离线服药命令词。
+# 两条谁命中都算唤醒。
+# 两个模型都会打进 srmodels.bin（build_default_assets.py 按 CONFIG_SR_WN_* /
+# CONFIG_SR_MN_* 收集），固件侧由 main/audio/wake_words/dual_wake_word.cc 同时驱动。
+CONFIG_SR_WN_WN9_NIHAOXIAOAN_TTS2=y
+# MultiNet 额外注册 2 音节短名「小安」（比 4 音节好叫，命中也算唤醒）。
+CONFIG_ELDER_WAKE_ALIASES="xiao an"
 # 业务后端地址（2026-10-18 起 IP 直连：域名未备案被厂商按 SNI 阻断，
 # 连 IP 不带 SNI 可绕过；服务端配 IP 证书后可开证书校验，见 Kconfig 帮助）
 CONFIG_ELDER_SERVER_URL="https://152.136.230.132"

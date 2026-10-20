@@ -32,6 +32,11 @@ public:
     bool GetWakeWordOpus(std::vector<uint8_t>& opus);
     const std::string& GetLastDetectedWakeWord() const { return last_detected_wake_word_; }
 
+    /* 放弃对 models_list 的所有权（析构时不再 esp_srmodel_deinit）。
+     * 只有 DualWakeWord 会用到：同一份 srmodel 列表被两个引擎共享，
+     * 两边都 deinit 就是双重释放。见 dual_wake_word.cc 析构函数。 */
+    void ForgetModels() { models_ = nullptr; }
+
 private:
     struct Command {
         std::string command;
