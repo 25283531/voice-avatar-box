@@ -322,6 +322,125 @@ ELDER_FIRMWARE_URL=https://152.136.230.132/firmware/xiaozhi-2.0.5.bin
 
 ---
 
+### 1.11 配置和风天气（可选）
+
+老人问"今天天气怎么样"时，服务端调和风天气取数据。**不配也能跑**，只是这
+类问题会答"我查不到天气"。
+
+原理、JWT 怎么签、缓存怎么命中，见 [和风天气接入](./和风天气接入.md)。
+本节只讲**怎么配、配完怎么验、坑在哪**。
+
+#### 1.11.1 五个必填变量
+
+| 变量 | 值从哪来 | 说明 |
+| --- | --- | --- |
+| `ELDER_QWEATHER_HOST` | 控制台「设置 → API Host」 | 形如 `xxxxxx.re.qweatherapi.com`，**不要带 `https://`**（带代码会剥，但别指望） |
+| `ELDER_QWEATHER_KEY_ID` | 控制台「项目管理 → 凭据 ID」 | JWT header 的 `kid` |
+| `ELDER_QWEATHER_PROJECT_ID` | 控制台「项目管理 → 项目 ID」 | JWT payload 的 `sub` |
+| `ELDER_QWEATHER_DEVELOPER_ID` | 控制台「账号 → 开发者 ID」 | JWT payload 的 `iss` |
+| `ELDER_QWEATHER_PRIVATE_KEY_PATH` | 自己生成的 Ed25519 私钥路径 | **容器内路径**，见 1.11.2 |
+
+可选调优（都有合理默认，不懂就别填）：
+
+| 变量 | 默认 | 说明 |
+| --- | --- | --- |
+| `ELDER_WEATHER_ENABLE` | `1` | 设 `0` 整体关闭，连定时预热都不跑 |
+| `ELDER_WEATHER_TTL_MIN` | `60` | 缓存有效期（分钟）。**写 0 会被当无效值回落到 60** |
+| `ELDER_WEATHER_DEFAULT_CITY` | `平顶山` | 老人没说是哪个城市、设备也没设过时用它 |
+| `ELDER_WEATHER_GEO_TTL_DAYS` | `30` | 城市名 → LocationID 的缓存天数 |
+| `ELDER_WEATHER_TIMEOUT_SEC` | `6` | 单次上游请求超时 |
+| `ELDER_WEATHER_WARM_HOURS` | `24` | 预热只刷"最近这么多小时内被问过"的城市 |
+| `ELDER_WEATHER_WARM_AHEAD_MIN` | `10` | 只刷"这么多分钟内就要过期"的城市 |
+
+#### 1.11.2 私钥：不能放项目目录
+
+项目目录要上传 GitHub，私钥进仓库等于把账号送人。所以：
+
+```bash
+# 1) 本地生成（只在部署机上做一次，别提交）
+openssl genpkey -algorithm ed25519 -out qweather-ed25519-private.pem
+openssl pkey -in qweather-ed25519-private.pem -pubout -out qweather-ed25519-public.pem
+
+# 2) 公钥内容贴到和风控制台「项目管理 → 凭据 → 上传公钥」
+cat qweather-ed25519-public.pem
+
+# 3) 私钥传到服务器，放到项目目录**之外**
+ssh root@<host> 'mkdir -p /opt/voice-avatar/secrets && chmod 700 /opt/voice-avatar/secrets'
+scp qweather-ed25519-private.pem root@<host>:/opt/voice-avatar/secrets/
+ssh root@<host> 'chmod 600 /opt/voice-avatar/secrets/qweather-ed25519-private.pem'
+```
+
+⚠️ **`chmod 600` 不是可选项**。私钥 world-readable 时，容器里任何一个进程
+都能读走它去刷你的和风配额。
+
+#### 1.11.3 挂载与注入（两个坑）
+
+`docker-compose.yml` 里要做两件事，**缺一不可**：
+
+```yaml
+services:
+  elder:
+    volumes:
+      # 坑 1：私钥必须挂进容器，且**只读**
+      - /opt/voice-avatar/secrets:/app/secrets:ro
+    environment:
+      # 坑 2：environment 是**显式列表**，.env 里的变量不会自动进容器！
+      - ELDER_QWEATHER_HOST=${ELDER_QWEATHER_HOST}
+      - ELDER_QWEATHER_KEY_ID=${ELDER_QWEATHER_KEY_ID}
+      - ELDER_QWEATHER_PROJECT_ID=${ELDER_QWEATHER_PROJECT_ID}
+      - ELDER_QWEATHER_DEVELOPER_ID=${ELDER_QWEATHER_DEVELOPER_ID}
+      - ELDER_QWEATHER_PRIVATE_KEY_PATH=/app/secrets/qweather-ed25519-private.pem
+```
+
+**坑 2 是本项目实际踩过的**：`.env` 只负责给 Compose 做变量替换，它**不会**
+把变量塞进容器。表现是"`.env` 里明明写了，容器里 `printenv` 却没有"，
+于是天气一直报未配置，而启动日志一切正常。
+
+另一个常见误配：私钥路径写成宿主机路径（`/opt/voice-avatar/secrets/...`）。
+容器里看到的是挂载点 `/app/secrets/...`，两者不是一回事。
+
+#### 1.11.4 验证（两步，都要做）
+
+接口需要登录态（`get_current_user`），先拿一个管理员 token：
+
+```bash
+TOKEN=$(curl -s -X POST http://<host>:8064/api/auth/login \
+  -H 'Content-Type: application/json' \
+  -d '{"username":"admin","password":"<口令>"}' | jq -r .access_token)
+```
+
+第一步，看配置有没有生效、缓存里有什么：
+
+```bash
+curl -s http://<host>:8064/api/weather/status -H "Authorization: Bearer $TOKEN" | jq
+```
+
+期望 `configured: true`，以及 `cache_rows` / `hits` 计数（首次部署时是 0）。
+
+第二步，**连打两次同一个城市**，看 `source` 有没有从 `api` 变成 `cache`：
+
+```bash
+for i in 1 2; do
+  curl -s "http://<host>:8064/api/weather/now?city=平顶山" \
+    -H "Authorization: Bearer $TOKEN" | jq '{source, stale, temp}'
+done
+```
+
+- 第 1 次：`source: "api"`（真调了和风，花掉一次配额）
+- 第 2 次：`source: "cache"`（命中 SQLite，**不花配额**）
+
+**这一步是验收红线**：两次都是 `api` 说明缓存没生效，上线后会按每次问话
+烧配额。反过来，第二次若 `stale: true`，说明命中的是**过期**缓存（上游挂了
+的降级路径），不是正常命中。
+
+#### 1.11.5 定时预热在做什么
+
+调度器每 10 分钟跑一次，只做一件事：把「最近 24 小时被问过」且「10 分钟内
+就要过期」的城市重新拉一遍。**不会拉全国**——没人问过的城市永远不会产生
+任何 API 调用。冷门城市第一次被问时走实时调用，之后进缓存。
+
+---
+
 ## 2. 接入 MySQL（完整步骤）
 
 ### 2.1 方式 A：让 Compose 起一个 MySQL 容器（overlay 叠加）
@@ -1214,6 +1333,19 @@ WS 地址由它自动换 scheme 推导成 `wss://voice.example.com/api/voice/v1/
 | `ELDER_FIRMWARE_VERSION` | 空（不返回 firmware 段） | **设备 OTA 报告的最新固件版本号**。与 `ELDER_FIRMWARE_URL` **同时配置**才在 OTA 响应里下发 `firmware` 段；版本真源是 `firmware/xiaozhi/CMakeLists.txt` 的 `PROJECT_VER`，版本比较由固件自己做。见 §1.10 |
 | `ELDER_FIRMWARE_URL` | 空（不返回 firmware 段） | **固件下载 URL**，**必须是单 app 镜像（`xiaozhi.bin`）不是 merged-flash.bin**（OTA 走 `esp_ota_write` 写 OTA 分区）；二进制由部署方托管，CI artifact 会过期别直接用。见 §1.10 |
 | `ELDER_LIBOPUS_PATH` | 空（自动探测） | **Opus 编解码库文件的绝对路径**。**Docker 部署不需要设** —— 镜像已 `apt-get install libopus0`。只在**本机裸跑**（§1.9）且自动探测失败时才需要，见 §6.12 |
+| `ELDER_QWEATHER_HOST` | 空（天气功能未配置） | **和风天气 API Host**（控制台给的裸 host，不带 `https://`）。见 §1.11 |
+| `ELDER_QWEATHER_KEY_ID` | 空 | 和风**凭据 ID**，JWT header 的 `kid`。见 §1.11 |
+| `ELDER_QWEATHER_PROJECT_ID` | 空 | 和风**项目 ID**，JWT payload 的 `sub`。见 §1.11 |
+| `ELDER_QWEATHER_DEVELOPER_ID` | 空 | 和风**开发者 ID**，JWT payload 的 `iss`。见 §1.11 |
+| `ELDER_QWEATHER_PRIVATE_KEY_PATH` | 空（回落仓库父目录的默认文件名） | **Ed25519 私钥路径（容器内路径）**。生产是 `/app/secrets/qweather-ed25519-private.pem`，**私钥不能放项目目录**（会进 GitHub）。见 §1.11.2 |
+| `ELDER_QWEATHER_PRIVATE_KEY` | 空 | 私钥**内容**（PEM 字符串）。与 `_PATH` 二选一，优先用它 —— 适合 k8s Secret 注入。见 §1.11 |
+| `ELDER_WEATHER_ENABLE` | `1` | 设 `0` 关闭天气子系统（连定时预热一起停） |
+| `ELDER_WEATHER_TTL_MIN` | `60` | 天气缓存有效期（分钟）。非法值/`0` 回落 60 |
+| `ELDER_WEATHER_DEFAULT_CITY` | `平顶山` | 没指定城市时的默认城市 |
+| `ELDER_WEATHER_GEO_TTL_DAYS` | `30` | 城市名→LocationID 缓存天数 |
+| `ELDER_WEATHER_TIMEOUT_SEC` | `6` | 单次上游请求超时秒数 |
+| `ELDER_WEATHER_WARM_HOURS` | `24` | 预热只刷最近这么多小时内被问过的城市 |
+| `ELDER_WEATHER_WARM_AHEAD_MIN` | `10` | 预热只刷这么多分钟内就要过期的条目 |
 | `ELDER_DB_ECHO` | `0` | 设为 `1` 打印所有 SQL，排查问题时开，平时关 |
 | `ELDER_ALLOW_PUBLIC_REGISTER` | `1`（开启） | **是否开放匿名自助注册**。设为 `0`/`false`/`no`/`off`/空串即关闭，关闭时 `POST /api/auth/register` 返回 `403` + 「当前未开放自助注册，请联系管理员开通账号」。详见 §5.1 |
 | `ELDER_BOOTSTRAP_ADMIN_USERNAME` | 空（未配置） | **初始管理员（bootstrap）的用户名**。只有用户名**逐字等于**它的注册者会成为管理员；未配置时**任何人注册都不是管理员**。详见 §5.1 |

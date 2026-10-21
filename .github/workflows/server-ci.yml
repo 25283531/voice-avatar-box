@@ -309,6 +309,15 @@ jobs:
       # 功能测试看不出来，只有调用计数和账单能发现。T4/T6 就是那两个计数器。
       - name: 和风天气按需缓存（计费红线 + 降级 + 预热）
         run: python tools/run_smoke.py logs/smoke_weather.log python tools/test_weather.py
+      # 可播性过滤 + 缓冲区尾巴补播 + TTS 返回体格式判别。
+      # 为什么必须进 CI：这三件事的失败现象**全都是"老人听到的声音不对"**，
+      # 而协议层、状态机、token 计量全部正常 —— 没有任何现有断言会红。
+      # 2026-10-21 真机事故就是「念出"我要调用 get_weather"，然后静音」：
+      # 前者是规划语没过滤，后者是 _run_turn 从不 flush 缓冲区尾巴。
+      # 这个脚本是纯函数级断言（秒级、不联网、不需要 libopus），
+      # 所以放在天气之后、重活之前。
+      - name: 语音可播性过滤 + 尾巴补播 + TTS 格式判别
+        run: python tools/run_smoke.py logs/smoke_speech_guard.log python tools/test_speech_guard.py
       # 会员制遗留五张表必须**真的**被删掉。
       # 这条门禁是补 875b38c 留下的洞：当时删表函数整个被掏空，全仓 CI 依然全绿
       # （qa3_migration 的老库 DDL 根本不建这五张表，删表分支恒为空操作）。

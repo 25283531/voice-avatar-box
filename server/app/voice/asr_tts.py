@@ -24,8 +24,10 @@ HTTP_PROXY。urllib 默认把**所有**请求（含 127.0.0.1）丢给代理，
 from __future__ import annotations
 
 import ipaddress
+import io
 import json
 import logging
+import math
 import socket
 import struct
 import urllib.error
@@ -56,6 +58,170 @@ TTS_SAMPLE_RATE: Final[int] = 24000
 # OpenAI 兼容的 TTS 端点返回的 WAV 头长度（44 字节标准头）。
 # 防御性处理：部分厂商无视 response_format=pcm 仍返回 wav。
 _WAV_HEADER_LEN: Final[int] = 44
+
+# ======================================================== TTS 返回体的格式判别
+#
+# 为什么必须做（2026-10-21 真机故障）
+# ----------------------------------
+# 老人听到的是"断断续续 + 杂音 + 破音"。而"杂音/破音"最经典的两个成因，
+# 都是**把非 PCM 字节当成 S16LE 送进 Opus 编码器**：
+#   · 厂商无视 ``response_format: "pcm"`` 回了 mp3/aac → 整段被当采样点，
+#     出来的是持续沙沙声；
+#   · 厂商回的是 **32-bit float PCM**（不少推理框架的默认输出格式）→
+#     IEEE754 位模式被当 int16 读，听感是沙沙声 + 爆音，而且**音量还很响**。
+# 原来的防御只认 ``RIFF`` 和 ``{``/``[``，这两种都漏。
+#
+# 这里的原则是「**先判别、再处理、并留下痕迹**」：不猜、不静默，
+# 每种异常格式都要在日志里留一条，否则下次还会从"声音难听"开始查。
+
+#: 每种异常格式在**本进程内只 INFO/WARNING 一次**（避免每句刷一条）。
+_SNIFF_LOGGED: set[str] = set()
+
+
+def _sniff_audio(raw: bytes) -> str:
+    """按魔数判别 TTS 返回体到底是什么格式。
+
+    返回 ``pcm`` / ``wav`` / ``mp3`` / ``aac`` / ``ogg`` / ``flac`` / ``json`` / ``empty``。
+    判不出来时返回 ``pcm`` —— 这是**保守选择**：宁可按约定格式处理，
+    也不要把正常音频误判成压缩包去解码（那会直接静音）。
+    """
+    if not raw:
+        return "empty"
+    head = raw[:12]
+    if head[:4] == b"RIFF":
+        return "wav"
+    if head[:3] == b"ID3":
+        return "mp3"
+    if head[:4] == b"OggS":
+        return "ogg"
+    if head[:4] == b"fLaC":
+        return "flac"
+    if head[:1] in (b"{", b"["):
+        return "json"
+    if len(head) >= 2 and head[0] == 0xFF and (head[1] & 0xE0) == 0xE0:
+        # MPEG 帧同步字。ADTS(AAC) 与 MP3 都是 0xFFFx，靠 layer 位区分：
+        # MPEG Audio 的 layer 位是 01/10/11，ADTS 恒为 00。
+        layer = (head[1] >> 1) & 0x03
+        return "aac" if layer == 0 else "mp3"
+    return "pcm"
+
+
+def _looks_like_float32(pcm: bytes) -> bool:
+    """判断一段"按 S16LE 收到"的字节，其实是不是 32-bit float PCM。
+
+    判据只有一条，但极强：**把每 4 字节当 float32 读，看是否几乎全部落在
+    [-1.5, 1.5]**。真实语音的 int16 采样对拼成 4 字节后，float 解释的指数位
+    是随机的，落在这个区间的比例约 1%；而真正的 float32 音频是 100%。
+    两者相差两个数量级，不存在"边缘地带"。
+    """
+    n = len(pcm) // 4
+    if n < 2048:            # 不足 8KB 统计不可靠，不做判断（保守）
+        return False
+    try:
+        values = struct.unpack(f"<{n}f", pcm[: n * 4])
+    except struct.error:    # pragma: no cover - 长度已保证，防御性保留
+        return False
+    in_range = 0
+    total = 0.0
+    for v in values:
+        if not math.isfinite(v):
+            return False     # int16 噪声里出现 NaN/Inf 才是常态，直接否掉
+        if -1.5 <= v <= 1.5:
+            in_range += 1
+            total += v * v
+    if in_range / n < 0.95:
+        return False
+    rms = math.sqrt(total / max(1, in_range))
+    return 0.002 < rms < 0.9   # 全零（静音）不算，避免误报
+
+
+def _float32_to_s16(data: bytes) -> bytes:
+    """32-bit float PCM → 16-bit PCM（削顶到 [-1,1]，与 Opus 输入口径一致）。"""
+    n = len(data) // 4
+    if not n:
+        return b""
+    values = struct.unpack(f"<{n}f", data[: n * 4])
+    out = []
+    for v in values:
+        if not math.isfinite(v):
+            v = 0.0
+        elif v > 1.0:
+            v = 1.0
+        elif v < -1.0:
+            v = -1.0
+        out.append(int(v * 32767))
+    return struct.pack(f"<{n}h", *out)
+
+
+def _decode_any_to_pcm24k(raw: bytes, endpoint: str) -> bytes:
+    """mp3/aac/ogg/flac → 24kHz/mono/S16LE 裸 PCM（用 PyAV，自带 ffmpeg）。
+
+    为什么不直接调 ``tts_edge.mp3_to_pcm_24k``
+    ------------------------------------------
+    那个函数是本模块需要的逻辑（且实现是对的：逐帧 resample + 末尾
+    ``resample(None)`` 冲洗），但它住在 **Edge 专用**模块里。让
+    ``asr_tts`` 依赖 ``tts_edge`` 会把「可选依赖 edge-tts」变成
+    「OpenAI 路径的隐性前置」，将来有人清理 Edge 分支时会连带炸掉主链路。
+    6 行代码的重复，换模块边界干净，这个交换是划算的。
+    """
+    try:
+        import av
+    except ImportError:
+        raise VoiceUpstreamError(
+            f"TTS 返回的是压缩音频（不是裸 PCM），需要 av 才能解码：{endpoint}。"
+            f"修复：pip install av，或把该 TTS 配置的响应格式改成 pcm"
+        ) from None
+    try:
+        container = av.open(io.BytesIO(raw))
+        try:
+            resampler = av.AudioResampler(format="s16", layout="mono",
+                                          rate=TTS_SAMPLE_RATE)
+            out = []
+            for frame in container.decode(audio=0):
+                out.extend(resampler.resample(frame))
+            out.extend(resampler.resample(None))   # 冲洗，漏了会切掉句尾
+            return b"".join(bytes(f.planes[0]) for f in out)
+        finally:
+            container.close()
+    except Exception as exc:  # noqa: BLE001
+        raise VoiceUpstreamError(
+            f"TTS 返回的压缩音频解码失败（{type(exc).__name__}: {exc}）：{endpoint}"
+        ) from None
+
+
+def _ensure_pcm(raw: bytes, endpoint: str, where: str) -> bytes:
+    """把 TTS 返回体**归一成** 24kHz/mono/S16LE 裸 PCM，并记下真实格式。
+
+    ``where`` 只用于日志（"非流式" / "流式首片"），便于定位是哪条路径。
+    """
+    fmt = _sniff_audio(raw)
+    if fmt not in ("pcm", "empty") and fmt not in _SNIFF_LOGGED:
+        _SNIFF_LOGGED.add(fmt)
+        log.warning("TTS 返回体真实格式是 %s（不是约定的裸 PCM）—— "
+                    "已在服务端转换，但应改厂商配置避免额外开销与音质损失："
+                    "%s（%s）", fmt, endpoint, where)
+
+    if fmt == "json":
+        raise VoiceUpstreamError(
+            f"TTS 返回体像 JSON 错误而非音频：{raw[:200]!r}：{endpoint}")
+    if fmt == "wav":
+        raw = raw[_WAV_HEADER_LEN:]
+        fmt = "pcm"
+    if fmt in ("mp3", "aac", "ogg", "flac"):
+        raw = _decode_any_to_pcm24k(raw, endpoint)
+        fmt = "pcm"
+    if fmt == "pcm" and _looks_like_float32(raw):
+        if "float32" not in _SNIFF_LOGGED:
+            _SNIFF_LOGGED.add("float32")
+            # 这条必须是 WARNING：float32 被当 int16 送 Opus，老人听到的
+            # 就是持续杂音 + 爆音，而服务端日志一切"正常"。
+            log.warning("TTS 返回的是 32-bit float PCM（约定是 16-bit），"
+                        "已自动转换。这是「杂音/破音」的典型成因：%s（%s）",
+                        endpoint, where)
+        raw = _float32_to_s16(raw)
+    if len(raw) % 2:
+        raw = raw[:-1]        # 丢掉半个采样，保证 S16LE 对齐
+    return raw
 
 _LOCAL_NETS: Final[tuple[Any, ...]] = (
     ipaddress.ip_network("127.0.0.0/8"),      # 本机 loopback
@@ -442,22 +608,11 @@ def _tts_openai(row: Any, sentence: str, *, voice: str, speed: float) -> bytes:
     if not raw:
         raise VoiceUpstreamError(f"TTS 返回空音频体：{endpoint}")
 
-    # 防御 1：厂商无视 response_format=pcm 仍回 wav。剥 44 字节头即可，
-    # 但必须先确认那确实是 RIFF 头 —— 否则会把合法音频的头 4 字节误判。
-    if raw[:4] == b"RIFF":
-        log.info("TTS 返回了 wav 容器（无视了 response_format=pcm），剥 44 字节头")
-        raw = raw[_WAV_HEADER_LEN:]
-
-    # 防御 2：错误体伪装成音频。厂商偶发把 JSON 错误塞进 200 响应里
-    # （部分网关的错误处理就是这样），不查会把 `{"error":...}` 当音频发出去，
-    # 老人听到的是一次爆音。
-    if raw[:1] in (b"{", b"["):
-        raise VoiceUpstreamError(
-            f"TTS 返回体像 JSON 错误而非音频：{raw[:200]!r}：{endpoint}")
-
-    if len(raw) % 2:
-        raw = raw[:-1]        # 丢掉半个采样，保证 S16LE 对齐
-    return raw
+    # 归一成裸 PCM：剥 wav 头、解码 mp3/aac/ogg/flac、转换 float32、
+    # 识别 JSON 错误体、按采样对齐。全部收在 _ensure_pcm 一处，
+    # 流式/非流式共用同一套判据 —— 两条路径各写一份必然漂移，
+    # 而漂移的表现是"非流式能出声、流式是噪音"，最难自查。
+    return _ensure_pcm(raw, endpoint, "非流式")
 
 
 def tts_stream(db: Any, sentence: str, *, voice: str = "",
@@ -474,9 +629,14 @@ def tts_stream(db: Any, sentence: str, *, voice: str = "",
         → 生成器只 yield 一次（整段），行为与 :func:`tts` 等价，**不报错也不
         假报流式**。上层按"第一帧早于整段合成完成"的实测值判断真实收益。
 
-    防御与非流式版逐字一致：RIFF 头剥 44 字节（可跨分片）、JSON 错误体
-    识别（读到就抛，不把错误文本当音频发出去）、奇数长度按采样对齐
-    （分片边界可能劈开一个采样，用 1 字节进位缓冲兜）。
+    防御口径与非流式版**共用同一套判据**（:func:`_ensure_pcm`）：
+    wav 剥 44 字节头、mp3/aac/ogg/flac 用 PyAV 解码、float32 转 int16、
+    JSON 错误体识别（读到就抛，不把错误文本当音频发出去）、奇数长度按
+    采样对齐（分片边界可能劈开一个采样，用 1 字节进位缓冲兜）。
+
+    ⚠️ 判别期会先攒 8KB 再决定走流式还是整段：float32 判据需要 2048 个
+    采样才有统计意义。代价是首帧晚约 170ms，换来的是"绝不把 mp3/float32
+    当 PCM 送出去"。这两类错误格式正是「杂音 + 破音」的直接成因。
     """
     from ..llm_gateway import resolve_row
 
@@ -538,9 +698,9 @@ def tts_stream(db: Any, sentence: str, *, voice: str = "",
             f"调用超时（{timeout:g}s 未返回）：{endpoint}，可调大该配置的「超时秒数」") from None
 
     try:
-        head = b""          # 尚未判别的头几个字节（RIFF / JSON / PCM）
-        carry = b""         # 奇数采样进位
-        seen_any = False
+        carry = b""         # 奇数采样进位（分片边界可能劈开一个采样）
+        head_buf = b""      # 判别格式前攒的字节
+        decided = False     # 是否已确认"这就是真 PCM，可以放心流式吐"
         while True:
             try:
                 chunk = resp.read(4096)
@@ -549,27 +709,43 @@ def tts_stream(db: Any, sentence: str, *, voice: str = "",
                     f"读取音频流超时：{endpoint}，可调大该配置的「超时秒数」") from None
             if not chunk:
                 break
-            if not seen_any and not head:
-                head = chunk[:8]
-                # 防御：错误体伪装成音频（与非流式版同一条判据）
-                if head[:1] in (b"{", b"["):
-                    rest = chunk + resp.read()
+
+            if not decided:
+                # ---- 判别期：先攒够 8KB 再决定怎么处理 ----
+                # 为什么要攒而不是看第一片：float32 判据需要 2048 个采样
+                # （8KB）才有统计意义，而 4KB 一片看不出来。代价是首帧
+                # 晚 170ms 左右（8KB @ 24k/16bit），换来的是"不会把 mp3
+                # 或 float32 当 PCM 送出去"——后者正是杂音/破音的成因。
+                head_buf += chunk
+                if len(head_buf) < 8192:
+                    continue
+                fmt = _sniff_audio(head_buf)
+                if fmt == "json":
+                    rest = head_buf + resp.read()
                     raise VoiceUpstreamError(
-                        f"TTS 返回体像 JSON 错误而非音频：{(chunk + rest)[:200]!r}：{endpoint}")
-            if not seen_any:
-                seen_any = True
-                if head[:4] == b"RIFF":
-                    # 剥 44 字节 WAV 头；头可能跨分片，先把前 44 字节攒齐
-                    need = _WAV_HEADER_LEN
-                    buf = chunk
-                    while len(buf) < need:
-                        more = resp.read(need - len(buf))
-                        if not more:
-                            break
-                        buf += more
-                    chunk = buf[need:]
-                    if not chunk:
-                        continue
+                        f"TTS 返回体像 JSON 错误而非音频：{rest[:200]!r}：{endpoint}")
+                if fmt in ("mp3", "aac", "ogg", "flac"):
+                    # 压缩格式无法边解边切（解码器有状态），整段收完再解。
+                    data = _ensure_pcm(head_buf + resp.read(), endpoint, "流式整段")
+                    if data:
+                        yield data
+                    return
+                if fmt == "wav":
+                    head_buf = head_buf[_WAV_HEADER_LEN:]
+                if _looks_like_float32(head_buf):
+                    data = _ensure_pcm(head_buf + resp.read(), endpoint, "流式整段")
+                    if data:
+                        yield data
+                    return
+                # 真 PCM：把攒下的这批吐出去，之后恢复逐片流式
+                decided = True
+                if len(head_buf) % 2:
+                    carry = head_buf[-1:]
+                    head_buf = head_buf[:-1]
+                if head_buf:
+                    yield head_buf
+                continue
+
             if carry:
                 chunk = carry + chunk
                 carry = b""
@@ -578,6 +754,15 @@ def tts_stream(db: Any, sentence: str, *, voice: str = "",
                 chunk = chunk[:-1]
             if chunk:
                 yield chunk
+
+        if not decided:
+            # 整个响应不足 8KB（短句很常见）：走一次完整归一。
+            if not head_buf:
+                raise VoiceUpstreamError(f"TTS 返回空音频体：{endpoint}")
+            data = _ensure_pcm(head_buf, endpoint, "流式短句")
+            if data:
+                yield data
+            return
         if carry:
             # 末尾剩半个采样：补零对齐（S16LE 必须是整采样）
             yield carry + b"\x00"

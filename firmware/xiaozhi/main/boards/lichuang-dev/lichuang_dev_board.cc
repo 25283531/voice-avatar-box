@@ -353,15 +353,45 @@ private:
             vTaskDelay(pdMS_TO_TICKS(100));
         }
         if (probe_err != ESP_OK) {
-            /* 探不到时把 I2C 总线上**实际有谁**打出来。
-             * 这一行是「摄像头到底接没接」的唯一可判据：
+            /* 探不到摄像头。**先判总线通不通，再决定要不要扫全表** ——
+             * 这一步是 2026-10-21 真机日志逼出来的：没接排线时下面那段
+             * 112 地址扫描会一个不落地全部超时，刷出 112 条
+             * `E i2c.master: probe device timeout`，把启动日志淹掉，
+             * 而它**查不出任何新信息**。
+             *
+             * 为什么 0x19 就是「总线通不通」的判据：PCA9557 是焊在板上的
+             * I/O 扩展器（触摸/功放使能都靠它），它不依赖任何外接排线。
+             * 而 I2C 的上拉电阻在**摄像头模组侧** —— 排线一拔，整条总线
+             * 失去上拉，SDA/SCL 悬空，于是**连板上这个 0x19 都不会 ACK**。
+             * 真机日志里那句 `I2C 总线上的器件：[无]（共 0 个）` 就是证据。
+             *
+             * 所以：0x19 不通 ⇒ 总线没上拉 ⇒ 扫 112 个地址必然全超时，
+             * 直接跳过，只留一行可执行的告警。0x19 通 ⇒ 总线是好的，
+             * 此时才值得扫表（「接了但型号不对」这种情况只有扫表能看出来）。 */
+            esp_err_t bus_err = i2c_master_probe(i2c_bus_, 0x19, pdMS_TO_TICKS(5));
+            if (bus_err != ESP_OK) {
+                ESP_LOGW(TAG, "未检测到摄像头（GC0308 @ 0x%02X，err=0x%x）→ 跳过初始化。"
+                              "板载 PCA9557(@0x19) 也不应答（err=0x%x），"
+                              "说明整条 I2C 总线没有上拉 —— 最常见原因就是**摄像头排线没接**"
+                              "（上拉电阻在模组侧）。已跳过全地址扫描，"
+                              "否则会刷出 112 条 probe timeout 且查不出新信息。"
+                              "接上排线后重启即可自动启用，不需要改固件，"
+                              "DVP 的 11 个 IO 也不会被占用。",
+                         CAMERA_SCCB_ADDR, probe_err, bus_err);
+                camera_ = nullptr;   // GetCamera() 返回 nullptr ⇒ MCP 不注册 take_photo
+                return;
+            }
+
+            /* 总线是通的，只是没有摄像头：把 I2C 上**实际有谁**打出来。
+             * 这一行是「接了但型号不对」的唯一可判据：
              *   · 列表里没有任何 0x21/0x42 之类 ⇒ 模组没插 / 没供电 / 排线反了
              *   · 列表里有陌生地址            ⇒ 接了但不是 GC0308（换型号要改驱动）
-             * 没有它，用户只能看到一句"未检测到"，无从下手。 */
+             * 单地址超时用 5ms（原 20ms）：总线已确认有上拉、能正常 NAK，
+             * 5ms 足够判定，最坏情况从 112×20ms=2.24s 降到 0.56s。 */
             char found[96] = {0};
             int n = 0;
             for (uint8_t addr = 0x08; addr < 0x78 && n < 12; ++addr) {
-                if (i2c_master_probe(i2c_bus_, addr, pdMS_TO_TICKS(20)) == ESP_OK) {
+                if (i2c_master_probe(i2c_bus_, addr, pdMS_TO_TICKS(5)) == ESP_OK) {
                     char one[8];
                     snprintf(one, sizeof(one), "%s0x%02X", n ? " " : "", addr);
                     strncat(found, one, sizeof(found) - strlen(found) - 1);
@@ -369,6 +399,7 @@ private:
                 }
             }
             ESP_LOGW(TAG, "未检测到摄像头（GC0308 @ 0x%02X，err=0x%x）→ 跳过初始化。"
+                          "总线正常（PCA9557 @0x19 已应答），"
                           "I2C 总线上的器件：[%s]（共 %d 个）。"
                           "没接摄像头时这是**正常的**；接上排线后重启即可自动启用，"
                           "不需要改固件，DVP 的 11 个 IO 也不会被占用。",

@@ -108,6 +108,102 @@ _PAUSE_MARGIN_MS: Final[int] = 500          # 自适应阈值的固定余量
 _INTERACTION_KIND: Final[int] = int(InteractionKind.DIALOG)
 
 
+# ============================================================ 送 TTS 前的可播性过滤
+#
+# 为什么必须有这一层（2026-10-21 真机事故）
+# ----------------------------------------
+# 老人问天气，听到的第一句是「老人查天气，我要调用……」——模型把**它自己的
+# 行动规划**当成回复念了出来，真正的天气答案反而在后面。
+#
+# 这不是偶发。根因是链路把「每一轮 LLM 的文本增量」都当回复播报，而
+# function calling 的一轮里，模型常常会先写一句"我打算做什么"再发
+# tool_calls。那一轮**不是给老人听的**，它是模型的思考草稿。
+#
+# 三层防御，这里是最外层（兜底）：
+#   ① prompts.py 的硬约束（让模型别这么写）
+#   ② 这一层的逐句安检（拦住漏网的）
+#   ③ 全部被拦时的话术兜底（见 UNSPEAKABLE_REPLY_FALLBACK）
+#
+# 为什么是「逐句」而不是「整轮扣住不播」
+# ------------------------------------
+# 整轮扣住要等模型把整段说完才知道有没有 tool_calls，首句延迟会多出
+# 整整一段生成时间 —— 老人本来就在抱怨"很久才开口"。逐句安检是 O(1) 的，
+# **不增加任何延迟**，只在命中特征时丢弃该句。
+
+#: 模型爱把工具名（`get_weather`、`createReminder`）写进正文。
+#: 只认**代码形状**的标识符：含下划线的，或小写开头接大写的驼峰。
+#: 刻意不拦所有拉丁字母 —— "PM2.5"、"3.5 度" 这类是要念出来的。
+_CODE_IDENT: Final[re.Pattern[str]] = re.compile(
+    r"[A-Za-z][A-Za-z0-9]*_[A-Za-z0-9_]+"      # snake_case：get_weather
+    r"|[a-z]{2,}[A-Z][a-z]+"                    # camelCase：createReminder
+)
+
+#: 「我要用工具」语义。命中即不播 —— 这类句子对老人零信息量。
+#: 注意 "调用" 后面要跟工具类名词才算：老人自己说"您调用一下电视"不该被拦，
+#: 但那是**上行**文本，根本不经过这里；这里只处理模型的下行回复。
+_TOOL_TALK: Final[re.Pattern[str]] = re.compile(
+    r"(?:调用|使用|执行)[^，。！？；]{0,10}(?:工具|函数|接口|参数)"
+    r"|(?:工具|函数)调用"
+    r"|tool_call"
+    r"|\bJSON\b"
+    r"|\bAPI\b"
+    r"|\btoken\b",
+    re.IGNORECASE,     # 中文字符不受影响；这里只为兜住 JSON/json、API/api 的大小写
+)
+
+#: 第三人称叙述（"老人查天气…"）。老人是听的人，不是被描述的第三方。
+#: 只认「老人 + 一个动作动词」这种主语结构，不拦"老人家用着方便"。
+_THIRD_PERSON: Final[re.Pattern[str]] = re.compile(
+    r"^\s*老人[^，。！？；]{0,10}(?:问|想|要|说|查|需要|希望)"
+)
+
+#: 「老人…我要…」同句出现 = 自我规划独白。
+_SELF_PLAN: Final[re.Pattern[str]] = re.compile(
+    r"老人[^。！？；]{0,24}(?:我要|我需要|我先|我来|让我)"
+)
+
+#: Markdown 强调符与行内代码。TTS 会把 ``**`` 念成"星号星号"。
+_MD_NOISE: Final[re.Pattern[str]] = re.compile(r"\*\*|__|`")
+_MD_HEADING: Final[re.Pattern[str]] = re.compile(r"^\s*#{1,6}\s*")
+#: 列表前缀（"- "、"1. "、"• "）。念出来是"横杠""一"这种噪音。
+_MD_BULLET: Final[re.Pattern[str]] = re.compile(r"^\s*(?:[-•·]|\d+[.、)])\s*")
+
+#: 整段回复都不可播时报给老人的话。
+#: 措辞必须"承认没办好"，不能假装答了 —— 老人会以为设备坏了。
+UNSPEAKABLE_REPLY_FALLBACK: Final[str] = "这个我一时没说明白，您再问一遍，我重新查"
+
+#: 纯标点（"。" / "……" / 只有标点和空白）。这种片段**不算事故**：
+#: 它是切句的副产物（整句已播完，缓冲区里只剩那个句号），
+#: 送去 TTS 会念出一声怪响。必须与"不可播报"分开计数 ——
+#: 混在一起会让"整段回复都被拦下"的兜底话术被误触发。
+_PUNCT_ONLY: Final[re.Pattern[str]] = re.compile(r"[。！？!?；;…、，,\s]+")
+
+
+def _speech_clean(sentence: str) -> str:
+    """去掉 Markdown 噪音，返回**可以直接念**的文本。"""
+    s = _MD_HEADING.sub("", sentence)
+    s = _MD_BULLET.sub("", s)
+    s = _MD_NOISE.sub("", s)
+    return s.strip()
+
+
+def _speech_block_reason(sentence: str) -> str:
+    """判断一句话能不能念给老人听。返回 "" 表示可播，否则返回原因标签。
+
+    标签会进日志与埋点（``dropped_sentences``），用来回答
+    "这轮为什么没声音"——只有布尔值的埋点在排查时等于没有。
+    """
+    if _CODE_IDENT.search(sentence):
+        return "code_ident"
+    if _TOOL_TALK.search(sentence):
+        return "tool_talk"
+    if _THIRD_PERSON.search(sentence):
+        return "third_person"
+    if _SELF_PLAN.search(sentence):
+        return "self_plan"
+    return ""
+
+
 def _now_ms() -> int:
     return int(time.time() * 1000)
 
@@ -743,8 +839,12 @@ class VoiceSession:
             log.info("[%s] 设备未绑定用户，拒绝调用 LLM（未授权设备）",
                      self.session_id)
             await self._send_alert(DEVICE_UNBOUND_MESSAGE)
-            await self._record_turn(utterance, "", started, t_asr,
-                                    0, 0, 0, reply_ok=False)
+            # ⚠️ 这里原来多传了一个 0（7 个位置参数对 6 个形参），
+            # 调用即 TypeError。而它正好在「设备未绑定」这条降级路径上 ——
+            # 这条路径平时没人走，测试也覆盖不到，于是错误一直没暴露。
+            # 一旦真走到，异常会打断整轮收尾（alert 已发、埋点没写）。
+            await self._record_turn(utterance, "", started, t_asr, 0, 0,
+                                    reply_ok=False)
             return utterance
 
         # ---- 记忆 + 人格召回
@@ -776,6 +876,7 @@ class VoiceSession:
         speaker = _ReplySpeaker(self)
         results: list[Any] = []          # 每轮一个 ChatResult（逐轮记账）
         tool_trace: list[dict[str, Any]] = []
+        timing: dict[str, Any] = {"round_ms": [], "ttft_ms": [], "tool_ms": 0}
         reply = ""
         try:
             for round_no in range(1, config.VOICE_TOOL_MAX_ROUNDS + 1):
@@ -783,9 +884,14 @@ class VoiceSession:
                     log.info("[%s] 思考/播报期间收到 abort，停止后续轮次",
                              self.session_id)
                     break
-                result = await self._chat_round(messages, speaker, round_no)
+                result = await self._chat_round(messages, speaker, round_no,
+                                                timing)
                 if result is not None:
                     results.append(result)
+                    # 每轮真实耗时：来自 llm_gateway 的 ChatResult.elapsed_ms，
+                    # 是**厂商 HTTP 往返**的时间，不含我们的工具执行与播报。
+                    timing["round_ms"].append(
+                        int(getattr(result, "elapsed_ms", 0) or 0))
                 if result is None or not getattr(result, "tool_calls", None):
                     reply = (result.text or "").strip() if result is not None else ""
                     break
@@ -797,7 +903,9 @@ class VoiceSession:
                 for call in result.tool_calls:
                     if self._abort:
                         break
+                    t_tool = _now_ms()
                     outcome = await self._run_tool(call)
+                    timing["tool_ms"] += _now_ms() - t_tool
                     tool_trace.append({
                         "round": round_no,
                         "name": str((call.get("function") or {}).get("name") or ""),
@@ -839,6 +947,27 @@ class VoiceSession:
             await self._send_alert("我没想好怎么回答，请您再说一遍")
             return utterance
 
+        # ---- 补播缓冲区尾巴（**这是 2026-10-21 修掉的一个静音 bug**）----
+        # push_text 只切"带句末标点的完整句"，最后一段没有 。！？ 的文本会
+        # 一直留在 speaker._buf 里，而 finish() 只发 tts stop —— 那段话
+        # **永远不会被念出来**。模型偶尔不给结尾标点（"今天晴，14 度"），
+        # 老人听到的就是一片安静，日志里却写着"播报完成"。必须在这里 flush。
+        await speaker.flush_rest()
+
+        # ---- 整段回复都被安检拦下：不能就这么静音 ----
+        # 走到这里说明模型这一轮全在讲"它要做什么"（规划语/工具名），
+        # 一句能念的都没有。宁可给一句实话，也不能让老人对着沉默的音箱。
+        if speaker.sentence_count == 0 and speaker.dropped > 0:
+            log.warning("[%s] 本轮回复全部不可播报（拦截 %d 句，原因 %s），"
+                        "改说兜底话术。原文：%r",
+                        self.session_id, speaker.dropped,
+                        ",".join(sorted(set(speaker.dropped_reasons))),
+                        reply[:200])
+            await speaker.push_text(UNSPEAKABLE_REPLY_FALLBACK)
+            await speaker.flush_rest()
+            # 历史里也换成兜底话术：把规划语留在上下文里，模型下一轮会照着学。
+            reply = UNSPEAKABLE_REPLY_FALLBACK
+
         # 会话内历史：**只在本轮成功拿到回复后**才追加。失败轮不进历史，
         # 否则下一轮的上下文里会有一条没有回复的 user 消息，
         # 模型会以为用户的话被忽略了。工具轮的中间文本不进历史 ——
@@ -848,7 +977,7 @@ class VoiceSession:
 
         # ---- 埋点 + 记忆沉淀（都不阻塞播报）
         await self._record_usage(results, utterance, reply, started, t_asr, t_llm,
-                                 tool_trace)
+                                 tool_trace, timing=timing, speaker=speaker)
 
         # ---- 收尾播报：流式过程中已播的句子不管，这里发 tts stop
         #    （或空回复的 start/stop 配对，设备靠它回落 idle）。
@@ -856,7 +985,8 @@ class VoiceSession:
         return utterance
 
     async def _chat_round(self, messages: list[dict[str, Any]],
-                          speaker: _ReplySpeaker, round_no: int) -> Any:
+                          speaker: _ReplySpeaker, round_no: int,
+                          timing: dict[str, Any] | None = None) -> Any:
         """跑一轮 LLM（流式）。文本增量实时交给 speaker 逐句播放。
 
         阻塞生成器（SSE 读取）不能直接在事件循环里跑，按项目既有口径
@@ -867,6 +997,11 @@ class VoiceSession:
         """
         db = SessionLocal()   # 本回合专用：生成器只在首个 next() 里碰 DB
         gen = None
+        # 首 token 时延（TTFT）：从发起请求到**第一个文本增量**到达。
+        # 这是"模型慢不慢"的唯一直接度量 —— 之前的 t_llm 把工具执行和
+        # 播报阻塞都算进去了，看那个数永远分不清是谁慢。
+        t_round = _now_ms()
+        got_first = False
         try:
             def _open() -> Any:
                 return chat_stream(db, "chat", messages, tools=TOOL_DEFS,
@@ -895,6 +1030,10 @@ class VoiceSession:
                         await speaker.flush_rest()
                     return payload
                 if kind == "text" and payload:
+                    if not got_first:
+                        got_first = True
+                        if timing is not None:
+                            timing["ttft_ms"].append(_now_ms() - t_round)
                     await speaker.push_text(payload)
             # abort 提前退出：关生成器（finally 关连接），没有 ChatResult
             return None
@@ -965,7 +1104,9 @@ class VoiceSession:
     # ================================================================ 埋点
     async def _record_usage(self, results: list[Any], utterance: str, reply: str,
                             started: float, t_asr: int, t_llm: int,
-                            tool_trace: list[dict[str, Any]] | None = None) -> None:
+                            tool_trace: list[dict[str, Any]] | None = None,
+                            *, timing: dict[str, Any] | None = None,
+                            speaker: _ReplySpeaker | None = None) -> None:
         """记账：token 用量 + 陪聊时长 + Interaction + 记忆沉淀。
 
         工具循环下**每轮 LLM 调用各记一行** model_usage（token 是每轮真实
@@ -985,6 +1126,41 @@ class VoiceSession:
         is_reminder = any(str(t.get("name", "")).endswith("reminder")
                           for t in (tool_trace or []))
 
+        # ---- 时延拆解（2026-10-21）----
+        # 老人反馈"很久很久才说话"，但原来 meta 里只有 asr_ms / llm_ms /
+        # tts_ms 三个数，其中 llm_ms 把工具执行和**播报阻塞**都算在内，
+        # 看它永远分不清是模型慢、工具慢还是 TTS 慢。这里按阶段拆开：
+        #   asr_ms      识别整段上传往返
+        #   ttft_ms     每轮"发出请求 → 第一个字到"（模型快慢的真指标）
+        #   round_ms    每轮厂商 HTTP 往返总耗时（ChatResult.elapsed_ms）
+        #   tool_ms     工具执行累计（含设备 MCP 往返）
+        #   tts_first   从 LLM 开始到**第一帧音频发出**（老人实际等待时长）
+        #   tts_ms      TTS 合成累计（串行，直接累加进总时延）
+        #   speak_ms    整轮总耗时
+        timing = timing or {}
+        tts_first_ms = int(getattr(speaker, "tts_first_ms", 0) or 0)
+        tts_total_ms = int(getattr(speaker, "tts_ms", 0) or 0)
+        tts_max_gap = int(getattr(speaker, "max_gap_ms", 0) or 0)
+        dropped = int(getattr(speaker, "dropped", 0) or 0)
+        dropped_reasons = list(getattr(speaker, "dropped_reasons", []) or [])
+        ttft = list(timing.get("ttft_ms") or [])
+        rounds = list(timing.get("round_ms") or [])
+
+        # 一行日志把"慢在哪"说清楚。这行是给运维直接 grep 的，
+        # 不需要去翻 Interaction 表算减法。
+        log.info("[%s] 时延 asr=%dms ttft=%s round=%s tool=%dms "
+                 "首帧=%dms tts=%dms 帧间隔峰值=%dms 总=%dms 轮数=%d 丢弃句=%d",
+                 self.session_id, t_asr, ttft or "-", rounds or "-",
+                 int(timing.get("tool_ms") or 0), tts_first_ms, tts_total_ms,
+                 tts_max_gap, elapsed_ms, len(results), dropped)
+        if tts_max_gap > 60:
+            # 每帧 60ms 音频，间隔超过 60ms 就意味着设备在这一段**没有声音可播**。
+            # 这条 WARNING 是"断断续续"的判决书：它在服务端，说明是我们供给不足；
+            # 它正常而老人仍觉得断续，问题就在设备侧（I2S 欠载）。
+            log.warning("[%s] 音频帧间隔峰值 %dms > 60ms（一帧只承载 60ms 音频）"
+                        "—— 服务端供帧不连续，老人会听到一顿一顿。"
+                        "多半是 TTS 分片慢或上游卡顿。", self.session_id, tts_max_gap)
+
         def _write() -> None:
             with SessionLocal() as db:
                 for result in results:
@@ -1002,12 +1178,22 @@ class VoiceSession:
                     "session_id": self.session_id,
                     "asr_ms": t_asr,
                     "llm_ms": t_llm,
-                    "tts_ms": 0,
+                    "tts_ms": tts_total_ms,
                     "stt_chars": len(utterance),
                     "reply_chars": len(reply),
                     "total_tokens": total_tokens,
                     "llm_rounds": len(results),
+                    # ---- 2026-10-21 时延拆解 ----
+                    "ttft_ms": ttft,
+                    "round_ms": rounds,
+                    "tool_ms": int(timing.get("tool_ms") or 0),
+                    "tts_first_ms": tts_first_ms,
+                    "tts_max_gap_ms": tts_max_gap,
+                    "total_ms": elapsed_ms,
+                    "dropped_sentences": dropped,
                 }
+                if dropped_reasons:
+                    meta["dropped_reasons"] = sorted(set(dropped_reasons))
                 if tool_trace:
                     meta["tool_calls"] = tool_trace
                 db.add(_m.Interaction(
@@ -1096,6 +1282,14 @@ class _ReplySpeaker:
         self._voice_loaded = False
         self.sentence_count = 0   # 已播句数（日志/埋点用）
         self.pushed_chars = 0     # 累计推入的文本字符数（非流式兜底判重用）
+        # ---- 2026-10-21 新增：可播性过滤与下行耗时埋点 ----
+        self.dropped = 0          # 被安检拦下的句数（不可播的规划语/工具名）
+        self.dropped_reasons: list[str] = []   # 拦截原因标签，进 meta
+        self.tts_first_ms = 0     # 首帧音频发出耗时（从 speaker 创建算起）
+        self.tts_ms = 0           # 全部合成下发累计耗时
+        self.max_gap_ms = 0       # 相邻两帧的最大间隔（>60ms 即供给不足）
+        self._last_frame_at = 0.0
+        self._t0 = time.monotonic()
 
     # ---------------------------------------------------------------- 文本
     async def push_text(self, text: str) -> None:
@@ -1121,7 +1315,10 @@ class _ReplySpeaker:
         """
         tail = self._buf.strip()
         self._buf = ""
-        if tail:
+        # 只剩标点（典型：整句已播完，缓冲区里留着那个"。"）时不要合成 ——
+        # TTS 对单个标点会念出一声奇怪的停顿或杂音。判断口径与
+        # _speak_sentence 里的一致，统一走 _PUNCT_ONLY。
+        if tail and not _PUNCT_ONLY.fullmatch(tail):
             await self._speak_sentence(tail)
 
     # ---------------------------------------------------------------- 播放
@@ -1130,6 +1327,24 @@ class _ReplySpeaker:
         if s._abort:
             log.info("[%s] 播报被打断，丢弃句子 %r", s.session_id, sentence[:20])
             return
+
+        # ---- 可播性安检（见模块顶部 _speech_block_reason 的说明）----
+        # 必须在发 ``sentence_start`` **之前**判：那个消息带 text，设备会把它
+        # 显示在屏幕上。拦下来的句子若已经发过 sentence_start，老人会在屏幕上
+        # 看到"老人查天气，我要调用 get_weather"——比念出来更糟。
+        text = _speech_clean(sentence)
+        if not text or _PUNCT_ONLY.fullmatch(text):
+            # 纯标点/空串：切句副产物，不是"不可播报"，**不计入 dropped**。
+            log.debug("[%s] 跳过无内容片段 %r", s.session_id, sentence[:20])
+            return
+        reason = _speech_block_reason(text)
+        if reason:
+            self.dropped += 1
+            self.dropped_reasons.append(reason)
+            log.warning("[%s] 丢弃不可播报的句子（%s）：%r",
+                        s.session_id, reason, sentence[:80])
+            return
+
         if not self._started:
             await s._send_json({"type": "tts", "state": "start"})
             self._started = True
@@ -1137,14 +1352,15 @@ class _ReplySpeaker:
         self.sentence_count += 1
 
         await s._send_json({"type": "tts", "state": "sentence_start",
-                            "text": sentence})
+                            "text": text})
         await s._send_json({"type": "llm", "emotion": "neutral"})
 
         # 单句 TTS 失败：跳过该句音频、后续句继续。
         # 不能整轮失败 —— 第一句合成失败而后面的句子都成功是常见的
         # （厂商对长句偶发 500），老人听到的是少一句，不是 silence。
+        t_one = time.monotonic()
         try:
-            await self._stream_sentence(sentence)
+            await self._stream_sentence(text)
         except asr_tts.VoiceConfigMissingError:
             log.info("[%s] 未配置 TTS，只发文本", s.session_id)
             self._tts_ok = False
@@ -1156,6 +1372,34 @@ class _ReplySpeaker:
             self._tts_ok = False
             log.warning("[%s] TTS 失败，跳过音频：%s: %s",
                         s.session_id, type(exc).__name__, exc)
+        finally:
+            # 逐句计时：这是判断"慢在 TTS 还是慢在 LLM"的唯一依据。
+            # 串行合成下这个数会直接累加进总时延，所以必须单独可见。
+            self.tts_ms += int((time.monotonic() - t_one) * 1000)
+
+    async def _send_frame(self, packet: bytes) -> None:
+        """下发一帧音频，并记下**首帧**时刻与**帧间隔**。
+
+        ``tts_first_ms`` 是"老人到底等了多久才听到第一个字"的直接度量：
+        它包含 LLM 出首句 + TTS 首分片 + 编码，与 ``tts_ms``（纯合成耗时）
+        分开记，才能区分"模型慢"和"TTS 慢"。0 表示一帧都没发出去。
+
+        ``max_gap_ms`` 回答另一个问题：「断断续续」到底怪谁。
+        每帧承载 60ms 音频，所以**服务端相邻两帧的间隔超过 60ms 就是供给不足**
+        （TTS 分片慢/上游卡顿），老人耳朵里就是一顿一顿；反之若间隔都远小于
+        60ms，说明音频是成串灌下去的，断续只可能发生在设备侧（解码任务被
+        抢 CPU 导致 I2S 欠载，听感是咔哒声 + 掉字）。
+        没有这个数，两边都只能靠猜。
+        """
+        now = time.monotonic()
+        if not self.tts_first_ms:
+            self.tts_first_ms = int((now - self._t0) * 1000)
+        elif self._last_frame_at:
+            gap = int((now - self._last_frame_at) * 1000)
+            if gap > self.max_gap_ms:
+                self.max_gap_ms = gap
+        self._last_frame_at = now
+        await self._s._send_audio(packet)
 
     async def _stream_sentence(self, sentence: str) -> None:
         """流式合成一句并逐帧下发。**帧间/分片间都检查 abort**。"""
@@ -1208,7 +1452,7 @@ class _ReplySpeaker:
                         log.debug("[%s] 无 libopus，跳过音频帧", s.session_id)
                         return
                     if packet:
-                        await s._send_audio(packet)
+                        await self._send_frame(packet)
             # 收尾：不足一帧的补零截齐（与 encode_opus 的口径一致）
             if carry and not s._abort:
                 try:
@@ -1217,7 +1461,7 @@ class _ReplySpeaker:
                 except opus_codec.OpusUnavailableError:
                     return
                 if packet:
-                    await s._send_audio(packet)
+                    await self._send_frame(packet)
         finally:
             if gen is not None:
                 try:
@@ -1244,6 +1488,12 @@ class _ReplySpeaker:
         log.info("[%s] 播报完成（%d 句，音频%s）",
                  s.session_id, self.sentence_count,
                  "不可用" if not self._tts_ok else "已发")
+        if self.dropped:
+            # 单独一行、WARNING 级：被拦下的句子是**真实发生过的事故痕迹**，
+            # 藏在 INFO 里就没人看，而它正是"老人说设备没回答"的答案。
+            log.warning("[%s] 本轮有 %d 句因不可播报被拦下（原因：%s）",
+                        s.session_id, self.dropped,
+                        ",".join(sorted(set(self.dropped_reasons))))
 
 
 def _split_first_sentence(buf: str) -> tuple[str, str]:
