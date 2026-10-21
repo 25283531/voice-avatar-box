@@ -191,6 +191,46 @@ class AvatarOut(AvatarIn):
     created_at: datetime
 
 
+# ================================================================ 声纹说话人（F3）
+class VoiceSpeakerIn(ORMBase):
+    """登记一位说话人。
+
+    ``speaker_key`` 必须与**外部声纹服务**上已注册的 ID 一致 —— 向量在那边，
+    这边只做"key → 是谁"的映射。填一个服务上不存在的 key 不会报错，
+    只会永远认不出人（服务端返回的 id 不在我们问过的列表里）。
+    """
+
+    speaker_key: str = Field(min_length=1, max_length=64)
+    name: str = Field(min_length=1, max_length=64)
+    description: str = Field(default="", max_length=255)
+    enabled: bool = True
+
+    @field_validator("speaker_key", "name")
+    @classmethod
+    def _strip(cls, v: str) -> str:
+        # 首尾空白会让 "张三" 和 "张三 " 变成两个说话人，而声纹服务那头
+        # 只认我们发过去的 speaker_ids 字符串 —— 不一致时表现为"认不出"。
+        v = v.strip()
+        if not v:
+            raise ValueError("不能为空白")
+        return v
+
+    @field_validator("speaker_key")
+    @classmethod
+    def _no_comma(cls, v: str) -> str:
+        # speaker_ids 是逗号分隔发给服务端的：key 里带逗号会把一个说话人
+        # 裂成两个，服务端返回的 id 就永远对不上我们的登记。
+        if "," in v:
+            raise ValueError("speaker_key 不能包含逗号")
+        return v
+
+
+class VoiceSpeakerOut(VoiceSpeakerIn):
+    id: int
+    owner_id: int
+    created_at: datetime
+
+
 # ============================================================ AI 供应商（仅平台配置）
 # 角色已彻底拆到 /api/roles（见本文件下方的 Role* schema）。
 # 因此 ProviderIn 现在**只描述平台配置**：kind 必填非空。

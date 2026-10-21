@@ -612,6 +612,96 @@ curl -s -X POST http://127.0.0.1:8064/api/voice/ota \
 
 ---
 
+### 1.14 声纹认人（F3 · 3D Speaker，默认关闭）
+
+设备端从来没有"认人"的代码 —— 这件事在小智的架构里属于**云端服务**。
+本节说明我们照上游 `xiaozhi-esp32-server` 的 `VoiceprintProvider`
+补上的那一半，以及**没有**补的另一半。
+
+#### 1.14.1 架构：我们只做客户端，模型在外部
+
+```
+设备 ──WS/MQTT──▶ 我们的服务 ──HTTP──▶ 外部声纹服务（3D-Speaker）
+   （16kHz PCM）      （同一段 PCM         （注册 + 向量库 +
+                      包成 WAV POST）     识别，都在它那里）
+```
+
+分工与上游逐字一致：**向量在外部服务上注册**（"enrolled out-of-band
+by the service itself"），我们的服务连音频都不落盘，只发一段 WAV
+出去、读一个 `{"speaker_id", "score"}` 回来。兼容的服务包括社区
+实现 voiceprint-api（ModelScope 3D-Speaker 模型），任何讲同一套
+HTTP 契约的都可以。
+
+#### 1.14.2 要配的三个变量（缺一个就不启用）
+
+| 变量 | 默认 | 说明 |
+| --- | --- | --- |
+| `ELDER_VOICEPRINT_URL` | 空（**关**） | 形如 `http://192.168.1.100:8005/voiceprint/health?key=XXXX`。key 从 query 解析，与上游同一约定 |
+| `ELDER_VOICEPRINT_THRESHOLD` | `0.4` | 相似度阈值，高于它才认人。必须在 (0, 1]，否则功能关闭并在启动日志说明 |
+| `ELDER_VOICEPRINT_TIMEOUT_SEC` | `5` | 单次识别超时。与 ASR 并行，通常不增加总时延；这是硬上限 |
+
+外加**两个非环境变量的前提**：① 外部服务已部署且健康
+（`GET /voiceprint/health` 回 `{"status":"healthy"}`）；② 有人登记了
+说话人（`/api/voice/speakers`，家属在 APP 里就能加）—— 库里一个都没有
+= 没配 = 不识别，与上游同语义。
+
+#### 1.14.3 ⚠️ Phase 1 只有明文 HTTP（与 MQTT 同类的已知缺口）
+
+key 与家庭音频在链路上裸奔。因此：**声纹服务应只在可信网络（局域网）
+内可达**，不要把带 key 的地址暴露到公网。TLS 是后续增量。
+
+#### 1.14.4 启用的效果与**不**启用的效果
+
+启用且认得出：模型知道"现在说话的是谁"—— 首轮在 system 里注入
+`当前说话人：{名字}。{介绍}`，并把用户消息包成
+`{"speaker": "...", "content": "..."}` 让模型自然称呼一次；
+**之后轮次降为纯文本**（每轮都出现名字会诱导模型反复称呼，
+上游专门修过这个 bug）。
+
+认不出 / 没登记 / 服务挂了：**行为与没开声纹时逐字节一致** ——
+不包 JSON、不注入、对话照常。这是设计目标：认不出人的最常见原因是
+老人感冒、离得远、麦克风蒙灰，不是家里来了陌生人；此时让模型说
+"我不认识你"是不可接受的。
+
+#### 1.14.5 验证三步
+
+```bash
+# 1. 服务端认为该开了吗 + 外部服务探活（不吐 URL/key）
+curl -H "Authorization: Bearer <任一用户token>" \
+     http://<服务>/api/voice/voiceprint/health
+#    {"enabled":true,"healthy":true,"threshold":0.4,...,"speakers":2}
+
+# 2. 登记一位说话人（speaker_key 必须与外部服务上已注册的 ID 一致）
+curl -X POST -H "Authorization: Bearer <token>" -H "Content-Type: application/json" \
+     -d '{"speaker_key":"son","name":"儿子","description":"您的儿子，在北京工作"}' \
+     http://<服务>/api/voice/speakers
+
+# 3. 让设备说一句话，看服务日志有没有「声纹认出：儿子（相似度 0.91）」
+docker compose logs -f elder-server | grep 声纹
+```
+
+#### 1.14.6 合规（生物特征数据，部署方义务）
+
+声纹是**生物特征**：欧盟 GDPR 的特别类别数据、Illinois BIPA 等辖区
+有专门义务。开启前请确认：① 声纹服务跑在本地/可信网络，家庭音频
+不发给第三方（除非有数据处理协议）；② 每位被登记的家属都明确同意，
+并写下保留与删除流程；③ 阈值别调太低 —— 误识别会把错误的人格喂给
+模型。删一位说话人：`DELETE /api/voice/speakers/{id}`（软删，行留着
+做审计，同 key 可重建）。
+
+#### 1.14.7 已知缺口（诚实记账）
+
+- **没有"注册音频"的端点**：向量在外部服务上录，本服务连音频都不存。
+  假装提供一个 enroll 代理、背后却连不上任何已标准化的接口，比没有
+  端点更坏。
+- **没有自建模型服务**：torch + 3D-Speaker 模型 + 向量库是独立的重大
+  决策（镜像体积、内存、启动时间全变），本轮刻意不做。
+- **不做说话人切换检测**（上游也没有）：每轮独立识别，靠"首轮才注入"
+  对冲串话。
+- **明文 HTTP**（见 1.14.3）。
+
+---
+
 ## 2. 接入 MySQL（完整步骤）
 
 ### 2.1 方式 A：让 Compose 起一个 MySQL 容器（overlay 叠加）

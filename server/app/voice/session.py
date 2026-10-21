@@ -37,6 +37,7 @@ import re
 import time
 from typing import Any, Final
 
+from sqlalchemy import select
 from starlette.concurrency import run_in_threadpool
 from starlette.websockets import WebSocket, WebSocketDisconnect
 
@@ -50,7 +51,7 @@ from ..models import InteractionKind
 from ..security import decode_token
 from .. import models as _m
 from .. import usage as usage_svc
-from . import asr_tts, opus_codec
+from . import asr_tts, opus_codec, voiceprint
 from .audio_pacing import AudioPacer
 from .prompts import (
     BASE_VOICE_PROMPT,
@@ -380,6 +381,18 @@ class VoiceSession:
         # 设备播完后继续听、不再喊唤醒词，服务端必须能自己重新武装监听
         # （见 _rearm_listening 的死锁说明）。
         self._listen_mode: str = ""
+
+        # ---- 声纹说话人（F3）状态 ----
+        # 已向 LLM "介绍过"的说话人（user 消息包成 {"speaker","content"}
+        # 的那一轮记一个）。复刻上游 xiaozhi-esp32-server 的
+        # introduced_speakers / system_introduced_speakers 语义：
+        # 首轮让模型自然称呼一次，之后降为纯文本 —— 否则每轮上下文里都
+        # 出现名字，模型会反复称呼，老人听着像复读机。
+        self._introduced_speakers: set[str] = set()
+        self._system_speakers: set[str] = set()
+        # 本轮认出的说话人显示名（None = 没开声纹 / 没认出 / 没登记）。
+        # 只为日志与埋点存在，不参与任何判据。
+        self._current_speaker: str | None = None
 
         # 静音看门狗 task 的单实例引用。重新武装前先取消旧的，
         # 否则会出现两个看门狗同时等静音（重复触发一轮对话）。
@@ -1207,13 +1220,47 @@ class VoiceSession:
 
     async def _run_turn(self, pcm: list[bytes], started: float) -> str:
         t_asr = _now_ms()
+        pcm_all = b"".join(pcm)
 
         def _asr() -> str:
             with SessionLocal() as db:
-                return asr_tts.asr(db, b"".join(pcm))
+                return asr_tts.asr(db, pcm_all)
+
+        # ---- F3 声纹：与 ASR **并行**发起（复刻上游 connection.py 的并行触发）
+        # 为什么并行而不是串在 ASR 后面：声纹服务按设计在局域网，通常比 ASR
+        # 厂商的 HTTP 往返快得多，并行约等于零成本；串行则每轮多等一个来回，
+        # 老人直接感觉得到。超时/失败一律按"没认出"处理（见 voiceprint 模块
+        # docstring 第 5 条）—— 认不出人只是这轮不个性化，绝不能卡住陪聊。
+        def _identify() -> tuple[tuple[str, str, str] | None, float]:
+            if self.dev.owner_id is None:
+                return None, 0.0        # 未绑定设备：没有"家人"可认
+            with SessionLocal() as db:
+                rows = list(db.scalars(
+                    select(_m.VoiceSpeaker).where(
+                        _m.VoiceSpeaker.owner_id == self.dev.owner_id,
+                        _m.VoiceSpeaker.enabled.is_(True),
+                        _m.VoiceSpeaker.deleted_at.is_(None))))
+            if not rows:
+                return None, 0.0        # 一个说话人都没登记 = 没配 = 不识别
+            speakers = [(r.speaker_key, r.name, r.description or "")
+                        for r in rows]
+            return voiceprint.identify_speaker(pcm_all, speakers)
 
         try:
-            utterance = await run_in_threadpool(_asr)
+            if voiceprint.enabled():
+                # return_exceptions=True：声纹那边的异常不外溢，ASR 的异常
+                # 照旧走下面的分支（拿不到第一个结果就直接 raise 它）。
+                asr_res, vp_res = await asyncio.gather(
+                    run_in_threadpool(_asr), run_in_threadpool(_identify),
+                    return_exceptions=True)
+                if isinstance(asr_res, BaseException):
+                    raise asr_res
+                utterance = asr_res
+                speaker_hit = (None, 0.0) if isinstance(vp_res, BaseException) \
+                    else vp_res
+            else:
+                utterance = await run_in_threadpool(_asr)
+                speaker_hit = (None, 0.0)
         except asr_tts.VoiceConfigMissingError:
             log.warning("[%s] 未配置 ASR", self.session_id)
             await self._send_alert("我现在听不见，请让家人在管理后台配置好语音识别")
@@ -1223,6 +1270,13 @@ class VoiceSession:
                         type(exc).__name__, exc)
             await self._send_alert("刚才没听清，请您再说一遍")
             return ""
+
+        speaker_row, speaker_score = speaker_hit
+        speaker_name = speaker_row[1] if speaker_row else None
+        if speaker_name:
+            self._current_speaker = speaker_name
+            log.info("[%s] 声纹认出：%s（相似度 %.3f）", self.session_id,
+                     speaker_name, speaker_score)
 
         if not utterance:
             # ASR 没认出东西：不调 LLM（让模型根据空文本编一句只会产出
@@ -1303,12 +1357,33 @@ class VoiceSession:
             memory_ctx = ""
 
         system = BASE_VOICE_PROMPT + "\n\n" + now_context()
+        # ---- F3：说话人身份注入 system（仅该说话人在本会话首次出现时）
+        # 与 user 消息的 JSON 包装是同一思路的两半：system 给"他是谁、
+        # 该怎么介绍他"（description 在这里才派上用场），JSON 让模型自然
+        # 称呼一次。两边都只来一次 —— 每轮都注入的后果是模型每轮都称呼，
+        # 上游为此专门加了两个 set，我们照抄这个判据。
+        if speaker_name and speaker_name not in self._system_speakers:
+            self._system_speakers.add(speaker_name)
+            desc = (speaker_row[2] or "").strip() if speaker_row else ""
+            line = f"当前说话人：{speaker_name}。"
+            if desc:
+                line += desc
+            system = system + "\n\n" + line
         if memory_ctx:
             system = system + "\n\n" + memory_ctx
 
         messages: list[dict[str, str]] = [{"role": "system", "content": system}]
         messages.extend(self._history[-config.VOICE_HISTORY_TURNS * 2:])
-        messages.append({"role": "user", "content": utterance})
+        # ---- F3：首轮把 user 内容包成 {"speaker","content"}
+        # 之后轮次用纯文本。降级是必须的：JSON 每轮都在上下文里出现名字，
+        # 会诱导模型反复称呼（上游 introduced_speakers 的同款语义）。
+        user_content = utterance
+        if speaker_name and speaker_name not in self._introduced_speakers:
+            self._introduced_speakers.add(speaker_name)
+            user_content = json.dumps(
+                {"speaker": speaker_name, "content": utterance},
+                ensure_ascii=False)
+        messages.append({"role": "user", "content": user_content})
 
         # ---- LLM（流式 + 工具调用循环）
         # 循环上限见 config.VOICE_TOOL_MAX_ROWS：LLM 反复调用工具时每轮都是
@@ -1691,6 +1766,10 @@ class VoiceSession:
                     meta["failed_tools"] = failed_tools
                 if tool_trace:
                     meta["tool_calls"] = tool_trace
+                if self._current_speaker:
+                    # F3：认出了谁。只记显示名，不记分数与音频 —— 埋点是给
+                    # 家属/运维看"个性化有没有生效"的，不是第二个声纹库。
+                    meta["speaker"] = self._current_speaker
                 db.add(_m.Interaction(
                     device_id=self.dev.id,
                     kind=_INTERACTION_KIND,

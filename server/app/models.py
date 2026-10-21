@@ -1313,3 +1313,56 @@ class WeatherCache(Base):
     last_hit_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow, index=True)
     hits: Mapped[int] = mapped_column(Integer, default=0)
+
+
+# ================================================================ 声纹说话人（F3）
+class VoiceSpeaker(Base):
+    """声纹登记的一位说话人（F3 · 3D Speaker）。
+
+    ``speaker_key`` 是**外部声纹服务那边**的 ID：向量是在那个服务上注册的
+    （"enrolled out-of-band by the service itself"，上游原话），我们只存
+    "这个 key 对应谁、该怎么向模型介绍他"。换个服务 = 重新在那边注册 +
+    把这边的 key 改过去，音频与向量都不经过本服务。
+
+    ⚠️ **刻意没有 record_type / preset 档**（与 Avatar 不同）：
+    "平台预设说话人"是个没有意义的概念 —— 平台不可能预先录好某位家属的
+    声纹。全部行都归属某个用户（这台设备的主人），管理员只是看得见全部。
+
+    ⚠️ **软删而不是真删**：与 Avatar 同一条理由的弱化版 —— 本表没有任何
+    外键指向它，真删也不会留下悬空引用；保留软删是为审计（谁删的、何时删的）
+    与"删了又想加回来"（同 key 重建，见 routers/voice_speakers.py 的 409
+    判定只数未删行）。
+    """
+
+    __tablename__ = "voice_speakers"
+    __table_args__ = (
+        Index("ix_voice_speaker_owner_key", "owner_id", "speaker_key"),
+        Index("ix_voice_speaker_owner_alive", "owner_id", "deleted_at"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    owner_id: Mapped[int] = mapped_column(
+        ForeignKey("users.id"), nullable=False, index=True)
+    #: 外部声纹服务侧的说话人 ID。同 owner 内未删行不允许重复（应用层 409）。
+    speaker_key: Mapped[str] = mapped_column(String(64), default="")
+    #: 显示名，也是喂给 LLM 的名字（"当前说话人：{name}"）。
+    name: Mapped[str] = mapped_column(String(64), default="")
+    #: 给 LLM 的一句话介绍（"您的儿子，在北京工作，周末常打电话"）。
+    #: 空 = 只报名字。它随 system prompt 发出去，别写长篇。
+    description: Mapped[str] = mapped_column(String(255), default="")
+    #: 停用不等于删除：保留登记、暂停参与识别（比如老人住院期间）。
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    deleted_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+    def is_alive(self) -> bool:
+        return self.deleted_at is None
+
+    def can_write(self, user: "User") -> bool:
+        """本人或管理员可写。没有 preset 档，所以不存在"平台行只读"的分支。"""
+        return bool(getattr(user, "is_admin", False)) or self.owner_id == user.id
+
+    def is_visible_to(self, user: "User") -> bool:
+        """本人或管理员可见（与 can_write 同判据：没有只读的他人行）。"""
+        return self.can_write(user)

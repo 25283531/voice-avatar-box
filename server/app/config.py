@@ -747,6 +747,35 @@ MQTT_MAX_CONNS = int(os.getenv("ELDER_MQTT_MAX_CONNS", "128"))
 # 设备按它发 UDP 只会打到代理自己身上。
 MQTT_UDP_HOST = os.getenv("ELDER_MQTT_UDP_HOST", "").strip()
 
+# ---------------------------------------------------------------- 声纹识别（F3）
+# 外部声纹服务的地址，形如 ``http://192.168.1.100:8005/voiceprint/health?key=XXXX``
+# （key 从 query 里解析，与上游 xiaozhi-esp32-server 的 VoiceprintProvider 同一约定）。
+# **空 = 功能关闭**（默认）。开启的前提：
+#   1. 已部署一个兼容的声纹服务（社区实现 voiceprint-api 用 ModelScope 3D-Speaker
+#      模型；契约见 app/voice/voiceprint.py 模块 docstring）；
+#   2. 管理端/用户端已在 /api/voice/speakers 登记了说话人（库里一个都没有 = 没配
+#      = 不识别，与上游"speakers 为空则禁用"同语义）；
+#   3. 知道这是**生物特征数据**：音频会离开本机发往该服务，欧盟 GDPR /  Illinois
+#      BIPA 等辖区的合规义务在部署方，详见 docs/DEPLOY.md §1.14。
+# ⚠️ 与 MQTT 同类的已知缺口：Phase 1 只有**明文 HTTP** —— key 与家庭音频在链路上
+# 裸奔。声纹服务应只在可信网络（局域网）内可达，不要把 key 下的地址暴露到公网。
+VOICEPRINT_URL = os.getenv("ELDER_VOICEPRINT_URL", "").strip()
+# 识别相似度阈值（0.0-1.0，默认 0.4，与上游一致）。高于它才认人：
+# 调高 = 误识别更少但拒识更多（老人被当成陌生人 ⇒ 该轮失去个性化，
+# 但对话本身不受影响 —— 这是我们刻意选的失败方向）。
+# 取值必须在 (0, 1]，否则功能关闭并在启动日志里说明（一个永真或永假的
+# 阈值比没有更坏：它让"认人了"这件事失去意义却看不出异常）。
+VOICEPRINT_THRESHOLD = float(os.getenv("ELDER_VOICEPRINT_THRESHOLD", "0.4"))
+# 单次识别超时（秒）。它与 ASR **并行**，所以通常不增加总时延；但这个值同时
+# 是硬上限 —— 声纹服务挂死时老人最多多等这么久，之后按"没认出"继续。
+# 上游用 10s；我们默认 5s：陪聊场景里"多等 10 秒"对老人是不可接受的，
+# 而识别失败的代价只是这一轮不个性化。
+VOICEPRINT_TIMEOUT_SEC = float(os.getenv("ELDER_VOICEPRINT_TIMEOUT_SEC", "5"))
+# 健康检查结果缓存（秒）。服务不可用时按这个间隔重探，避免每轮都去撞一次
+# 关掉的服务（每次最多耗时 VOICEPRINT_HEALTH_TIMEOUT_SEC）。
+VOICEPRINT_HEALTH_TTL_SEC = float(os.getenv("ELDER_VOICEPRINT_HEALTH_TTL_SEC", "30"))
+VOICEPRINT_HEALTH_TIMEOUT_SEC = float(os.getenv("ELDER_VOICEPRINT_HEALTH_TIMEOUT_SEC", "3"))
+
 # 服务端静音兜底阈值：连续静音超过它、且累计语音已达 VOICE_MIN_SPEECH_MS，
 # 就自动 finalize（等价于设备端 VAD 断句）。
 # 为什么需要它：① realtime 模式固件不做 VAD、等我们断句，而我们没有 AEC，

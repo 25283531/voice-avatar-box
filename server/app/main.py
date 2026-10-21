@@ -35,7 +35,7 @@ from .db import SessionLocal, get_db, init_db
 from .models import Avatar
 from .routers import (admin_presets, avatars, auth, chat_quota, device_api, devices,
                       home, mail, providers, reminders, roles, stats, support, usage,
-                      weather as weather_router)
+                      voice_speakers, weather as weather_router)
 from .schema_patch import run_all as run_schema_upgrade
 from .security import hash_password, verify_password
 # 记忆的 router 单独导入，**不从 .memory 包里取**：
@@ -568,6 +568,12 @@ for r in (weather_router.router,):
 # 也由我们自己签发（只给已绑定设备签，未绑定只给激活码，见 voice/__init__.py）。
 # attach() 自带幂等保护，冒烟脚本可提前自行调用。
 _voice.attach(app)
+
+# 声纹说话人登记（F3）：/api/voice/speakers CRUD + /api/voice/voiceprint/health。
+# 与语音链路同源同端口，但**不依赖语音链路被启用** —— 登记的是"外部声纹服务
+# 那边的 key ↔ 是谁"的映射，服务没配时列表照样能建（只是永远认不出人）。
+for r in (voice_speakers.router,):
+    app.include_router(r)
 
 # 人格预设运营后台：/api/admin/presets（调整现有平台预设的 5 个可改字段 +
 # 恢复默认 + 软约束 + 只读红线展示 + 审计）。只对**现有**平台预设开放，

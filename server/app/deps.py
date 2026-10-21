@@ -186,3 +186,27 @@ def require_avatar(
     elif not row.is_visible_to(user):
         raise HTTPException(status.HTTP_404_NOT_FOUND, "形象不存在")
     return row
+
+
+def require_voice_speaker(
+    db: Session,
+    speaker_pk: int,
+    user: models.User,
+    *,
+    write: bool = False,
+) -> models.VoiceSpeaker:
+    """取一个当前用户可访问的说话人行，否则 404。
+
+    与 require_avatar 同构（判定全交给模型上的 is_visible_to / can_write），
+    包括"不存在"与"无权访问"**同回 404** 这一条 —— 分开回码会让遍历 pk
+    成为探测"这个 id 是否存在"的工具。
+    """
+    row = db.get(models.VoiceSpeaker, speaker_pk)
+    if row is None or not row.is_alive():
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "说话人不存在")
+    if write:
+        if not row.can_write(user):
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "说话人不存在")
+    elif not row.is_visible_to(user):
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "说话人不存在")
+    return row

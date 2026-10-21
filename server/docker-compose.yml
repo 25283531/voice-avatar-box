@@ -94,6 +94,19 @@ services:
       # 对应端口也要在下面 ports 里放行（取消注释）：
       #   - "${ELDER_MQTT_PORT:-1883}:1883"
       #   - "${ELDER_MQTT_UDP_PORT:-8884}:8884/udp"
+      # ---------------------------------------------------------------- 声纹认人（F3，默认关）
+      # 设备端没有认人的代码（这在小智架构里属于云端）。开启后服务端把每段
+      # 语音 POST 给外部声纹服务（3D-Speaker），拿回身份喂给 LLM 做个性化。
+      # **默认关闭**：ELDER_VOICEPRINT_URL 留空 = 不识别，且**行为与没开时
+      # 逐字节一样**（认不出人绝不是降级事故）。
+      # 开启前提有两个（少一个就不识别）：外部声纹服务已部署且健康；
+      # 已在 /api/voice/speakers 登记说话人（家属在 APP 里加）。
+      # ⚠️ Phase 1 只有**明文 HTTP**：key 与家庭音频裸奔，声纹服务应只在
+      # 可信网络（局域网）可达。声纹是生物特征数据，合规义务在部署方
+      # （见 docs/DEPLOY.md §1.14）。
+      #   ELDER_VOICEPRINT_URL: "http://192.168.1.100:8005/voiceprint/health?key=XXXX"
+      #   ELDER_VOICEPRINT_THRESHOLD: "0.4"
+      #   ELDER_VOICEPRINT_TIMEOUT_SEC: "5"
     volumes:
       - elder-data:/data
     # 对外只发布一个端口，默认 8064（8080 常与其它服务冲突）。

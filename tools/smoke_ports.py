@@ -138,6 +138,10 @@ DEFAULT_PORTS: dict[str, int] = {
     # 顶部注释），与 8132 错开且不在上游默认段（1883/8884）上，免得撞到
     # 本机真装了的 mosquitto。
     "smoke_mqtt_udp": 8132,
+    # 声纹认人（F3）：提供者契约 + 说话人登记 CRUD + 端到端个性化注入。
+    # 进程内还会额外占一个假声纹服务的口（默认 18099，见 smoke_voiceprint.py
+    # 顶部注释），与 8133 错开；不在任何常见服务端口段上。
+    "smoke_voiceprint": 8133,
 }
 
 

@@ -51,7 +51,7 @@
 | 工作流 | 触发 | 作用 |
 | --- | --- | --- |
 | `pr-gate.yml` | push 到 `main`/`master` + **每个 PR**（刻意不加 paths 过滤） | 常驻门禁「守门人自检」：CODEOWNERS 覆盖 + workflows 可解析。push 时自动跑，结果可见但**不再拦截推送**（见下方流程变更） |
-| `server-ci.yml` | push/PR 改动 `server/`、`tools/`、`firmware/components/elder/`；可手动 | 装依赖（含 `libopus0`）后跑 **9 个 `smoke_*.py` 冒烟脚本 + 6 个 QA/审计脚本**（清单见下方），另有 5 个 job：elder 组件宿主测试、MySQL 真实路径冒烟、Compose 文件校验、Dockerfile 语法检查（hadolint） |
+| `server-ci.yml` | push/PR 改动 `server/`、`tools/`、`firmware/components/elder/`；可手动 | 装依赖（含 `libopus0`）后跑 **10 个 `smoke_*.py` 冒烟脚本 + 6 个 QA/审计脚本**（清单见下方），另有 5 个 job：elder 组件宿主测试、MySQL 真实路径冒烟、Compose 文件校验、Dockerfile 语法检查（hadolint） |
 | `docker-build.yml` | push/PR 改动 `server/`；可手动 | 构建镜像 → 起容器校验 `/api/health`；**push 到 `main` 且容器冒烟通过后**才推 `ghcr.io/25283531/voice-avatar-box` 的 `latest` + 短 SHA（冒烟失败不推，`latest` 不被污染）；PR 只构建不推送；手动触发勾选 `publish` 可覆盖 tag 发布 |
 | `firmware-build.yml` | push 改动 `firmware/`、`tools/merge_to_xiaozhi.py` 或本文件；可手动 | 在 `espressif/idf:v5.5.1` 容器里编译 ESP32-S3 固件 → 合并单文件烧录镜像 → 上传 artifact。**每次构建都会打印生效的 `CONFIG_OTA_URL` 并在偏离本项目地址（IP `152.136.230.132` / 域名 `voice.250886.xyz`）时告警**；手动触发可自选板卡与后端地址 |
 | `app-build.yml` | push/PR 改动 `app/`；可手动 | 构建 H5 / 微信小程序并上传产物；校验后端地址已内联 |
@@ -62,7 +62,7 @@
 
 ⚠️ **不是只有一个 `smoke_server.py`**。数口径时要分清三件事：**脚本个数 ≠ 调用次数**：
 
-- `smoke:` job 里跑 **9 个不同的 `smoke_*.py`**（端口已登记在 `tools/smoke_ports.py`，
+- `smoke:` job 里跑 **10 个不同的 `smoke_*.py`**（端口已登记在 `tools/smoke_ports.py`，
   那是唯一真源，新脚本先登记再写死）：
 
 | 脚本 | 端口 | 守什么 |
@@ -76,6 +76,7 @@
 | `smoke_voice_catalog.py` | 8124 | 音色目录单一真源 + **就绪度面板如实反映零配置未就绪** |
 | `smoke_voice.py` | 8119 | 自研语音链路：WS 协议逐字段对固件 + Opus 编解码 + OTA 签发口径 |
 | `smoke_mqtt_udp.py` | 8132 | MQTT+UDP 传输（F1）：broker 协议 + AES-128-CTR 音频面对齐固件 + 端到端一轮 + 4 条反向变异自检 |
+| `smoke_voiceprint.py` | 8133 | 声纹认人（F3）：提供者契约 + 说话人登记 CRUD + 端到端个性化注入 + 4 条反向变异自检 |
 
 - 另有 **6 个 QA / 审计脚本**同在 `smoke:` job 里，它们**不属于 `smoke_*.py` 系列**，
   别数漏也别数重：
@@ -92,7 +93,7 @@
 - `mysql-smoke:` job **复跑 2 个**：`smoke_server.py 8100` 与 `smoke_roles.py 8101`
   走真实 MySQL 往返，另加 `eval_persona.py` 与 `qa3_drop_tables.py`。
   **这是同一批脚本的方言复跑，不是新脚本** —— 所以全仓「不同脚本数」是 8 + 6 = **14 个**，
-  而 CI 里 `python tools/smoke_*.py` 的**调用次数**是 9（SQLite）+ 2（MySQL）= **11 次**。
+  而 CI 里 `python tools/smoke_*.py` 的**调用次数**是 10（SQLite）+ 2（MySQL）= **12 次**。
 
 ⚠️ 其余 4 个 `qa3_*` 脚本**刻意不进 MySQL job**——它们直连 `sqlite3` 且 `boot()` 里
 无条件 `env["ELDER_DB"] = f"sqlite:///{DB}"`，会**覆盖掉 CI 传入的 MySQL 连接串**。
