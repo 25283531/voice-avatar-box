@@ -26,6 +26,7 @@ import wave
 from fastapi import APIRouter, Depends, HTTPException, Response, status
 from sqlalchemy import select
 from sqlalchemy.orm import Session
+from typing import Final
 
 from .. import models
 from ..db import get_db
@@ -33,10 +34,16 @@ from ..deps import get_current_admin, get_current_user, require_config
 from ..llm_gateway import GatewayError, chat, embed, rerank, resolve_plan
 from .. import provider_presets
 from ..model_catalog import (
+    API_STYLE_LOCAL_ASR,
+    API_STYLE_LOCAL_EMBED,
     API_STYLES,
     EXPORT_KINDS,
     KIND_LABELS,
     KIND_LIST,
+    LOCAL_ASR_TIMEOUT_SEC,
+    LOCAL_EMBED_TIMEOUT_SEC,
+    LOCAL_SERVICE_DEFAULTS,
+    LOCAL_STYLE_KIND,
     USAGE_ASR,
     USAGE_CHAT,
     USAGE_EMBED,
@@ -69,6 +76,76 @@ VALID_KINDS = KIND_LIST
 _CHAT_USAGES = frozenset({"chat", "light", "vision"})
 _EMBED_USAGES = frozenset({"embed"})
 _RERANK_USAGES = frozenset({"rerank"})
+
+#: 本地自建风格 -> 默认超时（秒）。为什么本地要单独一档：GGUF 版 FunASR
+#: 冷启动约 2.8s、稳态 ~1s，且请求串行执行，并发高时会排队；云端 ASR 的
+#: 30s 默认值在这里会偶发误判超时（本地慢 ≫ 云端慢，而超时是同一个数）。
+#: 与 model_catalog.LOCAL_ASR_TIMEOUT_SEC / LOCAL_EMBED_TIMEOUT_SEC 同源，
+#: 或许将来该把这份映射搬过去 —— 现在两个消费方都小，先各自引用常量即可。
+_LOCAL_STYLE_TIMEOUT: Final[dict[str, int]] = {
+    API_STYLE_LOCAL_ASR: LOCAL_ASR_TIMEOUT_SEC,
+    API_STYLE_LOCAL_EMBED: LOCAL_EMBED_TIMEOUT_SEC,
+}
+
+
+def _normalize_local_service(payload: ProviderIn, explicit: set[str]) -> bool:
+    """本地自建服务（FunASR / FastEmbed）的**保存即用**归一化。
+
+    需求原文：下拉选中「本地 ASR / 本地向量化」时，**不需要填写其他信息，
+    直接点击保存就能使用**。要满足它，四条属性必须有一个地方在保存时
+    自动补齐：kind（能力分类）、endpoint（服务地址）、timeout（本地模型
+    首帧慢）、model（仅作展示）。集中定义在
+    ``model_catalog.LOCAL_SERVICE_DEFAULTS``，前端自动填表
+    （见 static/index.html 的 onApiStyleChange）与本函数读同一份常量，
+    才不会出现「前端说不用填、后端说缺 endpoint」。
+
+    为什么 create 与 update 必须共用这一个函数：两个入口各写一遍，
+    迟早出现「新建能直接保存、再编辑一次反而丢默认值」的漂移 ——
+    而那种故障的表现是「明明配过，过几天自己坏了」。
+
+    :param payload: 请求体（会被就地修正）。
+    :param explicit: 请求体里**显式出现过**的字段名
+        （``model_dump(exclude_unset=True).keys()``）。用它区分
+        「管理员没填超时」与「管理员显式填了 30s」：``ProviderIn`` 的
+        ``timeout_sec`` 默认值本身就是 30，不区分就永远不知道
+        该不该换成本地更宽的默认值。
+    :return: 这一行是不是本地服务（调方据此决定要不要清缓存/记日志）。
+    """
+    style = (payload.api_style or "").strip()
+    meta = LOCAL_SERVICE_DEFAULTS.get(style)
+    if meta is None:
+        return False
+
+    # ① kind 强制对齐：选了「本地 ASR」却落在 llm_main 上，配置存得进、
+    #    列表看得见，调用时才报「尚未配置 chat 用途的模型」——
+    #    页面一切正常而功能全废，是最难自查的一类故障（见 D50 同款成因）。
+    payload.kind = LOCAL_STYLE_KIND[style]
+    # ② name 允许只选下拉就保存：schema 层 name 必填但允许空串，
+    #    这里补一个可读的默认名（管理员随后可在列表里改）。
+    if not (payload.name or "").strip():
+        payload.name = meta["label"]
+    # ③ provider 留空则填预置值（填了不动）：asr_tts._asr_style 与
+    #    前端「当前厂商」回显都认它。
+    if not (payload.provider or "").strip():
+        payload.provider = meta["provider"]
+    # ④ endpoint 留空填默认（同机部署走 127.0.0.1）；管理员填了地址
+    #    （Docker 不在同一 netns 时填宿主 IP，如 10.2.0.16）就以他为准 ——
+    #    这个字段仍然是可编辑的，只是不再是必填。
+    if not (payload.endpoint or "").strip():
+        payload.endpoint = meta["endpoint"]
+    # ⑤ 本地服务没有密钥这一说：一律清空。前端对这个风格隐藏 API Key 栏，
+    #    但**后端不能依赖前端**（旧请求体、脚本调用、以后新前端都可能带回它）。
+    #    带着Bearer 头的另一个代价：将来换实现时没人想得起这个 key 是哪来的。
+    payload.api_key = ""
+    # ⑥ model 仅作展示：FunASR 按服务端加载的 gguf 识别、FastEmbed 同理，
+    #    都不看这个字段。留空填展示名；管理员填了就以他为准
+    #    （留一个不改代码就能改展示名的口子）。
+    if not (payload.model or "").strip():
+        payload.model = meta["model"]
+    # ⑦ 超时：没显式填才用本地默认值（理由见 _LOCAL_STYLE_TIMEOUT）
+    if "timeout_sec" not in explicit:
+        payload.timeout_sec = _LOCAL_STYLE_TIMEOUT[style]
+    return True
 
 
 def _clear_query_cache_if_embedding(kind: str | None) -> None:
@@ -113,7 +190,12 @@ def create_provider(payload: ProviderIn, db: Session = Depends(get_db),
     承载（人格、traits、guardrails、派生关系全在那里）。在这里放行空 kind
     等于给"角色改造波及平台配置"留了一条后门 —— APP 建角色时少传一个字段就
     会静默落成一条没有厂商的"平台配置"，然后被设备下发当成真配置用。
+
+    ⚠️ 归一化在校验**之前**：本地服务风格会自己补 kind（选中「本地 ASR」
+    却把能力留空是需求允许的用法），先校验证就把它和"真忘了传 kind"一起拒了。
     """
+    explicit = set(payload.model_dump(exclude_unset=True).keys())
+    _normalize_local_service(payload, explicit)
     if not (payload.kind or "").strip():
         raise HTTPException(
             status.HTTP_400_BAD_REQUEST,
@@ -188,6 +270,11 @@ def provider_catalog(user: models.User = Depends(get_current_user)):
             for u in USAGE_LIST
         ],
         "api_styles": [{"value": v, "label": t} for v, t in API_STYLES.items()],
+        # 本地自建服务（选中即用）：把默认 endpoint / kind / model / 超时
+        # 一起给前端，自动填表不硬编码地址 —— 单一真源在
+        # model_catalog.LOCAL_SERVICE_DEFAULTS，后端保存时还会再归一化一次。
+        "local_services": {style: dict(meta)
+                           for style, meta in LOCAL_SERVICE_DEFAULTS.items()},
     }
     payload.update(voice_catalog.catalog_payload())
     payload.update(voice_catalog.vendors_payload())
@@ -458,7 +545,12 @@ def test_voice(payload: ModelTestIn, db: Session = Depends(get_db),
     from ..voice.asr_tts import VoiceConfigMissingError, VoiceUpstreamError
 
     usage = _require_usage(payload.usage)
-    text = (payload.text or "老人，今天该吃药了").strip()
+    # ⚠️ text 允许是 list（embed 的批量入口，见 ModelTestIn）—— 语音侧只吃
+    # 单段字符串。必须在**调 .strip() 之前**归一：顺序反了的话一个 list 会
+    # 先在 .strip() 上抛 AttributeError → 500，而调用方（管理页）只会看到
+    # 一句"测试失败"，排查时根本看不出是类型不匹配。
+    raw_text = payload.text if isinstance(payload.text, str) else ""
+    text = (raw_text or "老人，今天该吃药了").strip()
     started = time.monotonic()
     try:
         if usage == USAGE_TTS:
@@ -524,7 +616,11 @@ def update_provider(provider_pk: int, payload: ProviderIn, db: Session = Depends
     非管理员一律 403，且**在取行之前**就拒 —— 否则 403/404 的差异会成为
     主键存在性的探测信道。管理员若传了一个非 config 的 id（角色行），返回
     404：这既防住了"把角色改成配置"，也让角色接口的语义保持唯一。
+
+    与 create_provider 同样：本地风格先归一化再校验 kind（内侧注释见那里）。
     """
+    explicit = set(payload.model_dump(exclude_unset=True).keys())
+    _normalize_local_service(payload, explicit)
     p = require_config(db, provider_pk, admin)
     if not (payload.kind or "").strip():
         raise HTTPException(

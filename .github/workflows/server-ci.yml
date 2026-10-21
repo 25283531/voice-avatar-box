@@ -253,6 +253,20 @@ jobs:
           PY
           python tools/smoke_voice.py 8119
 
+      # 模型接入点冒烟（九种 kind 注册 / usage 平滑过渡 / 四家报文协议切换 /
+      # 错误五码分诊 / 密钥脱敏 / 设备下发兜底 / context_window 裁剪）。
+      # 为什么必须进 CI（此前它只在本机跑，等于这套断言对 GitHub 上的每个
+      # PR 都不存在）：它守的正是「接入层」——**任何一次协议拼装改动
+      # （换 path、换字段名、换 priority 口径）都只在这里留下痕迹**。
+      # 2026-10-22 起它还覆盖两个本地自建服务（I 组：只选风格就保存、
+      # 本地 FastEmbed 的 /embed 单条与批量两种报文）——那正是本轮新接的
+      # 协议分支，不进 CI 的话「提交时绿、合并后没人再跑」。
+      # 全程打本地 127.0.0.1 上的假厂商（不花一分钱、不需要任何凭据），
+      # 端口 8104 已在 tools/smoke_ports.py 登记。
+      - name: 模型接入点冒烟（kind/usage/协议切换/错误分诊/本地自建服务）
+        # 经 run_smoke 落盘：红灯时日志进 artifact（见末尾「失败诊断」步骤）
+        run: python tools/run_smoke.py logs/smoke_smoke_models.log python tools/smoke_models.py 8104
+
       # 进程内故障注入：审计写失败时业务写必须回滚（T32 的**运行时**形态）。
       # 不起 HTTP 子进程、不占端口（进程内直调端点函数），所以不需要在
       # smoke_ports.py 登记；也不进 mysql-smoke job —— 它 monkeypatch 的

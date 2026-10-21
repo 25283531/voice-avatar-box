@@ -37,9 +37,10 @@ endpoint 有时不会立刻报错** —— 少写了 ``/v1`` 时，某些网关�
 """
 from __future__ import annotations
 
-from typing import Final, TypedDict
+from typing import Final, NotRequired, TypedDict
 
 from .model_catalog import (
+    KIND_ASR,
     KIND_EMBEDDING,
     KIND_LLM_LIGHT,
     KIND_LLM_MAIN,
@@ -57,6 +58,12 @@ class ProviderPreset(TypedDict):
     models: dict[str, str]  # kind -> 推荐模型名（前端按当前 kind 取）
     free_tier: str          # 费用口径（用户最关心的实际成本）
     notes: str              # 坑
+    # ---- 以下只对「本地自建服务」预置有意义（2026-10-22 接入）----
+    # 用 NotRequired 而不是另起一张表：云端预置一个都不写也合法，
+    # 本地预置则带上「这个预置隐含的能力分类」——前端选中它时同步 kind，
+    # 后端 _normalize_local_service 还会再强制一次（双保险，防前端漏改）。
+    # 两边都读 model_catalog.LOCAL_SERVICE_DEFAULTS 的同源常量。
+    kind: NotRequired[str]
 
 
 PROVIDER_PRESETS: Final[tuple[ProviderPreset, ...]] = (
@@ -142,6 +149,46 @@ PROVIDER_PRESETS: Final[tuple[ProviderPreset, ...]] = (
         "free_tier": "**无免费额度**，需绑卡。",
         "notes": "⚠️ 国内直连不稳定；本项目不为其做特殊处理，"
                  "连不上先查网络再查 key。",
+    },
+    # ============================================================ 本地自建（Docker）
+    # 为什么本地服务也要做预置：需求是「下拉选中本地 ASR / 本地向量化，
+    # 其它什么都不填，点保存就能用」。没有预置条目，管理员就只能手填
+    # api_style=local_asr —— 而那个下拉在「厂商 API 风格」里，正常人找不到。
+    # 这两条的 endpoint 与 model_catalog.LOCAL_SERVICE_DEFAULTS 同源，
+    # 后端保存时还会再归一化一次（见 routers/providers._normalize_local_service）。
+    {
+        "value": "funasr_local",
+        "label": "本地 ASR（FunASR/SenseVoice · 免密钥）",
+        "api_style": "local_asr",
+        "endpoint": "http://127.0.0.1:8082",
+        "needs_key": False,
+        "key_hint": "本地服务没有密钥这一说 —— 选中直接保存即可。",
+        "models": {KIND_ASR: "sensevoice-small"},
+        "free_tier": "**零调用成本**：模型跑在本机（llama.cpp GGUF 版 SenseVoice），"
+                     "代价是常驻内存与 CPU，且请求串行执行。",
+        "notes": "⚠️ ① 选中后能力会自动锁定为「语音识别 ASR」"
+                 "② 「模型」栏只是展示名，真正识别的模型由服务端加载的 gguf 决定"
+                 "③ 助手后端与模型不在同一 Docker 网络时，把接口地址改成宿主地址"
+                 "（如 http://10.2.0.16:8082）。",
+        "kind": KIND_ASR,
+    },
+    {
+        "value": "fastembed_local",
+        "label": "本地向量化（FastEmbed/bge · 免密钥）",
+        "api_style": "local_embed",
+        "endpoint": "http://127.0.0.1:8080",
+        "needs_key": False,
+        "key_hint": "本地服务没有密钥这一说 —— 选中直接保存即可。",
+        "models": {KIND_EMBEDDING: "bge-small-zh-v1.5"},
+        "free_tier": "**零调用成本**：FastEmbed（ONNX Runtime，CPU），"
+                     "512 维且已 L2 归一化（点积即余弦相似度），"
+                     "常驻约 222MB、单条约 30ms。",
+        "notes": "⚠️ ① 选中后能力会自动锁定为「向量模型 Embedding」"
+                 "② 助手后端与模型不在同一 Docker 网络时，把接口地址改成宿主地址"
+                 "（如 http://10.2.0.16:8080）"
+                 "③ 换不同维度的模型后，旧记忆的语义路会自动失效（维度不符不参与计算），"
+                 "需要重新入库。",
+        "kind": KIND_EMBEDDING,
     },
 )
 

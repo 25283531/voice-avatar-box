@@ -139,6 +139,13 @@ API_STYLE_VOLCENGINE: Final = "volcengine"
 API_STYLE_OLLAMA: Final = "ollama"
 API_STYLE_XINFERENCE: Final = "xinference"
 API_STYLE_CUSTOM: Final = "custom"
+# 本机自建的两种服务（2026-10-22 接入）：FunASR/SenseVoice 语音识别与
+# FastEmbed/bge 向量化。它们**不是** OpenAI 兼容（报文形状完全不同），
+# 也**不需要**密钥与模型名，所以单独立风格而不是复用 localhost 的
+# openai_compatible —— 后者会逼管理员填一个用不上的 model，且调用层
+# 会按 /audio/transcriptions 拼路径，连不上还查不出原因。
+API_STYLE_LOCAL_ASR: Final = "local_asr"
+API_STYLE_LOCAL_EMBED: Final = "local_embed"
 
 DEFAULT_API_STYLE: Final = API_STYLE_OPENAI_COMPAT
 
@@ -152,7 +159,50 @@ API_STYLES: Final[dict[str, str]] = {
     API_STYLE_OLLAMA: "Ollama（本地）",
     API_STYLE_XINFERENCE: "Xinference（本地推理网关）",
     API_STYLE_CUSTOM: "自定义（OpenAI 兼容）",
+    API_STYLE_LOCAL_ASR: "本地 ASR（FunASR/SenseVoice，无需密钥）",
+    API_STYLE_LOCAL_EMBED: "本地向量化（FastEmbed/bge，无需密钥）",
 }
+
+# ---------------------------------------------------------------- 本机自建服务
+# 为什么这些默认值必须集中在这里，而不是散落在路由/前端各写一份
+# ------------------------------------------------------------------
+# 需求是「在下拉里选中本地 ASR / 本地向量化，**其它什么都不填，点保存就能用**」。
+# 要满足它，kind、endpoint、超时必须有一个地方能在保存时自动补齐 ——
+# 三个消费方（路由归一化、前端自动填表、文档）读的是同一份常量，
+# 才不会出现「接口存得进但调不通」或「前端说不用填、后端说缺 endpoint」。
+#
+# endpoint 默认取 127.0.0.1 是因为这两个服务与本品端通常同机部署
+# （systemd 常驻，见 docs/DEPLOY.md §1.12）。Docker 部署时若不在同一
+# network namespace，管理员把它改成宿主地址（如 10.2.0.16）即可 ——
+# 字段仍然可编辑，只是不再是必填。
+LOCAL_SERVICE_DEFAULTS: Final[dict[str, dict[str, str]]] = {
+    API_STYLE_LOCAL_ASR: {
+        "kind": KIND_ASR,
+        "provider": "funasr_local",
+        "endpoint": "http://127.0.0.1:8082",
+        # 仅作展示用：FunASR 服务端按加载的模型识别，不看这个字段
+        "model": "sensevoice-small",
+        "label": "本地 ASR（FunASR/SenseVoice）",
+    },
+    API_STYLE_LOCAL_EMBED: {
+        "kind": KIND_EMBEDDING,
+        "provider": "fastembed_local",
+        "endpoint": "http://127.0.0.1:8080",
+        "model": "bge-small-zh-v1.5",
+        "label": "本地向量化（FastEmbed/bge）",
+    },
+}
+
+#: 这两种风格的隐含能力分类。保存时按它强制 kind，避免"选了本地 ASR 却落在
+#: llm_main 上"——那种配置存得进去、用的时候才报 no_config。
+LOCAL_STYLE_KIND: Final[dict[str, str]] = {
+    style: meta["kind"] for style, meta in LOCAL_SERVICE_DEFAULTS.items()
+}
+
+#: 本地服务的默认超时（秒）。GGUF 版 FunASR 冷启动约 2.8s、稳态 ~1s，
+#: 请求串行执行，高并发会排队 —— 比云端 ASR 宽一倍，宁可等也别误判超时。
+LOCAL_ASR_TIMEOUT_SEC: Final[int] = 60
+LOCAL_EMBED_TIMEOUT_SEC: Final[int] = 30
 
 # 风格 -> 线路协议。多个厂商共用一个协议是正常的：它们只是鉴权头或计费口径不同，
 # 报文形状一致。留此映射是为了将来某家改协议时只动一行。
@@ -160,6 +210,11 @@ PROTOCOL_OPENAI: Final = "openai"
 PROTOCOL_ANTHROPIC: Final = "anthropic"
 PROTOCOL_GEMINI: Final = "gemini"
 PROTOCOL_OLLAMA: Final = "ollama"
+# 本机自建服务的私有协议。不复用 openai：报文形状（/asr 的 multipart、
+# /embed 的 input/texts）与鉴权（无密钥）都不同，混在一起会让调用层
+# 到处判 style，正是本项目反复吃过的亏。
+PROTOCOL_LOCAL_ASR: Final = "local_asr"
+PROTOCOL_LOCAL_EMBED: Final = "local_embed"
 
 STYLE_PROTOCOL: Final[dict[str, str]] = {
     API_STYLE_OPENAI_COMPAT: PROTOCOL_OPENAI,
@@ -171,13 +226,29 @@ STYLE_PROTOCOL: Final[dict[str, str]] = {
     API_STYLE_OLLAMA: PROTOCOL_OLLAMA,
     API_STYLE_ANTHROPIC: PROTOCOL_ANTHROPIC,
     API_STYLE_GEMINI: PROTOCOL_GEMINI,
+    API_STYLE_LOCAL_ASR: PROTOCOL_LOCAL_ASR,
+    API_STYLE_LOCAL_EMBED: PROTOCOL_LOCAL_EMBED,
 }
 
 # 哪些协议支持 /embeddings 与 /rerank。
 # Anthropic 官方没有 embeddings 接口（要用得配 Voyage），Gemini 走的是
 # :embedContent 另一套路径，先不实现，命中时给一句明确报错，好过返回一个空向量。
-PROTOCOL_WITH_EMBEDDINGS: Final[tuple[str, ...]] = (PROTOCOL_OPENAI, PROTOCOL_OLLAMA)
+PROTOCOL_WITH_EMBEDDINGS: Final[tuple[str, ...]] = (
+    PROTOCOL_OPENAI, PROTOCOL_OLLAMA, PROTOCOL_LOCAL_EMBED,
+)
 PROTOCOL_WITH_RERANK: Final[tuple[str, ...]] = (PROTOCOL_OPENAI,)
+
+
+def protocol_of_style(api_style: str | None) -> str:
+    """与 :func:`protocol_of` 同义，但**只认显式风格**（不回落默认）。
+
+    给「保存时归一化」这类需要区分"用户到底选没选本地服务"的场合用：
+    空风格要按 OpenAI 兼容处理，而这里必须返回空串让调用方自己决定。
+    """
+    style = (api_style or "").strip()
+    if not style:
+        return ""
+    return STYLE_PROTOCOL.get(style, PROTOCOL_OPENAI)
 
 
 def usage_kinds(usage: str) -> tuple[str, ...]:

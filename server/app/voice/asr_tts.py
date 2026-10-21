@@ -1,6 +1,6 @@
-"""ASR / TTS 客户端：**只实现 OpenAI 兼容风格**（V1 边界）。
+"""ASR / TTS 客户端：默认只实现 OpenAI 兼容风格（V1 边界）。
 
-为什么只做一种风格
+为什么默认只做一种风格
 ----------------
 本项目把第三方服务全部收敛到自己的镜像里（见 config.py 的「历史沿革」注释），
 云端 ASR/TTS 厂商的私有报文形状一个都不接。OpenAI 兼容是事实标准：
@@ -8,6 +8,12 @@ vLLM / Xinference / Ollama(兼容层) / one-api / new-api / 各种国产网关�
 提供 ``/audio/transcriptions`` 与 ``/audio/speech``。要接新厂商时优先
 在**网关层**做风格适配，而不是在这里加分支 —— 那会把 llm_gateway
 已经踩过的坑（四种报文形状的翻译）再踩一遍。
+
+例外：本机自建的 FunASR/SenseVoice（``api_style=local_asr``）
+------------------------------------------------------------
+它不是 OpenAI 兼容（``/asr`` + multipart ``audio`` 字段、无 model 无密钥），
+硬套 OpenAI 路径只会得到 404/400 且报错指不到真因，所以在 :func:`asr`
+里有一个显式分支。判据见 :func:`_asr_style`。
 
 ⚠️ V1 已知边界：**流式 TTS 未实现**（一次性拿完整段音频再切帧发）。
 实时逐句 TTS 是明显的下一轮增量；当前实现首句延迟 = 完整推理时间，
@@ -36,7 +42,7 @@ import urllib.request
 from typing import Any, Final
 
 from .. import config
-from ..model_catalog import usage_kinds
+from ..model_catalog import API_STYLE_LOCAL_ASR, usage_kinds
 
 log = logging.getLogger(__name__)
 
@@ -386,6 +392,26 @@ def _asr_endpoint_scheme(row: Any) -> str:
     return (urllib.parse.urlsplit(endpoint).scheme or "").lower()
 
 
+def _asr_style(row: Any) -> str:
+    """这一行走哪条 ASR 实现（``local_asr`` 或 ``openai_compatible``）。
+
+    判据与 ``_tts_dispatch_style`` 同构：先认 provider 预置值，再认显式
+    ``api_style``。**本地 ASR 必须排在 api_style 之前判**的理由与 TTS 侧
+    完全一样：预置会把 api_style 一并写好，但历史行可能是老默认值，
+    让 api_style 先判会把本地行静默路由到 OpenAI 路径（表现为
+    「配好了却报 endpoint 格式不对」）。
+
+    回落 OpenAI 兼容而不是报错，与 TTS 侧同一理由：不破坏存量配置。
+    """
+    provider = (getattr(row, "provider", "") or "").strip().lower()
+    if provider == "funasr_local":
+        return API_STYLE_LOCAL_ASR
+    style = (getattr(row, "api_style", "") or "").strip()
+    if style == API_STYLE_LOCAL_ASR:
+        return API_STYLE_LOCAL_ASR
+    return "openai_compatible"
+
+
 def _row_label(row: Any) -> str:
     return f"{getattr(row, 'name', '')}({getattr(row, 'model', '')})"
 
@@ -410,6 +436,10 @@ def asr(db: Any, pcm_16k: bytes) -> str:
     整条语音链路「唤醒成功但一个字都识别不出」。
     ⇒ 改成与 LLM 网关同构的「按序兜底」：非 http(s) 端点跳过并告警，
     调用失败换下一条，全部失败才抛。
+
+    风格分支（2026-10-22）：``api_style=local_asr`` 走本机 FunASR/SenseVoice
+    的 ``/asr``，其余走 OpenAI 兼容的 ``/audio/transcriptions``。判据见
+    :func:`_asr_style`。
     """
     from ..llm_gateway import resolve_plan
 
@@ -431,15 +461,24 @@ def asr(db: Any, pcm_16k: bytes) -> str:
             continue
 
         timeout = _row_timeout(row, ASR_TIMEOUT_SEC)
-        model = (getattr(row, "model", "") or "").strip() or "whisper-1"
-        fields = {
-            "model": model,
-            "language": config.VOICE_ASR_LANGUAGE,
-            "response_format": "json",
-        }
         try:
-            payload = _post_multipart(row, "/audio/transcriptions", fields,
-                                      "file", "utterance.wav", wav, timeout)
+            if _asr_style(row) == API_STYLE_LOCAL_ASR:
+                # 本机 FunASR/SenseVoice（llama.cpp GGUF 版）：
+                # POST {endpoint}/asr，multipart 字段名 audio，**不需要**
+                # model / language / response_format —— 服务端按加载的模型
+                # 识别、语种自动判别。多传字段无害，但传 model 会让人误以为
+                # 换个名字就能换模型（实际要改服务端加载的 gguf）。
+                payload = _post_multipart(row, "/asr", {},
+                                          "audio", "utterance.wav", wav, timeout)
+            else:
+                model = (getattr(row, "model", "") or "").strip() or "whisper-1"
+                fields = {
+                    "model": model,
+                    "language": config.VOICE_ASR_LANGUAGE,
+                    "response_format": "json",
+                }
+                payload = _post_multipart(row, "/audio/transcriptions", fields,
+                                          "file", "utterance.wav", wav, timeout)
         except VoiceUpstreamError as exc:
             log.warning("ASR 配置「%s」调用失败，按序换下一条：%s",
                         _row_label(row), exc)

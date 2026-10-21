@@ -78,6 +78,7 @@ from .model_catalog import (
     DEFAULT_API_STYLE,
     PROTOCOL_ANTHROPIC,
     PROTOCOL_GEMINI,
+    PROTOCOL_LOCAL_EMBED,
     PROTOCOL_OLLAMA,
     PROTOCOL_OPENAI,
     PROTOCOL_WITH_EMBEDDINGS,
@@ -1474,11 +1475,38 @@ def embed(db: Session, text: str | list[str], *, usage: str = "embed",
                 f"「{API_STYLES.get(style, style)}」风格暂不支持文本嵌入；"
                 f"请改用 OpenAI 兼容的向量模型（如 bge-m3、text-embedding-v3）"
             )
+        timeout = _timeout_of(row, timeout_sec)
+
+        if protocol == PROTOCOL_LOCAL_EMBED:
+            # 本机 FastEmbed（BAAI/bge-small-zh-v1.5，512 维，已 L2 归一化）。
+            # 报文形状与 OpenAI 完全不同（/embed + input/texts，无 model 无密钥），
+            # 所以这里是独立分支而不是拼 /embeddings 再撞 404。
+            # 单条用 input、批量用 texts —— 与本地服务实现的判据一一对应
+            # （服务端只认这两种报文形状，混用会 400）。
+            body: dict[str, Any] = (
+                {"input": inputs[0]} if len(inputs) == 1 else {"texts": inputs}
+            )
+            started = time.monotonic()
+            _, raw = _http_post(row, "/embed", body, timeout)
+            payload = _load_json(raw)
+            vectors = _extract_vectors(protocol, payload)
+            if not vectors:
+                raise BadResponseError(
+                    "本地向量化服务响应里没有 embedding 数组，"
+                    "请检查服务是否已加载模型（GET /health 看 dim）"
+                )
+            # model 字段本地服务根本不看，只为落库对账留个可读名字。
+            model = (getattr(row, "model", "") or "").strip() or "bge-small-zh-v1.5"
+            return VectorResult(
+                vectors=vectors, provider_pk=row.id, provider_name=row.name, kind=kind,
+                model=model, usage=usage, dimensions=len(vectors[0]),
+                elapsed_ms=int((time.monotonic() - started) * 1000),
+            )
+
         model = (getattr(row, "model", "") or "").strip()
         if not model:
             raise BadConfigError(f"配置「{row.name}」没有填写模型名（model）")
 
-        timeout = _timeout_of(row, timeout_sec)
         if protocol == PROTOCOL_OLLAMA:
             path, body = "/api/embeddings", {"model": model, "input": inputs}
         else:
@@ -1502,9 +1530,13 @@ def embed(db: Session, text: str | list[str], *, usage: str = "embed",
 
 
 def _extract_vectors(protocol: str, payload: dict[str, Any]) -> list[list[float]]:
-    """各家 embeddings 响应取向量：OpenAI 是 data[].embedding，Ollama 是 embeddings[]。"""
+    """各家 embeddings 响应取向量：
+    OpenAI 是 data[].embedding；Ollama 是 embeddings[]；
+    本地 FastEmbed 批量是 embeddings[]（键名与 Ollama 恰好一致，同上处理）。
+    """
     out: list[list[float]] = []
-    if protocol == PROTOCOL_OLLAMA and isinstance(payload.get("embeddings"), list):
+    if protocol in (PROTOCOL_OLLAMA, PROTOCOL_LOCAL_EMBED) \
+            and isinstance(payload.get("embeddings"), list):
         rows_src = [{"embedding": v} for v in payload["embeddings"]]
     else:
         rows_src = payload.get("data") or []

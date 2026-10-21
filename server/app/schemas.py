@@ -4,9 +4,15 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    field_validator,
+    model_validator,
+)
 
-from .model_catalog import API_STYLES, KIND_LIST
+from .model_catalog import API_STYLES, KIND_LIST, LOCAL_SERVICE_DEFAULTS
 from .schedule import parse_hhmm
 
 
@@ -221,14 +227,36 @@ class ProviderIn(ORMBase):
     @classmethod
     def _check_kind(cls, v: str) -> str:
         v = (v or "").strip()
-        # 空 kind 一律拒绝：那是角色，而角色的入口是 /api/roles。
-        # 在schema 层就挡住，比在路由里判更早，也让"忘记传 kind"这种调用方 bug
-        # 直接暴露成 422 而不是静默落一条残缺数据。
+        # 空 kind 先放行到 model_validator：本地自建服务风格
+        # （local_asr / local_embed）允许「只选风格就保存」，kind 由保存时的
+        # 归一化补齐（见 routers/providers._normalize_local_service）。
+        # 在**字段校验器**里做不了这个例外：api_style 声明在 kind 之后，
+        # 字段校验器拿不到还没校验的后续字段（info.data 里没有它）。
         if not v:
-            raise ValueError("kind 必填。创建角色请用 POST /api/roles")
+            return ""
         if v not in KIND_LIST:
             raise ValueError(f"kind 只能是 {'/'.join(KIND_LIST)} 之一")
         return v
+
+    @model_validator(mode="after")
+    def _kind_required_unless_local_service(self) -> "ProviderIn":
+        """空 kind 只对本地自建风格放行，其余一律拒绝（角色走 /api/roles）。
+
+        为什么例外只有这两个风格：需求是「下拉选中本地 ASR / 本地向量化时，
+        其它什么都不填，点保存就能用」。而空 kind 对其它任何风格都是残缺
+        数据 —— 那种行存得进、resolve 时却落到别的用途上，属于
+        「接口能存进去但查不出来」的玄学故障（见 model_catalog 模块说明）。
+
+        ⚠️ 判据用 ``api_style`` 而不是 ``provider``：风格才是「走哪条协议」，
+        手填 local_asr 的人未必会同时把 provider 手填成 funasr_local。
+        """
+        if not (self.kind or "").strip():
+            style = (self.api_style or "").strip()
+            if style not in LOCAL_SERVICE_DEFAULTS:
+                raise ValueError(
+                    "kind 必填。创建角色请用 POST /api/roles；"
+                    "本地 ASR / 本地向量化可只选风格保存")
+        return self
 
     @field_validator("api_style")
     @classmethod
@@ -458,8 +486,11 @@ class ModelTestIn(ORMBase):
     usage: str = "chat"
     # chat / vision 用：OpenAI 形状的 messages
     messages: list[dict[str, Any]] = Field(default_factory=list)
-    # embed 用：待向量化的文本
-    text: str = ""
+    # embed 用：待向量化的文本。**允许 list（批量）**：embed() 本就支持，
+    # 而本地 FastEmbed 的批量报文（texts[]）与单条（input）是两条不同路径
+    # （见 llm_gateway.embed 的 local_embed 分支）—— 不让它进来，
+    # 批量那半条路就永远没有请求能覆盖。
+    text: str | list[str] = ""
     # rerank 用：待重排的候选文档
     documents: list[str] = Field(default_factory=list)
 

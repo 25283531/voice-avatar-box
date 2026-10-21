@@ -985,9 +985,17 @@
             <div><label>模型</label><input v-model="pForm.model" style="width:100%" /></div>
             <div v-if="showEndpoint"><label>接口地址</label>
               <input v-model="pForm.endpoint" style="width:100%" />
+              <!-- 本地自建服务：地址仍然可编辑（Docker 不同网络命名空间时要改成
+                   宿主地址），但「填到 /v1 这一级」的通用提示对它完全不适用，
+                   所以两套提示按 localService 切换，不混排。 -->
+              <div v-if="localService" style="font-size:12px;color:#888;margin-top:4px">
+                默认 <code>{{localService.endpoint}}</code>（与助手同机部署）。
+                若模型不在同一个 Docker 网络里，改成宿主地址（如
+                <code>http://10.2.0.16:8080</code>）。不懂就保持默认。
+              </div>
               <!-- 这条提示对所有 kind 都给：endpoint 填错是本项目反复踩的坑，且
                    LLM 侧更隐蔽 —— 少写 /v1 有时拿到的是 HTML 首页而不是报错 -->
-              <div style="font-size:12px;color:#888;margin-top:4px">
+              <div v-else style="font-size:12px;color:#888;margin-top:4px">
                 填到 <code>/v1</code> 这一级（如 <code>https://…/compatible-mode/v1</code>），
                 不要填官网首页，也不要把整条接口地址（如 <code>…/chat/completions</code>）粘进来。
               </div>
@@ -1010,7 +1018,8 @@
                 <option :value="true">启用</option><option :value="false">停用</option>
               </select></div>
             <div><label>厂商 API 风格</label>
-              <select v-model="pForm.api_style" style="width:100%">
+              <select v-model="pForm.api_style" style="width:100%"
+                      @change="onApiStyleChange">
                 <option value="">OpenAI 兼容（默认）</option>
                 <option value="openai_compatible">OpenAI 兼容</option>
                 <option value="openai">OpenAI 官方</option>
@@ -1021,6 +1030,11 @@
                 <option value="ollama">Ollama（本地）</option>
                 <option value="xinference">Xinference（本地）</option>
                 <option value="custom">自定义</option>
+                <!-- 本机自建服务：路径与鉴权都与 OpenAI 兼容不同，选中即用
+                     （endpoint 自动补、API Key 隐藏）。默认值口径来自服务端
+                     local_services，不在这里硬编码地址。 -->
+                <option value="local_asr">本地 ASR（FunASR/SenseVoice，无需密钥）</option>
+                <option value="local_embed">本地向量化（FastEmbed/bge，无需密钥）</option>
               </select></div>
             <div><label>超时（秒）</label><input v-model.number="pForm.timeout_sec" type="number" min="1" max="600" /></div>
             <div><label>失败重试次数</label><input v-model.number="pForm.max_retries" type="number" min="0" max="5" /></div>
@@ -1440,6 +1454,10 @@ createApp({
       // 与 ttsVendors 同理走服务端下发，理由同上：厂商→endpoint/模型/免费口径
       // 只有 provider_presets.py 一份真源。字段缺失时回落成空数组（见装载处）。
       providerPresets: [],
+      // 本地自建服务默认值（同一接口的 local_services 字段，api_style ->
+      // {kind, provider, endpoint, model, label}）。前端「选中即用」的自动填表
+      // 全部读它，不硬编码地址 —— 单一真源在 model_catalog.LOCAL_SERVICE_DEFAULTS。
+      localServices: {},
       // 就绪度面板数据（GET /api/providers/readiness）
       readiness: null, readyBusy:false,
       pEditBox: false, pEdit: null, presetBusy:false,
@@ -1517,6 +1535,7 @@ createApp({
     // 单段（填两段反而连不上），本地服务压根不需要（留空即可）。
     apiKeyHint(){
       const f = this.pForm || {};
+      if (this.localService) return '本地服务没有密钥这一说 —— 选中直接保存即可。';
       if (f.kind === 'tts'){
         return (this.vendorInfo && this.vendorInfo.key_hint) || '（OpenAI 兼容服务只填一段 key）';
       }
@@ -1715,6 +1734,11 @@ createApp({
           // ⚠️ 用 Array.isArray 兜住，而不是 `|| []`：预置字段缺失/类型不对时
           // 退回「只有自部署三项」的下拉，而不是让模板里 v-for 拿到非数组直接抛错。
           this.providerPresets = Array.isArray(r.provider_presets) ? r.provider_presets : [];
+          // 本地自建服务默认值（本地 ASR / 向量化"选中即用"的地址来源）。
+          // 同样用类型兜底：拿不到就退回空表，本地两项在下拉里仍然可选，
+          // 只是不自动填 endpoint —— 后端保存时还会兜一次（归一化）。
+          this.localServices = (r.local_services && typeof r.local_services === 'object')
+            ? r.local_services : {};
           // 目录到达后要重新拆分：openPreset/editAvatar/openProvider 可能在
           // 目录还空时就把存量音色判成了「不在清单里」，落进自定义框。
           if (this.pEdit) Object.assign(this.pEdit, this.splitVoice(this.pEdit.tts_voice));
@@ -1920,6 +1944,13 @@ createApp({
       const map = this.voicesByVendor || {};
       return map[this.pForm.provider] || [];
     },
+    // 本地自建服务（本地 ASR / 本地向量化）：按当前 api_style 取服务端下发的
+    // 默认值。**非空即代表"这条配置是本地服务"**——API Key 隐藏、接口地址提示
+    // 切换、平台下拉联动都靠它判，判据统一在这一处。
+    localService(){
+      const s = (this.pForm && this.pForm.api_style) || '';
+      return (this.localServices || {})[s] || null;
+    },
     // Edge 没有 endpoint、没有 key —— 显示这两个输入框只会让人瞎填
     showEndpoint(){
       if (!this.pForm || this.pForm.kind!=='tts') return true;
@@ -1928,6 +1959,9 @@ createApp({
       return !!(this.vendorInfo && this.vendorInfo.endpoint);
     },
     showApiKey(){
+      // 本地服务（FunASR / FastEmbed）没有密钥：显示输入框只会让人瞎填，
+      // 而填了还会被后端清掉（providers 路由的归一化），不如干脆隐藏。
+      if (this.localService) return false;
       if (!this.pForm || this.pForm.kind!=='tts') return true;
       if (this.pForm.provider==='edge') return false;
       if (this.pForm.provider==='__other__') return true;
@@ -1942,9 +1976,21 @@ createApp({
         // 非 TTS：走 provider_presets 预置。__other__ / 自部署 / Dify /
         // 火山方舟 都不在预置表里 —— 这时**不干预**，让管理员自己填。
         const preset = this.providerPreset;
-        if (!preset) return;
+        if (!preset) {
+          // 但有个例外必须管：切到预置表之外的服务（Ollama / Dify / 自建…）时，
+          // 清掉上一个**本地预置**留下的 local_* 风格。留着它，后端会按本地
+          // 协议发请求 —— 症状是「明明配了 Ollama，却去连 8082」且日志无异常。
+          if (this.localService) this.pForm.api_style = '';
+          return;
+        }
+        // 本地预置隐含能力分类（选中「本地 ASR」而能力还停在 llm_main 时，
+        // 后端保存时会强制改 kind —— 这里先同步，管理员至少看得见）。
+        // 必须放在取模型之前：模型名正是按 kind 去预置表里查的。
+        if (preset.kind) this.pForm.kind = preset.kind;
         if (!this.pForm.endpoint)  this.pForm.endpoint  = preset.endpoint;
-        if (!this.pForm.api_style) this.pForm.api_style = preset.api_style;
+        // api_style 跟随预置**强一致**（不留"只填空值"的活口）：一旦某个
+        // local_* 风格残留下来，比 endpoint 填错更难查（见上一段注释）。
+        if (preset.api_style) this.pForm.api_style = preset.api_style;
         // 模型按当前 kind 取；该 kind 预置里没有（如 deepseek 没有 rerank）
         // 就**什么都不做** —— 既不清空也不瞎填，清空会毁掉管理员手填的模型名。
         if (!this.pForm.model) {
@@ -1959,6 +2005,16 @@ createApp({
       // 换厂商后音色必然失效（火山只认 BV00x、百炼只认 Cherry）
       this.pForm.params_text_voice = '';
       this.pForm.tts_voice_custom = '';
+    },
+    // 直接改「厂商 API 风格」→ 本地服务一键就绪（需求：选本地 ASR / 本地
+    // 向量化时不需要填写其他信息，点保存就能用）。默认地址取服务端下发的
+    // local_services，不硬编码。**不动 kind**：风格是管理员主动改的，能力
+    // 可能是特意选的；真要错配，后端保存时会强制对齐（providers 归一化）。
+    onApiStyleChange(){
+      const ls = this.localService;
+      if (!ls) return;
+      if (!this.pForm.endpoint) this.pForm.endpoint = ls.endpoint;
+      if (!this.pForm.model)    this.pForm.model    = ls.model;
     },
     // 「测试连接」与「解析用途」：调到新增的两个网关端点上
     async testModel(){

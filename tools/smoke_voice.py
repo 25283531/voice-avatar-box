@@ -32,6 +32,11 @@
 14. **老人语速向 VAD（新增）**：句中停顿 1.8s 不提前断句（自适应阈值）、
     轻声（RMS 0.007，旧门限 0.01 会整句丢失）可正常 finalize、
     迟滞（软语音期限内不掉出语音态）+ 期限（底噪不会让会话挂死）。
+15. **本地 ASR 协议（2026-10-22 新增）**：管理页下拉选「本地 ASR
+    （FunASR/SenseVoice）」保存后那条配置（``api_style=local_asr``，
+    priority 压过 OpenAI 兼容行）→ 请求真打 ``POST {endpoint}/asr``
+    （multipart ``audio``、无 model 无密钥），stt 采用其返回值，
+    且 OpenAI 兼容那条一次都没被调用。
 
 ⚠️ 本机（Windows）没有 libopus 时怎么算
 --------------------------------------
@@ -149,6 +154,9 @@ def ws_connect(url: str, headers: dict[str, str] | None = None, **kwargs):
     return websockets.connect(url, **kwargs)
 
 FAKE_ASR_TEXT = "小暖小暖，明天早上八点提醒我吃药"
+# 本地 FunASR/SenseVoice 桩的返回值（第 15 组）。与 FAKE_ASR_TEXT **故意不同**：
+# 两路 ASR 回同一句话，就无法从 transcript 分辨请求到底走了哪条协议。
+FAKE_LOCAL_ASR_TEXT = "本地识别，明天早上八点提醒我吃药"
 FAKE_REPLY = "好的，明天早上八点我提醒您吃药。您也要记得多喝水。我陪您聊聊。"
 FAKE_TOTAL_TOKENS = 155
 
@@ -220,6 +228,10 @@ class _UpstreamState:
         self.asr_calls = 0
         self.tts_calls = 0
         self.asr_text = FAKE_ASR_TEXT
+        # ---- 本地 FunASR / SenseVoice 协议（第 15 组）----
+        self.asr_local_calls = 0
+        self.local_asr_text = FAKE_LOCAL_ASR_TEXT
+        self.last_asr_path = ""
         self.reply = FAKE_REPLY
         self.tts_enabled = True
         self.llm_enabled = True
@@ -383,6 +395,17 @@ class _FakeUpstream(BaseHTTPRequestHandler):
         if path.endswith("/audio/transcriptions"):
             UP.bump("asr_calls")
             self._json({"text": UP.get("asr_text")})
+            return
+
+        if path.endswith("/asr"):
+            # 本地 FunASR/SenseVoice 协议（app/voice/asr_tts.py 的 local_asr 分支）：
+            # POST {endpoint}/asr + multipart「audio」字段，**没有** model / language /
+            # response_format，也无 Authorization。这里刻意**不解析 multipart**：
+            # 要证明的是「请求真的走了这条路」（路径 + 计数 + 返回文本被上层采用），
+            # 报文细节由 tools/test_speech_guard 的直接调用断言覆盖。
+            UP.bump("asr_local_calls")
+            UP.last_asr_path = path
+            self._json({"text": UP.get("local_asr_text"), "raw": {"stub": True}})
             return
 
         if path.endswith("/audio/speech"):
@@ -704,6 +727,17 @@ def seed(upstream_port: int) -> dict:
             api_style="openai_compatible",
             endpoint=f"http://127.0.0.1:{upstream_port}/v1",
             api_key="sk-fake", model="whisper-1", enabled=True, priority=1)
+        # 本地 FunASR/SenseVoice（2026-10-22 接入）。协议与 OpenAI 兼容完全不同：
+        # POST {endpoint}/asr（**没有** /v1 后缀）+ multipart audio 字段、无密钥无 model。
+        # priority=0 让它压过上面那条 OpenAI 兼容行；但**播种时停用**——
+        # 否则第 4/9 组这些走语音的组会全被它截走（它们的断言写的是
+        # FAKE_ASR_TEXT 的转写结果），症状是一片与本组无关的假失败。
+        # 第 15 组自己启用、组末自己停用，前后状态干净。
+        asr_local = _ensure(
+            "asr", "本地 ASR（FunASR 冒烟）",
+            api_style="local_asr", provider="funasr_local",
+            endpoint=f"http://127.0.0.1:{upstream_port}",
+            api_key="", model="sensevoice-small", enabled=False, priority=0)
         tts = _ensure(
             "tts", "假 TTS（冒烟）",
             api_style="openai_compatible",
@@ -717,6 +751,7 @@ def seed(upstream_port: int) -> dict:
             "llm_pk": llm_pks["openai_compatible"],
             "llm_pks": llm_pks,
             "asr_pk": int(asr.id), "tts_pk": int(tts.id),
+            "asr_local_pk": int(asr_local.id),
             "token": issue_device_token(int(bound.id), MAC_BOUND),
         }
     finally:
@@ -840,6 +875,16 @@ def _set_llm_enabled(pks, enabled: bool) -> None:
             if row is not None:
                 row.enabled = enabled
         db.commit()
+
+
+def _set_asr_local_enabled(pk: int, enabled: bool) -> None:
+    """切「本地 ASR」配置行的启用位（第 15 组前后各用一次）。
+
+    播种时该行就是停用的（见 seed 的注释），本组开启、组末关闭 ——
+    priority=0 的配置一旦常开，会静默改变**其余所有组**的观测对象，
+    那种假失败与本组代码毫无关系，最难归因。
+    """
+    _set_llm_enabled([pk], enabled)
 
 
 def _ota(mac: str, method: str = "POST") -> tuple[int, dict]:
@@ -1521,6 +1566,67 @@ async def t_empty_asr(ids: dict) -> None:
                   f"reply={reply_text!r}")
     finally:
         UP.asr_text = FAKE_ASR_TEXT
+
+
+async def t_local_asr(ids: dict) -> None:
+    """第 15 组：本地 FunASR/SenseVoice 协议（``api_style=local_asr``）。
+
+    验的是**真机部署形态**：管理页下拉选「本地 ASR（FunASR/SenseVoice）」保存后
+    的那条配置 —— ``POST {endpoint}/asr`` + multipart ``audio`` 字段、无 model
+    无密钥。这条路与 OpenAI 兼容路径除了 endpoint 之外毫无共同点，写错任何一处
+    的症状都是「唤醒成功但一个字都识别不出」，而服务端日志只会说 404/400。
+
+    断言三条，各自守一个失效方向：
+      1. 请求真打到 ``/asr``（不是 ``/audio/transcriptions``）——路径拼错；
+      2. 识别文本被上层采用（stt 事件 == 桩返回值）——报文解析错；
+      3. OpenAI 兼容那条**一次都没被调用**——resolve 选错了行（priority 失效）。
+    """
+    print("── 15. 本地 ASR（FunASR/SenseVoice）协议 ──")
+    import websockets
+
+    await _settle()
+    _set_asr_local_enabled(ids["asr_local_pk"], True)
+    local_before = UP.get("asr_local_calls")
+    openai_before = UP.get("asr_calls")
+    headers = {"Authorization": f"Bearer {ids['token']}",
+               "Device-Id": MAC_BOUND, "Protocol-Version": "1"}
+    seen = {}
+    try:
+        async with ws_connect(WS_URL, open_timeout=10,
+                                      headers=headers) as ws:
+            await _handshake(ws, ids, 1)
+            await _drain(ws)
+            await ws.send(json.dumps({"type": "listen", "state": "start",
+                                      "mode": "auto"}))
+            await asyncio.sleep(0.2)
+            for _ in range(6):
+                await ws.send(os.urandom(40))
+            await ws.send(json.dumps({"type": "listen", "state": "stop"}))
+
+            deadline = time.time() + 30
+            while time.time() < deadline:
+                try:
+                    msg = await asyncio.wait_for(ws.recv(), timeout=5)
+                except asyncio.TimeoutError:
+                    break
+                if isinstance(msg, bytes):
+                    continue
+                obj = json.loads(msg)
+                if obj.get("type") in ("stt", "tts", "alert"):
+                    seen[obj["type"]] = obj.get("text") or obj.get("state")
+                if obj.get("type") == "tts" and obj.get("state") == "stop":
+                    break
+    finally:
+        _set_asr_local_enabled(ids["asr_local_pk"], False)
+
+    check("第 15 条 · 请求真打到本地协议的 /asr",
+          UP.last_asr_path.endswith("/asr") and UP.get("asr_local_calls") > local_before,
+          f"path={UP.last_asr_path} 调用 {local_before} -> {UP.get('asr_local_calls')}")
+    check("第 15 条 · stt 采用本地 ASR 的识别结果",
+          seen.get("stt") == FAKE_LOCAL_ASR_TEXT, f"stt={seen.get('stt')!r}")
+    check("第 15 条 · OpenAI 兼容 ASR 一次都没被调用（resolve 选对了行）",
+          UP.get("asr_calls") == openai_before,
+          f"{openai_before} -> {UP.get('asr_calls')}")
 
 
 async def t_quota(ids: dict) -> None:
@@ -2544,6 +2650,8 @@ async def _amain(ids: dict, libopus: bool) -> None:
     await t_elder_soft_voice(ids)
     await t_elder_hysteresis(ids)
     await t_elder_noise(ids)
+    # ---- 2026-10-22 新增：本地自建 ASR 协议（组末自会停用该配置行）----
+    await t_local_asr(ids)
 
 
 def main() -> int:

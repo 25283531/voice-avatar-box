@@ -8,6 +8,8 @@
   B. resolve?usage= 的平滑过渡（新 kind 没配时退回旧 llm）
   C. 同一用途多条配置按 priority 选择 / 禁用后自动落到次条
   D. 真实调用链路（chat / embed / rerank，含三家厂商协议切换）
+  D2.本地自建服务：只选风格就保存（kind/endpoint/model 自动补齐），
+     本地向量化走 POST /embed 真打通（单条 input / 批量 texts 两种报文）
   E. 错误分诊：配置缺失 / 密钥错误 / 超时 / 5xx / 429 五种返回必须彼此不同
   F. 脱敏：/safe、/resolve、/export 都不返回 api_key
   G. 设备下发：只配新 kind 时 /api/device/sync 仍能拿到一条可用 LLM
@@ -104,6 +106,12 @@ class StubState:
 
     def __post_init__(self):
         self.hits = {}
+        # ---- 本地自建服务（2026-10-22 接入）的观测 ----
+        # 为什么单独记而不并进 hits：hits 按 model 记账，而本地服务
+        # **没有 model 字段**（服务端按加载的模型工作），并进去永远是 "" 计数。
+        self.local_embed_input: str = ""
+        self.local_embed_texts: list = None  # type: ignore[assignment]
+        self.asr_local_calls: int = 0
 
 
 STATE = StubState()
@@ -139,6 +147,30 @@ class StubVendor(BaseHTTPRequestHandler):
             body = {}
         model = str(body.get("model") or "")
         path = self.path.split("?")[0]
+
+        # ---- 本地自建服务（先于厂商分支判：本地路径里没有 model）----
+        if path == "/asr":
+            # 本地 FunASR/SenseVoice：POST {endpoint}/asr + multipart「audio」，
+            # 无 model / language / response_format。请求体不是 JSON（multipart），
+            # 上面的 json.loads 会落进 {} —— 正好说明「这条路径不解析 JSON」。
+            # 刻意**不解析 multipart**：报文细节由 smoke_voice 第 15 组端到端覆盖。
+            STATE.asr_local_calls += 1
+            STATE.last_path = path
+            self._reply(200, {"text": "本地识别：明天早上八点提醒我吃药", "raw": {"stub": True}})
+            return
+        if path == "/embed":
+            # 本地 FastEmbed/bge：单条 {"input": ...} -> {"embedding":[...]}，
+            # 批量 {"texts":[...]} -> {"embeddings":[[...]]}，同样没有 model。
+            if isinstance(body.get("texts"), list):
+                STATE.local_embed_texts = list(body["texts"])
+                self._reply(200, {"dim": 3,
+                                  "embeddings": [[0.1 * (i + 1), 0.2, 0.3]
+                                                 for i in range(len(body["texts"]))]})
+            else:
+                STATE.local_embed_input = str(body.get("input") or "")
+                self._reply(200, {"dim": 3, "embedding": [0.4, 0.5, 0.6]})
+            STATE.last_path = path
+            return
 
         STATE.last_path = path
         STATE.last_body = body
@@ -553,6 +585,83 @@ def main() -> int:
             req("DELETE", f"/api/providers/{gem['id']}", token=token)
         else:
             check("api_style=gemini 走 :generateContent", False, f"create failed code={code}")
+
+        # -------------------------------------------------- I. 本地自建服务
+        print("\n── I. 本地自建服务：选中即保存、保存即能调 ──")
+        # 需求原文：下拉选中「本地 ASR / 本地向量化」时，**不需要填写其他信息，
+        # 直接点击保存就能使用**。这里最小化请求体到只剩 name + api_style，
+        # 等价于前端「只在下拉里选了一下」。
+        # kind 由服务端归一化补齐（不能传空 kind 指望它被拒 —— 见 schema 的
+        # model_validator，本地风格是唯一例外），endpoint 先给默认值、
+        # 下面再 PATCH 成桩地址（真实部署里 127.0.0.1:8080 就是模型服务）。
+        code, loc = req("POST", "/api/providers",
+                        {"name": "本地向量化（冒烟）", "kind": "",
+                         "api_style": "local_embed"}, token)
+        row = loc if isinstance(loc, dict) else {}
+        check("I·1 只选风格就保存成功（201，且 kind 被补成 embedding）",
+              code == 201 and row.get("kind") == "embedding",
+              f"code={code} kind={row.get('kind')} detail={str(loc)[:120]}")
+        check("I·2 endpoint / model / provider / api_key 全部自动补齐",
+              row.get("endpoint") == "http://127.0.0.1:8080"
+              and row.get("model") == "bge-small-zh-v1.5"
+              and row.get("provider") == "fastembed_local"
+              and row.get("api_key") in ("", None),
+              f"endpoint={row.get('endpoint')} model={row.get('model')} "
+              f"provider={row.get('provider')} key={row.get('api_key')!r}")
+        loc_pk = row.get("id")
+        if loc_pk:
+            # 把地址改成桩服务（同一次 PATCH 走 update 侧的归一化，
+            # 顺手验证「编辑本地行不会丢默认值」这条路）
+            code, cur = req("GET", "/api/providers", token=token)
+            full = next((r for r in cur if r["id"] == loc_pk), None)
+            for k in ("id", "created_at"):
+                full.pop(k, None)
+            # 同时把 priority 压到 0：否则 D 组那条 emb-online（priority=1）
+            # 会继续被网关选中，/api/providers/test 就打不到本地路径上去了
+            # —— 那种失败长得像"本地协议没接上"，实际是选错了行。
+            full["endpoint"] = f"http://127.0.0.1:{stub_port}"
+            full["priority"] = 0
+            req("PATCH", f"/api/providers/{loc_pk}", full, token)
+
+            code, r = req("POST", "/api/providers/test",
+                          {"usage": "embed", "text": "今天吃了降压药"}, token)
+            vec = (r or {}).get("vectors") or [[]]
+            check("I·3 本地向量化真打通：走 /embed 且拿到 3 维向量",
+                  code == 200 and r.get("ok") is True and len(vec[0]) == 3
+                  and STATE.last_path == "/embed"
+                  and STATE.local_embed_input == "今天吃了降压药",
+                  f"path={STATE.last_path} input={STATE.local_embed_input!r} "
+                  f"dim={len(vec[0])} via {r.get('model')}")
+
+            code, r = req("POST", "/api/providers/test",
+                          {"usage": "embed", "text": ["你好", "世界"]}, token)
+            vec = (r or {}).get("vectors") or []
+            check("I·4 批量走 texts[] 路径（embeddings[] 数组也被取对）",
+                  r.get("ok") is True and len(vec) == 2 and len(vec[0]) == 3
+                  and STATE.local_embed_texts == ["你好", "世界"],
+                  f"texts={STATE.local_embed_texts} n={len(vec)}")
+            req("DELETE", f"/api/providers/{loc_pk}", token=token)
+        else:
+            check("I·3 本地向量化真打通：走 /embed 且拿到 3 维向量", False,
+                  f"create failed: {str(loc)[:120]}")
+            check("I·4 批量走 texts[] 路径（embeddings[] 数组也被取对）", False, "同上")
+
+        # 本地 ASR：保存归一化与本地 embed 同一条代码路径（_normalize_local_service），
+        # 这里验 kind 落到 asr、超时拿到 60s 的本地档；**真实调用**由
+        # tools/smoke_voice.py 第 15 组端到端覆盖（本脚本没有 ASR 调用入口）。
+        code, lasr = req("POST", "/api/providers",
+                         {"name": "本地 ASR（冒烟）", "kind": "",
+                          "api_style": "local_asr"}, token)
+        arow = lasr if isinstance(lasr, dict) else {}
+        check("I·5 本地 ASR 只选风格即保存，kind=asr + 60s 超时档",
+              code == 201 and arow.get("kind") == "asr"
+              and arow.get("timeout_sec") == 60
+              and arow.get("endpoint") == "http://127.0.0.1:8082"
+              and arow.get("model") == "sensevoice-small",
+              f"code={code} kind={arow.get('kind')} timeout={arow.get('timeout_sec')} "
+              f"endpoint={arow.get('endpoint')}")
+        if arow.get("id"):
+            req("DELETE", f"/api/providers/{arow['id']}", token=token)
 
         # -------------------------------------------------- E. 错误分诊
         print("\n── E. 错误类型必须彼此区分开 ──")
