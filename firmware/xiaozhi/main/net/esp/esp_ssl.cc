@@ -54,12 +54,24 @@ bool EspSsl::Connect(const std::string& host, int port) {
     connected_ = true;
 
     xEventGroupClearBits(event_group_, ESP_SSL_EVENT_RECEIVE_TASK_EXIT);
+    /* 优先级 1 → 5（2026-10-21，P2「断续/卡顿/破音」根因修复之一）。
+     *
+     * 本任务是 WebSocket 语音下行链路的入口：recv + mbedTLS 解密 + WS 帧解析
+     * → on_data_ → PushPacketToDecodeQueue → opus_codec(prio 2) 解码
+     * → audio_output(prio 4) 播放。原值 1 意味着它会被链路上**自己的下游**
+     * 以及 audio_input(prio 8) 反复抢占：TLS 解密是 CPU 密集的，被抢一次
+     * 就晚一批包进 decode 队列，而设备侧总共只有 180ms 抖动吸收
+     * （播放队列 2 帧 + I2S DMA 60ms，见 audio_service.h 的 16 帧改动）
+     * ⇒ 超过就是 underrun ⇒ 咔哒/断续。
+     * 取 5：高于两个音频消费任务（2/4），低于麦克风生产任务（8）。
+     * 它绝大部分时间阻塞在 read 上，提高优先级只减少调度延迟、
+     * 不增加总 CPU 占用。 */
     xTaskCreate([](void* arg) {
         EspSsl* ssl = (EspSsl*)arg;
         ssl->ReceiveTask();
         xEventGroupSetBits(ssl->event_group_, ESP_SSL_EVENT_RECEIVE_TASK_EXIT);
         vTaskDelete(NULL);
-    }, "ssl_receive", 4096, this, 1, &receive_task_handle_);
+    }, "ssl_receive", 4096, this, 5, &receive_task_handle_);
     return true;
 }
 

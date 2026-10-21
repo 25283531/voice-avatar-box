@@ -61,12 +61,16 @@ bool EspTcp::Connect(const std::string& host, int port) {
     connected_ = true;
 
     xEventGroupClearBits(event_group_, ESP_TCP_EVENT_RECEIVE_TASK_EXIT);
+    /* 优先级 1 → 5（2026-10-21，P2 根因修复；与 esp_ssl.cc 的 ssl_receive
+     * 同理由）。明文 ws:// 走这条：收包任务是被音频消费任务（opus_codec
+     * prio 2 / audio_output prio 4）和 audio_input(prio 8) 抢的入口，
+     * 优先级 1 时晚一批包 = 设备侧 180ms 抖动窗口被吃掉 = underrun。 */
     xTaskCreate([](void* arg) {
         EspTcp* tcp = (EspTcp*)arg;
         tcp->ReceiveTask();
         xEventGroupSetBits(tcp->event_group_, ESP_TCP_EVENT_RECEIVE_TASK_EXIT);
         vTaskDelete(NULL);
-    }, "tcp_receive", 4096, this, 1, &receive_task_handle_);
+    }, "tcp_receive", 4096, this, 5, &receive_task_handle_);
     return true;
 }
 

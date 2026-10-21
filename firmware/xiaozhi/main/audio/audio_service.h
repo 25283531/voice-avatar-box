@@ -37,7 +37,27 @@
 
 #define OPUS_FRAME_DURATION_MS 60
 #define MAX_ENCODE_TASKS_IN_QUEUE 2
-#define MAX_PLAYBACK_TASKS_IN_QUEUE 2
+/* 播放队列深度：2 → 16（2026-10-21，P2「断续/卡顿/破音」根因修复）。
+ *
+ * 机械根源（与上游小智 v2.0.5 逐点对比后定位）：
+ * 下行链路 = ssl_receive(prio 1) 收包+解密 → audio_decode_queue_(≤40 帧)
+ *   → opus_codec(prio 2) 解码 → audio_playback_queue_ → audio_output(prio 4)
+ *   → I2S DMA(6 desc × 240 帧 = 1440 帧 = 60ms)。
+ * 原值 2 帧 = 120ms，加上 DMA 的 60ms，设备只容忍 **180ms** 的调度停顿；
+ * 一旦 opus_codec / audio_output / ssl_receive 中任何一个被抢超过 180ms，
+ * DMA 排空 ⇒ underrun ⇒ 可听见的咔哒/断续/破音。
+ * 而 audio_input 被本项目钉在 core 1、优先级 8（为修 IDLE0 饿死，见
+ * audio_service.cc Start() 注释），AEC+双声道重采样+AFE 是持续负载，
+ * 未钉核的播放任务落到 core 1 就会被反复抢 —— 180ms 的窗口太窄。
+ *
+ * 为什么 16 帧安全：服务端 D50 节流器已按 60ms/帧的实时节奏发（实测
+ * tts_max_gap 62–126ms），稳态下播放队列深度仍是 0–2 帧（前 5 帧预突发
+ * 封顶），**不增加延迟**；只有到达突发/停顿时队列才加深 —— 那正是
+ * 需要吸收的时刻。抖动吸收窗口 120ms → 960ms。
+ *
+ * ⚠️ 这条提高的是耐受度、不是根除调度饥饿。core 1 上 audio_input(prio 8)
+ * 与播放任务的争抢仍需真机日志验证；不要据这条改动宣称「已修复」。 */
+#define MAX_PLAYBACK_TASKS_IN_QUEUE 16
 #define MAX_DECODE_PACKETS_IN_QUEUE (2400 / OPUS_FRAME_DURATION_MS)
 #define MAX_SEND_PACKETS_IN_QUEUE (2400 / OPUS_FRAME_DURATION_MS)
 #define AUDIO_TESTING_MAX_DURATION_MS 10000
@@ -77,6 +97,9 @@ struct DebugStatistics {
     uint32_t decode_count = 0;
     uint32_t encode_count = 0;
     uint32_t playback_count = 0;
+    /* decode 队列满时的丢弃计数（2026-10-21 P2 新增）：播放断续时先看它，
+     * 非 0 就说明「解码跟不上到达」，与 opus_codec/audio_output 被抢对应。 */
+    uint32_t dropped_count = 0;
 };
 
 class AudioService {

@@ -98,11 +98,22 @@ void AudioService::Start() {
     }, "audio_input", 2048 * 3, this, 8, &audio_input_task_handle_, 1);
 
     /* Start the audio output task */
-    xTaskCreate([](void* arg) {
+    /* 钉 core 0（2026-10-21，P2「断续/卡顿/破音」根因修复之一）。
+     *
+     * audio_input 为修 IDLE0 饿死已钉在 core 1、优先级 8（见上），
+     * AEC + 24k→16k 双声道重采样 + AFE 是 core 1 上的持续负载。
+     * audio_output 原来不钉核，落到 core 1 就会被 audio_input 反复抢：
+     * 它的职责是每 60ms 往 I2S DMA 喂一帧，晚一步 DMA 就排空
+     * ⇒ underrun ⇒ 咔哒/断续。
+     * 钉 core 0 后，播放链（收包 ssl_receive prio 5 → 解码 → 输出）
+     * 与麦克风链（audio_input prio 8）分居两核，互不抢占。
+     * core 0 上的 WiFi/lwIP 是 I/O 阻塞型任务（突发后即睡），
+     * 且本任务每帧只做一次 DMA 写入，被抢也只是微秒级延迟。 */
+    xTaskCreatePinnedToCore([](void* arg) {
         AudioService* audio_service = (AudioService*)arg;
         audio_service->AudioOutputTask();
         vTaskDelete(NULL);
-    }, "audio_output", 2048 * 2, this, 4, &audio_output_task_handle_);
+    }, "audio_output", 2048 * 2, this, 4, &audio_output_task_handle_, 0);
 #else
     /* Start the audio input task */
     /* 同上面的理由：钉 core 1，避免与 core 0 上的 WiFi 协议栈抢核。 */
@@ -113,11 +124,13 @@ void AudioService::Start() {
     }, "audio_input", 2048 * 2, this, 8, &audio_input_task_handle_, 1);
 
     /* Start the audio output task */
-    xTaskCreate([](void* arg) {
+    /* 同 CONFIG_USE_AUDIO_PROCESSOR 分支的理由：钉 core 0，远离 core 1 上
+     * 优先级 8 的 audio_input。 */
+    xTaskCreatePinnedToCore([](void* arg) {
         AudioService* audio_service = (AudioService*)arg;
         audio_service->AudioOutputTask();
         vTaskDelete(NULL);
-    }, "audio_output", 2048, this, 4, &audio_output_task_handle_);
+    }, "audio_output", 2048, this, 4, &audio_output_task_handle_, 0);
 #endif
 
     /* Start the opus codec task */
@@ -426,6 +439,17 @@ bool AudioService::PushPacketToDecodeQueue(std::unique_ptr<AudioStreamPacket> pa
         if (wait) {
             audio_queue_cv_.wait(lock, [this]() { return audio_decode_queue_.size() < MAX_DECODE_PACKETS_IN_QUEUE; });
         } else {
+            /* 静默丢包是本项目最贵的一类故障（2026-10-21，P2）：队列满 =
+             * 解码跟不上到达，丢一帧就是老人听到的一处咔哒/断续，而原来
+             * 这里 return false 连日志都没有，真机复现时无从判断。
+             * 现在至少计数 + 打点，让「丢没丢、丢多少」在串口日志里可见。
+             * 调用方（application.cc）用的是默认 wait=false —— 不回压
+             * 服务端，所以这个计数器是设备侧唯一的拥塞信号。 */
+            debug_statistics_.dropped_count++;
+            if (debug_statistics_.dropped_count % 10 == 1) {
+                ESP_LOGW(TAG, "Decode queue full (%u packets), dropped audio frame #%u",
+                         audio_decode_queue_.size(), debug_statistics_.dropped_count);
+            }
             return false;
         }
     }
