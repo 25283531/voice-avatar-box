@@ -393,7 +393,7 @@ def _asr_endpoint_scheme(row: Any) -> str:
 
 
 def _asr_style(row: Any) -> str:
-    """这一行走哪条 ASR 实现（``local_asr`` 或 ``openai_compatible``）。
+    """这一行走哪条 ASR 实现（``local_asr`` / ``tencent`` / ``openai_compatible``）。
 
     判据与 ``_tts_dispatch_style`` 同构：先认 provider 预置值，再认显式
     ``api_style``。**本地 ASR 必须排在 api_style 之前判**的理由与 TTS 侧
@@ -406,9 +406,15 @@ def _asr_style(row: Any) -> str:
     provider = (getattr(row, "provider", "") or "").strip().lower()
     if provider == "funasr_local":
         return API_STYLE_LOCAL_ASR
+    # 腾讯云的 ASR 预置 provider 值是 tencent_asr（与 TTS 的 tencent 分开：
+    # 两张预置表各管一摊，但走同一个适配器）。
+    if provider in ("tencent", "tencent_asr"):
+        return "tencent"
     style = (getattr(row, "api_style", "") or "").strip()
     if style == API_STYLE_LOCAL_ASR:
         return API_STYLE_LOCAL_ASR
+    if style == "tencent":
+        return "tencent"
     return "openai_compatible"
 
 
@@ -453,8 +459,13 @@ def asr(db: Any, pcm_16k: bytes) -> str:
     skipped: list[str] = []
 
     for _kind, row in plan:
+        style = _asr_style(row)
         scheme = _asr_endpoint_scheme(row)
-        if scheme not in ("http", "https"):
+        # 腾讯云这类「固定域名 + 请求体签名」的厂商**不需要 endpoint**：
+        # 域名写在适配器里，endpoint 只是可选的覆盖（私有化/代理）。
+        # 若沿用 http/https 闸门，管理员留空 endpoint（最自然的填法）会被
+        # 静默跳过，表现为「配好了腾讯云却一直用回退的那条」。
+        if style != "tencent" and scheme not in ("http", "https"):
             skipped.append(
                 f"{_row_label(row)} endpoint={scheme + '://' if scheme else '（空）'}"
                 f"{'（实时 ASR 等服务端未实现的协议）' if scheme in ('ws', 'wss') else ''}")
@@ -462,7 +473,7 @@ def asr(db: Any, pcm_16k: bytes) -> str:
 
         timeout = _row_timeout(row, ASR_TIMEOUT_SEC)
         try:
-            if _asr_style(row) == API_STYLE_LOCAL_ASR:
+            if style == API_STYLE_LOCAL_ASR:
                 # 本机 FunASR/SenseVoice（llama.cpp GGUF 版）：
                 # POST {endpoint}/asr，multipart 字段名 audio，**不需要**
                 # model / language / response_format —— 服务端按加载的模型
@@ -470,6 +481,26 @@ def asr(db: Any, pcm_16k: bytes) -> str:
                 # 换个名字就能换模型（实际要改服务端加载的 gguf）。
                 payload = _post_multipart(row, "/asr", {},
                                           "audio", "utterance.wav", wav, timeout)
+            elif style == "tencent":
+                from . import asr_tencent
+                secret_id, secret_key = _secret_pair(row)
+                # 腾讯云的「模型」字段存的是 EngSerViceType（如 16k_zh）。
+                # 本平台音频固定 16kHz，所以只可能选 16k_* 系列。
+                engine = ((getattr(row, "model", "") or "").strip()
+                          or asr_tencent.DEFAULT_ENGINE)
+                try:
+                    return asr_tencent.transcribe(
+                        pcm_16k, secret_id=secret_id, secret_key=secret_key,
+                        engine=engine, endpoint=_row_endpoint(row),
+                        timeout=timeout).strip()
+                except Exception as exc:  # noqa: BLE001
+                    # ⚠️ 必须转成 VoiceUpstreamError：外层只认这个类型才会
+                    # 「按序换下一条」。腾讯云的 TencentError 是 RuntimeError
+                    # 子类，直接冒泡会让第一优先级的腾讯云 key 填错时
+                    # **整条 ASR 全挂**，而不是回落到后面的配置行 ——
+                    # 那正是 2026-10-20 那次「唤醒成功但一个字都识别不出」
+                    # 事故的同一个形状。
+                    raise VoiceUpstreamError(f"腾讯云 ASR 失败：{exc}") from None
             else:
                 model = (getattr(row, "model", "") or "").strip() or "whisper-1"
                 fields = {
@@ -531,17 +562,20 @@ def _tts_dispatch_style(row: Any) -> str:
     if provider == "edge":
         return "edge"
     style = (getattr(row, "api_style", "") or "").strip()
-    if style in ("edge", "volcengine"):
+    if style in ("edge", "volcengine", "tencent"):
         return style
     return "openai_compatible"
 
 
-def _volc_keys(row: Any) -> tuple[str, str]:
-    """从密钥字段里拆出火山要的 ``(ak, sk)``。
+def _secret_pair(row: Any) -> tuple[str, str]:
+    """从密钥字段里拆出厂商要的 ``(id, secret)`` 两段。
+
+    火山要 ``AK:SK``、腾讯云要 ``SecretId:SecretKey`` —— **同一个形状**，
+    所以只留一份解析（历史上它叫 ``_volc_keys``，腾讯云接入时改名）。
 
     接受两种写法（都要支持，否则管理员会以为自己填错了）：
-      * ``AK:SK``（推荐，冒号分隔）
-      * 只有一段 → 当作 AK，SK 留空（此时火山会 403，错误文案会指明）
+      * ``ID:SECRET``（推荐，冒号分隔）
+      * 只有一段 → 当作 ID，SECRET 留空（此时厂商会 401/403，错误文案会指明）
 
     用中文冒号不行 —— 从网页上复制的文案里经常混进全角冒号，
     而用户**看不出**自己复制了什么，必须在这里兜住。
@@ -587,7 +621,7 @@ def tts(db: Any, sentence: str, *, voice: str = "", speed: float = 1.0) -> bytes
 
     if style == "volcengine":
         from . import tts_volc
-        ak, sk = _volc_keys(row)
+        ak, sk = _secret_pair(row)
         endpoint = _row_endpoint(row)
         try:
             return tts_volc.tts(sentence, voice, access_key=ak, secret_key=sk,
@@ -596,6 +630,20 @@ def tts(db: Any, sentence: str, *, voice: str = "", speed: float = 1.0) -> bytes
                                  timeout=_row_timeout(row, TTS_TIMEOUT_SEC))
         except Exception as exc:  # noqa: BLE001
             raise VoiceUpstreamError(f"火山引擎 TTS 失败：{exc}") from None
+
+    if style == "tencent":
+        from . import tts_tencent
+        secret_id, secret_key = _secret_pair(row)
+        try:
+            return tts_tencent.tts(
+                sentence, voice, secret_id=secret_id, secret_key=secret_key,
+                endpoint=_row_endpoint(row),
+                # ⚠️ 腾讯云的 TTS 不需要 Region（与 ASR 一致，官方未要求），
+                # 传了也不影响签名（它不在 signed headers 里）。
+                speed=speed,
+                timeout=_row_timeout(row, TTS_TIMEOUT_SEC))
+        except Exception as exc:  # noqa: BLE001
+            raise VoiceUpstreamError(f"腾讯云 TTS 失败：{exc}") from None
 
     return _tts_openai(row, sentence, voice=voice, speed=speed)
 
@@ -688,14 +736,15 @@ def tts_stream(db: Any, sentence: str, *, voice: str = "",
     # Edge 的 endpoint 是空串 → 拼出 "/audio/speech" → 连到本机自己 → 失败。
     # 症状是「非流式能出声、流式不出声」，属于最难自查的一类不一致。
     _style = _tts_dispatch_style(row)
-    if _style in ("edge", "volcengine"):
-        # ⚠️ 这两个分支的 tts() 返回**整段 bytes**，不是分片迭代器。
+    if _style in ("edge", "volcengine", "tencent"):
+        # ⚠️ 这三个分支的 tts() 返回**整段 bytes**，不是分片迭代器。
         # 曾经写成 `for chunk in tts(...)`：bytes 被逐字节迭代 ⇒ chunk 是 int
         # ⇒ 上层 session.py 的 `carry += chunk` 抛
         # `TypeError: can't concat int to bytes`，老人一个字都听不到，
         # 而 finish() 照样打印「音频已发」（假绿日志把这起事故藏了两周）。
-        # 这两条路径本身没有增量能力（Edge 要等整段解码完，火山是整包响应），
-        # 所以这里**整段 yield 一次**：行为与 tts() 等价，也不假装流式。
+        # 这三条路径本身没有增量能力（Edge 要等整段解码完，火山/腾讯云都是
+        # 整包 JSON 响应），所以这里**整段 yield 一次**：行为与 tts() 等价，
+        # 也不假装流式。
         yield tts(db, sentence, voice=voice, speed=speed)
         return
 

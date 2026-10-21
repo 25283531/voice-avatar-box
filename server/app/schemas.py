@@ -1,23 +1,99 @@
 """Pydantic 进出参模型（Pydantic v2）。"""
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    field_serializer,
     field_validator,
     model_validator,
 )
 
+from .config import TZ
 from .model_catalog import API_STYLES, KIND_LIST, LOCAL_SERVICE_DEFAULTS
 from .schedule import parse_hhmm
 
 
+# ============================================================ 时间口径（单一真源）
+# 本项目**不是**"所有时间戳都是 UTC"，而是**两种口径并存**，全部集中在这里说明：
+#
+#   A. UTC（``models.utcnow()`` 写入）：created_at / updated_at / last_seen_at /
+#      bound_at / expires_at / ack_at / ts / replied_at / ...
+#   B. 北京墙上时间（naive，不带偏移）：reminder_events 的 due_at / fired_at /
+#      confirmed_at。这一组由 ``schedule.next_occurrence()`` 产生（aware +08:00），
+#      写进 SQLite 时 tzinfo 被丢弃，读回来就是「北京钟点的字面量」。
+#      之所以不改成 UTC：这两个值还与**固件**交换（设备离线自建实例、回传
+#      确认），固件那边按 localtime_r 的北京钟点算，改了要对刷固件；而它们
+#      的语义就是"老人看到的那个钟点"，存墙上值反而少一层换算。
+#
+# ⚠️ 为什么必须显式标出来（2026-10-21 时区统一）：
+# 这两类值在 JSON 里**长得一模一样**（``"2026-10-22T08:00:00"``，都没有偏移），
+# 于是手机 App / 管理后台的 ``new Date(s)`` 只能按**浏览器本地时区**猜 ——
+# 猜对了是运气，猜错了整体偏 8 小时（且只在非北京时区的设备上复现）。
+# 给它们各打上正确的偏移（A → ``Z``/``+00:00``，B → ``+08:00``）之后，
+# ``new Date(s)`` 就完全确定，前端不需要知道任何业务约定。
+LOCAL_WALL_FIELDS = frozenset({"due_at", "fired_at", "confirmed_at"})
+
+
 class ORMBase(BaseModel):
+    """所有出入参的基类：``from_attributes`` + **自动补时区标记**。
+
+    序列化时给每个 datetime 补上偏移，规则见 :data:`LOCAL_WALL_FIELDS`：
+
+    * 已在白名单里（北京墙上）→ 补 ``config.TZ``（Asia/Shanghai，+08:00）
+    * 其余（UTC）→ 补 ``UTC``（输出成 ``...Z``）
+    * 本来就是 aware 的（如 ``next_fire_at``、``server_time``）→ **原样不动**
+
+    为什么放在基类而不是逐个 schema 写 ``field_serializer``：32 个 datetime
+    字段散在 15 个 schema 里，逐个写必然漏 —— 而漏的那个不会报错，只会让
+    某个页面上的时间差 8 小时。白名单集中一处，漏了也只需改一行。
+
+    为什么入参不受影响：``model_dump()`` 主要被 router 用来 ``Model(**dump)``
+    构造 ORM 行。带上 tzinfo 后 SQLAlchemy 写入 SQLite 取的仍是同一个墙上
+    字面量（``+08:00`` 的北京墙上 = 原来的 naive 值），**值不变**，只是多了
+    一个本来就成立的标注。
+    """
+
     model_config = ConfigDict(from_attributes=True)
+
+    @field_serializer("*", when_used="always")
+    def _attach_timezone(self, value: Any, info: Any) -> Any:
+        """通配序列化器：给每个 datetime 补上正确的偏移（规则见上）。
+
+        ⚠️ 必须用 ``field_serializer("*")`` 而不是 ``model_serializer(wrap)``：
+        后者拿到的已经是**JSON 化之后的字符串**（``"2026-10-22T08:00:00"``），
+        ``isinstance(value, datetime)`` 恒为 False ⇒ 整段逻辑静默不执行，
+        而输出看起来"正常"（只是少了偏移），最容易被当成"改好了"。
+
+        ⚠️ 白名单里的字段**优先读同一行上的 ``tz``**（2026-10-21 跨时区改造）。
+        以前一律补 ``config.TZ``，那在"所有规则都在北京"的年代成立；现在一条
+        纽约规则的 ``due_at`` 是纽约钟点，补 +08:00 就是**错 12 小时的标注**，
+        而错标注比没有标注更坏 —— 前端会拿它当权威去换算。
+
+        ⚠️ 取 ``tz`` 只能走 ``self``（实例属性）。``info`` 是
+        ``SerializationInfo``，**没有** ``data`` 字段 —— 那是校验期的
+        ``ValidationInfo`` 才有的。写成 ``info.data`` 会在**序列化时才炸**
+        （``AttributeError``），而校验、单元测试里直接构造对象都不会触发，
+        表现是"某个接口一返回 500"。
+        """
+        if isinstance(value, datetime) and value.tzinfo is None:
+            if info.field_name not in LOCAL_WALL_FIELDS:
+                return value.replace(tzinfo=timezone.utc)
+            return value.replace(tzinfo=_zone_of(getattr(self, "tz", "")))
+        return value
+
+
+def _zone_of(name: Any):
+    """``tz`` 字符串 → ZoneInfo；非法/空串一律退回 ``config.TZ``。"""
+    from .geo import valid_timezone
+
+    valid = valid_timezone(name)
+    return ZoneInfo(valid) if valid else TZ
 
 
 # ============================================================ 认证
@@ -812,6 +888,13 @@ class ReminderIn(ORMBase):
     escalate_after_min: int = 30
     confirm_methods: list[str] = Field(default_factory=list)
     enabled: bool = True
+    #: 这条规则的钟点基准（IANA 名）。空串 = 历史数据 = ``config.TZ``，
+    #: 也 = 「由服务端按设备 IP 判定」（见 routers/reminders._reminder_tz）。
+    #:
+    #: 字段名刻意用 ``tz`` 而不是 ``timezone``：``model_dump()`` 会被 router
+    #: 直接展开成 ``models.Reminder(**dump)``，字段名必须与**列名**逐字相同，
+    #: 否则是 ``TypeError: 'timezone' is an invalid keyword argument``。
+    tz: str = ""
 
     @field_validator("times_of_day")
     @classmethod
@@ -820,6 +903,21 @@ class ReminderIn(ORMBase):
             if parse_hhmm(t) is None:
                 raise ValueError(f"时间格式非法: {t}，应为 HH:MM")
         return v
+
+    @field_validator("tz")
+    @classmethod
+    def _check_tz(cls, v: str) -> str:
+        """非法时区**直接拒绝**，不静默丢弃。
+
+        静默丢弃看起来更"宽容"，但后果是：客户端以为设成了纽约时间，
+        实际落库的是北京时间 —— 老人早上 8 点的药变成晚上 8 点响，
+        而 API 返回 201、界面上看不出任何异常。宁可 422 让它当场暴露。
+        """
+        from .geo import valid_timezone
+
+        if (v or "").strip() and not valid_timezone(v):
+            raise ValueError(f"时区名非法: {v}，应为 IANA 名（如 Asia/Shanghai）")
+        return v.strip()
 
     @field_validator("weekdays")
     @classmethod
@@ -851,6 +949,9 @@ class EventOut(ORMBase):
     id: int
     reminder_id: int
     device_id: int
+    #: 这一实例的钟点基准（IANA 名）。序列化器通过 ``self.tz`` 读它，
+    #: 所以它**必须在模型上有默认值** —— 老版本客户端/缺字段时不至于 AttributeError。
+    tz: str = ""
     due_at: datetime
     fired_at: datetime | None
     confirmed_at: datetime | None

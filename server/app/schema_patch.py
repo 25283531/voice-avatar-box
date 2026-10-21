@@ -262,6 +262,14 @@ def _mark_applied(conn: Any, patch_id: str) -> None:
 NEW_COLUMNS: Final[list[tuple[str, str, str, str]]] = [
     # 表名, 列名, SQLite 类型, MySQL 类型
     ("users", "email", "VARCHAR(128) DEFAULT ''", "VARCHAR(128) DEFAULT ''"),
+    # ---- 跨时区（2026-10-21）：提醒的钟点基准 ----
+    # 存量行一律留空串 = 「按 config.TZ 解释」= 与升级前的实际行为逐字一致。
+    # **不做数据迁移**：把历史规则改标成别的时区，等于让升级本身变成一次
+    # 「所有提醒整体平移 N 小时」的事故。
+    ("reminders", "tz", "VARCHAR(64) DEFAULT ''", "VARCHAR(64) DEFAULT ''"),
+    # 实例上的 tz 是 due_at 的**解读方式**，不是展示偏好：
+    # 少了它 due_at 就只是一个无法还原的裸钟点（SQLite 不保留 tzinfo）。
+    ("reminder_events", "tz", "VARCHAR(64) DEFAULT ''", "VARCHAR(64) DEFAULT ''"),
     ("devices", "agent_id", "INTEGER", "INT NULL"),
     # 设备 token 代次：解绑时 +1，让旧 device_token（无状态 JWT）立即失效。
     # 没有它，管理员解绑只清了归属、没清访问权 —— 旧 token 在 365 天有效期内

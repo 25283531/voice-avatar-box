@@ -16,6 +16,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from enum import IntEnum
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from sqlalchemy import (
     Boolean,
@@ -38,6 +39,71 @@ from .db import Base
 def utcnow() -> datetime:
     """统一返回带 UTC 时区的当前时间。"""
     return datetime.now(timezone.utc)
+
+
+def as_utc(dt: datetime | None) -> datetime | None:
+    """把库列读回来的 **naive UTC** 补上 UTC 时区（None 透传）。
+
+    为什么需要这个函数（2026-10-21 时区统一）
+    ----------------------------------------
+    SQLite 的 ``DateTime(timezone=True)`` **不保留 tzinfo**（实测：存 aware
+    值读回来是 naive）。本项目所有 ``created_at`` / ``ts`` / ``last_seen_at``
+    都由 :func:`utcnow` 写入，所以读回来的 naive 值**语义就是 UTC** ——
+    但这层语义只存在于"写的人都用 utcnow"这个约定里，``.isoformat()`` 是
+    不知道的，它会吐一个**没有偏移**的串（``2026-10-21T14:00:00``），
+    而任何前端 ``new Date(s)`` 都会按**浏览器本地时区**解释它 ⇒ 手机不在
+    东八区就整体偏 8 小时。
+
+    给需要手工 ``isoformat()`` 的地方（不经 Pydantic schema）用它，
+    比让每处自己写 ``.replace(tzinfo=timezone.utc)`` 少一次写错的机会。
+
+    ⚠️ **不要**用它处理 ``reminder_events.due_at`` / ``fired_at`` /
+    ``confirmed_at``：那三列存的是**北京墙上时间**，用 :func:`as_local`。
+    """
+    if dt is None:
+        return None
+    return dt if dt.tzinfo is not None else dt.replace(tzinfo=timezone.utc)
+
+
+def as_local(dt: datetime | None, tz: str = "") -> datetime | None:
+    """把库列读回来的 **naive 墙上时间** 补上时区标记。
+
+    只用于 ``due_at`` / ``fired_at`` / ``confirmed_at`` —— 它们由
+    ``schedule`` 的展开函数产出（aware），写进 SQLite 后 tzinfo 被丢弃，
+    剩下的是"**所属规则时区的钟点字面量**"。口径细节见
+    ``schemas.LOCAL_WALL_FIELDS`` 的说明。
+
+    :param tz: 该行所属规则的 IANA 时区（``Reminder.tz`` / ``ReminderEvent.tz``）。
+               **空串 = 历史数据 = ``config.TZ``** —— 升级前的规则都是按北京
+               时间创建的，把它当北京才与当初的实际行为一致；当成 UTC 会让
+               所有存量提醒整体偏 8 小时。
+    """
+    if dt is None:
+        return None
+    if dt.tzinfo is not None:
+        return dt
+    from .config import TZ
+    from .geo import valid_timezone
+    name = valid_timezone(tz)
+    return dt.replace(tzinfo=ZoneInfo(name) if name else TZ)
+
+
+def iso_utc(dt: datetime | None) -> str | None:
+    """naive UTC 库列 → **与 Pydantic 逐字一致**的 ISO 串（None 透传）。
+
+    为什么需要它：手写 ``as_utc(dt).isoformat()`` 得到 ``...+00:00``，
+    而 Pydantic v2 序列化同一个时刻得到 ``...Z``。两个字段表达同一个时间点
+    却长得不一样，于是"device_time 与 last_seen_at 一致"这类断言**必红**，
+    而它红的原因跟数据对不对毫无关系 —— 只是两种格式化写法。
+
+    反过来把断言放宽（去掉 Z 再比）更糟：那会让"一个字段少了个时区标记"
+    这种真缺陷漏过去。统一格式才是正解，且必须只有一处。
+    """
+    if dt is None:
+        return None
+    value = as_utc(dt)
+    text = value.isoformat() if value is not None else ""
+    return text[:-6] + "Z" if text.endswith("+00:00") else text
 
 
 # ================================================================ 记录类型
@@ -498,6 +564,20 @@ class Reminder(Base):
     confirm_methods: Mapped[list[str]] = mapped_column(JSON, default=list)
 
     enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+
+    # 这条规则按**哪个时区**的钟点解释（IANA 名，如 ``Asia/Shanghai``）。
+    #
+    # 为什么必须有这一列（2026-10-21 用户定调"用户在哪个国家就按哪个时区"）：
+    # ``times_of_day = ["08:00"]`` 里的 8 点**不是绝对时刻**，它得挂在一个
+    # 时区上才有意义。以前全仓隐含 ``config.TZ``（北京时间），于是：
+    #   * 一个在美国的家庭，IP 在美国，设"早上 8 点吃药"→ 实际在**北京时间**
+    #     8 点响 = 当地下午/晚上，老人该吃药的时候不响、不该吃的时候响；
+    #   * 反过来把 ``TZ`` 改成别的，又会把所有存量规则整体平移。
+    #
+    # 空串 = **历史数据**，语义等同 ``config.TZ``（升级时不做数据迁移：
+    # 存量规则当初就是按北京时间创建的，把它标成北京时间才是如实记录）。
+    tz: Mapped[str] = mapped_column(String(64), default="", server_default="")
+
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
 
@@ -529,8 +609,15 @@ class ReminderEvent(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     reminder_id: Mapped[int] = mapped_column(ForeignKey("reminders.id"), index=True)
     device_id: Mapped[int] = mapped_column(ForeignKey("devices.id"), index=True)
-    # 计划触发时刻（设备本地时区）
+    # 计划触发时刻。**语义 = 规则 ``tz`` 时区的墙上时间**，不是 UTC。
+    # SQLite 的 DateTime(timezone=True) 不保留 tzinfo（写进去是 aware、
+    # 读回来是 naive），光看这一列分不出"北京的 8 点"和"纽约的 8 点" ——
+    # 所以下面 ``tz`` 列是**这一列的解读方式**，两者必须一起用。
     due_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    # 这一实例所属规则当时用的时区（从 Reminder.tz 复制，不 JOIN）。
+    # 为什么冗余一份而不是连表：序列化时要给 due_at 补偏移，而 Pydantic 的
+    # field_serializer 拿不到关联对象；空串 = 历史数据 = config.TZ。
+    tz: Mapped[str] = mapped_column(String(64), default="", server_default="")
     fired_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     confirmed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 

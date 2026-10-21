@@ -18,6 +18,13 @@
 #include <vector>
 #include <sstream>
 #include <algorithm>
+/* 时钟校准（SetServerTime）。显式包含是因为 struct timeval / settimeofday /
+ * tzset / setenv 原先只靠其它头文件间接带入 —— 那种"能用但说不清从哪来"
+ * 的依赖在换 ESP-IDF 版本时会静默断掉，而症状是编译错误指向 setenv 未声明，
+ * 与"时钟错了"毫无关联，白绕一圈。 */
+#include <sys/time.h>
+#include <ctime>
+#include <cstdlib>
 
 #define TAG "Ota"
 
@@ -186,21 +193,48 @@ esp_err_t Ota::CheckVersion() {
     cJSON *server_time = cJSON_GetObjectItem(root, "server_time");
     if (cJSON_IsObject(server_time)) {
         cJSON *timestamp = cJSON_GetObjectItem(server_time, "timestamp");
-        cJSON *timezone_offset = cJSON_GetObjectItem(server_time, "timezone_offset");
+        /* 刻意**不读** timezone_offset：服务端仍会下发它（契约兼容），
+         * 但固件不再拿它做加法 —— 北京时间由 TZ=CST-8 负责，见下面的说明。
+         * 留着这个变量不用会触发 -Werror=unused-variable，所以直接不声明。 */
         
         if (cJSON_IsNumber(timestamp)) {
-            // 设置系统时间
+            /* ⚠️ 服务端下发的 timestamp 是**绝对 UTC 毫秒**
+             * （见 server/app/voice/__init__.py::_server_time，
+             *   由 datetime.now(timezone.utc).timestamp()*1000 生成），
+             * 而 settimeofday() 要的也正是 UTC epoch —— 两者口径一致，
+             * **不需要也不允许**再加时区偏移。
+             *
+             * 2026-10-21 修正（原来这里有一行 ts += timezone_offset*60*1000）：
+             * 那行是"没人设 TZ、localtime_r 按 UTC 解释"年代的补偿，让提醒
+             * 拿到北京钟点。但 elder_time_apply_server_time()（sync.c）后来
+             * 已经 setenv("TZ","CST-8") + tzset()，补偿就变成了**双重偏移**：
+             *   系统时钟快 8 小时 ⇒ 日志时间错 8h；提醒引擎（reminder.c 全走
+             *   localtime_r，"现在几点"再被 TZ 加 8h）判据整体错位，可能把
+             *   当天该响的判成漏服/跳过。
+             * 更糟的是它与 sync.c 那条**正确**的校时路径互相覆盖 —— 最终时钟
+             * 取决于"哪条最后跑"，这种不确定性比固定偏差难查得多。
+             *
+             * 现在两条路径口径统一：**系统时钟恒为真 UTC**，北京时间的换算
+             * 全部交给 TZ=CST-8 + localtime_r()。timezone_offset 字段仍然保留
+             * 在响应里（契约兼容），但固件不再拿它做加法。 */
             struct timeval tv;
             double ts = timestamp->valuedouble;
-            
-            // 如果有时区偏移，计算本地时间
-            if (cJSON_IsNumber(timezone_offset)) {
-                ts += (timezone_offset->valueint * 60 * 1000); // 转换分钟为毫秒
-            }
-            
+
             tv.tv_sec = (time_t)(ts / 1000);  // 转换毫秒为秒
             tv.tv_usec = (suseconds_t)((long long)ts % 1000) * 1000;  // 剩余的毫秒转换为微秒
             settimeofday(&tv, NULL);
+
+            /* 与 sync.c 保持一致：TZ 未设时 localtime_r() 会按 UTC 解释，
+             * 提醒引擎会整体早 8 小时响。这里幂等设置一次（重复调用无害），
+             * 保证「只走过 OTA 校时、还没走 device/sync」的首次开机也正确。 */
+            setenv("TZ", "CST-8", 1);   /* POSIX TZ：CST-8 = UTC+8，无夏令时 */
+            tzset();
+
+            /* ⚠️ `%ld` 而不是 `%lld`：本工程开了
+             * CONFIG_LIBC_NEWLIB_NANO_FORMAT=y，nano-printf 不支持 %lld，
+             * 会原样打出 "(ld)" 字面量。time_t 在 ESP32 是 64 位，但秒级
+             * 时间戳到 2038 年前都在 32 位范围内，转 (long) 打印够用。 */
+            ESP_LOGI(TAG, "Server time applied: utc=%ld (TZ=CST-8)", (long)tv.tv_sec);
             has_server_time_ = true;
         }
     } else {

@@ -16,17 +16,30 @@ import {
 } from '@/api/elder'
 import type { Device, Reminder, ReminderEvent } from '@/api/elder'
 import { getElderToken } from '@/http/elder'
+import { fmtDateTime, startOfToday } from '@/utils/time'
 
-/** 今天零点（本地时区） */
+/**
+ * **展示时区**的今天零点（绝对时刻）。
+ *
+ * ⚠️ 两次纠偏的历史，别改回去：
+ *   1. 最初是 `d.setHours(0,0,0,0)` —— 设备时区的零点。设备时区错了
+ *      （出厂默认/手动改过/人在国外），"今天"的边界跟着错；
+ *   2. 后来改成**硬编码 UTC+8** —— 那是错的：家属在海外，看到的"今天"
+ *      与他自己日历上的今天不是同一天（用户 2026-10-21 明确纠偏：
+ *      不能统一时区，要按所在国家/地区判定）；
+ *   3. 现在是 `startOfToday()`：时区由服务端按 IP 判定
+ *      （`GET /api/geo/timezone`），设备自报只作兜底。
+ *
+ * 与服务端 `_medicine_today` 的日界**可能不同**（那头按设备自己的时区算）——
+ * 这是刻意的：服务端回答"老人今天吃了几次"，这里只用来过滤本机列表。
+ */
 function todayStart(): Date {
-  const d = new Date()
-  d.setHours(0, 0, 0, 0)
-  return d
+  return startOfToday()
 }
 
+/** 保留本地同名函数：模板里已经在用 `fmtTime(...)`，改名要连带改模板。 */
 function fmtTime(v?: string | null) {
-  if (!v) return '—'
-  return v.replace('T', ' ').slice(0, 16)
+  return fmtDateTime(v)
 }
 
 const devices = ref<Device[]>([])

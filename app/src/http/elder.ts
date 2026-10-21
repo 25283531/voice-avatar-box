@@ -68,6 +68,13 @@ export interface ElderRequestOptions {
   /** 是否弹出错误提示，默认 true */
   toast?: boolean
   timeout?: number
+  /**
+   * 额外请求头（与默认的 Content-Type/Authorization 合并，同名时以这里为准）。
+   *
+   * 目前只有 `/api/geo/timezone` 用：它需要 `X-Client-Timezone` 来细化
+   * 「跨多时区国家」（IP 只能定到国家，纽约还是洛杉矶要靠设备自报）。
+   */
+  header?: Record<string, string>
 }
 
 /** 原始响应：连同 HTTP 状态码一起交出（成功失败都 resolve） */
@@ -88,7 +95,7 @@ export function elderRequestRaw<T = any>(
   path: string,
   options: ElderRequestOptions = {},
 ): Promise<ElderRawResult<T>> {
-  const { method = 'GET', data, auth = true, timeout = 10000 } = options
+  const { method = 'GET', data, auth = true, timeout = 10000, header: extra } = options
 
   const header: Record<string, string> = { 'Content-Type': 'application/json' }
   if (auth === 'optional') {
@@ -99,6 +106,7 @@ export function elderRequestRaw<T = any>(
     const token = getElderToken()
     header.Authorization = `Bearer ${token}`
   }
+  if (extra) Object.assign(header, extra)
 
   return new Promise<ElderRawResult<T>>((resolve, reject) => {
     uni.request({

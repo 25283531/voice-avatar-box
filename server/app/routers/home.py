@@ -26,7 +26,7 @@ APP 首页要展示两块信息：绑定的设备及其状态、当天服药情�
 from __future__ import annotations
 
 import logging
-from datetime import datetime, time, timedelta
+from datetime import datetime, time, timedelta, timezone
 
 from fastapi import APIRouter, Depends
 from sqlalchemy import select
@@ -38,7 +38,7 @@ from ..db import get_db
 from ..deps import get_current_user
 from ..device_state import is_online
 from ..models import ReminderType
-from ..schedule import local_now, occurrences_on
+from ..schedule import event_instant, local_now, occurrences_on, reminder_zone
 from ..schemas import (
     HomeDeviceOut,
     HomeSummaryOut,
@@ -52,7 +52,13 @@ router = APIRouter(prefix="/api/home", tags=["home"])
 
 # ---------------------------------------------------------------- 服药统计
 def _medicine_today(db: Session, device_ids: list[int]) -> MedicineTodayOut:
-    """统计当天（服务端时区 TZ 的自然日）服药情况。
+    """统计当天服药情况。
+
+    ⚠️ 「当天」是**每条规则自己时区**的自然日（2026-10-21 跨时区改造）。
+    以前统一用 ``config.TZ``，于是美西家庭 8 点的药会被算到北京那一天的
+    另一个格子里 —— 首页数字对不上、家属还以为老人没吃药。
+    这里刻意**不**跟随请求方的时区：服药记录属于老人那台设备，
+    "今天吃了几次"不该因为看的人在北京还是纽约而变。
 
     数据来源是「规则实时推算 ∪ 排期实例」，见模块头部第 3 条。
     只统计 rtype=0（服药），日程 / 喝水 / 运动等不算，避免首页数字被稀释。
@@ -62,13 +68,10 @@ def _medicine_today(db: Session, device_ids: list[int]) -> MedicineTodayOut:
         return empty
 
     try:
-        today = local_now().date()
-        day_start = datetime.combine(today, time(0, 0), tzinfo=TZ)
-        day_end = day_start + timedelta(days=1)
-
         # 1) 按规则实时推算当天应触发的服药时间点，默认都是「待服药」
         #    （reminder_id, "HH:MM"）-> 状态
         slots: dict[tuple[int, str], int] = {}
+        rule_zone: dict[int, object] = {}
         rules = db.scalars(
             select(models.Reminder).where(
                 models.Reminder.device_id.in_(device_ids),
@@ -77,24 +80,38 @@ def _medicine_today(db: Session, device_ids: list[int]) -> MedicineTodayOut:
             )
         ).all()
         for r in rules:
+            zone = reminder_zone(r)
+            rule_zone[r.id] = zone
+            today = datetime.now(zone).date()
             for ts in occurrences_on(r, today):
                 slots[(r.id, ts.strftime("%H:%M"))] = int(models.EventState.PENDING)
 
         # 2) 用实例表覆盖真实状态。为什么按 (提醒, HH:MM) 对齐而不是按完整时间：
-        #    SQLite 存的是不带时区的墙上时间（见 db 层的 DateTime(timezone=True) 行为），
-        #    而规则推算出的是带 TZ 的时间，直接比对象会踩时区坑；HH:MM 两边语义一致。
+        #    SQLite 不保留 tzinfo，due_at 读回来是"规则时区的裸钟点"，而
+        #    occurrences_on 推算出的 HH:MM 是同一个时区的钟点 —— 两边语义一致。
+        #
+        #    范围粗筛不能用"今天的零点"：due_at 的钟点基准逐规则不同，
+        #    SQL 里没法统一。取 ±2 天（已远大于任何时区与 UTC 的差）粗筛，
+        #    再用每条规则自己的"今天"精确判定。
+        now_wall = datetime.now(timezone.utc).replace(tzinfo=None)
         rows = db.scalars(
             select(models.ReminderEvent)
             .join(models.Reminder, models.Reminder.id == models.ReminderEvent.reminder_id)
             .where(
                 models.ReminderEvent.device_id.in_(device_ids),
                 models.Reminder.rtype == int(ReminderType.MEDICINE),
-                models.ReminderEvent.due_at >= day_start,
-                models.ReminderEvent.due_at < day_end,
+                models.ReminderEvent.due_at >= now_wall - timedelta(days=2),
+                models.ReminderEvent.due_at < now_wall + timedelta(days=2),
             )
         ).all()
         for ev in rows:
-            slots[(ev.reminder_id, ev.due_at.strftime("%H:%M"))] = int(ev.state)
+            rid = ev.reminder_id
+            if rid not in rule_zone:
+                continue
+            zone = rule_zone[rid]
+            if event_instant(ev.due_at).astimezone(zone).date() != datetime.now(zone).date():
+                continue
+            slots[(rid, ev.due_at.strftime("%H:%M"))] = int(ev.state)
 
         confirmed = sum(1 for s in slots.values() if s == int(models.EventState.CONFIRMED))
         # 主动跳过（SKIPPED）不算待服药：家属明确点了「这次不吃了」
@@ -137,7 +154,14 @@ def home_summary(db: Session = Depends(get_db),
             last_seen_at=d.last_seen_at,
             ip=d.ip or "",
             fw_version=d.fw_version or "",
-            device_time=(d.last_seen_at.isoformat() if d.last_seen_at else None),
+            # ⚠️ 必须带 UTC 偏移：这里不走 Pydantic schema（手写 isoformat），
+            # 而 last_seen_at 是库里的 naive UTC。裸 isoformat 会产出无偏移的
+            # "2026-10-21T14:00:00"，前端 new Date() 按浏览器本地时区解释 ⇒
+            # 手机不在东八区就整体差 8 小时（时区统一前的真实症状）。
+            # 用 models.iso_utc 而不是手写 as_utc(...).isoformat()：后者产出
+            # "+00:00"，而 schema 序列化的同一个时刻是 "Z" —— 同一份数据里
+            # 两种写法并存，前端和断言都得跟着猜。
+            device_time=models.iso_utc(d.last_seen_at),
             agent_name=(agent.name if agent else None),
             avatar_name=(avatar.name if avatar else None),
         ))

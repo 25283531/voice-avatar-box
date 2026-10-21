@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
-from datetime import timedelta, timezone
+from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import func, select
@@ -12,7 +12,7 @@ from .. import models
 from ..db import get_db
 from ..deps import get_current_user
 from ..models import EventState, InteractionKind
-from ..schedule import local_now
+from ..schedule import device_zone
 from ..schemas import StatsOverview, StatsPoint
 
 router = APIRouter(prefix="/api/stats", tags=["stats"])
@@ -32,7 +32,11 @@ def overview(device_pk: int, days: int = Query(7, ge=1, le=60),
     from ..deps import require_device_owner
 
     dev = require_device_owner(device_pk, user, db)
-    now = local_now()
+    # 「今天」按**设备所在时区**算（2026-10-21 跨时区改造）：老人早上 7 点吃
+    # 了药，在美西那就是北京时间前一天 —— 用服务端时区分桶会让"今日已确认"
+    # 在半个地球的用户那里永远是 0。存量设备（规则 tz 为空）行为不变。
+    zone = device_zone(db, device_pk)
+    now = datetime.now(zone)
     today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
 
     # --- 交互次数按天聚合 ---
@@ -97,7 +101,10 @@ def overview(device_pk: int, days: int = Query(7, ge=1, le=60),
         select(func.count(models.ReminderEvent.id)).where(
             models.ReminderEvent.device_id == device_pk,
             models.ReminderEvent.state == int(EventState.MISSED),
-            models.ReminderEvent.due_at >= today_start,
+            # due_at 是**设备时区的裸钟点**，所以比较对象也要取同一个基准的
+            # 钟点（去掉 tzinfo），否则 SQL 里是拿"纽约钟点"比"纽约零点的
+            # aware 值"，SQLite 绑定时只取字面量 —— 看起来能跑，其实靠巧合。
+            models.ReminderEvent.due_at >= today_start.replace(tzinfo=None),
         )
     ) or 0
 
@@ -134,7 +141,9 @@ def recent(device_pk: int, limit: int = Query(20, ge=1, le=200),
         {
             "id": r.id,
             "kind": _KIND_KEYS.get(r.kind, "dialog"),
-            "ts": r.ts.isoformat(),
+            # 同 home.py：手写 isoformat 必须补 UTC 偏移，否则前端按本地
+            # 时区猜，非东八区手机整体差 8 小时。
+            "ts": models.as_utc(r.ts).isoformat(),
             "duration_ms": r.duration_ms,
             "meta": r.meta or {},
         }

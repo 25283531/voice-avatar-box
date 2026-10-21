@@ -49,9 +49,11 @@ import logging
 import math
 import time
 from collections import Counter, OrderedDict
+from datetime import datetime
 from dataclasses import dataclass, field
 from typing import Any, Iterable, Sequence
 
+from .. import config
 from .client import ModelClient, get_default_client
 from .store import SOURCE_LLM, SOURCE_MANUAL, MemoryRow, MemoryStore
 from .textutil import extract_entities, tokenize
@@ -181,9 +183,16 @@ class MemoryHit:
 
 
 def _iso(ts: float) -> str:
+    """epoch 秒 → 「2026-10-21 14:00:00」（**北京时间**）。
+
+    ⚠️ 原来用 ``time.strftime(..., time.localtime(ts))``：依赖进程 TZ
+    环境变量（容器设了、本机可能没设），同一份数据在两处显示差 8 小时。
+    这个串会进调试输出与工具结果，错的时间会直接误导排查
+    （本项目真机日志已经因此绕过一圈）。改用显式 ``config.TZ``。
+    """
     if not ts:
         return ""
-    return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts))
+    return datetime.fromtimestamp(ts, config.TZ).strftime("%Y-%m-%d %H:%M:%S")
 
 
 # ---------------------------------------------------------------- 查询向量缓存

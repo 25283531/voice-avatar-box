@@ -18,6 +18,7 @@ import {
   updateDevice,
 } from '@/api/elder'
 import type { Avatar, Device } from '@/api/elder'
+import { fmtDateTime } from '@/utils/time'
 import { getElderToken } from '@/http/elder'
 
 const devices = ref<Device[]>([])
@@ -206,7 +207,7 @@ onShow(() => { refresh() })
         <text :class="['tag', d.online ? 'ok' : '']">{{ d.online ? '在线' : '离线' }}</text>
       </view>
       <view class="sub">标识 {{ d.device_id }}</view>
-      <view class="sub">最近在线 {{ d.last_seen_at ? d.last_seen_at.replace('T', ' ').slice(0, 16) : '—' }}</view>
+      <view class="sub">最近在线 {{ fmtDateTime(d.last_seen_at) }}</view>
       <view class="sub">固件 {{ d.fw_version || '—' }}{{ d.ip ? ` · ${d.ip}` : '' }}</view>
 
       <view class="row ops">

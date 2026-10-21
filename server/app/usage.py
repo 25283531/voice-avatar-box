@@ -18,14 +18,13 @@ from __future__ import annotations
 
 import logging
 import secrets
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from . import models
-from .models import utcnow
+from . import config, models
 
 log = logging.getLogger("elder.usage")
 
@@ -263,7 +262,11 @@ def usage_summary(
         bucket = summary["by_usage"].setdefault(r.usage or "", 0)
         summary["by_usage"][r.usage or ""] = bucket + int(r.total_tokens or 0)
         if by_day:
-            day = r.created_at.date().isoformat() if r.created_at else ""
+            # ⚠️ 必须按**北京时间**分日（不是 UTC）：created_at 是 naive UTC，
+            # 直接 .date() 会把北京 00:00–08:00 的调用算到前一天，
+            # 家属看到的"今天用了多少"在凌晨总是偏少（时区统一，2026-10-21）。
+            day = (models.as_utc(r.created_at).astimezone(config.TZ).date().isoformat()
+                   if r.created_at else "")
             summary["by_day"][day] = summary["by_day"].get(day, 0) + int(r.total_tokens or 0)
     if by_day:
         summary["by_day"] = [{"date": d, "total_tokens": t}
@@ -295,8 +298,16 @@ def recent_usage_rows(
 
 
 def count_calls_today(db: Session, device_id: int) -> int:
-    """某设备今天的调用次数（设备端「今天聊了多少句」的轻量口径）。"""
-    start = utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+    """某设备今天的调用次数（设备端「今天聊了多少句」的轻量口径）。
+
+    ⚠️ 「今天」是**北京时间的今天**：起点必须是北京 00:00 对应的 UTC 时刻。
+    原先用 ``utcnow().replace(hour=0, ...)`` 得到的是"UTC 今天 0 点"，
+    在北京时区它等于 08:00 —— 于是每天 00:00–08:00 的对话都被算进"昨天"，
+    设备上那句"今天聊了 N 句"每天早上一开屏就归零（时区统一，2026-10-21）。
+    """
+    local_midnight = datetime.now(config.TZ).replace(
+        hour=0, minute=0, second=0, microsecond=0)
+    start = local_midnight.astimezone(timezone.utc)
     return int(db.scalar(
         select(func.count(models.ModelUsage.id))
         .where(models.ModelUsage.device_id == device_id,

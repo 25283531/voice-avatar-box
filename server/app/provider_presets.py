@@ -173,6 +173,28 @@ PROVIDER_PRESETS: Final[tuple[ProviderPreset, ...]] = (
         "kind": KIND_ASR,
     },
     {
+        "value": "tencent_asr",
+        "label": "腾讯云语音识别 ASR（一句话识别 · 国内直连）",
+        "api_style": "tencent",
+        "endpoint": "https://asr.tencentcloudapi.com",
+        "needs_key": True,
+        "key_hint": "填 **SecretId:SecretKey**，用**英文冒号**分隔"
+                    "（例：AKIDxxxx:xxxxxx）。这是访问密钥的两段，"
+                    "不是 API 密钥单串。",
+        # 「模型」在本厂商里存的是**引擎类型**（EngSerViceType），
+        # 本平台音频固定 16kHz ⇒ 只列 16k_* 系列。选 8k_* 的后果是
+        # 「能识别但全是乱码」——接口照样 200，最难自查。
+        "models": {KIND_ASR: "16k_zh"},
+        "free_tier": "新用户每月有免费额度（以控制台「语音识别」页面为准）；"
+                     "之后按小时计费。**非永久免费**。",
+        "notes": "⚠️ ① 引擎只选 **16k_** 开头（本平台音频是 16kHz，"
+                 "选 8k_ 会把音频按半速解释，结果全是乱字）"
+                 "② 老人说方言时选 `16k_zh_dialect`（支持 23 种方言）"
+                 "③ 单段上限 60s / 3MB，超了由服务端提前拦截并报错"
+                 " ④ 一句话识别不保留音频，适合隐私敏感场景",
+        "kind": KIND_ASR,
+    },
+    {
         "value": "fastembed_local",
         "label": "本地向量化（FastEmbed/bge · 免密钥）",
         "api_style": "local_embed",

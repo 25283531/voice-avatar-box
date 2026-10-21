@@ -698,9 +698,26 @@ def _create_reminder(db: Any, device_pk: int, args: dict[str, Any]) -> dict[str,
     if not parsed.ok:
         return {"ok": False, "need_clarify": True, "message": parsed.reason}
 
+    # 这条提醒按**设备所在时区**落库（2026-10-21 跨时区改造）。
+    # 老人说"明天早上八点"，指的是他眼前那个钟的八点 —— 服务端在哪个时区
+    # 与这件事无关。判不出来（设备没上报过 IP）就留空串 = config.TZ，
+    # 与改造前逐字一致，不会让存量设备的时间发生任何漂移。
+    from .. import geo
+    from ..schedule import zone_of
+
+    dev = db.get(models.Device, device_pk)
+    rule_tz = geo.device_timezone(dev)
+    zone = zone_of(rule_tz)
+    # "明天""后天"这类相对词必须按同一个时区解释：用北京时间的 now 去算
+    # "明天"，在美西可能整体差一天。parse_when 支持显式 now，传进去即可。
+    parsed = parse_when(when, now=datetime.now(zone))
+    if not parsed.ok:
+        return {"ok": False, "need_clarify": True, "message": parsed.reason}
+
     r = models.Reminder(
         device_id=device_pk,
         creator_id=None,
+        tz=rule_tz,
         title=title[:120],
         speak_text="",
         rtype=_guess_rtype(title),

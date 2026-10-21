@@ -45,6 +45,27 @@ services:
       ELDER_DB_WAIT_SEC: ${ELDER_DB_WAIT_SEC:-180}
       ELDER_JWT_SECRET: ${ELDER_JWT_SECRET:-please-change-this-secret-in-production}
       ELDER_CORS: ${ELDER_CORS:-*}
+      # ---------------------------------------------------------------- 展示时区（2026-10-21）
+      # 用户端/设备端按**各自 IP 所在国家/地区**的时区显示，管理后台固定北京时间
+      # （三份口径与判定顺序见 docs/DEPLOY.md §1.15）。
+      #
+      # ⚠️ 必须在这里**逐条透传**：本文件不是 env_file，`.env` 里的变量
+      # 不加进 environment 就到不了容器。漏一条的表现是"配了没用"，
+      # 而 `source` 字段会如实显示 `default` —— 排障时先看它。
+      #
+      # ELDER_GEO_API 是 IP → 国家的查询地址模板，占位符用 **@IP@**
+      # （等价于 `{ip}`；这里用 @IP@ 是因为 docker compose 的 `${VAR:-默认值}`
+      #  插值遇到 `{ip}` 里的 `}` 会**提前截断**，把模板切成半截 URL，
+      #  而截断后的值仍然是个"看起来像地址"的字符串 —— 症状是永远查不到国家）。
+      # **留空 = 关闭网络判定**（注意这里用 `-` 不是 `:-`：`:-` 会把显式空串
+      #  当成"没设置"从而填回默认值，等于这个开关关不掉）。
+      # 打开时客户端 IP 会发给该服务商；注重隐私就给本地 mmdb（ELDER_GEOIP_DB）。
+      ELDER_GEO_API: ${ELDER_GEO_API-https://ipwho.is/@IP@}
+      ELDER_GEO_TIMEOUT_SEC: ${ELDER_GEO_TIMEOUT_SEC:-2.5}
+      ELDER_GEO_CACHE_TTL_SEC: ${ELDER_GEO_CACHE_TTL_SEC:-21600}
+      ELDER_GEO_FAIL_TTL_SEC: ${ELDER_GEO_FAIL_TTL_SEC:-300}
+      ELDER_GEOIP_DB: ${ELDER_GEOIP_DB:-}
+      ELDER_GEO_COUNTRY_HEADER: ${ELDER_GEO_COUNTRY_HEADER:-cf-ipcountry}
       # ---------------------------------------------------------------- 语音链路
       # 自研语音链路与本服务同源同端口，设备地址由服务端自动推导，**默认不用配**。
       # 只有当部署在反代后面、且 Host 头没被正确透传时才需要显式指定，例如：

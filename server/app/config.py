@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import logging
 import os
-from datetime import timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
 from urllib.parse import urlparse
 from zoneinfo import ZoneInfo
@@ -38,6 +38,84 @@ PORT = int(os.getenv("ELDER_PORT", "8080"))
 # 服药提醒是时间强相关业务，服务端、设备端、展示层必须统一到同一个时区，
 # 否则「早上 8 点吃药」会整体漂移 8 小时。
 TZ = ZoneInfo(os.getenv("ELDER_TZ", "Asia/Shanghai"))
+
+#: 日志统一格式。``main.py`` 的 ``basicConfig`` 与 ``config._ensure_deploy_log_handler``
+#: 都读这一份 —— 两处各写一份字面量时，改格式必然漏一处（本项目的老毛病）。
+LOG_FORMAT: str = "%(asctime)s %(levelname)-7s %(name)s | %(message)s"
+
+# ---------------------------------------------------------------- 时区判定（按 IP）
+# ⚠️ **``TZ`` 不是"所有人看到的时区"**（2026-10-21 用户纠偏）。
+#
+# 一度把展示层也统一成 ``TZ``（北京时间），那是错的：家属在海外用手机看老人的
+# 服药记录，显示北京时间等于要他先做心算。反过来直接用设备时区同样不行 ——
+# 老人机/家属手机的时区**可能是错的**（出厂默认 UTC、手动改过、英文系统）。
+#
+# 现在的口径：**由 `app/geo.py` 按客户端 IP 所在国家/地区判定**，设备自报的
+# 时区只在"国家未知"或"该国跨多时区"时参与。``TZ`` 在这里降级成**最后一级
+# 兜底**（查不到任何信息时用），它仍然决定服务端"北京墙上时间"类字段
+# （``reminder_events.due_at`` 等）的语义，那部分是数据口径、不是展示口径，
+# 两者不在同一个层面，别混。
+#
+# ``ELDER_GEO_API``：IP → 国家的查询地址模板，占位符 ``{ip}`` 或 ``@IP@``
+# （两种等价；用 ``@IP@`` 是为了绕开 docker-compose 插值里 ``{ip}`` 的 ``}``
+#   会提前截断模板 —— 截断后的半截 URL 看起来仍像个地址，症状是永远查不到国家）。
+#   * **默认 ``https://ipwho.is/{ip}``** —— 免费、HTTPS、免密钥，返回
+#     ``{"success":true,"country_code":"CN", ...}``；
+#   * **设成空串则整条网络判定关闭**（只剩「可信反代头」与「本地 mmdb」两层）。
+#     注重隐私的部署请显式设空 —— 打开时客户端 IP 会发给该服务商。
+#   * 只发 IP、不发任何其它数据；结果按 /24（IPv6 按 /48）缓存，见 geo.py。
+#   * 服务方只认下面这几个字段名（按顺序尝试），所以换成 ipapi.co / ip-api.com
+#     这类同形状的服务也能直接用：``country_code`` / ``countryCode`` /
+#     ``country``（值可以是 2 位码也可以是英文国名）。
+GEO_API_URL = os.getenv("ELDER_GEO_API", "https://ipwho.is/{ip}").strip()
+#: 单次查询的硬超时（秒）。**别调得太小**：实测国际链路抖动很大
+#: （同一服务 0.5s / 1.7s / 2.7s 都出现过），0.8s 会让"明明能查到"的网络
+#: 稳定判成查不到，而那时 ``source`` 会显示 ``device``/``default`` ——
+#: 看起来像"配置没生效"。代价是首次调用最多等这么久，
+#: 但同一网段 6 小时内只查一次（见 ``GEO_CACHE_TTL_SEC``）。
+GEO_API_TIMEOUT_SEC = float(os.getenv("ELDER_GEO_TIMEOUT_SEC", "2.5"))
+#: 查询结果缓存时长（秒）。IP 归属地不会分钟级变动，6 小时是"够准且不浪费"。
+GEO_CACHE_TTL_SEC = float(os.getenv("ELDER_GEO_CACHE_TTL_SEC", "21600"))
+#: **查询失败**的缓存时长（秒）。必须远短于成功值：一次网络抖动若按 6 小时
+#: 缓存成"这个网段没有国家"，等于让那一整片用户连续 6 小时吃兜底值，
+#: 而看日志只能看到一次 timeout。
+GEO_FAIL_TTL_SEC = float(os.getenv("ELDER_GEO_FAIL_TTL_SEC", "300"))
+#: 缓存条目上限。键是网段不是单 IP，攻击者无法把表撑爆（且超限时整体清空，
+#: 不清空就意味着一条不要凭证的 OOM 路径）。
+GEO_CACHE_MAX = int(os.getenv("ELDER_GEO_CACHE_MAX", "4096"))
+#: 本地 MaxMind 库（``GeoLite2-Country.mmdb``）路径。**可选**：
+#: 装了 ``maxminddb`` 且文件存在时才生效，否则该层静默不可用（``source`` 会
+#: 如实反映，不会假装查到了）。有它就不必开 ``ELDER_GEO_API``。
+GEOIP_DB = os.getenv("ELDER_GEOIP_DB", "").strip()
+#: 可信反代声明的"客户端国家"响应头名（如 Cloudflare 的 ``CF-IPCountry``）。
+#: **只有 TCP 对端在 ``TRUSTED_PROXY_IPS`` 名单里才会被采信** —— 否则任何人
+#: 加一个头就能把时区改成任意值。
+GEO_COUNTRY_HEADER = os.getenv("ELDER_GEO_COUNTRY_HEADER", "cf-ipcountry").strip().lower()
+
+
+class BeijingFormatter(logging.Formatter):
+    """把 ``%(asctime)s`` 固定成**北京时间**，不依赖进程 TZ 环境变量。
+
+    为什么不用默认 `Formatter`（2026-10-21 时区统一）
+    ----------------------------------------------
+    默认实现走 ``time.localtime(record.created)``，读的是**进程 TZ 环境变量**：
+    容器里 ``ENV TZ=Asia/Shanghai`` 所以对；本地开发（未设 TZ 的 shell）、
+    CI runner（UTC）就各不相同 —— 同一份代码在三处打出三种时间。
+    用户抱怨的「几个节点时区不统一」里，Docker 日志正是其中一处。
+    这里显式用 :data:`TZ` 换算，日志时间与 TZ 环境变量彻底解耦。
+
+    ⚠️ ``docker logs -t`` 前缀的时间戳**不受本类影响**：那是 Docker 守护进程
+    生成的，永远是 UTC。要看北京时间请直接看应用日志里的 asctime
+    （或 ``TZ=Asia/Shanghai docker logs -t``，但那只改变显示不改数据）。
+    """
+
+    def formatTime(self, record: logging.LogRecord,
+                   datefmt: str | None = None) -> str:
+        dt = datetime.fromtimestamp(record.created, TZ)
+        base = dt.strftime(datefmt or "%Y-%m-%d %H:%M:%S")
+        if datefmt:
+            return base
+        return f"{base},{int(record.msecs):03d}"
 
 # ---------------------------------------------------------------- 数据库
 # 默认**内置 SQLite**：`docker compose up -d` 开箱即用，不需要任何外部数据库，
@@ -535,8 +613,7 @@ def _ensure_deploy_log_handler() -> None:
     if root.handlers:
         return
     handler = logging.StreamHandler()
-    handler.setFormatter(logging.Formatter(
-        "%(asctime)s %(levelname)-7s %(name)s | %(message)s"))
+    handler.setFormatter(BeijingFormatter(LOG_FORMAT))
     root.addHandler(handler)
     root.setLevel(logging.INFO)
 

@@ -273,6 +273,17 @@ jobs:
       - name: 声纹认人冒烟（提供者契约 / 登记 CRUD / 端到端 + 反向变异）
         run: python tools/run_smoke.py logs/smoke_voiceprint.log python tools/smoke_voiceprint.py 8133
 
+      # 展示时区判定冒烟（端口 8135，假 IP 地理位置服务 8335，均已在
+      # smoke_ports.py / 脚本头部登记）。
+      # 守的是「用户端/设备端按各自 IP 所在国家/地区显示，管理端统一北京时间」
+      # 这条口径里最容易错的一环：**提醒的"早上 8 点"挂在哪个时区上**。
+      # 挂错了完全无症状（接口 201、界面正常，只是老人半夜被叫醒），
+      # 所以断言全部落在**绝对时刻**上，并配 4 条反向变异。
+      # 全程打本机假 IP 库（不依赖公网、不需要任何凭据），
+      # 因此也不会因为第三方服务抖动而假红。
+      - name: 展示时区冒烟（IP→国家→时区 + 提醒按规则时区展开 + 反向变异）
+        run: python tools/run_smoke.py logs/smoke_geo.log python tools/smoke_geo.py 8135
+
       # 模型接入点冒烟（九种 kind 注册 / usage 平滑过渡 / 四家报文协议切换 /
       # 错误五码分诊 / 密钥脱敏 / 设备下发兜底 / context_window 裁剪）。
       # 为什么必须进 CI（此前它只在本机跑，等于这套断言对 GitHub 上的每个

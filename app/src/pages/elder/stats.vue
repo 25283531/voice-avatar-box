@@ -9,6 +9,7 @@ import { onLoad, onShow } from '@dcloudio/uni-app'
 import { computed, ref } from 'vue'
 import { statsOverview } from '@/api/elder'
 import type { StatsOverview } from '@/api/elder'
+import { fmtDateTime } from '@/utils/time'
 
 const devicePk = ref(0)
 const deviceName = ref('')
@@ -52,7 +53,7 @@ onShow(() => { refresh() })
   <view class="page">
     <view class="head">
       <text class="dname">{{ deviceName }}</text>
-      <text class="sub">{{ stat?.online ? '在线' : '离线' }} · 最近在线 {{ stat?.last_seen_at ? stat.last_seen_at.replace('T', ' ').slice(0, 16) : '—' }}</text>
+      <text class="sub">{{ stat?.online ? '在线' : '离线' }} · 最近在线 {{ fmtDateTime(stat?.last_seen_at) }}</text>
     </view>
 
     <view class="tabs">

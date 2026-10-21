@@ -23,6 +23,8 @@ from fastapi.staticfiles import StaticFiles
 from sqlalchemy import select
 
 from .config import (
+    BeijingFormatter,
+    LOG_FORMAT,
     APP_NAME,
     APP_VERSION,
     CORS_ORIGINS,
@@ -34,8 +36,8 @@ from .config import (
 from .db import SessionLocal, get_db, init_db
 from .models import Avatar
 from .routers import (admin_presets, avatars, auth, chat_quota, device_api, devices,
-                      home, mail, providers, reminders, roles, stats, support, usage,
-                      voice_speakers, weather as weather_router)
+                      geo as geo_router, home, mail, providers, reminders, roles,
+                      stats, support, usage, voice_speakers, weather as weather_router)
 from .schema_patch import run_all as run_schema_upgrade
 from .security import hash_password, verify_password
 # 记忆的 router 单独导入，**不从 .memory 包里取**：
@@ -46,10 +48,12 @@ from .memory import router as memory_router
 # 这里只把模块引进来，真正接线在 app 定义之后的那一行 _voice.attach(app)。
 from . import voice as _voice
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)-7s %(name)s | %(message)s",
-)
+# ⚠️ 不用 basicConfig(format=...)：那会走默认 Formatter，而默认 Formatter 的
+# asctime 读进程 TZ 环境变量（CI 上跑出来就是 UTC）。显式挂 config 里的
+# BeijingFormatter —— 时间恒为北京时间，与 TZ 环境变量无关。
+_log_handler = logging.StreamHandler()
+_log_handler.setFormatter(BeijingFormatter(LOG_FORMAT))
+logging.basicConfig(level=logging.INFO, handlers=[_log_handler])
 log = logging.getLogger("elder")
 
 STATIC_DIR = Path(__file__).parent / "static"
@@ -530,6 +534,13 @@ app.add_middleware(
 
 for r in (auth.router, devices.router, reminders.router, avatars.router,
           providers.router, roles.router, stats.router, device_api.router, home.router):
+    app.include_router(r)
+
+# 展示时区判定：/api/geo/timezone。**无鉴权**（登录页与首屏都要用），
+# 输出只有时区名/国家码/偏移，不含用户数据。判定逻辑在 app/geo.py。
+# 口径（2026-10-21 用户定调）：用户端/设备端按各自 IP 所在国家/地区显示，
+# **管理端统一北京时间**（管理员在中国，统一口径才好排查与统计）。
+for r in (geo_router.router,):
     app.include_router(r)
 
 # 陪聊时长：设备端 /api/device/quota（当日统计 + 服药关键词）与 /api/device/chat-usage（上报）。

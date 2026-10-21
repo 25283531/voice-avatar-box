@@ -15,11 +15,12 @@ from __future__ import annotations
 
 import logging
 import threading
+from datetime import datetime
 from typing import Any, Sequence
 
 from sqlalchemy.orm import Session
 
-from .. import models
+from .. import config, models
 from .client import ModelClient, get_default_client
 from .extract import Fact, as_turns, extract_facts
 from .persona import observe_reply
@@ -248,11 +249,17 @@ def build_context(db: Session, query: str, user_id: int, agent_id: int | None,
 
 
 def _stamp(ts: float) -> str:
+    """epoch 秒 → 「，2026-10-21」（**北京时间**）。
+
+    ⚠️ 原来用 ``time.localtime(ts)``：它读的是**进程级 TZ 环境变量**，
+    而这行字会拼进 **LLM 的 prompt**（"这条记忆是哪天记的"）——
+    容器里有 TZ=Asia/Shanghai 就对，本机没设就按 UTC，同一份数据在两处
+    说出不同的日期，模型也就给出不同的回答。改用显式 ``config.TZ``，
+    不再依赖进程环境（时区统一，2026-10-21）。
+    """
     if not ts:
         return ""
-    import time as _t
-
-    return "，" + _t.strftime("%Y-%m-%d", _t.localtime(ts))
+    return "，" + datetime.fromtimestamp(ts, config.TZ).strftime("%Y-%m-%d")
 
 
 def recent_turns(db: Session, user_id: int, agent_id: int | None,

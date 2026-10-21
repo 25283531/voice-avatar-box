@@ -2463,12 +2463,34 @@ createApp({
     },
 
     // -------- 展示辅助 --------
+    /* 管理后台的时间**一律按北京时间**显示（用户 2026-10-21 明确要求）。
+       口径分两层，别混：
+         · 用户端/设备端 —— 按**各自 IP 所在国家/地区**的时区显示
+           （见后端 app/geo.py 与 App 的 utils/time.ts），因为老人和家属
+           可能不在同一个国家；
+         · 管理端 —— 统一北京时间。管理员在中国，看系统日志、token 调用
+           流水、提醒回执时，多时区混排会让"几点出的问题"没法对齐，
+           统计也没法按天汇总。统一口径的唯一目的就是**可排查、可统计**。
+       为什么不用 d.getHours()/getFullYear()：那些是「管理员电脑的时区」，
+       出差/时区设错/英文系统都会让整页时间偏移 8 小时，而这时
+       "统一北京时间"就不成立了。所以先按偏移解析、再用 getUTC* 取值
+       （与运行环境时区无关）。中国自 1991 年起无夏令时，
+       Asia/Shanghai 恒等于 UTC+8，手算即等价。
+       ⚠️ 接口返回的串**带偏移**（后端 schemas.ORMBase 会按每一行自己的
+       tz 补上），所以跨时区的提醒实例也能正确换算到北京时间。 */
     fmt(v){
       if (!v) return '—';
-      const d = new Date(v);
+      let s = String(v).trim();
+      // "2026-10-21 14:00:00" → ISO（Safari 不认空格分隔）
+      if (s.includes(' ') && !s.includes('T')) s = s.replace(' ', 'T');
+      // 裸串按「北京墙上时间」补齐（本项目 naive 串的语义，见 schemas.LOCAL_WALL_FIELDS）
+      if (!/[zZ]$|[+-]\d{2}:?\d{2}$/.test(s)) s += '+08:00';
+      const d = new Date(s);
       if (isNaN(d.getTime())) return v;
+      const b = new Date(d.getTime() + 8 * 60 * 60 * 1000);
       const p = n => String(n).padStart(2,'0');
-      return d.getFullYear()+'-'+p(d.getMonth()+1)+'-'+p(d.getDate())+' '+p(d.getHours())+':'+p(d.getMinutes());
+      return b.getUTCFullYear()+'-'+p(b.getUTCMonth()+1)+'-'+p(b.getUTCDate())
+        +' '+p(b.getUTCHours())+':'+p(b.getUTCMinutes());
     },
     /* 柱子高度百分比：**必须按本图表自己的数据集归一化**。
        旧实现用 this.stat.series 当基准，token 页 stat 通常为 null ⇒ max=1 ⇒

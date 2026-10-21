@@ -5,13 +5,18 @@
 =====================  ====================================================
 ``__init__.py``        本文件：暴露 :func:`attach`，注册 WS 端点与 OTA 路由
 ``opus_codec.py``      ctypes 直连 libopus，模块级 ``decode_opus`` / ``encode_opus``
-``asr_tts.py``        OpenAI 兼容的 ASR / TTS 客户端 + 音色回落链
+``asr_tts.py``        ASR / TTS 的**统一分发入口**（按 provider/api_style 选实现）
 ``session.py``         一次连接一个 :class:`VoiceSession`（状态机 + 全链路编排）
 ``prompts.py``         语音专用基础口令与固定话术
 ``mqtt_udp.py``        F1：MQTT broker + UDP 音频网关 + WS 形状传输适配器
                        （**默认关闭**，``ELDER_MQTT_PORT`` 门控，见该模块注释）
 ``voiceprint.py``      F3：外部声纹服务客户端（3D-Speaker 契约，**默认关闭**，
                        ``ELDER_VOICEPRINT_URL`` 门控，见该模块注释）
+``tc3.py``             腾讯云 API 3.0 签名（TC3-HMAC-SHA256），TTS/ASR 共用
+``tts_tencent.py``     腾讯云语音合成适配（云 API，``Codec=pcm`` / 24kHz）
+``asr_tencent.py``     腾讯云一句话识别适配（云 API，``VoiceFormat=pcm``）
+``tts_volc.py``        火山引擎 TTS 适配（私有协议，V4 派生签名）
+``tts_edge.py``        Edge TTS 桥（免密钥兜底，需要额外依赖）
 =====================  ====================================================
 
 接线约定
@@ -37,6 +42,11 @@
    未配置 / 没登记说话人 / 服务不健康时，识别不发生且**对话行为与没开
    声纹时逐字节一致** —— 认不出人绝不是降级事故。合规注意（生物特征
    数据出境）见 docs/DEPLOY.md §1.14。
+8. **腾讯云语音的端到端未在真机验证**：TC3 签名与报文按官方文档实现，
+   没有真实 SecretId/SecretKey 时只能做结构断言（见
+   ``tools/smoke_tencent_voice.py``）。首次启用请先在管理后台该配置行点
+   「测试连接」—— TTS 会真合成一次（消耗几十字额度），ASR 只验配置存在
+   （需要真实录音才能验，界面上会明说）。
 """
 from __future__ import annotations
 
@@ -108,11 +118,15 @@ def _ws_endpoint(request: Request) -> str:
 
 
 def _server_time() -> dict[str, Any]:
-    """服务端时间段。timezone_offset 固定 Asia/Shanghai = +480 分钟。
+    """服务端时间段。``timestamp`` 是**绝对 UTC 毫秒**，与 ``settimeofday`` 同口径。
 
-    为什么写死而不是从 ``config.TZ`` 反推：固件 ota.cc 只做
-    ``ts += offset * 60 * 1000`` 的算术，拿不到负偏移时的夏令时规则；
-    而项目面向国内部署，TZ 事实上恒为 Asia/Shanghai。
+    ``timezone_offset`` 仍下发 480（Asia/Shanghai），但**固件已不再用它做加法**
+    （2026-10-21 修正，见 ``firmware/xiaozhi/main/ota.cc`` 的说明）：
+    那一行曾经造成双重偏移 —— 系统时钟快 8 小时，提醒判据整体错位。
+    保留这个字段是为了与既有固件版本/上游契约兼容（老固件读到它也无害，
+    只是新的就不再读了），**不要因为"没人用了"就删掉**，那会让老固件
+    失去一个它认识的字段（虽然它也只是加偏移，但静默改变 JSON 形状
+    属于没有收益的风险）。
     """
     import datetime as _dt
 

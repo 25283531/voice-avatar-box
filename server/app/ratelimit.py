@@ -262,6 +262,19 @@ def _is_trusted(ip: str) -> bool:
     return False
 
 
+def is_trusted_proxy(ip: str) -> bool:
+    """这个地址是不是我们**显式声明过**的可信代理？
+
+    公开出来的唯一原因：``app/geo.py`` 要判断「能不能采信反代声明的国家头」。
+    那个判断与限速器判断「能不能采信 X-Forwarded-For」**必须是同一个名单** ——
+    两处各维护一份，迟早出现「限速信 XFF、地理不信 XFF」的错位，而错位本身
+    没有任何症状，只是某天开始所有人都被判定成同一个国家。
+    """
+    if not _TRUSTED:
+        return False
+    return _is_trusted(ip)
+
+
 def client_ip(request) -> str:
     """取限速用的客户端 IP。
 

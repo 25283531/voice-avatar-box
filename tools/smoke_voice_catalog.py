@@ -578,7 +578,7 @@ def main() -> int:
         # 火山行会被静默路由到 OpenAI 路径 —— 表现为「配好了却报格式不对」。
         print("\n── H8. 分发判据（provider 必须优先于 api_style）──")
         sys.path.insert(0, str(SERVER))
-        from app.voice.asr_tts import _tts_dispatch_style, _volc_keys  # noqa: E402
+        from app.voice.asr_tts import _tts_dispatch_style, _secret_pair  # noqa: E402
 
         class _Row:      # 最小替身：分发只读这两个属性
             def __init__(self, **kw):
@@ -594,16 +594,23 @@ def main() -> int:
                               api_style="openai_compatible"), "openai_compatible"),
             ("手填火山（仅 api_style）",
              _Row(provider="my_gateway", api_style="volcengine"), "volcengine"),
+            # 腾讯云与火山同型：预置会把 api_style 一并写好，必须让
+            # provider 优先，否则腾讯云行会被静默路由到 OpenAI 路径。
+            ("腾讯云", _Row(provider="tencent",
+                          api_style="openai_compatible"), "tencent"),
+            ("手填腾讯云（仅 api_style）",
+             _Row(provider="my_gateway", api_style="tencent"), "tencent"),
             ("自建未知", _Row(provider="openai_compatible"), "openai_compatible"),
             ("存量老配置（provider 空）", _Row(provider=""), "openai_compatible"),
         ]:
             got = _tts_dispatch_style(row)
             check(f"H8 分发 {name}", got == expect, f"得到 {got}，应为 {expect}")
 
-        check("H9 火山密钥支持中英文冒号分隔",
-              _volc_keys(_Row(api_key="AK:SEC")) == ("AK", "SEC")
-              and _volc_keys(_Row(api_key="AK：SEC")) == ("AK", "SEC"),
-              str(_volc_keys(_Row(api_key="AK：SEC"))))
+        check("H9 两段密钥支持中英文冒号分隔（火山 + 腾讯云共用）",
+              _secret_pair(_Row(api_key="AK:SEC")) == ("AK", "SEC")
+              and _secret_pair(_Row(api_key="AK：SEC")) == ("AK", "SEC")
+              and _secret_pair(_Row(api_key="ONLY")) == ("ONLY", ""),
+              str(_secret_pair(_Row(api_key="AK：SEC"))))
 
         # --- 火山签名：无法真调，改用官方文档推导过程做确定性断言 ---
         print("\n── H10. 火山签名算法（无 AK/SK，改用文档推导断言）──")

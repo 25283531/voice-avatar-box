@@ -143,6 +143,15 @@ def _volc_voices() -> tuple[dict, ...]:
     from .tts_volc import VOLC_VOICES
     return VOLC_VOICES
 
+
+# 腾讯云音色同理：清单住在 ``tts_tencent.TENCENT_VOICES``，本模块只转出。
+# ⚠️ 腾讯云的音色 ID 是**整数**（如 1001），但本表统一用字符串承载 ——
+# ai_providers.voice 是文本列，前端下拉也按字符串传。转换发生在
+# ``tts_tencent._voice_type``，不要在本表里塞 int（会与其它厂商的行不同型）。
+def _tencent_voices() -> tuple[dict, ...]:
+    from .tts_tencent import TENCENT_VOICES
+    return TENCENT_VOICES
+
 # 出厂默认音色：⚠️ **这里只做转出，不做定义**。
 #
 # 真源在 ``app.persona.catalog.DEFAULT_PRESET_TTS_VOICE`` —— main.py 的种子写入、
@@ -256,6 +265,33 @@ VENDOR_CATALOG: Final[tuple[VendorEntry, ...]] = (
         "notes": "⚠️ ① 付费音色需在控制台单独开通，填了没权限会报错"
                  " ② 下面预置的都是**公版免费音色**"
                  " ③ 密钥是 AK/SK 两段，别当成一个 key",
+    },
+    {
+        "value": "tencent",
+        "label": "腾讯云语音合成 TTS（国内直连 · 支持多情感音色）",
+        "api_style": "tencent",
+        # 腾讯云的域名是固定的（与 endpoint 填不填无关），这里填上是让人
+        # 看得见"请求打到哪"，私有化/代理场景可改成自己的地址。
+        "endpoint": "https://tts.tencentcloudapi.com",
+        # 腾讯云 TTS 没有"模型名"这个概念（ModelType 恒为 1，不是可选模型），
+        # 所以这一栏留空 —— 别为了填满表单编一个值出来。
+        "model": "",
+        "needs_key": True,
+        "key_hint": "填 **SecretId:SecretKey**，用**英文冒号**分隔"
+                    "（例：AKIDxxxx:xxxxxx）。注意是「访问密钥」的两段，"
+                    "**不是** API 密钥单串，也不是 AppID。",
+        "needs_voice": True,
+        "voices": [dict(v) for v in _tencent_voices()],
+        "free_tier": "新用户有试用额度（具体额度以腾讯云控制台「语音合成」"
+                     "页面为准）；之后按量计费，音色不同价位不同。"
+                     "**非永久免费**。",
+        "notes": "⚠️ ① 音色 ID 是**整数**（如 601009）—— 把火山/百炼那种字符串"
+                 " ID 粘过来会报 InvalidParameterValue.VoiceType"
+                 " ② 下列 8 个预置音色**全部支持 24kHz**（本平台要的采样率），"
+                 "可直接选用；若手填别的 ID 请先确认它支持 24k，否则合成会失败"
+                 " ③ **情感只有 601xxx 大模型音色支持**（9 种）；402/403/502 "
+                 "超自然音色只支持中性，选了它们再传情感会自动降级为无情感"
+                 " ④ 单次合成上限 150 个汉字，超长由服务端自动分段拼接",
     },
     {
         "value": "aliyun",

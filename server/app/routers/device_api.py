@@ -7,7 +7,6 @@
 from __future__ import annotations
 
 from datetime import timedelta
-from datetime import timezone as dt_timezone
 from typing import Any
 
 from fastapi import APIRouter, Depends, Request, status
@@ -28,7 +27,8 @@ from ..llm_gateway import resolve_row
 from ..chat_quota import quota_snapshot
 from ..model_catalog import DEVICE_KINDS, KIND_LLM
 from ..models import EventState, Interaction, ReminderEvent, utcnow
-from ..schedule import local_now, materialize_events, next_occurrence
+from ..schedule import (TZ_MARGIN, event_due_utc, local_now, materialize_events,
+                        next_occurrence)
 from ..schemas import (
     AvatarOut,
     DeviceQuotaOut,
@@ -123,15 +123,21 @@ def sync(request: Request, fw_version: str = "", hw_model: str = "",
                                       models.Reminder.enabled.is_(True))
     ).all()
     now = local_now()
+    wall = now.replace(tzinfo=None)
+    # ⚠️ due_at 是**规则时区的裸钟点**，跨时区后 SQL 范围条件不再是绝对时刻。
+    # 先按 ±TZ_MARGIN 放宽粗筛（覆盖任何时区），再按绝对时刻精确过滤。
     upcoming = list(db.scalars(
         select(ReminderEvent)
         .where(ReminderEvent.device_id == dev.id,
                ReminderEvent.state == int(EventState.PENDING),
-               ReminderEvent.due_at >= now - timedelta(minutes=10),
-               ReminderEvent.due_at <= now + timedelta(hours=SCHEDULE_AHEAD_HOURS))
+               ReminderEvent.due_at >= wall - TZ_MARGIN - timedelta(minutes=10),
+               ReminderEvent.due_at <= wall + timedelta(hours=SCHEDULE_AHEAD_HOURS) + TZ_MARGIN)
         .order_by(ReminderEvent.due_at)
         .limit(200)
     ).all())
+    upcoming = [e for e in upcoming
+                if now - timedelta(minutes=10) <= event_due_utc(e)
+                <= now + timedelta(hours=SCHEDULE_AHEAD_HOURS)]
 
     # 补齐「视野内一条实例都没有」的规则，让每条启用规则至少有一次触发随心跳下发。
     #
@@ -159,6 +165,7 @@ def sync(request: Request, fw_version: str = "", hw_model: str = "",
         )
         if ev is None:
             ev = ReminderEvent(reminder_id=r.id, device_id=dev.id, due_at=nxt,
+                               tz=r.tz or "",
                                state=int(EventState.PENDING))
             db.add(ev)
             created = True
@@ -169,10 +176,12 @@ def sync(request: Request, fw_version: str = "", hw_model: str = "",
         covered.add(r.id)
     if created:
         db.commit()
-    # 统一按 UTC 排序键排：窗口查出来的行 due_at 是 SQLite 回读的「墙上时间」(naive)，
-    # 刚 db.add 的对象还是 schedule 生成的 aware 值，直接排序会抛
-    # TypeError: can't compare offset-naive and offset-aware datetimes。
-    upcoming.sort(key=lambda e: e.due_at.replace(tzinfo=dt_timezone.utc))
+    # 统一按**绝对时刻**排序：窗口查出来的行 due_at 是 SQLite 回读的裸钟点
+    # （基准逐规则不同），刚 db.add 的对象还是 schedule 生成的 aware 值，
+    # 直接排序会抛 TypeError: can't compare offset-naive and offset-aware。
+    # 注意**不能**简单地补一个 UTC 标记了事 —— 那样排的是"墙上钟点"，
+    # 混时区时（一条北京规则 + 一条纽约规则）顺序会错。
+    upcoming.sort(key=event_due_utc)
 
     avatar = db.get(models.Avatar, dev.avatar_id) if dev.avatar_id else None
     # ⚠️⚠️ 下面这条查询是本项目最敏感的一行，**绝对不要**加 owner 或 record_type 条件。
@@ -247,7 +256,15 @@ def report_event(payload: EventReportIn, db: Session = Depends(get_db),
 
     若该实例服务端未预排（设备离线期间自行排的），这里按
     (reminder_id, due_at) 补建，保证对账不丢。
+
+    ⚠️ ``due_at`` 在这里是**设备本地钟点**（固件 ``sync.c`` 用
+    ``elder_time_iso_local`` 按自己的 TZ 格式化，不带偏移）。它与
+    ``reminder_events.due_at`` 能对上，前提是**设备时区 == 规则时区**。
+    两者不一致时的对账（设备在别国、固件 TZ 还是 CST-8）需要固件侧先上报
+    自己的时区，属于单独的固件改动；在那之前，这里的行为与改造前完全一致
+    （存量设备全部在北京时间下，条件成立）。
     """
+    rule = db.get(models.Reminder, payload.reminder_id)
     ev = db.scalar(
         select(ReminderEvent).where(
             ReminderEvent.reminder_id == payload.reminder_id,
@@ -259,6 +276,8 @@ def report_event(payload: EventReportIn, db: Session = Depends(get_db),
             reminder_id=payload.reminder_id,
             device_id=dev.id,
             due_at=payload.due_at,
+            # 补建时补上规则时区，否则这条实例的 due_at 就再也没法还原成绝对时刻
+            tz=(rule.tz if rule is not None else "") or "",
         )
         db.add(ev)
         db.flush()

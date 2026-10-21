@@ -23,7 +23,7 @@ from .config import SCHEDULER_INTERVAL_SEC, SCHEDULE_AHEAD_HOURS, TZ
 from .db import SessionLocal
 from .device_state import mark_offline_devices
 from .models import Device, EventState, Reminder, ReminderEvent
-from .schedule import local_now, materialize_events
+from .schedule import event_due_utc, local_now, materialize_events
 
 log = logging.getLogger("elder.scheduler")
 
@@ -121,12 +121,12 @@ def _tick(session: Session) -> None:
         rule = session.get(Reminder, ev.reminder_id)
         if not rule or not rule.require_confirm:
             continue
-        # due_at 是 schedule 按服务端时区 TZ 生成的，落库时带时区，
-        # 但 SQLite 读回来会把时区抹掉变成 naive —— 直接和 now（aware）比较会抛
-        # `TypeError: can't compare offset-naive and offset-aware datetimes`，
-        # 异常会顺着冒到 run_forever，把这一轮后面的所有步骤（含离线清扫）
-        # 一起带走。这里按 TZ 把时区补回去再比较。
-        due = ev.due_at if ev.due_at.tzinfo else ev.due_at.replace(tzinfo=TZ)
+        # due_at 存的是**规则所在时区**的裸钟点（跨时区之后不再是"服务端钟点"），
+        # 直接和 now（aware）比较会抛 TypeError，而且就算补了 TZ 也只有北京规则
+        # 是对的。统一走 schedule.event_due_utc() 还原成绝对时刻。
+        # ⚠️ 异常若是顺着冒到 run_forever，会把这一轮后面的所有步骤
+        # （含离线清扫）一起带走，所以这里也刻意不做 try 之外的花活。
+        due = event_due_utc(ev)
         deadline = due + timedelta(minutes=max(1, rule.escalate_after_min))
         if now > deadline:
             ev.state = int(EventState.MISSED)

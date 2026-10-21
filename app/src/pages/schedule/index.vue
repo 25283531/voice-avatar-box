@@ -19,6 +19,7 @@ import {
 } from '@/api/elder'
 import type { Device, Reminder } from '@/api/elder'
 import { getElderToken } from '@/http/elder'
+import { fmtDateTime } from '@/utils/time'
 
 const devices = ref<Device[]>([])
 const devicePk = ref(0)
@@ -46,9 +47,9 @@ function kindText(r: Reminder) {
   }
 }
 
+/** 保留本地名 `fmt`：模板已在用，改名要连带改模板。统一走北京时间。 */
 function fmt(v?: string | null) {
-  if (!v) return '—'
-  return v.replace('T', ' ').slice(0, 16)
+  return fmtDateTime(v)
 }
 
 async function refresh() {
