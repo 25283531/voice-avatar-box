@@ -238,7 +238,6 @@ static void ScheduleAnnounce(const char *text)
         delete payload;
     }
 }
-}
 
 int s_arming_id = -1;
 

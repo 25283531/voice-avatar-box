@@ -76,6 +76,23 @@ jobs:
           fi
           echo "注入副本与源树一致"
 
+      # ⚠️ 2026-10-22 真事故：提交 8b18c9d 在 elder_bridge.cc 里多留了一个 `}`，
+      # 本地所有冒烟脚本全绿（它们读文本做断言，**不编译 C++**，多一个花括号
+      # 对它们不可见），一路推到 CI 才在 `elder_bridge.cc:397` 报
+      # `expected declaration before '}' token` ⇒ 固件编不出来 ⇒ 烧录无从谈起。
+      #
+      # 用户已拍板「固件一律 CI 编，本机不编」，所以本机必须有一道**不依赖
+      # 工具链**的机械闸门。花括号配平不需要头文件、不需要交叉编译器，
+      # 几毫秒就能把这类错误挡在推送之前（本地同样一条命令：
+      # `python tools/check_c_braces.py`）。
+      #
+      # 放在「注入 elder 组件」之后、真正编译之前：报出的是**第一个**多余的
+      # 右括号所在行号，比等 8 分钟编译拿到同一句话有用得多。
+      - name: 花括号配平自检（多/少一个 `}` 是编译期才发现的最贵错误）
+        run: |
+          set -e
+          python3 tools/check_c_braces.py
+
       - name: 按输入覆盖板卡与后端地址
         env:
           BOARD_SYM: ${{ inputs.board || 'CONFIG_BOARD_TYPE_LICHUANG_DEV_S3' }}
