@@ -10,9 +10,11 @@
    ``run_in_threadpool``。
 3. **任何异常都不许把 WS 连接搞崩**。设备侧重连成本高（要走一次 OTA
    才拿得到新 token），一轮对话失败最多是"这次没答上来"。
-4. **音频帧的收与发都不经过 asyncio 队列做缓冲**：上行直接进
-   ``list[bytes]``（60ms 一帧，一轮最多几十帧，内存可忽略）；
-   下行边合成边发（流式 TTS，见 :class:`_ReplySpeaker`）。
+4. **音频上行不进 asyncio 队列**：直接进 ``list[bytes]``（60ms 一帧，
+   一轮最多几十帧，内存可忽略）。**下行反过来，必须进节流队列**：
+   边合成边交给 :class:`~app.voice.audio_pacing.AudioPacer`，
+   由它按虚拟播放时钟 60ms 一帧匀速发 —— 自己直接 await socket 的话
+   帧间隔不可控（断续）且反压会堵住 LLM 流读取（响应慢）。
 
 ⚠️ 关于 MCP（``{"type":"mcp"}``）
 --------------------------------
@@ -49,6 +51,7 @@ from ..security import decode_token
 from .. import models as _m
 from .. import usage as usage_svc
 from . import asr_tts, opus_codec
+from .audio_pacing import AudioPacer
 from .prompts import (
     BASE_VOICE_PROMPT,
     DEVICE_UNBOUND_MESSAGE,
@@ -253,6 +256,12 @@ class VoiceSession:
 
         self._t0: float = 0.0               # 本轮 listen start 时刻
 
+        # 当前这一轮的播报器（_ReplySpeaker）。abort 时要能立刻丢掉它
+        # 队列里还没发出去的音频帧 —— 否则老人已经喊停了，音箱还在
+        # 把剩下的半句话说完。由 _ReplySpeaker.__init__ 写入、
+        # finish()/close() 清空。
+        self._speaker: _ReplySpeaker | None = None
+
         # ---- 服务端 → 设备 MCP 工具通道（JSON-RPC 2.0）----
         # 键是 JSON-RPC id（**必须是整数**：固件 mcp_server.cc 的
         # ParseMessage 用 cJSON_IsNumber 校验 id，字符串 id 会被直接丢弃），
@@ -322,6 +331,17 @@ class VoiceSession:
                 # 对已断开的连接每帧抛一次异常（刷满日志且掩盖真因）。
                 self._abort = True
                 self._turn_task.cancel()
+            # 节流协程挂在 _ReplySpeaker 上，由 finish()/close() 停。
+            # 断开的那一轮可能正卡在 finish() 的等待里被连带取消 ⇒ 没人停它，
+            # 它会带着 WebSocket 引用一直挂在进程里。这里补一刀
+            # （close() 不发协议消息，对已断开的连接也无害）。
+            sp = self._speaker
+            if sp is not None:
+                try:
+                    await sp.close()
+                except Exception:  # noqa: BLE001  清理路径不能反抛
+                    log.debug("[%s] 断开时清理播报器失败", self.session_id,
+                              exc_info=True)
 
     async def _authenticate(self) -> bool:
         """握手鉴权。返回 False 表示已 close，调用方应直接退出。"""
@@ -657,6 +677,17 @@ class VoiceSession:
         self._frames.clear()
         if self.state == "speaking":
             self.state = "idle"
+        # 把节流器队列里**还没走下 socket** 的音频帧全部作废。
+        # 只置 _abort 是不够的：_stream_sentence 要等下一个 run_in_threadpool
+        # 才看得到它，而队列里可能还压着十几帧 —— 那段时间里老人会继续
+        # 听到话音（表现是"喊停了还在说"）。reset() 是同步的，立刻生效。
+        sp = self._speaker
+        if sp is not None:
+            try:
+                sp._pacer.reset()
+            except Exception:  # noqa: BLE001  打断路径不能反抛
+                log.debug("[%s] abort 时复位节流器失败", self.session_id,
+                          exc_info=True)
 
     # ---------------------------------------------------------------- 重新武装
     def _continuous(self) -> bool:
@@ -929,11 +960,13 @@ class VoiceSession:
                 await speaker.flush_rest()
         except ConfigMissingError:
             log.warning("[%s] 未配置 LLM", self.session_id)
+            await speaker.close()   # 只收协程，不发协议消息（原行为不变）
             await self._send_alert(LLM_NOT_CONFIGURED_MESSAGE)
             return utterance
         except Exception as exc:  # noqa: BLE001
             log.warning("[%s] LLM 调用失败：%s: %s", self.session_id,
                         type(exc).__name__, exc)
+            await speaker.close()
             await self._send_alert("我刚才走神了，请您再说一遍")
             return utterance
 
@@ -944,6 +977,7 @@ class VoiceSession:
                 await speaker.finish()
                 return utterance
             log.warning("[%s] LLM 返回空文本", self.session_id)
+            await speaker.close()
             await self._send_alert("我没想好怎么回答，请您再说一遍")
             return utterance
 
@@ -1018,6 +1052,15 @@ class VoiceSession:
                 event = await run_in_threadpool(next, gen, None)
                 if event is None:
                     return None
+                if not got_first:
+                    # 首事件时延（TTFT）：**不分事件类型**。
+                    # 纯工具调用轮一个 text 增量都没有（tool_calls 只在
+                    # done 事件里给），只按 text 记的话这类轮的时延整段消失
+                    # —— 而"天气问句是不是慢在工具那一轮"恰恰是最常要查的
+                    # 问题（真机事故里老人等了几秒，日志里 ttft 是空的）。
+                    got_first = True
+                    if timing is not None:
+                        timing["ttft_ms"].append(_now_ms() - t_round)
                 kind, payload = event
                 if kind == "done":
                     # ⚠️ 非流式兜底：厂商没理会 stream:true 时（网关 documented
@@ -1030,10 +1073,6 @@ class VoiceSession:
                         await speaker.flush_rest()
                     return payload
                 if kind == "text" and payload:
-                    if not got_first:
-                        got_first = True
-                        if timing is not None:
-                            timing["ttft_ms"].append(_now_ms() - t_round)
                     await speaker.push_text(payload)
             # abort 提前退出：关生成器（finally 关连接），没有 ChatResult
             return None
@@ -1131,35 +1170,60 @@ class VoiceSession:
         # tts_ms 三个数，其中 llm_ms 把工具执行和**播报阻塞**都算在内，
         # 看它永远分不清是模型慢、工具慢还是 TTS 慢。这里按阶段拆开：
         #   asr_ms      识别整段上传往返
-        #   ttft_ms     每轮"发出请求 → 第一个字到"（模型快慢的真指标）
+        #   ttft_ms     每轮"发出请求 → 第一个事件到达"（不分类型：纯工具
+        #               调用轮没有文本增量，只按 text 记会让它整段消失）
         #   round_ms    每轮厂商 HTTP 往返总耗时（ChatResult.elapsed_ms）
         #   tool_ms     工具执行累计（含设备 MCP 往返）
         #   tts_first   从 LLM 开始到**第一帧音频发出**（老人实际等待时长）
         #   tts_ms      TTS 合成累计（串行，直接累加进总时延）
+        #   帧间隔峰值   相邻两帧实际间隔的最大值；超过 3 帧才算供给断档
+        #   积压峰值    节流队列里待发帧数的最大值；越大说明整段音频越靠后，
+        #               **最后一句话延后越久**（N 帧 ≈ N×60ms）
         #   speak_ms    整轮总耗时
         timing = timing or {}
         tts_first_ms = int(getattr(speaker, "tts_first_ms", 0) or 0)
         tts_total_ms = int(getattr(speaker, "tts_ms", 0) or 0)
         tts_max_gap = int(getattr(speaker, "max_gap_ms", 0) or 0)
+        tts_max_pending = int(getattr(speaker, "max_pending", 0) or 0)
         dropped = int(getattr(speaker, "dropped", 0) or 0)
         dropped_reasons = list(getattr(speaker, "dropped_reasons", []) or [])
         ttft = list(timing.get("ttft_ms") or [])
         rounds = list(timing.get("round_ms") or [])
+        frame_ms = int(config.VOICE_FRAME_DURATION_MS or 60)
+        gap_warn_ms = 3 * frame_ms          # 见下面那段 WARNING 的门限说明
+        backlog_warn_frames = int(2000 / max(1, frame_ms))   # ≈2s 音频
 
         # 一行日志把"慢在哪"说清楚。这行是给运维直接 grep 的，
         # 不需要去翻 Interaction 表算减法。
         log.info("[%s] 时延 asr=%dms ttft=%s round=%s tool=%dms "
-                 "首帧=%dms tts=%dms 帧间隔峰值=%dms 总=%dms 轮数=%d 丢弃句=%d",
+                 "首帧=%dms tts=%dms 帧间隔峰值=%dms 积压峰值=%d帧 "
+                 "总=%dms 轮数=%d 丢弃句=%d",
                  self.session_id, t_asr, ttft or "-", rounds or "-",
                  int(timing.get("tool_ms") or 0), tts_first_ms, tts_total_ms,
-                 tts_max_gap, elapsed_ms, len(results), dropped)
-        if tts_max_gap > 60:
-            # 每帧 60ms 音频，间隔超过 60ms 就意味着设备在这一段**没有声音可播**。
-            # 这条 WARNING 是"断断续续"的判决书：它在服务端，说明是我们供给不足；
-            # 它正常而老人仍觉得断续，问题就在设备侧（I2S 欠载）。
-            log.warning("[%s] 音频帧间隔峰值 %dms > 60ms（一帧只承载 60ms 音频）"
-                        "—— 服务端供帧不连续，老人会听到一顿一顿。"
-                        "多半是 TTS 分片慢或上游卡顿。", self.session_id, tts_max_gap)
+                 tts_max_gap, tts_max_pending,
+                 elapsed_ms, len(results), dropped)
+        if tts_max_gap > gap_warn_ms:
+            # 每帧 frame_ms 音频，间隔超过 3 帧就意味着设备在这一大段里
+            # **没有声音可播**。这条 WARNING 是"断断续续"的判决书：它在
+            # 服务端，说明是我们供给不足；它正常而老人仍觉得断续，
+            # 问题就在设备侧（I2S 欠载）。
+            # ⚠️ 门限必须是 3 帧而不是 1 帧：asyncio 的 sleep 粒度（Windows
+            # 上约 15ms）与 TTS 分片的到达节奏合起来，1~2 帧的抖动**几乎
+            # 每轮都有**（实测稳态 70~90ms）。拿 60ms 当门限只会每轮都报警，
+            # 真事故反而被埋掉 —— 那正是本项目最反对的日志噪音。
+            log.warning("[%s] 音频帧间隔峰值 %dms > %dms（一帧只承载 %dms）"
+                        "—— 供给断过档，老人会听到一顿一顿。"
+                        "多半是 TTS 分片慢、上游卡顿或设备侧 socket 读不动。",
+                        self.session_id, tts_max_gap, gap_warn_ms, frame_ms)
+        if tts_max_pending > backlog_warn_frames:
+            # 这不是断续，是**迟到**：整段音频从生产到播放整体后移，
+            # 最后一句话会明显晚半拍到几秒。TTS 出帧比播放快时正常，
+            # 持续偏高说明设备侧 socket 读得慢（反压）。
+            log.info("[%s] 音频积压峰值 %d 帧（约 %.1fs）——话音整体后移，"
+                     "最后一句会晚一些。TTS 出帧比播放快时正常，持续偏高"
+                     "说明设备侧读得慢。",
+                     self.session_id, tts_max_pending,
+                     tts_max_pending * frame_ms / 1000.0)
 
         def _write() -> None:
             with SessionLocal() as db:
@@ -1189,6 +1253,7 @@ class VoiceSession:
                     "tool_ms": int(timing.get("tool_ms") or 0),
                     "tts_first_ms": tts_first_ms,
                     "tts_max_gap_ms": tts_max_gap,
+                    "tts_max_pending": tts_max_pending,
                     "total_ms": elapsed_ms,
                     "dropped_sentences": dropped,
                 }
@@ -1271,7 +1336,25 @@ class _ReplySpeaker:
 
     打断语义与旧实现一致：每句之间、每个分片、每一帧都检查 ``_abort``；
     **不重置** ``_abort``（清空时机只有新的 listen start 一处）。
+
+    下行音频一律经过 :class:`~app.voice.audio_pacing.AudioPacer`
+    --------------------------------------------------------
+    2026-10-22 起，音频帧不再"能发多快发多快"地直接 await socket，而是
+    先进节流器、由独立协程按 60ms 一帧的虚拟播放时钟匀速下发。三件事
+    因此同时成立（见 audio_pacing 模块 docstring 的事故背景）：
+
+    * **不再断续**：帧间隔由时钟决定，不再取决于 TCP 反压；
+    * **不再拖慢 LLM**：``push_text`` 只入队就返回，socket 堵住不再
+      反压到流式读取协程上；
+    * **控制消息顺序不坏**：``tts start`` / ``sentence_start`` /
+      ``llm emotion`` / ``tts stop`` 与音频帧共用同一条 FIFO，
+      ``tts stop`` 因此不可能插到音频前面（那个 bug 的表现是每句话
+      最后几个字被吃掉，而服务端日志一切正常）。
     """
+
+    #: ``finish()`` 等音频排空的上限（秒）。超时就 WARNING 并发 stop ——
+    #: 宁可截断也不能把会话挂死在这个等待上。正常一句语音几秒内必然排空。
+    _DRAIN_TIMEOUT_SEC: Final[float] = 60.0
 
     def __init__(self, session: VoiceSession) -> None:
         self._s = session
@@ -1290,6 +1373,22 @@ class _ReplySpeaker:
         self.max_gap_ms = 0       # 相邻两帧的最大间隔（>60ms 即供给不足）
         self._last_frame_at = 0.0
         self._t0 = time.monotonic()
+
+        # ---- 下行节流器（2026-10-22）----
+        # 发送回调用 _send_frame：统计埋点全部留在这里，节流器只是
+        # 决定"什么时候调它"。start() 幂等，协程随后台常驻。
+        self._pacer = AudioPacer(
+            self._send_frame,
+            frame_ms=config.VOICE_FRAME_DURATION_MS,
+            send_json=session._send_json,
+        )
+        self._pacer.start()
+        # 队列积压峰值（帧）。节流器把帧间隔钉死之后，"TTS 供帧快不快"
+        # 改看这个数：积压越深，整段音频越靠后，**最后一句延后越久**。
+        self.max_pending = 0
+
+        # abort 要能立刻作废队列里的帧（见 VoiceSession._on_abort）
+        session._speaker = self
 
     # ---------------------------------------------------------------- 文本
     async def push_text(self, text: str) -> None:
@@ -1346,14 +1445,17 @@ class _ReplySpeaker:
             return
 
         if not self._started:
-            await s._send_json({"type": "tts", "state": "start"})
+            # 控制消息走节流器的插队通道：立即发、不占播放时间，且与音频帧
+            # 共用同一条 FIFO —— 顺序因此有保证（旧实现直接 await _send_json，
+            # 在音频开始节流之后会插到队列前头去）。
+            self._pacer.add_json({"type": "tts", "state": "start"})
             self._started = True
             s.state = "speaking"
         self.sentence_count += 1
 
-        await s._send_json({"type": "tts", "state": "sentence_start",
-                            "text": text})
-        await s._send_json({"type": "llm", "emotion": "neutral"})
+        self._pacer.add_json({"type": "tts", "state": "sentence_start",
+                              "text": text})
+        self._pacer.add_json({"type": "llm", "emotion": "neutral"})
 
         # 单句 TTS 失败：跳过该句音频、后续句继续。
         # 不能整轮失败 —— 第一句合成失败而后面的句子都成功是常见的
@@ -1385,11 +1487,17 @@ class _ReplySpeaker:
         分开记，才能区分"模型慢"和"TTS 慢"。0 表示一帧都没发出去。
 
         ``max_gap_ms`` 回答另一个问题：「断断续续」到底怪谁。
-        每帧承载 60ms 音频，所以**服务端相邻两帧的间隔超过 60ms 就是供给不足**
-        （TTS 分片慢/上游卡顿），老人耳朵里就是一顿一顿；反之若间隔都远小于
-        60ms，说明音频是成串灌下去的，断续只可能发生在设备侧（解码任务被
-        抢 CPU 导致 I2S 欠载，听感是咔哒声 + 掉字）。
-        没有这个数，两边都只能靠猜。
+        每帧承载 60ms 音频，所以**服务端相邻两帧的间隔明显超过 60ms 就是
+        供给不足**（TTS 分片慢/上游卡顿，或设备侧 socket 读不动），
+        老人耳朵里就是一顿一顿；反之若间隔都贴近 60ms，说明音频是按播放
+        节奏走的，断续只可能发生在设备侧（解码任务被抢 CPU 导致 I2S 欠载，
+        听感是咔哒声 + 掉字）。
+
+        2026-10-22 起这个回调由**节流器**按 60ms 一帧调用（见
+        :class:`~app.voice.audio_pacing.AudioPacer`），所以正常情况下它
+        测到的是"≈60ms"而不是"远小于 60ms"—— 突发灌帧的老路已经没了。
+        于是这个数的含义变回它本该有的样子：**显著大于 60ms = 有一次
+        供给断档**（设备至少 60ms 没有声音可播）。
         """
         now = time.monotonic()
         if not self.tts_first_ms:
@@ -1402,7 +1510,13 @@ class _ReplySpeaker:
         await self._s._send_audio(packet)
 
     async def _stream_sentence(self, sentence: str) -> None:
-        """流式合成一句并逐帧下发。**帧间/分片间都检查 abort**。"""
+        """流式合成一句并逐帧**入队**下发。**帧间/分片间都检查 abort**。
+
+        帧是交给节流器的（``_enqueue``），不是直接 await socket：把 socket
+        等待留在这里，一来帧间隔不可控（断续），二来反压会顺着
+        ``push_text`` 一路堵住 LLM 的流式读取（响应慢）。见
+        ``audio_pacing`` 模块 docstring。
+        """
         s = self._s
         if not self._voice_loaded:
             self._voice_loaded = True
@@ -1428,6 +1542,7 @@ class _ReplySpeaker:
             while True:
                 if s._abort:
                     log.info("[%s] 帧级打断", s.session_id)
+                    self._pacer.reset()   # 作废已入队未发出的帧
                     return
                 # ⚠️ 同 _chat_round：用哨兵而不是捕获 StopIteration，
                 # StopIteration 穿过协程边界会被转成 RuntimeError。
@@ -1441,6 +1556,7 @@ class _ReplySpeaker:
                 while len(carry) >= frame_bytes:
                     if s._abort:
                         log.info("[%s] 帧级打断", s.session_id)
+                        self._pacer.reset()
                         return
                     frame = carry[:frame_bytes]
                     carry = carry[frame_bytes:]
@@ -1450,9 +1566,10 @@ class _ReplySpeaker:
                     except opus_codec.OpusUnavailableError:
                         # 无 libopus：音频发不了，但文本已经发了。
                         log.debug("[%s] 无 libopus，跳过音频帧", s.session_id)
+                        self._pacer.reset()
                         return
                     if packet:
-                        await self._send_frame(packet)
+                        self._enqueue(packet)
             # 收尾：不足一帧的补零截齐（与 encode_opus 的口径一致）
             if carry and not s._abort:
                 try:
@@ -1461,7 +1578,7 @@ class _ReplySpeaker:
                 except opus_codec.OpusUnavailableError:
                     return
                 if packet:
-                    await self._send_frame(packet)
+                    self._enqueue(packet)
         finally:
             if gen is not None:
                 try:
@@ -1470,30 +1587,88 @@ class _ReplySpeaker:
                     pass
             db.close()
 
+    def _enqueue(self, packet: bytes) -> None:
+        """把一帧交给节流器，并记录队列积压峰值。
+
+        **不 await socket**：等待是节流器协程的事。这就是"断续"与
+        "响应慢"的共同修法 —— 详见 ``audio_pacing`` 模块 docstring。
+        """
+        self._pacer.add_audio(packet)
+        pending = self._pacer.pending
+        if pending > self.max_pending:
+            self.max_pending = pending
+
     async def finish(self) -> None:
-        """收尾：发 tts stop（或成对的空 start/stop）。
+        """收尾：等音频排空 → 发 tts stop（或成对的空 start/stop）。
 
         设备侧 application.cc 只在收到 stop 时回落 listening/idle ——
         **一对都不能少**，否则老人看到的是一直"说话中"的音箱。
+
+        ⚠️ 排空等待是 2026-10-22 加的：音频帧现在由节流器按 60ms 一帧
+        慢慢发，``finish()`` 被调用时队列里通常还压着十几帧。不等就发
+        stop，设备会**在话音中途停下**（每句话最后几个字被吃掉），
+        而服务端日志一片正常 —— 正是最难查的那类故障。
         """
         s = self._s
-        if self._started:
-            await s._send_json({"type": "tts", "state": "stop"})
-        else:
-            # 一句都没发（空回复 / 全被 abort 或 TTS 失败吞掉）：
-            # 仍然要 start/stop 成对。
-            await s._send_json({"type": "tts", "state": "start"})
-            await s._send_json({"type": "tts", "state": "stop"})
-        s.state = "idle"
-        log.info("[%s] 播报完成（%d 句，音频%s）",
-                 s.session_id, self.sentence_count,
-                 "不可用" if not self._tts_ok else "已发")
-        if self.dropped:
-            # 单独一行、WARNING 级：被拦下的句子是**真实发生过的事故痕迹**，
-            # 藏在 INFO 里就没人看，而它正是"老人说设备没回答"的答案。
-            log.warning("[%s] 本轮有 %d 句因不可播报被拦下（原因：%s）",
-                        s.session_id, self.dropped,
-                        ",".join(sorted(set(self.dropped_reasons))))
+        try:
+            if self._started:
+                if self._pacer.broken:
+                    # 音频通道已死（连续发送失败）：这一轮其实没有声音，
+                    # 必须把结论写进日志和 meta，不能假装"音频已发"。
+                    self._tts_ok = False
+                    log.error("[%s] 音频下行通道已死，本轮音频并未真正发出",
+                              s.session_id)
+                elif not await self._pacer.wait_idle(
+                        timeout=self._DRAIN_TIMEOUT_SEC):
+                    log.warning("[%s] 音频队列 %.0fs 未排空就发 tts stop"
+                                "（仍有 %d 帧待发），话音尾部可能被截断",
+                                s.session_id, self._DRAIN_TIMEOUT_SEC,
+                                self._pacer.pending)
+                await s._send_json({"type": "tts", "state": "stop"})
+            else:
+                # 一句都没发（空回复 / 全被 abort 或 TTS 失败吞掉）：
+                # 仍然要 start/stop 成对。
+                await s._send_json({"type": "tts", "state": "start"})
+                await s._send_json({"type": "tts", "state": "stop"})
+            s.state = "idle"
+            log.info("[%s] 播报完成（%d 句，音频%s）",
+                     s.session_id, self.sentence_count,
+                     "不可用" if not self._tts_ok else "已发")
+            if self.dropped:
+                # 单独一行、WARNING 级：被拦下的句子是**真实发生过的事故痕迹**，
+                # 藏在 INFO 里就没人看，而它正是"老人说设备没回答"的答案。
+                log.warning("[%s] 本轮有 %d 句因不可播报被拦下（原因：%s）",
+                            s.session_id, self.dropped,
+                            ",".join(sorted(set(self.dropped_reasons))))
+        finally:
+            # 节流协程必须停：它持有 WebSocket 引用，每轮泄漏一个的话，
+            # 长时间运行的服务会慢慢吃掉内存，且没有任何报错。
+            await self._pacer.stop(drain=False)
+            self._detach()
+
+    async def drain(self) -> None:
+        """等已入队的音频帧真的走下 socket（**不停发送协程**）。
+
+        给"这句话到底播完了没"的判定用（测试、以及任何想在下一次
+        协议动作前确认音频已送达的调用方）。不加超时：队列只会在
+        节流协程活着的时候排空，协程死掉时 ``wait_idle`` 永远不返回 ——
+        那本身就是异常，宁可挂住也不要靜靜地少播。
+        """
+        await self._pacer.wait_idle()
+
+    async def close(self) -> None:
+        """停掉节流协程，**不发任何协议消息**。
+
+        给"本轮提前返回"的路径用（LLM 未配置 / LLM 抛异常 / 空回复）：
+        那些路径原本就不发 ``tts stop``，这里保持原样，只把协程收掉。
+        """
+        await self._pacer.stop(drain=False)
+        self._detach()
+
+    def _detach(self) -> None:
+        """把自己从会话上摘下来（``_on_abort`` 会摸 ``_speaker``）。"""
+        if getattr(self._s, "_speaker", None) is self:
+            self._s._speaker = None
 
 
 def _split_first_sentence(buf: str) -> tuple[str, str]:

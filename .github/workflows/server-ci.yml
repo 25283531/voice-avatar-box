@@ -318,6 +318,15 @@ jobs:
       # 所以放在天气之后、重活之前。
       - name: 语音可播性过滤 + 尾巴补播 + TTS 格式判别
         run: python tools/run_smoke.py logs/smoke_speech_guard.log python tools/test_speech_guard.py
+      # 音频下行节流器（虚拟播放时钟）。
+      # 为什么必须进 CI：它是 2026-10-22「声音断断续续 + 响应慢」的正主，
+      # 而它的失效形态是**老人听不到声音、服务端日志全绿**——协议层、
+      # 状态机、token 计量没有任何一个会红。本脚本是纯内存断言（不起服务、
+      # 不占端口、不需要 libopus），毫秒级跑完。
+      # ⚠️ T8/T9 两条是变异验证过的：把「popleft 前查队列」的防护删掉、
+      # 或把 finish() 里的排空等待删掉，它们必须变红，否则就是假绿。
+      - name: 音频下行节流器（虚拟播放时钟）
+        run: python tools/run_smoke.py logs/smoke_audio_pacing.log python tools/test_audio_pacing.py
       # 会员制遗留五张表必须**真的**被删掉。
       # 这条门禁是补 875b38c 留下的洞：当时删表函数整个被掏空，全仓 CI 依然全绿
       # （qa3_migration 的老库 DDL 根本不建这五张表，删表分支恒为空操作）。

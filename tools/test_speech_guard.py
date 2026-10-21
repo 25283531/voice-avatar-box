@@ -53,12 +53,17 @@ class _FakeWS:
     def __init__(self) -> None:
         self.json: list[dict] = []
         self.audio: list[bytes] = []
+        # 统一事件流：json 与 audio 按**真实到达顺序**记在一起。
+        # 分成两个 list 就再也验不了"tts stop 是不是插到了音频前面"。
+        self.events: list[tuple[str, Any]] = []
 
     async def send_json(self, obj: dict) -> None:
         self.json.append(obj)
+        self.events.append(("json", obj))
 
     async def send_bytes(self, payload: bytes) -> None:
         self.audio.append(payload)
+        self.events.append(("audio", payload))
 
 
 class _FakeSession:
@@ -101,6 +106,12 @@ async def _speak(text: str, pcm_chunks: list[bytes] | None = None,
     await sp.push_text(text)
     if flush:
         await sp.flush_rest()
+    # ⚠️ 2026-10-22：音频帧现在先进节流器、由独立协程按 60ms 一帧发，
+    # 不再在 _stream_sentence 里 await socket。所以 push_text 返回时帧
+    # **还没走下 socket** —— 不 drain 就断言 ws.audio 是假红（测的是
+    # "队列里有帧"，不是"帧发出去了"）。真实调用链里承担这件事的是
+    # finish()（它 wait_idle 之后才发 tts stop）。
+    await sp.drain()
     return s, sp
 
 
@@ -266,6 +277,47 @@ def t5_audio_sniff() -> None:
     check(bool(raised), "T5 JSON 错误体被拒（不当音频发出去）", raised)
 
 
+# ================================================================ T7 节流接入
+def t7_pacing_order() -> None:
+    print("\n── T7 节流器接入：tts stop 不许插到音频前面 ──")
+
+    async def _run() -> None:
+        # 12 帧 > 预缓冲 5 帧 ⇒ finish() 被调用时队列里必然还有帧。
+        # 旧实现"能发多快发多快"，调 finish() 时帧早已发完；接入节流器后
+        # 队列是异步排空的，finish() 必须等它 —— 不等的话 stop 会插到音频
+        # 前面，表现是每句话最后几个字被吃掉，而日志一切正常。
+        _install_fakes([b"\x00" * 2880] * 6)
+        s = _FakeSession()
+        sp = _ReplySpeaker(s)
+        await sp.push_text("今天晴，十八度。明天下雨，记得带伞。")
+        await sp.flush_rest()
+        await sp.finish()
+        await sp.close()
+
+        ev = s.ws.events
+        kinds = [k for k, _ in ev]
+        check(bool(ev) and kinds[-1] == "json"
+              and ev[-1][1].get("state") == "stop",
+              "T7 ★ tts stop 是最后一条消息（没有插到音频前面）",
+              str(ev[-1] if ev else None))
+        check(kinds.count("audio") == 12,
+              "T7 十二帧全部发出（节流不丢帧、不重发）",
+              str(kinds.count("audio")))
+        starts = [i for i, (k, v) in enumerate(ev)
+                  if k == "json" and v.get("state") == "sentence_start"]
+        check(len(starts) == 2, "T7 两句各发一次 sentence_start", str(starts))
+        for idx, pos in enumerate(starts):
+            nxt = starts[idx + 1] if idx + 1 < len(starts) else len(ev)
+            between = [k for k, _ in ev[pos + 1:nxt]]
+            check("audio" in between,
+                  f"T7 第 {idx + 1} 句的 sentence_start 之后有音频帧",
+                  str(between[:3]))
+        check(sp.tts_first_ms > 0, "T7 首帧时刻仍被记录",
+              f"{sp.tts_first_ms}ms")
+
+    asyncio.run(_run())
+
+
 # ================================================================ T6 调用点
 def t6_call_arity() -> None:
     print("\n── T6 内部方法调用点：位置参数个数必须对得上 ──")
@@ -321,6 +373,7 @@ def main() -> int:
     t4_split()
     t5_audio_sniff()
     t6_call_arity()
+    t7_pacing_order()
     print("\n" + "=" * 64)
     print(f"通过 {_passed} 项，失败 {_failed} 项")
     if _failed:
