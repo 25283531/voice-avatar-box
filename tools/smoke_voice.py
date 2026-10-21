@@ -3255,6 +3255,87 @@ def _frame_v3(payload: bytes) -> bytes:
     return struct.pack(">BBH", 0, 0, len(payload)) + payload
 
 
+async def t_device_announce(ids: dict, libopus: bool = True) -> None:
+    """提醒播报：设备发 ``{"type":"mcp","payload":{"type":"tts","text":...}}``。
+
+    服务端必须真的**合成并下发**（``sentence_start`` 文本 + 音频帧），
+    不能当"无人等待的 mcp 消息"丢掉。
+
+    2026-10-22 真机事故
+    ------------------
+    定时提醒到点了：屏幕上形象切到「提醒」、事件表 ``state=1 fired``、设备也回了
+    回执 —— **就是一声不响**。根因不在固件也不在提醒引擎，而在这一跳：
+    固件 ``elder_bridge.cc::OnSpeak`` 把要念的话塞进 ``SendMcpMessage``
+    （它假定"在线走 TTS"），而服务端只把 ``type:mcp`` 当"设备本地工具回包"，
+    拿 ``payload["id"]`` 去 ``_mcp_pending`` 里找等待者，找不到就 debug 丢弃。
+    整条链路两侧都"跑通"，产物却什么都没有。
+
+    所以这条断言必须验**音频帧真的来了**，只验 JSON 不够 ——
+    "回了话但没声音"正是这次事故的形态。
+
+    另外产品要求「先响一段 3-10 秒音乐，再念事项」（见 ``app/voice/chime.py``）。
+    顺序比"有没有声音"更容易在重构中丢掉（把 play_pcm 挪到 push_text 之后，
+    一切日志都正常、声音也有，只是音乐盖在话音上），所以这里显式验
+    **音乐帧必须在第一句 sentence_start 之前**。
+    """
+    print("── 提醒播报：设备请求念一句话（mcp/tts）──")
+    ws, _sid = await _connect(ids)
+    try:
+        await ws.send(json.dumps(
+            {"type": "mcp", "payload": {"type": "tts", "text": "喝水时间到了"}},
+            ensure_ascii=False))
+        sentences: list[str] = []
+        bins = 0
+        bins_before_text = 0
+        text_at_event = -1
+        events: list[tuple] = []
+        deadline = time.time() + 40
+        while time.time() < deadline:
+            try:
+                msg = await asyncio.wait_for(ws.recv(), timeout=15)
+            except asyncio.TimeoutError:
+                break
+            if isinstance(msg, bytes):
+                bins += 1
+                if text_at_event < 0:
+                    bins_before_text += 1
+                events.append(("bin", "", ""))
+                continue
+            obj = json.loads(msg)
+            events.append((str(obj.get("type")), str(obj.get("state")),
+                           str(obj.get("text") or "")))
+            if obj.get("type") == "tts" and obj.get("state") == "sentence_start":
+                if text_at_event < 0:
+                    text_at_event = len(events) - 1
+                sentences.append(str(obj.get("text") or ""))
+            if obj.get("type") == "tts" and obj.get("state") == "stop":
+                break
+        check("设备请求播报 → 字幕文本原样下发（老人能看到它说了什么）",
+              sentences == ["喝水时间到了"], repr(sentences))
+        # 无 libopus 时服务端**发不出任何音频帧**（encode 直接抛 OpusUnavailableError），
+        # 这是环境事实而不是缺陷 ⇒ 音频类断言走 SKIP（第三态），绝不在这里红。
+        # 否则本机永远红、CI 永远绿，两边各自"自洽"，比假绿更浪费——CI 的
+        # ubuntu runner 已装 libopus0，那里必须真跑。
+        if not libopus:
+            skip("设备请求播报 → 收到音频帧", "本机无 libopus，服务端发不出 Opus 帧")
+            skip("设备请求播报 → tts start/stop 成对", "同上")
+        else:
+            check("设备请求播报 → 真的收到了音频帧（不再只是屏幕变一下）",
+                  bins > 0, f"bins={bins} events={events[:6]}")
+            # 提示音乐**不在服务端**：它是固件内置的固定 OGG
+            # （tools/smoke_reminder_chime.py 守它）。服务端只负责念文字，
+            # 所以这里只需要验「字幕先到、音频随后」，与正常对话同序。
+            check("设备请求播报 → 音频帧出现在 sentence_start 之后（与正常播报同序）",
+                  bins > bins_before_text,
+                  f"总帧={bins} 文本前帧={bins_before_text} 文本@事件#{text_at_event}")
+            check("设备请求播报 → 播报有始有终（tts start / stop 成对）",
+                  ("tts", "start", "") in events and
+                  ("tts", "stop", "") in events, repr(events[:8]))
+    finally:
+        await ws.close()
+        await _settle(1.0)
+
+
 async def t_binary_framing(ids: dict) -> None:
     print("── 10. 二进制帧封装 v1/v2/v3 + 服务端静音兜底（编解码用替身）──")
     import websockets
@@ -3471,6 +3552,7 @@ async def t_malformed_frame(ids: dict) -> None:
 async def _amain(ids: dict, libopus: bool) -> None:
     await t_ws_auth(ids)
     await t_handshake_and_turn(ids, libopus)
+    await t_device_announce(ids, libopus)
     await t_binary_framing(ids)
     await t_malformed_frame(ids)
     await t_interrupt(ids)

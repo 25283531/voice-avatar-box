@@ -225,6 +225,45 @@ def _normalize_preset_service(payload: ProviderIn, explicit: set[str]) -> None:
         payload.name = str(preset.get("label") or "")
 
 
+def _check_tts_voice_shape(payload: ProviderIn) -> None:
+    """TTS 配置里填的音色必须符合该厂商的形态（各厂商音色 ID 不通用）。
+
+    为什么要在保存时就报错
+    ----------------------
+    ``voice/asr_tts._shape_ok_voice`` 运行时已经会「形态不符就退回厂商默认」，
+    但那属于**静默兜底**：管理员在弹窗里选了腾讯云，却填了 Edge 的音色名
+    （``zh-CN-XiaoxiaoNeural``）—— 听到的是默认音色，自己却以为配的音色生效了。
+    2026-10-22 那次「有文字没声音」正是这一族问题（腾讯云收到 Edge 音色名，
+    回「VoiceType 必须是整数」，整句音频被跳过）。
+
+    运行时要宽容（配好的服务不能因为一个音色字段就整条不出声），
+    保存时要严格（让人在**改配置的那一刻**就知道填错了）。两者不矛盾：
+    严格的是「新写入的数据」，宽容的是「已经在库里的数据」。
+
+    只校验形态封闭的厂商（腾讯云纯整数、Edge BCP-47 名）。火山、OpenAI 兼容
+    等一律放行 —— 它们的音色表含私有/克隆 ID，形态不封闭，硬校验只会误伤。
+    """
+    if (payload.kind or "").strip() != "tts":
+        return
+    voice = str((payload.params or {}).get("voice") or "").strip()
+    if not voice:
+        return
+    from ..voice.asr_tts import _VOICE_SHAPES, _tts_dispatch_style
+
+    style = _tts_dispatch_style(payload)
+    pattern = _VOICE_SHAPES.get(style)
+    if pattern is None or pattern.match(voice):
+        return
+    hint = ("只能是**整数**音色 ID（如 601009）"
+            if style == "tencent"
+            else "必须是 Edge 音色名（如 zh-CN-XiaoxiaoNeural）")
+    raise HTTPException(
+        status_code=status.HTTP_400_BAD_REQUEST,
+        detail=(f"{style} 的音色 {voice!r} 不合法：{hint}。"
+                "各厂商音色 ID 不通用 —— 想换厂商就得在这个弹窗里重选音色"
+                "（留空则用该厂商默认音色）。"))
+
+
 def _preset_entry(provider: str) -> dict | None:
     """按厂商名取非 TTS 预置条目（找不到返回 None）。"""
     from ..provider_presets import preset_entry
@@ -286,6 +325,7 @@ def create_provider(payload: ProviderIn, db: Session = Depends(get_db),
             status.HTTP_400_BAD_REQUEST,
             "创建角色请用 POST /api/roles；本接口只接受带 kind 的平台 AI 配置",
         )
+    _check_tts_voice_shape(payload)
     p = models.AIProvider(**payload.model_dump())
     # 显式写死 record_type：不依赖模型默认值，避免将来默认值改动波及这里
     p.record_type = models.RECORD_TYPE_CONFIG
@@ -707,6 +747,7 @@ def update_provider(provider_pk: int, payload: ProviderIn, db: Session = Depends
     explicit = set(payload.model_dump(exclude_unset=True).keys())
     _normalize_local_service(payload, explicit)
     _normalize_preset_service(payload, explicit)
+    _check_tts_voice_shape(payload)
     p = require_config(db, provider_pk, admin)
     if not (payload.kind or "").strip():
         raise HTTPException(

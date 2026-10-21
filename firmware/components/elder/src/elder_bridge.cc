@@ -16,10 +16,12 @@
 #include <cstring>
 #include <cstdio>
 #include <string>
+#include <string_view>
 
 #include "sdkconfig.h"
 #include "esp_log.h"
 #include "esp_random.h"
+#include "esp_timer.h"
 #include "nvs_flash.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -90,6 +92,24 @@ void OnNotify(const char *text, const char *emotion, void *ctx)
 
 /* ---------------------------------------------------------------- 提示音 */
 
+// 提醒专用音乐：**一段固定的、编译进固件的 OGG**（约 4.9 秒）。
+//
+// 来源与约束
+// ----------
+// * 文件：firmware/xiaozhi/main/assets/common/reminder_chime.ogg
+//   由 tools/make_reminder_chime.py 一次性生成（五声音阶铃声），
+//   生成后即入库，**运行时不再合成、所有设备听到的都是同一段**。
+// * 嵌入：main/CMakeLists.txt 里 file(GLOB COMMON_SOUNDS .../assets/common/*.ogg)
+//   把它收进 EMBED_FILES，链接期变成下面这两个符号（文件名里的 . 换成 _）。
+// * 为什么本地播：提醒的第一声不能依赖网络。断网时语音内容可以没有，
+//   但"有事"这个信号必须有 —— 否则老人根本不知道到点了。
+extern const char ogg_reminder_chime_start[] asm("_binary_reminder_chime_ogg_start");
+extern const char ogg_reminder_chime_end[] asm("_binary_reminder_chime_ogg_end");
+static const std::string_view kReminderChime{
+    static_cast<const char *>(ogg_reminder_chime_start),
+    static_cast<size_t>(ogg_reminder_chime_end - ogg_reminder_chime_start)
+};
+
 // 全部来自固件内置 ogg（EMBED_FILES 编进 .rodata），**不依赖网络**
 const char *ToneName(elder_tone_t tone)
 {
@@ -99,6 +119,7 @@ const char *ToneName(elder_tone_t tone)
     case ELDER_TONE_SUCCESS:     return "success";
     case ELDER_TONE_VIBRATION:   return "vibration";
     case ELDER_TONE_LOW_BATTERY: return "low_battery";
+    case ELDER_TONE_REMINDER:    return "reminder_chime";
     default:                     return nullptr;
     }
 }
@@ -122,6 +143,10 @@ void OnPlayTone(elder_tone_t tone, void *ctx)
         break;
     case ELDER_TONE_LOW_BATTERY:
         app.PlaySound(Lang::Sounds::OGG_LOW_BATTERY);
+        break;
+    case ELDER_TONE_REMINDER:
+        // 提醒音乐：固件内置固定资源，离线可用
+        app.PlaySound(kReminderChime);
         break;
     default:
         break;
@@ -170,6 +195,61 @@ void OnSpeak(const char *text, void *ctx)
 
 /* ---------------------------------------------------------------- 提醒 */
 
+/* 提醒的节奏：**先响音乐，再念事项**。
+ *
+ * 为什么用定时器而不是"等播放结束回调"：``PlaySound`` 只是把 OGG 入队给
+ * 音频服务，没有任何完成回调可用；按已知时长 + 余量延后，是这套 API 下
+ * 唯一确定的顺序保证。余量 400ms 给解码器起播与 I2S 缓冲 —— 宁可晚一点，
+ * 也不能让音乐盖住第一句话（老人只听得清开头，被盖住就等于没说）。
+ *
+ * 另一个必须延后的理由：音乐与语音若同时下发，音频服务里两路 PCM 会争
+ * 同一个输出通道，实测是"音乐断续 + 语音只出半句"这种最难查的故障。 */
+static constexpr int64_t kChimeMs = 4900 + 400;
+
+static esp_timer_handle_t s_announce_timer = nullptr;
+static std::string s_pending_announce;
+
+static void AnnounceTimerCb(void *arg)
+{
+    (void)arg;
+    if (s_pending_announce.empty()) {
+        return;
+    }
+    std::string text;
+    text.swap(s_pending_announce);   // 先取出再播，避免回调里重入写同一个串
+    // 音乐已经响过 ⇒ 传 ELDER_TONE_NONE：离线时不要再多叠一声 popup
+    elder_ui_announce(text.c_str(), ELDER_TONE_NONE);
+}
+
+static void ScheduleAnnounce(const char *text)
+{
+    if (!text || !text[0]) {
+        return;
+    }
+    if (s_announce_timer == nullptr) {
+        esp_timer_create_args_t args = {};
+        args.callback = &AnnounceTimerCb;
+        args.name = "rmd_announce";
+        esp_err_t err = esp_timer_create(&args, &s_announce_timer);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "提醒播报定时器创建失败(%s)，改为立即播报", esp_err_to_name(err));
+            elder_ui_announce(text, ELDER_TONE_NONE);
+            return;
+        }
+    }
+    if (!s_pending_announce.empty()) {
+        ESP_LOGW(TAG, "上一条提醒还没念完（%s），被这一条覆盖",
+                 s_pending_announce.c_str());
+    }
+    s_pending_announce = text;
+    esp_timer_stop(s_announce_timer);   // 未启动时返回 INVALID_STATE，按设计忽略
+    if (esp_timer_start_once(s_announce_timer, kChimeMs * 1000) != ESP_OK) {
+        ESP_LOGE(TAG, "提醒播报定时启动失败，改为立即播报");
+        s_pending_announce.clear();
+        elder_ui_announce(text, ELDER_TONE_NONE);
+    }
+}
+
 int s_arming_id = -1;
 
 void OnReminder(const elder_rmd_item_t *item, elder_rmd_state_t st, void *ctx)
@@ -189,8 +269,11 @@ void OnReminder(const elder_rmd_item_t *item, elder_rmd_state_t st, void *ctx)
         } else {
             snprintf(text, sizeof(text), "%s时间到了", item->label);
         }
-        // 在线走 TTS，离线自动降级为本地 popup 提示音
-        elder_ui_announce(text, ELDER_TONE_POPUP);
+        /* 1) 先响固件内置的提醒音乐（约 4.9 秒，离线也有声音）
+         * 2) 音乐放完再念事项内容（在线 TTS；离线只屏显+说明）
+         * 两步分开而不是"边响边说"：见 ScheduleAnnounce 上方的注释。 */
+        elder_ui_play_tone(ELDER_TONE_REMINDER);
+        ScheduleAnnounce(text);
         break;
     }
     case ELDER_RMD_DONE:

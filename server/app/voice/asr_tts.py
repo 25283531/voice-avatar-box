@@ -34,6 +34,7 @@ import io
 import json
 import logging
 import math
+import re
 import socket
 import struct
 import urllib.error
@@ -576,6 +577,54 @@ def asr(db: Any, pcm_16k: bytes) -> str:
 
 
 # ---------------------------------------------------------------- TTS
+def _row_voice(row: Any) -> str:
+    """配置行**自己**填的音色（空串 = 这行没指定，交给调用方偏好）。
+
+    为什么要单独取一次：``pick_voice()`` 的回落链是
+    「设备 agent → 角色 tts_voice → 形象 tts_voice → 配置行 params.voice」，
+    **整条链里没有 ``ai_providers.tts_voice``**。结果就是管理后台「TTS 配置」
+    弹窗里那个音色输入框填什么都不生效 —— 生产上表现为：腾讯云那行填了音色，
+    实际请求里塞的却是角色级的 ``zh-CN-XiaoxiaoNeural``（Edge 的音色名），
+    腾讯云回「VoiceType 必须是整数」，整句音频被跳过（老人侧就是"没有声音"）。
+    """
+    if row is None:
+        return ""
+    own = str(getattr(row, "tts_voice", "") or "").strip()
+    if own:
+        return own
+    # 后台「AI 配置」弹窗里那个「音色」下拉写的是 ``params.voice``（不是
+    # tts_voice 列），两处都得认，否则管理员在弹窗里选了音色照样不生效。
+    return str(_row_params(row).get("voice", "") or "").strip()
+
+
+#: 各 TTS 风格的**音色形态**判据。
+#:
+#: 音色 ID 不跨厂商通用（腾讯云是纯整数、Edge 是 BCP-47 名、火山是 ``BV001_streaming``）。
+#: 而 ``pick_voice()`` 拿到的是**角色级**音色，它必然只对某一家成立；一旦这一行
+#: 被按序兜底轮到，形态不符就会让厂商回参数错误 —— 整句没有声音。
+#: 所以形态不符时**置空**（让该厂商用自己的默认音色），"有声音"优先于"精确用某个音色"。
+#:
+#: ⚠️ 故意**不给 volcengine 加**判据：火山的音色表含私有音色与声音克隆 ID，
+#: 形态不封闭，猜一个正则只会在正常音色上误判、静默改用默认 —— 比不做更坏。
+_VOICE_SHAPES: Final[dict[str, "re.Pattern[str]"]] = {
+    "tencent": re.compile(r"^\d+$"),
+    "edge": re.compile(r"^[A-Za-z]{2,3}-[A-Za-z0-9]+-"),
+}
+
+
+def _shape_ok_voice(style: str, voice: str) -> str:
+    """形态与目标厂商不符的音色 → 空串（用厂商默认），并留一条日志。"""
+    voice = (voice or "").strip()
+    if not voice:
+        return ""
+    pattern = _VOICE_SHAPES.get(style)
+    if pattern is None or pattern.match(voice):
+        return voice
+    log.warning("音色 %r 不适用于 %s（各厂商音色 ID 不通用）→ 改用该厂商默认音色",
+                voice, style)
+    return ""
+
+
 def _tts_dispatch_style(row: Any) -> str:
     """判断这一行该走哪条 TTS 实现。
 
@@ -643,6 +692,9 @@ def tts(db: Any, sentence: str, *, voice: str = "", speed: float = 1.0,
 
     :param voice: 音色。空串表示**不带 voice 字段**，让厂商用默认
         （见 pick_voice 的回落链）。
+        ⚠️ 这是**调用方（角色级）偏好**，不是最终值：配置行自己填了
+        ``tts_voice`` 时以配置行为准（见 _row_voice），且形态与该厂商不符时
+        会被置空用厂商默认（见 _shape_ok_voice）。
     :param row: 指定用哪一行配置。缺省（None）表示自己按优先级取第一条。
         给 ``tts_stream`` 的按序兜底用 —— 它必须能明确指定"这一次试哪一行"，
         否则兜底循环里每次调 tts() 都会被 resolve_row 拉回第一条，
@@ -657,6 +709,10 @@ def tts(db: Any, sentence: str, *, voice: str = "", speed: float = 1.0,
         raise VoiceConfigMissingError("tts")
 
     style = _tts_dispatch_style(row)
+    # 音色两级定：配置行自己填的 > 调用方（角色）偏好；再按厂商形态过滤。
+    # 顺序不能反 —— 角色音色对「所有」厂商都会流下来，只有配置行知道
+    # 自己这一家认什么。
+    voice = _shape_ok_voice(style, _row_voice(row) or voice)
     if style == "edge":
         from . import tts_edge
         try:

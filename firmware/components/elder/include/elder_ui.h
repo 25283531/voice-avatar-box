@@ -44,7 +44,11 @@ typedef enum {
     ELDER_TONE_EXCLAMATION,  /* 感叹 —— 升级告警 */
     ELDER_TONE_SUCCESS,      /* 成功 —— 确认完成 */
     ELDER_TONE_VIBRATION,    /* 震动音 —— 求助 */
-    ELDER_TONE_LOW_BATTERY
+    ELDER_TONE_LOW_BATTERY,
+    /* 提醒专用音乐（约 4.9 秒，固件内置固定资源，见
+     * tools/make_reminder_chime.py）。与 POPUP 那种"叮咚"分开的原因：
+     * 提醒要先响一段音乐把老人叫过来，再念事项内容，两声必须能分别控制。 */
+    ELDER_TONE_REMINDER
 } elder_tone_t;
 
 typedef struct {

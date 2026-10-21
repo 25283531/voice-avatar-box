@@ -804,6 +804,35 @@ def t_endpoint_defaults() -> None:
           unknown.endpoint == "" and unknown.model == "",
           f"endpoint={unknown.endpoint!r} model={unknown.model!r}")
 
+    # ---- 保存时音色形态校验：静默失败要变成「改配置那一刻的可读报错」----
+    from app.routers.providers import _check_tts_voice_shape
+
+    def bad_voice(provider: str, voice: str, kind: str = "tts") -> str:
+        """返回报错文案（没报错就是空串）。"""
+        try:
+            _check_tts_voice_shape(
+                ProviderIn(name="x", kind=kind, provider=provider,
+                           params={"voice": voice}))
+        except Exception as exc:  # noqa: BLE001
+            return str(getattr(exc, "detail", exc))
+        return ""
+
+    msg = bad_voice("tencent", "zh-CN-XiaoxiaoNeural")
+    check("I15 保存腾讯云 TTS 却填 Edge 音色 → 400（这就是 2026-10-22「没声音」的元凶）",
+          "整数" in msg, msg[:140])
+    check("I16 腾讯云填整数音色能正常保存", bad_voice("tencent", "601009") == "",
+          bad_voice("tencent", "601009")[:140])
+    check("I17 Edge 填数字音色 → 400（反向同样拦住）",
+          "Edge 音色名" in bad_voice("edge", "601009"), bad_voice("edge", "601009")[:140])
+    check("I18 火山音色不校验形态（含私有/克隆 ID，形态不封闭，硬校验会误伤）",
+          bad_voice("volcengine", "S_abcdefg") == "",
+          bad_voice("volcengine", "S_abcdefg")[:140])
+    check("I19 音色留空不校验（用厂商默认，是最常见也最正确的用法）",
+          bad_voice("tencent", "") == "", bad_voice("tencent", "")[:140])
+    check("I20 ASR 配置上填音色不受此校验影响（只有 TTS 才有音色概念）",
+          bad_voice("tencent", "zh-CN-XiaoxiaoNeural", kind="asr") == "",
+          bad_voice("tencent", "zh-CN-XiaoxiaoNeural", kind="asr")[:140])
+
 
 def t_fallback_policy() -> None:
     """兜底口径：ASR 保底=自部署 FunASR，TTS 保底=微软免费 Edge，且**永远最后试**。
@@ -880,6 +909,99 @@ def t_fallback_policy() -> None:
           raised == "VoiceUpstreamError", raised)
 
 
+# ================================================================ K 组：音色解析
+def t_voice_resolution() -> None:
+    """音色解析：**配置行说了算**，跨厂商音色自动退回该厂商默认。
+
+    为什么这条必须是断言（2026-10-22 生产事故）
+    ------------------------------------------
+    真机「有文字、没声音」的直接原因就在这里：腾讯云那一行的 ``tts_voice`` 列与
+    ``params.voice`` 都是空的，而角色音色是 ``zh-CN-XiaoxiaoNeural``（Edge 的音色
+    名）。``tts()`` 原实现只转发调用方 voice ⇒ 腾讯云回「VoiceType 必须是整数」
+    ⇒ 整句音频被跳过，屏幕上文字却照常打。
+
+    本组用打桩捕获**真正发给厂商的 voice**，验的是分发后的结果；只加了
+    ``_row_voice`` 却忘了在 ``tts()`` 里调用它，照样红。
+    """
+    print("\n── K. 音色解析：配置行优先 + 跨厂商音色退回默认 ──")
+    from app.voice import asr_tts, tts_edge, tts_tencent
+
+    captured: list[str] = []
+    orig_tencent, orig_edge = tts_tencent.tts, tts_edge.synth_pcm
+
+    def fake_tencent(_sentence, voice, **_kw):
+        captured.append(voice)
+        return b"\x00\x01" * 32
+
+    def fake_edge(_text, voice, **_kw):
+        captured.append(voice)
+        return b"\x00\x01" * 32
+
+    def trow(**kw):
+        base = dict(provider="tencent", api_style="tencent",
+                    endpoint="https://tts.tencentcloudapi.com",
+                    api_key="AKIDsmoke:SECRETsmoke", model="", tts_voice="",
+                    name="腾讯云", timeout_sec=5, params={})
+        base.update(kw)
+        return _Row(**base)
+
+    def erow(**kw):
+        base = dict(provider="edge", api_style="edge", endpoint="", api_key="",
+                    model="", tts_voice="", name="EDGE", timeout_sec=5, params={})
+        base.update(kw)
+        return _Row(**base)
+
+    EDGE_VOICE = "zh-CN-XiaoxiaoNeural"
+
+    tts_tencent.tts = fake_tencent
+    tts_edge.synth_pcm = fake_edge
+    raised = ""
+    try:
+        # K1：弹窗里选的音色（存 params.voice）必须压过角色音色
+        captured.clear()
+        asr_tts.tts(None, "你好", voice=EDGE_VOICE,
+                    row=trow(params={"voice": "601009"}))
+        check("K1 TTS 配置弹窗选的音色（params.voice）压过角色音色",
+              captured == ["601009"], repr(captured))
+
+        # K2：tts_voice 列同样生效（两种存法都要认，否则改存法就静默失效）
+        captured.clear()
+        asr_tts.tts(None, "你好", voice=EDGE_VOICE, row=trow(tts_voice="601010"))
+        check("K2 配置行 tts_voice 列同样生效", captured == ["601010"], repr(captured))
+
+        # K3：两处都空 + 角色是 Edge 音色 ⇒ 置空（腾讯用自己的默认 601009），
+        #     既不是把 Edge 名硬塞给腾讯云，也不能因此抛错。
+        captured.clear()
+        try:
+            asr_tts.tts(None, "你好", voice=EDGE_VOICE, row=trow(params={}))
+        except Exception as exc:  # noqa: BLE001
+            raised = f"{type(exc).__name__}: {exc}"
+        check("K3 跨厂商音色（Edge 名发给腾讯云）→ 置空用厂商默认，不报错",
+              captured == [""] and raised == "", f"{captured!r} raised={raised}")
+
+        # K4：反向——数字音色发给 Edge，同样置空（回落到晓晓）
+        captured.clear()
+        asr_tts.tts(None, "你好", voice="601009", row=erow(params={}))
+        check("K4 反向：数字音色发给 Edge → 置空回落默认",
+              captured == [""], repr(captured))
+
+        # K5：两边都没指定 ⇒ 保持空串（历史上就是不带头 voice 字段）
+        captured.clear()
+        asr_tts.tts(None, "你好", voice="", row=trow(params={}))
+        check("K5 两边都没指定音色 → 空串（由厂商默认决定）",
+              captured == [""], repr(captured))
+    finally:
+        tts_tencent.tts = orig_tencent
+        tts_edge.synth_pcm = orig_edge
+
+    # K6：火山**不做**形态判据（音色表含私有/克隆 ID，形态不封闭，
+    #     猜正则会在正常音色上误判 ⇒ 比不做更坏）。这条守着"别好心加坏"。
+    check("K6 火山音色不参与形态过滤（形态不封闭，误判会静默改默认）",
+          asr_tts._shape_ok_voice("volcengine", "BV001_streaming") == "BV001_streaming"
+          and "volcengine" not in asr_tts._VOICE_SHAPES,
+          repr(sorted(asr_tts._VOICE_SHAPES)))
+
+
 # ================================================================ H 组：反向变异
 MUTATIONS: dict[str, tuple[str, str, list[str]]] = {
     # 名字: (原文, 替换, 期望变红的断言关键字)
@@ -931,6 +1053,18 @@ MUTATIONS: dict[str, tuple[str, str, list[str]]] = {
         "    pass\n",
         ["J4 云端 ASR 先试"],
     ),
+    # 删掉「跨厂商音色形态过滤」—— 角色级 Edge 音色又会硬塞给腾讯云（"没声音"原样复现）
+    "M8": (
+        "    voice = _shape_ok_voice(style, _row_voice(row) or voice)\n",
+        "    voice = voice\n",
+        ["K1 TTS 配置弹窗选的音色", "K3 跨厂商音色"],
+    ),
+    # 删掉「配置行音色优先」—— 弹窗里选的音色又变死数据（只在角色未指定时才生效）
+    "M9": (
+        "    voice = _shape_ok_voice(style, _row_voice(row) or voice)\n",
+        "    voice = _shape_ok_voice(style, voice)\n",
+        ["K1 TTS 配置弹窗选的音色", "K2 配置行 tts_voice"],
+    ),
 }
 
 _MUTATION_TARGETS = {
@@ -941,6 +1075,8 @@ _MUTATION_TARGETS = {
     "M5": "server/app/voice/asr_tts.py",
     "M6": "server/app/routers/providers.py",
     "M7": "server/app/voice/asr_tts.py",
+    "M8": "server/app/voice/asr_tts.py",
+    "M9": "server/app/voice/asr_tts.py",
 }
 
 
@@ -1057,6 +1193,7 @@ def main(argv: list[str] | None = None) -> int:
         t_errors(HTTP_PORT)
         t_endpoint_defaults()
         t_fallback_policy()
+        t_voice_resolution()
         if not mutate_name and not args.no_mutation:
             # 变异子进程各用父端口 +100 起自己的假上游
             t_mutations(HTTP_PORT + 100)

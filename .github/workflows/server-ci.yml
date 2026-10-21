@@ -102,6 +102,14 @@ jobs:
       - name: 运行库默认路径解析冒烟（含双库冲突 / 0 字节 / 不落回仓库树）
         run: python tools/run_smoke.py logs/smoke_smoke_db_path.log python tools/smoke_db_path.py
 
+      # 提醒提示音乐是**固化进固件的资源**（assets/common/reminder_chime.ogg，
+      # 由 tools/make_reminder_chime.py 生成）。它被删/换坏/忘接进 OnPlayTone 时，
+      # 运行时**零报错**：提醒照样到点、屏照样变、回执照样回，只是没有声音。
+      # 这条静态门禁同时守住「先响音乐、再念内容」这个顺序（顺序反了照样能编译）。
+      # 纯文件解析 + 源码切片，不起服务；A8 的逐包解码在 runner（有 libopus0）真跑。
+      - name: 提醒音乐资源门禁（OGG 结构 / 时长 / 固件接入顺序）
+        run: python tools/run_smoke.py logs/smoke_smoke_reminder_chime.log python tools/smoke_reminder_chime.py
+
       # P0：`devices.id` 无 AUTOINCREMENT ⇒ 删掉最大行后 pk 被复用，而已删设备的
       # 旧 device_token（ep 与代次都是 0）会**通过鉴权读到另一家人**的提醒与回执；
       # 同一根因还有一条不需要 token 的通道（Interaction / ChatUsage 无 cascade ⇒

@@ -910,13 +910,18 @@ class VoiceSession:
             self._on_abort(obj)
         elif mtype == "mcp":
             # 设备本地工具通道（JSON-RPC 2.0，设备当 MCP server）。
-            # 两种来源要分清，不能一律丢弃：
+            # 三种来源要分清，不能一律丢弃：
+            #  0. 设备请求「念一句话」（提醒播报）→ **必须真的合成下发**，
+            #     见 _on_device_announce。这条不是 MCP，只是借了 mcp 这个信封。
             #  1. 我们主动下发 tools/call 的**回包** → 按 id 唤醒等待的
             #     Future（见 call_device_tool）。丢掉它会让服药确认永远超时。
             #  2. 设备主动发的通知（如 tools/list_changed）→ 目前没有消费者，
             #     记 debug 即可。
             payload = obj.get("payload")
             if isinstance(payload, dict):
+                if payload.get("type") == "tts":
+                    await self._on_device_announce(payload)
+                    return
                 rid = payload.get("id")
                 fut = self._mcp_pending.get(rid) if isinstance(rid, int) else None
                 if fut is not None and not fut.done():
@@ -925,6 +930,46 @@ class VoiceSession:
             log.debug("忽略无人等待的 mcp 消息：%r", str(payload)[:200])
         else:
             log.debug("忽略未知消息类型 %r", mtype)
+
+    async def _on_device_announce(self, payload: dict[str, Any]) -> None:
+        """设备请求「念一句话」（``{"type":"tts","text":"喝水时间到了"}``）。
+
+        为什么必须有这条（2026-10-22 真机：定时提醒只有屏幕变化、没有声音）
+        ------------------------------------------------------------------
+        固件 ``elder_bridge.cc::OnSpeak`` 在提醒触发时只做两件事：把设备状态切到
+        「提醒」形象，然后把要念的话**塞进 ``SendMcpMessage``** 发给服务端。
+        它假定「在线走 TTS」，但本服务端从来只把 ``type:mcp`` 当「设备本地工具
+        回包」处理 —— 这条 ``{"type":"tts"}`` 落进 ``_mcp_pending`` 查不到 id，
+        被当成「无人等待的消息」记 debug 丢掉。结果：提醒**到点了、屏也变了、
+        回执也回了，就是不出声**，管理后台看起来一切正常。
+
+        修在这里而不是改固件：设备早就在发这句话，缺的是服务端这一侧的实现；
+        改服务端不用重新烧录，存量设备立刻生效。
+
+        与正常对话共用 :meth:`_speak_reply` 的下发路径，所以提醒会**同时**有
+        声音和 ``sentence_start`` 字幕 —— 老人低头能看到刚才说了什么。
+        """
+        text = str(payload.get("text") or "").strip()
+        if not text:
+            log.warning("设备请求播报但 text 为空，忽略")
+            return
+        # 正在一轮对话里（设备多半也判了 idle，但两边不同步）：不打断。
+        # 提醒的价值在于「说一句」，打断老人正在说的话是更大的伤害。
+        if self._turn_task is not None and not self._turn_task.done():
+            log.warning("设备请求播报「%s」，但正在对话中 → 跳过（不打断）", text)
+            return
+        log.info("设备请求播报：%s", text)
+        try:
+            # 提示音乐**不在这里发**：它是固件内置的一段固定 OGG
+            # （firmware/xiaozhi/main/assets/common/reminder_chime.ogg，
+            #  由 tools/make_reminder_chime.py 一次性生成后编进固件），
+            # 设备自己先响音乐、约 5 秒后再发这条 mcp/tts 请求。
+            # 服务端只负责「把事项念出来」——这样音乐不依赖网络，
+            # 断网时提醒仍然有声音（只是没有语音内容）。
+            await self._speak_reply(text, time.monotonic())
+        except Exception as exc:  # noqa: BLE001  播报失败绝不能带崩 WS 连接
+            log.warning("设备请求播报失败（提醒可能只在屏幕上显示）：%s: %s",
+                        type(exc).__name__, exc)
 
     async def _on_listen(self, obj: dict[str, Any]) -> None:
         state = obj.get("state")
