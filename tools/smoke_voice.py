@@ -2147,6 +2147,8 @@ async def _vad_round(ws, sid: str, script: list[float], *, version: int = 1):
     返回 (stt_frame_idx, sentences, events)。stt_frame_idx 是"收到 stt 时
     已经发了多少帧"—— None 表示发送全部结束后才到（没提前断句）。
     """
+    from websockets.exceptions import ConnectionClosedError
+
     sent = 0
     stt_idx: int | None = None
     sentences: list[str] = []
@@ -2158,7 +2160,14 @@ async def _vad_round(ws, sid: str, script: list[float], *, version: int = 1):
             blob = _frame_v2(FAKE_OPUS_PACKET)
         else:
             blob = _frame_v3(FAKE_OPUS_PACKET)
-        await ws.send(blob)
+        try:
+            await ws.send(blob)
+        except ConnectionClosedError as exc:
+            # 连接已死（服务端异常掐断）：记成事件再走。没有这条，
+            # 客户端只会无限等待后报一个莫名的超时 —— 2026-10-22 排查
+            # UnboundLocalError 时，红得很慢且不指向真因。
+            events.append(("closed", f"send: {type(exc).__name__}: {exc}"))
+            return stt_idx, sentences, events, sent
         sent += 1
         await asyncio.sleep(0.02)
         # 非阻塞扫一眼：stt 在发送途中到达 == 提前断句
@@ -2167,8 +2176,9 @@ async def _vad_round(ws, sid: str, script: list[float], *, version: int = 1):
                 msg = await asyncio.wait_for(ws.recv(), timeout=0.001)
             except asyncio.TimeoutError:
                 break
-            except Exception:
-                raise
+            except ConnectionClosedError as exc:
+                events.append(("closed", f"recv: {type(exc).__name__}: {exc}"))
+                return stt_idx, sentences, events, sent
             if isinstance(msg, bytes):
                 events.append(("bin", len(msg)))
                 continue
@@ -2187,6 +2197,9 @@ async def _vad_round(ws, sid: str, script: list[float], *, version: int = 1):
         try:
             msg = await asyncio.wait_for(ws.recv(), timeout=5)
         except asyncio.TimeoutError:
+            break
+        except ConnectionClosedError as exc:
+            events.append(("closed", f"recv: {type(exc).__name__}: {exc}"))
             break
         if isinstance(msg, bytes):
             events.append(("bin", len(msg)))
@@ -2426,6 +2439,442 @@ def t_parse_when_units() -> None:
     t_false_success_gate()
     t_dismiss_and_watchdog()
     t_asr_silence_trim()
+    t_emotion_tag()
+    t_barge_in()
+
+
+def t_barge_in() -> None:
+    """12l. 全双工打断（F2）：播报中老人开口就停嘴改听。
+
+    参照上游 receiveAudioHandle.py（client_aec + have_voice +
+    client_is_speaking → abort），差别是我们把"已收到的人声"交接给
+    下一轮 —— 否则老人打断后反而永远说不上话（_speech_ms 不满足
+    看门狗判据，一路挂到 60s 上限再被当"一句没说"重新武装）。
+
+    三处刻意设计（都踩过的坑）：
+    1. **decode 换身份替身**：_feed_barge_in 吃的是 Opus 包，本机/CI
+       有没有 libopus 不该改变被测路径 —— 按环境分叉的测试比假绿更坏。
+       RMS 判定、累计、宽限、交接这些真正的逻辑全真跑。
+    2. **整个测试跑在 asyncio.run 里**：_trigger_barge_in 会
+       asyncio.create_task 补看门狗，同步上下文直接 RuntimeError
+       （2026-10-22 实测：第一次写这组断言时全红就是因为这个）。
+    3. **看门狗用记录器**：真看门狗 while state=="listening" 会摸一堆
+       假会话上不存在的属性；记录器同时让"补看门狗"这个行为可断言
+       （没人收尾的话，交接那一轮永远不 finalize）。
+    """
+    import asyncio
+    import types
+
+    from app.voice import opus_codec
+    from app.voice import session as S
+
+    frame_ms = S.config.VOICE_FRAME_DURATION_MS or 60
+    min_speech = S.config.VOICE_MIN_SPEECH_MS
+
+    def _mk(speech: bool) -> bytes:
+        if speech:
+            n = 16000 * frame_ms // 1000
+            import struct
+            return b"".join(
+                struct.pack("<h", int(10000 * ((i % 64) / 32.0 - 1)))
+                for i in range(n))
+        return b"\x00\x00" * (16000 * frame_ms // 1000)
+
+    def _mk_session(mode: str = "realtime") -> types.SimpleNamespace:
+        s = types.SimpleNamespace()
+        s.session_id = "SMOKE-BARGE"
+        s.state = "speaking"
+        s._listen_mode = mode
+        s._continuous = types.MethodType(S.VoiceSession._continuous, s)
+        s._frames = []
+        s._pcm = []
+        s._noise_floor = S._NOISE_FLOOR_INIT
+        s._speech_ms = 0
+        s._silence_ms = 0
+        s._ms_since_loud = 10 ** 9
+        s._max_closed_pause_ms = 0
+        s._first_speech_frame = -1
+        s._last_speech_frame = -1
+        s._mark_speech_frame = types.MethodType(
+            S.VoiceSession._mark_speech_frame, s)
+        s._reset_speech_window = types.MethodType(
+            S.VoiceSession._reset_speech_window, s)
+        s._barge_speech_ms = 0
+        s._barge_silence_ms = 0
+        s._barge_handover = False
+        s._abort = False
+        s._t0 = 0.0
+        s._speaking_started_at = 0.0
+        reset_calls = []
+        pacer = types.SimpleNamespace(reset=lambda: reset_calls.append(1))
+        s._speaker = types.SimpleNamespace(_pacer=pacer)
+        s._reset_calls = reset_calls
+        done_task = types.SimpleNamespace(done=lambda: True)
+        s._watchdog_task = done_task
+        s._watchdog_spawned = []
+
+        async def _rec_watchdog() -> None:
+            s._watchdog_spawned.append(1)
+
+        s._silence_watchdog = _rec_watchdog
+        s._feed_barge_in = types.MethodType(S.VoiceSession._feed_barge_in, s)
+        s._trigger_barge_in = types.MethodType(
+            S.VoiceSession._trigger_barge_in, s)
+        return s
+
+    real_decode = opus_codec.decode_opus
+
+    def _identity_decode(data: bytes, sr: int, channels: int = 1) -> bytes:
+        return data      # MUTATION-FREE 替身：喂进去的 PCM 原样返回
+
+    opus_codec.decode_opus = _identity_decode
+    try:
+        async def _run() -> None:
+            # ---- ① 开播 grace 过后持续人声 → 打断 ----
+            s = _mk_session()
+            s._speaking_started_at = time.monotonic() - 10   # 早就开播了
+            n_frames = (min_speech // frame_ms) + 1
+            for _ in range(n_frames):
+                s._feed_barge_in(_mk(True))
+            # 让 create_task 起的看门狗记录器真跑一次：本协程之后不再
+            # await，不让出控制权的话任务建了却不会被调度，spawned 恒 0
+            # （那是假红，不是真没补看门狗）。
+            await asyncio.sleep(0.05)
+            check("12l · 播报中持续人声触发打断（abort + 停嘴 + 回 listening）",
+                  s._abort and s._reset_calls and s.state == "listening",
+                  f"abort={s._abort} reset={len(s._reset_calls)} state={s.state}")
+            check("12l · 打断时把已收到的人声交接给收音轮（_speech_ms 非 0）",
+                  s._speech_ms >= min_speech, f"speech_ms={s._speech_ms}")
+            check("12l · 播报期的帧留在 _pcm 里（老人刚说的就是下一轮输入）",
+                  len(s._pcm) == n_frames, f"pcm={len(s._pcm)} want={n_frames}")
+            # P1×F2 交互：裁剪窗口必须从第一帧就盖上老人抢话的开头，
+            # 否则下一轮 _trim_silence_edges 把前半句当静音切掉。
+            check("12l ★ 打断人声记进裁剪窗口（first=0，不切老人刚说的话）",
+                  s._first_speech_frame == 0 and s._last_speech_frame >= 0,
+                  f"first={s._first_speech_frame} last={s._last_speech_frame}")
+            check("12l ★ 打断置交接保护（rearm 不能把 _pcm 当新一轮清掉）",
+                  s._barge_handover, f"handover={s._barge_handover}")
+            check("12l · 打断后补起看门狗（没人收尾的话这一轮永远不 finalize）",
+                  len(s._watchdog_spawned) >= 1,
+                  f"spawned={len(s._watchdog_spawned)}")
+
+            # ---- ② grace 期内不判打断 ----
+            s2 = _mk_session()
+            s2._speaking_started_at = time.monotonic()          # 刚开播
+            for _ in range(30):
+                s2._feed_barge_in(_mk(True))
+            check("12l · 开播 2s 宽限期内不判打断（AEC 残余 + 唤醒词尾巴）",
+                  not s2._abort and s2.state == "speaking",
+                  f"abort={s2._abort} state={s2.state}")
+
+            # ---- ③ 播报期只有静音 → 不打断 ----
+            s3 = _mk_session()
+            s3._speaking_started_at = time.monotonic() - 10
+            for _ in range(30):
+                s3._feed_barge_in(_mk(False))
+            check("12l · 播报期只有环境声不打断（AEC 把播放声抵掉后的残留下）",
+                  not s3._abort and s3.state == "speaking",
+                  f"abort={s3._abort} state={s3.state}")
+
+            # ---- ④ manual 模式（无 AEC）不走打断：_continuous() 为假 ----
+            #    没有 AEC 时音箱自己的声音就会触发"打断"，比不能打断糟得多。
+            s4 = _mk_session(mode="manual")
+            s4._speaking_started_at = time.monotonic() - 10
+            s4._on_binary_probe = True
+            # 直接走 _on_binary 的判定逻辑代价太大（要 WS），这里验判据本身：
+            check("12l · manual 模式 _continuous() 为假（无 AEC 不配全双工）",
+                  not s4._continuous(), f"mode={s4._listen_mode}")
+
+            # ---- ⑤ 反向变异：打断触发条件拔掉 ⇒ ① 必须红 ----
+            real_trigger = S.VoiceSession._trigger_barge_in
+
+            def _no_trigger(self):
+                pass    # MUTATION: 打断永不触发
+            S.VoiceSession._trigger_barge_in = _no_trigger
+            try:
+                s5 = _mk_session()
+                s5._speaking_started_at = time.monotonic() - 10
+                for _ in range((min_speech // frame_ms) + 1):
+                    s5._feed_barge_in(_mk(True))
+                mutated_ok = s5._abort
+            finally:
+                S.VoiceSession._trigger_barge_in = real_trigger
+            check("12l ★ 变异能抓到（打断失效时 abort 不会被置上）",
+                  not mutated_ok, f"mutated_abort={mutated_ok}")
+
+            # ---- ⑥ 反向变异：裁剪窗口标记拔掉 ⇒ ① 的窗口断言必须红 ----
+            real_mark = S.VoiceSession._mark_speech_frame
+            S.VoiceSession._mark_speech_frame = lambda self, idx: None
+            try:
+                s6 = _mk_session()
+                s6._speaking_started_at = time.monotonic() - 10
+                for _ in range((min_speech // frame_ms) + 1):
+                    s6._feed_barge_in(_mk(True))
+                mutated_first = s6._first_speech_frame
+            finally:
+                S.VoiceSession._mark_speech_frame = real_mark
+            check("12l ★ 变异能抓到（不记窗口时 first 保持 -1，"
+                  "说明①的窗口断言不是恒真）",
+                  mutated_first == -1, f"mutated_first={mutated_first}")
+
+            # ---- ⑦ 交接保护：barge 后那次 rearm 不许清掉老人刚说的话 ----
+            # 链条：barge → 轮次任务收尾发 tts stop → 设备回 listening
+            # 重发 listen start（realtime 固件行为）→ _rearm_listening。
+            # 没有保留分支，老人打断了服务端、服务端却把他刚说的话当
+            # 没说过 —— 产品上就是"打断了但没用"，他得再重复一遍。
+            def _rearm_with_handover(pcm_n: int, speech_ms: int,
+                                     handover: bool) -> types.SimpleNamespace:
+                # _mk_session 已带记录器看门狗 + done_task，直接复用
+                s = _mk_session()
+                s._pcm = [b"\x01"] * pcm_n
+                s._speech_ms = speech_ms
+                s._barge_handover = handover
+                s._rearm_listening = types.MethodType(
+                    S.VoiceSession._rearm_listening, s)
+                return s
+
+            s7 = _rearm_with_handover(6, 300, True)
+            s7._rearm_listening()
+            await asyncio.sleep(0)    # 让 rearm 起的看门狗记录器跑掉
+            check("12l ★ 交接保护：rearm 保留 _pcm/_speech_ms"
+                  "（不清的话老人白打断，得再重复一遍）",
+                  len(s7._pcm) == 6 and s7._speech_ms == 300
+                  and s7.state == "listening",
+                  f"pcm={len(s7._pcm)} speech_ms={s7._speech_ms} "
+                  f"state={s7.state}")
+
+            # 没有交接时照旧全清 —— 保留分支不能变成"永不清"，
+            # 否则上一轮的残余音频会混进下一轮送 ASR。
+            s7b = _rearm_with_handover(6, 300, False)
+            s7b._rearm_listening()
+            await asyncio.sleep(0)
+            check("12l · 无交接时 rearm 照旧全清（保留分支不是永不清）",
+                  not s7b._pcm and s7b._speech_ms == 0,
+                  f"pcm={len(s7b._pcm)} speech_ms={s7b._speech_ms}")
+
+            # 代码级变异：保留分支失效（标志被强制清掉再走真 rearm）
+            # ⇒ ⑦ 的断言必须红。用包装而不是改输入：走的是真代码路径。
+            real_rearm = S.VoiceSession._rearm_listening
+
+            def _rearm_no_preserve(self) -> None:   # MUTATION: 拔掉保留分支
+                self._barge_handover = False
+                real_rearm(self)
+
+            S.VoiceSession._rearm_listening = _rearm_no_preserve
+            try:
+                s7c = _rearm_with_handover(6, 300, True)
+                s7c._rearm_listening()
+                await asyncio.sleep(0)
+                mutated_pcm = len(s7c._pcm)
+            finally:
+                S.VoiceSession._rearm_listening = real_rearm
+            check("12l ★ 变异能抓到（保留分支失效时 _pcm 被清空，"
+                  "说明⑦不是恒真）",
+                  mutated_pcm == 0, f"mutated_pcm={mutated_pcm}")
+
+            # ---- ⑧ finalize 用完裁剪窗口即清零 + 交接标志清除 ----
+            # 窗口不清：播报期之后的下一轮拿着上一轮的下标，把老人刚
+            # 开口的话当静音裁掉。标志不清：会残留到下一轮，把下一轮
+            # 的 _pcm 错当交接保护起来（该轮静音兜底直接送空音频）。
+            s8 = types.SimpleNamespace()
+            s8.session_id = "SMOKE-FIN"
+            s8.state = "listening"
+            s8._frames = []
+            s8._pcm = [_mk(False)] * 5 + [_mk(True)] * 5
+            s8._first_speech_frame = 5
+            s8._last_speech_frame = 9
+            s8._barge_handover = True
+            ran = []
+
+            async def _run_turn_stub(pcm, started) -> str:
+                ran.append(len(pcm))
+                return ""
+
+            s8._run_turn = _run_turn_stub
+            s8._finalize = types.MethodType(S.VoiceSession._finalize, s8)
+            s8._trim_silence_edges = types.MethodType(
+                S.VoiceSession._trim_silence_edges, s8)
+            s8._reset_speech_window = types.MethodType(
+                S.VoiceSession._reset_speech_window, s8)
+            await s8._finalize()
+            check("12l ★ finalize 后裁剪窗口清零 + 交接标志清除"
+                  "（不清则下一轮裁掉老人刚说的话 / 错保空音频）",
+                  s8._first_speech_frame == -1 and s8._last_speech_frame == -1
+                  and not s8._barge_handover and ran == [10],
+                  f"first={s8._first_speech_frame} last={s8._last_speech_frame} "
+                  f"handover={s8._barge_handover} ran={ran}")
+
+            # 代码级变异：窗口清零拔掉 ⇒ ⑧ 必须红
+            real_reset = S.VoiceSession._reset_speech_window
+            S.VoiceSession._reset_speech_window = lambda self: None
+            try:
+                s8b = types.SimpleNamespace()
+                s8b.session_id = "SMOKE-FIN2"
+                s8b.state = "listening"
+                s8b._frames = []
+                s8b._pcm = [_mk(False)] * 5 + [_mk(True)] * 5
+                s8b._first_speech_frame = 5
+                s8b._last_speech_frame = 9
+                s8b._barge_handover = False
+                ran2 = []
+
+                async def _run_turn_stub2(pcm, started) -> str:
+                    ran2.append(len(pcm))
+                    return ""
+
+                s8b._run_turn = _run_turn_stub2
+                s8b._finalize = types.MethodType(S.VoiceSession._finalize, s8b)
+                s8b._trim_silence_edges = types.MethodType(
+                    S.VoiceSession._trim_silence_edges, s8b)
+                s8b._reset_speech_window = types.MethodType(
+                    S.VoiceSession._reset_speech_window, s8b)
+                await s8b._finalize()
+                mutated_window = s8b._first_speech_frame
+            finally:
+                S.VoiceSession._reset_speech_window = real_reset
+            check("12l ★ 变异能抓到（不清窗口时 first 停在 5，说明⑧不是恒真）",
+                  mutated_window == 5, f"mutated_first={mutated_window}")
+
+        asyncio.run(_run())
+    finally:
+        opus_codec.decode_opus = real_decode
+
+
+
+def t_emotion_tag() -> None:
+    """12k. 情绪表情（F4）：行首 [情绪词] 标记 → 设备换表情，文本照念。
+
+    设备端通路本来就在（application.cc 的 llm 分支 → SetEmotion，词表与
+    固件内置 21 个表情一一对应），缺的是服务端**真的发情绪**—— 原来写死
+    "neutral"，音箱上的小人脸永远只有一张脸。
+    """
+    import types
+
+    from app.voice import session as S
+
+    # ---- ① 提取：词表内（大小写不敏感）→ 剥标记 ----
+    e, t = S._extract_emotion("[happy]今天天气不错，出门走走。")
+    check("12k · [happy] 标记被剥出，情绪=happy，文本不带标记",
+          e == "happy" and t == "今天天气不错，出门走走。", f"e={e} t={t!r}")
+
+    e, t = S._extract_emotion("[SAD]他今天不太舒服。")
+    check("12k · 情绪标记大小写不敏感（[SAD] → sad）",
+          e == "sad" and t == "他今天不太舒服。", f"e={e} t={t!r}")
+
+    # ---- ② 没有标记 → neutral，原文照返 ----
+    e, t = S._extract_emotion("今天天气不错。")
+    check("12k · 无标记时 neutral 且文本不动", e == "neutral" and t == "今天天气不错。",
+          f"e={e} t={t!r}")
+
+    # ---- ③ 不在词表内的方括号 → 不剥（可能是正常文字）----
+    e, t = S._extract_emotion("[重点]明天记得吃药。")
+    check("12k · 词表外的方括号不剥（[重点] 原样留给 TTS，宁多留不少说）",
+          e == "neutral" and t == "[重点]明天记得吃药。", f"e={e} t={t!r}")
+
+    # ---- ④ 21 个词表名全部认（漏一个 = 设备永远收不到那个表情）----
+    missing = [n for n in S._EMOTION_NAMES
+               if S._extract_emotion(f"[{n}]x。")[0] != n]
+    check("12k ★ 词表 21 个情绪名全部可提取（与设备内置表情一一对应）",
+          not missing, f"missing={missing}")
+
+    # ---- ⑤ 集成：经 _speak_sentence 全链路，pacer 收到真实情绪 ----
+    class _Pacer:
+        def __init__(self):
+            self.json_calls = []
+        def add_json(self, o): self.json_calls.append(o)
+        def add_audio(self, p): pass
+        pending = 0
+        def reset(self): pass
+        async def start(self): pass
+        async def stop(self, drain=True): pass
+        async def wait_idle(self, timeout=None): return True
+        broken = False
+
+    s = types.SimpleNamespace()
+    s.session_id = "SMOKE-EMO"
+    s._abort = False
+    s.state = "idle"
+    s._send_json = lambda *a, **k: None
+    s._send_audio = lambda *a, **k: None
+
+    sp = S._ReplySpeaker.__new__(S._ReplySpeaker)
+    sp._s = s
+    sp._buf = ""
+    sp._started = False
+    sp._tts_ok = True
+    sp._voice = ""
+    sp._voice_loaded = True
+    sp.sentence_count = 0
+    sp.pushed_chars = 0
+    sp.dropped = 0
+    sp.dropped_reasons = []
+    sp.failed_tools = set()
+    sp.claim_blocked = 0
+    sp._claim_fallback_done = False
+    sp._fail_message = ""
+    sp.tts_first_ms = 0
+    sp.tts_ms = 0
+    pacer = _Pacer()
+    sp._pacer = pacer
+    spoken = []
+    async def _fake_stream(text):
+        spoken.append(text)
+    sp._stream_sentence = _fake_stream
+
+    import asyncio
+    asyncio.run(sp._speak_sentence("[laughing]哈哈哈，您真会开玩笑。"))
+    emotions = [c.get("emotion") for c in pacer.json_calls
+                if c.get("type") == "llm"]
+    check("12k · 集成：pacer 收到 emotion=laughing（不再是写死的 neutral）",
+          emotions == ["laughing"], f"emotions={emotions}")
+    check("12k · 集成：TTS 收到的文本已剥掉标记（标记不该被念出来）",
+          spoken == ["哈哈哈，您真会开玩笑。"], f"spoken={spoken}")
+
+    # 无标记句 → neutral（回归原行为，不许因为新功能把情绪搞丢）
+    pacer.json_calls.clear()
+    spoken.clear()
+    asyncio.run(sp._speak_sentence("今天天气不错。"))
+    emotions = [c.get("emotion") for c in pacer.json_calls
+                if c.get("type") == "llm"]
+    check("12k · 集成：无标记句仍发 neutral（原有行为不回归）",
+          emotions == ["neutral"], f"emotions={emotions}")
+
+    # ---- ⑥ 反向变异：提取函数永远返回 neutral ⇒ 集成断言必须红 ----
+    # 基准要用**同一条带标记的句子**现跑一次再取：拿上一条 neutral 运行的
+    # 结果当基准，条件永远不成立（自己给自己设假绿）。
+    real_extract = S._extract_emotion
+    pacer.json_calls.clear()
+    spoken.clear()
+    asyncio.run(sp._speak_sentence("[laughing]哈哈哈，您真会开玩笑。"))
+    baseline_emotions = [c.get("emotion") for c in pacer.json_calls
+                         if c.get("type") == "llm"]
+    baseline_spoken = list(spoken)
+    S._extract_emotion = lambda s: ("neutral", s)
+    try:
+        pacer.json_calls.clear()
+        spoken.clear()
+        asyncio.run(sp._speak_sentence("[laughing]哈哈哈，您真会开玩笑。"))
+        mutated_emotions = [c.get("emotion") for c in pacer.json_calls
+                            if c.get("type") == "llm"]
+        mutated_spoken = list(spoken)
+    finally:
+        S._extract_emotion = real_extract
+    check("12k ★ 变异能抓到（提取失效时情绪回落 neutral 且标记混进文本）",
+          mutated_emotions == ["neutral"] and baseline_emotions == ["laughing"]
+          and mutated_spoken == ["[laughing]哈哈哈，您真会开玩笑。"]
+          and baseline_spoken == ["哈哈哈，您真会开玩笑。"],
+          f"mutated_emotions={mutated_emotions} mutated_spoken={mutated_spoken}")
+
+    # ---- ⑦ 剥完标记只剩空壳：整句跳过，不进 TTS 也不发情绪 ----
+    pacer.json_calls.clear()
+    spoken.clear()
+    sp.sentence_count = 0
+    asyncio.run(sp._speak_sentence("[happy]"))
+    check("12k · 只有情绪标记没有内容的句子被跳过（不合成空音频）",
+          not spoken and sp.sentence_count == 0
+          and not any(c.get("type") == "llm" for c in pacer.json_calls),
+          f"spoken={spoken} count={sp.sentence_count}")
+
 
 
 def t_asr_silence_trim() -> None:
@@ -2510,6 +2959,8 @@ def t_asr_silence_trim() -> None:
     s6._silence_ms = 0
     s6._first_speech_frame = -1
     s6._last_speech_frame = -1
+    s6._mark_speech_frame = types.MethodType(
+        S.VoiceSession._mark_speech_frame, s6)
     s6._feed_vad = types.MethodType(S.VoiceSession._feed_vad, s6)
     for i in range(30):
         p = _mk(i >= 8 and i < 25)
@@ -2649,7 +3100,10 @@ def t_dismiss_and_watchdog() -> None:
         armed = []
         turned = []
         s._rearm_listening = lambda: armed.append(1)
-        s._start_turn = lambda: turned.append(1)
+        # ⚠️ 必须返回 True：看门狗以返回值判断"这轮起没起成"——
+        # False（旧轮收尾中）时它会继续等而不是退出。桩返回 None
+        # （falsy）会让看门狗永远转圈，测试表现为莫名的超时。
+        s._start_turn = lambda: (turned.append(1), True)[1]
         s._silence_threshold_ms = lambda: 10 ** 9   # 静音分支永远不满足
         # 真方法：看门狗是 VoiceSession 的方法，必须绑到这个假对象上跑，
         # 否则测的只是一个同名的 lambda（假绿）。
@@ -2677,7 +3131,7 @@ def t_dismiss_and_watchdog() -> None:
         armed2 = []
         turned2 = []
         s2._rearm_listening = lambda: armed2.append(1)
-        s2._start_turn = lambda: turned2.append(1)
+        s2._start_turn = lambda: (turned2.append(1), True)[1]   # 同上的 True
         s2._silence_threshold_ms = lambda: 10 ** 9
         s2._silence_watchdog = types.MethodType(
             S.VoiceSession._silence_watchdog, s2)
@@ -2687,6 +3141,36 @@ def t_dismiss_and_watchdog() -> None:
             S.config.VOICE_MAX_LISTEN_MS = real_max
         check("12i · 确实说过话时，超时兜底照旧 finalize（不能修成永不识别）",
               turned2 and not armed2, f"armed={len(armed2)} turned={len(turned2)}")
+
+        # ---- ④ 旧轮还在收尾（_start_turn 返回 False）：看门狗必须继续等 ----
+        # barge 打断后轮次任务还在飞（TTS 分片在途），此时静音条件已
+        # 满足。若干脆 return，看门狗没了、这一轮再没人收尾 —— 老人抢
+        # 说的话永远送不进 ASR。2026-10-22 F2 加的分支。
+        s3 = types.SimpleNamespace()
+        s3.session_id = "SMOKE-WD3"
+        s3.state = "listening"
+        s3._speech_ms = VOICE_MIN_SPEECH_MS + 500
+        s3._silence_ms = 10 ** 6          # 静音分支立刻满足
+        s3._t0 = 0.0
+        s3._abort = False
+        turned3 = []
+        calls = {"n": 0}
+
+        def _start_turn_flaky() -> bool:
+            # 前两次"旧轮还在跑"（返回 False），第三次才真起
+            calls["n"] += 1
+            turned3.append(calls["n"])
+            return calls["n"] >= 3
+
+        s3._rearm_listening = lambda: None
+        s3._start_turn = _start_turn_flaky
+        s3._silence_threshold_ms = lambda: 0
+        s3._silence_watchdog = types.MethodType(
+            S.VoiceSession._silence_watchdog, s3)
+        await asyncio.wait_for(s3._silence_watchdog(), timeout=5)
+        check("12i ★ 旧轮收尾中（_start_turn=False）看门狗继续等而不退出"
+              "（barge 交接轮靠它收尾；若改成 return，本断言 1≠3 会红）",
+              len(turned3) == 3, f"start_turn 调用 {len(turned3)} 次")
 
     asyncio.run(_run())
 
@@ -2835,6 +3319,8 @@ async def t_binary_framing(ids: dict) -> None:
 
 async def _one_round(ws, session_id, version, frames, *, send_stop=True):
     """跑一轮"收音 -> 播报"，返回 (收到的二进制帧, 收到的 JSON 列表)。"""
+    from websockets.exceptions import ConnectionClosedError
+
     await ws.send(json.dumps({"session_id": session_id, "type": "listen",
                               "state": "start", "mode": "auto"}))
     await asyncio.sleep(0.25)
@@ -2845,11 +3331,19 @@ async def _one_round(ws, session_id, version, frames, *, send_stop=True):
             blob = _frame_v3(payload)
         else:
             blob = payload
-        await ws.send(blob)
+        try:
+            await ws.send(blob)
+        except ConnectionClosedError as exc:
+            # 连接已死：见 _vad_round 里同款注释。收包循环会立刻
+            # 记到 ("closed", ...) 事件，断言消息里看得见。
+            break
         await asyncio.sleep(0.02)
     if send_stop:
-        await ws.send(json.dumps({"session_id": session_id, "type": "listen",
-                                  "state": "stop"}))
+        try:
+            await ws.send(json.dumps({"session_id": session_id, "type": "listen",
+                                      "state": "stop"}))
+        except ConnectionClosedError:
+            pass    # 连接已死：由下面的收包循环记 ("closed", ...) 事件
     got_bin: list[bytes] = []
     got_json: list[dict] = []
     deadline = time.time() + 30
@@ -2857,6 +3351,10 @@ async def _one_round(ws, session_id, version, frames, *, send_stop=True):
         try:
             msg = await asyncio.wait_for(ws.recv(), timeout=5)
         except asyncio.TimeoutError:
+            break
+        except ConnectionClosedError as exc:
+            got_json.append({"type": "closed",
+                             "error": f"{type(exc).__name__}: {exc}"})
             break
         if isinstance(msg, bytes):
             got_bin.append(msg)

@@ -105,6 +105,20 @@ _ENTER_FACTOR: Final[float] = 2.0           # enter 门限 = 底噪 × 2
 _KEEP_FACTOR: Final[float] = 1.3            # keep  门限 = 底噪 × 1.3
 _PAUSE_MARGIN_MS: Final[int] = 500          # 自适应阈值的固定余量
 
+# ---- 全双工打断（F2，2026-10-21）----
+# 播报中检测到人声就停嘴改听 —— 这是"AEC 全双工"的体验核心：老人说话时
+# 音箱不该自顾自讲完。上游小智同款机制（core/handle/receiveAudioHandle.py：
+# ``if conn.client_aec and have_voice: if conn.client_is_speaking ...:
+# handleAbortMessage``），且同样有唤醒后宽限期（上游 2s）。
+#
+# 为什么敢在播报期信 VAD：设备侧 AEC（CONFIG_USE_DEVICE_AEC）已把播放声
+# 从麦克风信号里抵掉，残留下的能量远低于人声门限。**没有 AEC 的会话**
+# （auto/manual 模式）不走这条：那种模式下设备播报时根本不推流，
+# _continuous() 为假自然被挡住 —— 但真正的原因是没 AEC 时这会把音箱
+# 自己的声音当成打断，那比不能打断糟得多。
+_BARGE_GRACE_SEC: Final[float] = 2.0        # 开播后 2s 内不判打断
+                                              # （AEC 残余 + 唤醒词尾巴）
+
 # ---- 送 ASR 前裁掉头尾静音（P1：首句响应时间，2026-10-21）----
 # 实测（生产主机容器内 → 宿主 FunASR 8082）：ASR 延迟 ≈ 280ms 基座
 # + 230ms/秒音频，**音频长度线性进耗时**。而 _pcm 里装的是从 listen start
@@ -238,6 +252,50 @@ _DISMISS_REPLY: Final[str] = "好的，您先忙，有需要再叫我。"
 _CLAIM_FALLBACK: Final[str] = "我没太听清，您再说一遍具体时间好吗？"
 
 
+# ============================================================ 情绪表情（F4）
+#
+# 为什么用 [情绪词] 标记而不是上游的 emoji 字符
+# --------------------------------------------
+# 上游小智（core/utils/textUtils.py）让模型在回复里夹带一个 emoji，服务端
+# 取第一个 emoji 映射成情绪名发给设备。我们不照抄，有两个具体原因：
+#   ① Edge TTS 对 emoji 字符的处理不可预期（有的跳过、有的念"表情"），
+#      而我们的 TTS 链是先合成再分帧，出问题整句都要重来；
+#   ② emoji 在 UTF-8 里是多字节，切片/正则稍不留神就切出乱码，而
+#      「老人听到乱码」是本项目最贵的故障形态之一。
+# 改用行首 [情绪词] 标记：ASCII 方括号 + 固定词表，正则简单、TTS 无歧义。
+#
+# 词表与设备端内置表情**逐一对应**（firmware 的 Twemoji32/64 各 21 个，
+# 见 display/lvgl_display/emoji_collection.cc 的 AddEmoji 列表）—— 两边
+# 任何一处增删都会让对方收到不存在的情绪名，设备侧查不到图就静默回落
+# FontAwesome，表现为"换了 prompt 但表情不变"。改词表必须同时改固件。
+_EMOTION_NAMES: Final[frozenset[str]] = frozenset({
+    "neutral", "happy", "laughing", "funny", "sad", "angry", "crying",
+    "loving", "embarrassed", "surprised", "shocked", "thinking", "winking",
+    "cool", "relaxed", "delicious", "kissy", "confident", "sleepy", "silly",
+    "confused",
+})
+
+#: 行首情绪标记：[情绪词]，只认词表内的（大小写不敏感）。**不在词表内的
+#: 方括号内容一律不剥**—— 那可能是模型写的正常文字（如"[笔记]"），剥了
+#: 就是往老人嘴里塞内容。宁可多留一个标记，不能少说一个字。
+_EMOTION_TAG: Final[re.Pattern[str]] = re.compile(r"^\[([a-zA-Z]+)\]")
+
+
+def _extract_emotion(sentence: str) -> tuple[str, str]:
+    """从一句话开头剥出情绪标记。返回 ``(emotion, 剩余文本)``。
+
+    ``emotion`` 是词表内的名字；没有标记或不在词表内时返回 ``"neutral"``
+    **且原文照返**（不剥）。调用方把 emotion 发给设备、把剩余文本送 TTS。
+    """
+    m = _EMOTION_TAG.match(sentence)
+    if m is None:
+        return "neutral", sentence
+    name = m.group(1).lower()
+    if name not in _EMOTION_NAMES:
+        return "neutral", sentence
+    return name, sentence[m.end():]
+
+
 def _speech_clean(sentence: str) -> str:
     """去掉 Markdown 噪音，返回**可以直接念**的文本。"""
     s = _MD_HEADING.sub("", sentence)
@@ -304,6 +362,19 @@ class VoiceSession:
         # 当前这一轮对话的 task。**必须与收包主循环解耦**，否则播报期间
         # 读不到上行消息、abort 失效（见 run() 里的注释）。
         self._turn_task: asyncio.Task | None = None
+
+        # ---- 全双工打断（F2）状态 ----
+        # 播报期的人声累计/静音累计。**独立于 _speech_ms/_silence_ms**：
+        # 那两个是"收音轮"的状态，混用会让下一轮的门限和停顿自适应被
+        # 播报期的能量污染（表现为轮询结束判据错乱）。
+        self._barge_speech_ms: int = 0
+        self._barge_silence_ms: int = 0
+        # 本轮播报开始时刻（开播 grace 期由此算起）。0 = 还没开始播。
+        self._speaking_started_at: float = 0.0
+        # 打断交接保护：barge 触发后置位，_finalize 消费交接音频时清除。
+        # 为真的是防止随后那次 _rearm_listening 把 _pcm 里老人刚说的话
+        # 当"新一轮"清掉 —— 链条见 _rearm_listening 里的注释。
+        self._barge_handover: bool = False
 
         # 设备上报的收听模式（realtime/auto/manual）。连续对话模式下
         # 设备播完后继续听、不再喊唤醒词，服务端必须能自己重新武装监听
@@ -584,6 +655,19 @@ class VoiceSession:
             log.info("[%s] idle 态仍收到上行音频，按连续对话重新武装监听",
                      self.session_id)
             self._rearm_listening()
+        if self.state == "speaking" and self._continuous():
+            # 全双工打断（F2）：realtime 模式设备播报时仍在推流（AEC 已把
+            # 播放声抵掉）。收下来只为判"有没有人想插话"—— 有就停嘴改听。
+            # 这些帧同时留在 _pcm 里：打断后老人刚说的就是下一轮的输入。
+            # ⚠️ 必须先剥头再进这个分支：payload 的赋值在任何使用之前。
+            # 曾经写在分支后面 ⇒ speaking 期每帧一个 UnboundLocalError，
+            # 会话整段死掉，而客户端症状只是"没有 tts stop"（连接被悄悄
+            # 掐断），极难定位。剥头失败（畸形帧）时本帧整个丢弃，与
+            # listening 路径同口径。
+            payload = self._strip_binary_header(data)
+            if payload is not None:
+                self._feed_barge_in(payload)
+            return
         if self.state != "listening":
             # 非 listening 态收到的音频：设备在播报时也可能继续推流
             # （固件不停止麦克风）。丢弃即可，不回错误 —— 回错误会让
@@ -646,18 +730,14 @@ class VoiceSession:
             self._speech_ms += frame_ms
             self._silence_ms = 0
             self._ms_since_loud = 0
-            if self._first_speech_frame < 0:
-                self._first_speech_frame = frame_idx
-            self._last_speech_frame = frame_idx
+            self._mark_speech_frame(frame_idx)
         elif rms >= keep and self._ms_since_loud <= config.VOICE_SOFT_GRACE_MS:
             # 3) 软语音：开口后的轻声延续。**不刷新 _ms_since_loud** ——
             #    刷新它等于让持续底噪无限续期，会话永远不结束。
             self._speech_ms += frame_ms
             self._silence_ms = 0
             self._ms_since_loud += frame_ms
-            if self._first_speech_frame < 0:
-                self._first_speech_frame = frame_idx
-            self._last_speech_frame = frame_idx
+            self._mark_speech_frame(frame_idx)
         else:
             # 4) 静音
             self._silence_ms += frame_ms
@@ -669,6 +749,106 @@ class VoiceSession:
                     + _PAUSE_MARGIN_MS)
         return int(max(config.VOICE_SILENCE_MS,
                        min(config.VOICE_SILENCE_MAX_MS, adaptive)))
+
+    def _mark_speech_frame(self, idx: int) -> None:
+        """把一帧记进"语音帧区间"（ASR 前裁静音用，见 _trim_silence_edges）。
+
+        抽成方法是因为有三个调用方：_feed_vad 的高能量/软语音分支、
+        _feed_barge_in 的人声分支。同一事实多处实现必然分叉 —— 区间
+        口径一歪，裁掉的就不是静音而是话。
+        """
+        if self._first_speech_frame < 0:
+            self._first_speech_frame = idx
+        self._last_speech_frame = idx
+
+    def _reset_speech_window(self) -> None:
+        """清空"语音帧区间"。每轮用完即清（_finalize / 重新武装时）。
+
+        不清的后果（2026-10-22 F2 实测推演）：播报期之后的下一轮
+        _feed_vad 看到的是上一轮的下标（``< 0`` 判不成立 ⇒ 不更新），
+        下一轮裁剪会把老人刚开口的话当静音切掉。
+        """
+        self._first_speech_frame = -1
+        self._last_speech_frame = -1
+
+    # ---------------------------------------------------------------- 全双工
+    def _feed_barge_in(self, payload: bytes) -> None:
+        """播报期喂一帧：判"有没有人想插话"，顺手把帧留进 _pcm。
+
+        与 _feed_vad 的三条区别（都是故意的）：
+        1. **用听前的底噪做门限**：播报期的"底噪"含 AEC 残余，跟着它涨
+           门限会把真正的人声挡在门外；
+        2. **计数器独立**（_barge_*）：不碰收音轮的 _speech_ms/_silence_ms；
+        3. **开播 2s 宽限期**：AEC 残余集中在刚开播的时刻，唤醒词尾巴
+           也可能这时候到（上游同款 2s，见常量区注释）。
+        """
+        try:
+            pcm = opus_codec.decode_opus(payload, 16000, 1)
+        except opus_codec.OpusUnavailableError:
+            # 无 libopus：打断检测失效，但帧照收（abort 与协议不受影响）。
+            log.debug("无 libopus，跳过本帧打断检测")
+            return
+        self._pcm.append(pcm)
+        if self._speaking_started_at and \
+                time.monotonic() - self._speaking_started_at < _BARGE_GRACE_SEC:
+            return
+        rms = opus_codec.pcm_rms(pcm)
+        frame_ms = config.VOICE_FRAME_DURATION_MS or 60
+        enter = max(config.VOICE_SPEECH_RMS, self._noise_floor * _ENTER_FACTOR)
+        if rms >= enter:
+            # 这一帧是人声：记进裁剪窗口。没有这一步，老人"抢过来的"前
+            # 两三秒全在 _pcm 里却不被区间覆盖，下一轮 _trim_silence_edges
+            # 会把它们当静音切掉 —— 老人费劲插的话，服务端当没听见。
+            # （区间起点由 _finalize 在每轮结束时清零，不会串轮。）
+            self._mark_speech_frame(len(self._pcm) - 1)
+            self._barge_speech_ms += frame_ms
+            self._barge_silence_ms = 0
+            if self._barge_speech_ms >= config.VOICE_MIN_SPEECH_MS:
+                self._trigger_barge_in()
+        else:
+            self._barge_silence_ms += frame_ms
+            # 长静音才清零累计：句中换气/停顿不该把"想打断"这件事忘掉。
+            if self._barge_silence_ms >= config.VOICE_PAUSE_MIN_MS:
+                self._barge_speech_ms = 0
+
+    def _trigger_barge_in(self) -> None:
+        """停嘴改听：作废未发出的音频、把已收到的人声交接给收音轮。
+
+        幂等由调用方保证（_barge_speech_ms 累积到阈值才进来一次，
+        进来立刻清零）。
+        """
+        log.info("[%s] 全双工打断：播报中检测到人声（%dms），停止播报改听",
+                 self.session_id, self._barge_speech_ms)
+        # ⚠️ 先取数再清零：反过来的话下面转移给 _speech_ms 的是 0，
+        # 看门狗的 _speech_ms 判据不满足，老人打断后反而说不上话。
+        detected_ms = self._barge_speech_ms
+        self._barge_speech_ms = 0
+        self._barge_silence_ms = 0
+        # 1) 停嘴：abort 让 LLM 流与 TTS 逐帧检查后退出，pacer.reset()
+        #    把**还没走下 socket** 的队列帧全部作废 —— 只置 _abort 的话
+        #    老人还会听到已经排队的十几帧（"喊停了还在说"）。
+        self._abort = True
+        speaker = self._speaker
+        if speaker is not None:
+            speaker._pacer.reset()
+        # 2) 交接：播报期收到的人声就是下一轮的输入。把打断检测攒到的
+        #    语音量并进收音轮，否则看门狗的 _speech_ms 判据不满足，
+        #    会一路挂到 VOICE_MAX_LISTEN_MS 再被当"一句没说"重新武装
+        #    —— 老人打断之后再也说不上话，比不能打断更糟。
+        self._speech_ms = max(self._speech_ms, detected_ms)
+        self._silence_ms = 0
+        self._ms_since_loud = 0          # 刚才是人声，软语音期限从头算
+        self._t0 = time.monotonic()      # 60s 收听上限为这一句重新起算
+        self.state = "listening"
+        # 交接保护：紧接着轮次任务会收尾发 tts stop，设备据此回 listening
+        # 并重发 listen start（realtime 固件行为）⇒ 触发一次
+        # _rearm_listening。没有这个标志，那次 rearm 会把 _pcm 里老人
+        # 刚说的话当新一轮清掉。见 _rearm_listening 的保留分支。
+        self._barge_handover = True
+        # 3) 看门狗：_run_turn 的 finally 只把 "thinking" 改回 idle，
+        #    不会碰 listening；这里若没有活着的看门狗就补一个。
+        if self._watchdog_task is None or self._watchdog_task.done():
+            self._watchdog_task = asyncio.create_task(self._silence_watchdog())
 
     def _strip_binary_header(self, data: bytes) -> bytes | None:
         """按协议版本剥下行/上行的二进制头。v1 无头。"""
@@ -755,8 +935,9 @@ class VoiceSession:
             self._noise_floor = _NOISE_FLOOR_INIT
             self._ms_since_loud = 10 ** 9
             self._max_closed_pause_ms = 0
-            self._first_speech_frame = -1
-            self._last_speech_frame = -1
+            self._reset_speech_window()
+            self._barge_speech_ms = 0
+            self._barge_silence_ms = 0
 
     def _on_abort(self, obj: dict[str, Any]) -> None:
         reason = obj.get("reason", "")
@@ -805,6 +986,26 @@ class VoiceSession:
           2. 服务端在 idle 态收到上行音频时，自动按连续对话重新武装
              （本函数，覆盖固件不发消息的路径，如 ASR 失败后的 alert）。
         """
+        if self._barge_handover:
+            # 全双工打断（F2）的交接保护：这次 rearm 不是"新的一轮"，
+            # 而是被我们自己的 abort 掐断的那一轮的延续。链条：
+            # barge 触发 → 轮次任务收尾发 tts stop → 设备回 listening
+            # 重发 listen start → 本函数。此时 _pcm 里正是老人抢话
+            # 说的内容，_speech_ms 是交接过来的语音量 —— 一律清掉的
+            # 话，老人打断了服务端、服务端却把他刚说的话当没说过，
+            # 他得再重复一遍（产品上就是"打断了但没用"）。
+            # ⇒ 保留全部 VAD 状态与音频，只重置轮次控制项。
+            # 标志**不清**：由 _finalize 把交接音频送进 ASR 时清；
+            # 中途设备若重发 listen start，仍按交接保护走。
+            self._frames.clear()
+            self._abort = False
+            self._t0 = time.monotonic()
+            self.state = "listening"
+            # 看门狗单实例：旧的先取消，避免两个看门狗同时等静音。
+            if self._watchdog_task is not None and not self._watchdog_task.done():
+                self._watchdog_task.cancel()
+            self._watchdog_task = asyncio.create_task(self._silence_watchdog())
+            return
         self._frames.clear()
         self._pcm.clear()
         self._speech_ms = 0
@@ -812,8 +1013,9 @@ class VoiceSession:
         self._noise_floor = _NOISE_FLOOR_INIT
         self._ms_since_loud = 10 ** 9
         self._max_closed_pause_ms = 0
-        self._first_speech_frame = -1
-        self._last_speech_frame = -1
+        self._reset_speech_window()
+        self._barge_speech_ms = 0
+        self._barge_silence_ms = 0
         self._abort = False
         self._t0 = time.monotonic()
         self.state = "listening"
@@ -840,11 +1042,15 @@ class VoiceSession:
                 threshold = self._silence_threshold_ms()
                 if self._silence_ms >= threshold and \
                         self._speech_ms >= config.VOICE_MIN_SPEECH_MS:
+                    if not self._start_turn():
+                        # 旧轮还在收尾（barge 打断后尤其常见）：等它完了
+                        # 再起，**不能 return** —— 把看门狗一起带走的话，
+                        # 这一轮就再没人收尾了。下个 0.2s 轮次自然重试。
+                        continue
                     log.info("[%s] 服务端静音兜底触发（连续静音 %dms ≥ 阈值 %dms，"
                              "累计语音 %dms，底噪 %.4f）",
                              self.session_id, self._silence_ms, threshold,
                              self._speech_ms, self._noise_floor)
-                    self._start_turn()
                     return
                 # 收听超时兜底：阈值再自适应也有上限，而这一个管的是
                 # "一直不满足条件"的极端情形（老人离开、设备持续送接近
@@ -875,7 +1081,8 @@ class VoiceSession:
                     log.info("[%s] 收听超 %ds 兜底 finalize（累计语音 %dms）",
                              self.session_id, config.VOICE_MAX_LISTEN_MS // 1000,
                              self._speech_ms)
-                    self._start_turn()
+                    if not self._start_turn():
+                        continue   # 旧轮收尾中：等它完了再起（同上）
                     return
         except asyncio.CancelledError:
             raise
@@ -883,8 +1090,8 @@ class VoiceSession:
             log.warning("[%s] 静音兜底异常：%s: %s", self.session_id,
                         type(exc).__name__, exc)
 
-    def _start_turn(self) -> None:
-        """起一个 task 跑本轮对话；已有在跑的那轮就直接返回。
+    def _start_turn(self) -> bool:
+        """起一个 task 跑本轮对话；已有在跑的那轮就直接返回 False。
 
         **幂等的两道闸**（缺一不可）：
         1. 这里：``_turn_task`` 还没跑完就再起一轮，等于同一段音频
@@ -893,13 +1100,19 @@ class VoiceSession:
            ``create_task`` 不会立刻执行，第二个 stop 消息可能在第一个
            task 真正跑起来之前就到了，那时 state 还是 listening。
 
+        返回值语义（2026-10-22 加）：False = 本轮仍在进行、没有起新轮。
+        看门狗据此**继续等**而不是 return —— barge 打断后旧轮还在收尾
+        （TTS 分片在飞）时静音条件已满足，直接 return 会把看门狗一起
+        带走，那一轮再没人收尾，老人的话永远送不进 ASR。
+
         为什么用 ``create_task`` 而不是直接 await：见 :meth:`run` 的注释
         （await 会卡住收包主循环 ⇒ abort 失效）。
         """
         if self._turn_task is not None and not self._turn_task.done():
             log.debug("[%s] 本轮仍在进行，忽略重复的 finalize 触发", self.session_id)
-            return
+            return False
         self._turn_task = asyncio.create_task(self._finalize())
+        return True
 
     async def _finalize(self) -> None:
         """结束本轮收音并跑完整链路：ASR → 配额 → LLM → TTS。
@@ -923,6 +1136,16 @@ class VoiceSession:
 
         started = time.monotonic()
         pcm = self._trim_silence_edges(pcm)
+        # 交接音频已被本轮消费（或本就没有交接）：标志必须在这里清。
+        # barge 后正常路径是 rearm 保留交接、看门狗再来一次 finalize；
+        # 若旧轮走的是 close() 路径（LLM 失败，不发 tts stop、没有
+        # rearm），标志会一直挂到这次 finalize 才清 —— 两处合计保证
+        # 它不会残留到下一轮，把下一轮的 _pcm 错当交接保护起来。
+        self._barge_handover = False
+        # 裁剪窗口本轮已用完，立刻清零。不清的话播报期（F2）之后，
+        # 下一轮 _feed_vad 看到的是上一轮的下标（`< 0` 判不成立 ⇒
+        # 不更新），下一轮裁剪会把老人刚开口的话当静音切掉。
+        self._reset_speech_window()
         try:
             await self._run_turn(pcm, started)
         except Exception as exc:  # noqa: BLE001
@@ -1639,9 +1862,14 @@ class _ReplySpeaker:
         # 显示在屏幕上。拦下来的句子若已经发过 sentence_start，老人会在屏幕上
         # 看到"老人查天气，我要调用 get_weather"——比念出来更糟。
         text = _speech_clean(sentence)
+
+        # ---- 情绪标记（F4）：行首 [情绪词]，剥掉再送后面的安检/闸门/TTS ----
+        # 必须在 block 检查与假成功闸门**之前**剥：那两个判据看的是要念的
+        # 文本，标记不该参与；字幕（sentence_start 的 text）也必须是剥过的。
+        emotion, text = _extract_emotion(text)
         if not text or _PUNCT_ONLY.fullmatch(text):
-            # 纯标点/空串：切句副产物，不是"不可播报"，**不计入 dropped**。
-            log.debug("[%s] 跳过无内容片段 %r", s.session_id, sentence[:20])
+            # 剥完标记只剩标点/空串：这一句整个是个情绪壳，没有可念内容。
+            log.debug("[%s] 跳过只有情绪标记的片段 %r", s.session_id, sentence[:20])
             return
         reason = _speech_block_reason(text)
         if reason:
@@ -1675,11 +1903,18 @@ class _ReplySpeaker:
             self._pacer.add_json({"type": "tts", "state": "start"})
             self._started = True
             s.state = "speaking"
+            # 全双工打断的 grace 期从**第一句话开口**算起（F2）。
+            s._speaking_started_at = time.monotonic()
+            s._barge_speech_ms = 0
+            s._barge_silence_ms = 0
         self.sentence_count += 1
 
         self._pacer.add_json({"type": "tts", "state": "sentence_start",
                               "text": text})
-        self._pacer.add_json({"type": "llm", "emotion": "neutral"})
+        # 情绪随句走：设备端 application.cc 的 llm 分支据此调 SetEmotion，
+        # 词表与固件内置 21 个表情一一对应（见 _EMOTION_NAMES 注释）。
+        # 以前这里写死 "neutral"—— 设备有整套表情却永远只显示一张脸。
+        self._pacer.add_json({"type": "llm", "emotion": emotion})
 
         # 单句 TTS 失败：跳过该句音频、后续句继续。
         # 不能整轮失败 —— 第一句合成失败而后面的句子都成功是常见的
