@@ -284,6 +284,18 @@ jobs:
       - name: 展示时区冒烟（IP→国家→时区 + 提醒按规则时区展开 + 反向变异）
         run: python tools/run_smoke.py logs/smoke_geo.log python tools/smoke_geo.py 8135
 
+      # 腾讯云语音冒烟（端口 8134，假上游 8234 = 8134+100，变异子进程再 +100）。
+      # 为什么它必须进 CI：腾讯云的两条链路**没有真实密钥就无法验证**，而
+      # 三种失败的错误信息互不相干（签名错是 401 / 音色不支持 24k 是
+      # InvalidParameterValue.SampleRate / 音色 ID 抄成火山的字符串是
+      # InvalidParameterValue.VoiceType），管理员点「保存」时一条都不会提前暴露。
+      # 脚本用「对齐官方文档的测试向量（CanonicalRequest / StringToSign 全文
+      # 不依赖 SecretKey，可逐字节复现）+ 假上游独立复算签名」把能验的都验掉，
+      # **不需要任何凭据**，配合 4 条反向变异（Codec / UTC 日期 / DataLen 口径 /
+      # 文本分段）。此前只在本机跑 ⇒ 这套断言对 GitHub 上的每个 PR 都不存在。
+      - name: 腾讯云语音冒烟（TC3 签名对齐文档向量 + 假上游验签 + 反向变异）
+        run: python tools/run_smoke.py logs/smoke_tencent_voice.log python tools/smoke_tencent_voice.py 8134
+
       # 模型接入点冒烟（九种 kind 注册 / usage 平滑过渡 / 四家报文协议切换 /
       # 错误五码分诊 / 密钥脱敏 / 设备下发兜底 / context_window 裁剪）。
       # 为什么必须进 CI（此前它只在本机跑，等于这套断言对 GitHub 上的每个

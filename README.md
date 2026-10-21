@@ -51,7 +51,7 @@
 | 工作流 | 触发 | 作用 |
 | --- | --- | --- |
 | `pr-gate.yml` | push 到 `main`/`master` + **每个 PR**（刻意不加 paths 过滤） | 常驻门禁「守门人自检」：CODEOWNERS 覆盖 + workflows 可解析。push 时自动跑，结果可见但**不再拦截推送**（见下方流程变更） |
-| `server-ci.yml` | push/PR 改动 `server/`、`tools/`、`firmware/components/elder/`；可手动 | 装依赖（含 `libopus0`）后跑 **10 个 `smoke_*.py` 冒烟脚本 + 6 个 QA/审计脚本**（清单见下方），另有 5 个 job：elder 组件宿主测试、MySQL 真实路径冒烟、Compose 文件校验、Dockerfile 语法检查（hadolint） |
+| `server-ci.yml` | push/PR 改动 `server/`、`tools/`、`firmware/components/elder/`；可手动 | 装依赖（含 `libopus0`）后跑 **19 个 `smoke_*.py` 冒烟脚本 + 10 个 QA/单测脚本**（清单见下方），另有 5 个 job：elder 组件宿主测试、MySQL 真实路径冒烟、Compose 文件校验、Dockerfile 语法检查（hadolint） |
 | `docker-build.yml` | push/PR 改动 `server/`；可手动 | 构建镜像 → 起容器校验 `/api/health`；**push 到 `main` 且容器冒烟通过后**才推 `ghcr.io/25283531/voice-avatar-box` 的 `latest` + 短 SHA（冒烟失败不推，`latest` 不被污染）；PR 只构建不推送；手动触发勾选 `publish` 可覆盖 tag 发布 |
 | `firmware-build.yml` | push 改动 `firmware/`、`tools/merge_to_xiaozhi.py` 或本文件；可手动 | 在 `espressif/idf:v5.5.1` 容器里编译 ESP32-S3 固件 → 合并单文件烧录镜像 → 上传 artifact。**每次构建都会打印生效的 `CONFIG_OTA_URL` 并在偏离本项目地址（IP `152.136.230.132` / 域名 `voice.250886.xyz`）时告警**；手动触发可自选板卡与后端地址 |
 | `app-build.yml` | push/PR 改动 `app/`；可手动 | 构建 H5 / 微信小程序并上传产物；校验后端地址已内联 |
@@ -62,8 +62,8 @@
 
 ⚠️ **不是只有一个 `smoke_server.py`**。数口径时要分清三件事：**脚本个数 ≠ 调用次数**：
 
-- `smoke:` job 里跑 **10 个不同的 `smoke_*.py`**（端口已登记在 `tools/smoke_ports.py`，
-  那是唯一真源，新脚本先登记再写死）：
+- `smoke:` job 里跑 **19 个不同的 `smoke_*.py`**（端口已登记在 `tools/smoke_ports.py`，
+  那是唯一真源，新脚本先登记再写死；标注「不占端口」的是纯函数直调或静态扫描）：
 
 | 脚本 | 端口 | 守什么 |
 | --- | --- | --- |
@@ -74,11 +74,20 @@
 | `smoke_quota.py` | 8106 | 陪聊计量 + 「授权设备无限量」不变量（原 `smoke_membership`，会员端点须已下线） |
 | `smoke_usage.py` | 8120 | token 用量：网关提取 + 双端接口对账 + 越权隔离 |
 | `smoke_voice_catalog.py` | 8124 | 音色目录单一真源 + **就绪度面板如实反映零配置未就绪** |
-| `smoke_voice.py` | 8119 | 自研语音链路：WS 协议逐字段对固件 + Opus 编解码 + OTA 签发口径 |
+| `smoke_voice.py` | 8119 | 自研语音链路：WS 协议逐字段对固件 + Opus 编解码 + OTA 签发口径（含 8 条口语时间解析断言，如「两分钟后」「半小时后」，含跨午夜滚动） |
 | `smoke_mqtt_udp.py` | 8132 | MQTT+UDP 传输（F1）：broker 协议 + AES-128-CTR 音频面对齐固件 + 端到端一轮 + 4 条反向变异自检 |
 | `smoke_voiceprint.py` | 8133 | 声纹认人（F3）：提供者契约 + 说话人登记 CRUD + 端到端个性化注入 + 4 条反向变异自检 |
+| `smoke_geo.py` | 8135 | 跨时区口径：IP→国家→时区判定链 + 提醒按**规则自己的时区**展开 + 4 条反向变异（§1.15） |
+| `smoke_tencent_voice.py` | 8134 | 腾讯云语音：TC3 签名对齐官方文档测试向量（不需密钥）+ 假上游独立复算验签 + TTS/ASR 端到端 + 4 条反向变异（§1.16） |
+| `smoke_models.py` | 8104 | 模型接入点：九种 kind 注册 / 四家报文协议切换 / 错误五码分诊 / context_window 裁剪 / 本地自建服务 |
+| `smoke_proxy_headers.py` | 8125 | 可信反代：ProxyHeaders 算法 + 307 Location 的 scheme 推导 + Dockerfile CMD 形态 |
+| `smoke_db_path.py` | 不占端口 | 默认数据库路径解析（纯函数直调，不起服务、不建 uvicorn） |
+| `smoke_pk_reuse.py` | 8130 | pk 复用 ⇒ 已删除设备的旧 token 复活（P0）+ 从属行串台 |
+| `smoke_sqlite_concurrency.py` | 不占端口 | 读事务不得把写事务饿死（2026-10-20 生产事故） |
+| `smoke_support_email.py` | 8131 | 求助邮箱不许写死：env → 管理端 SMTP → 空串 三级回落 |
+| `smoke_frontend_hygiene.py` | 不占端口 | 前端模板卫生（静态扫描，专抓 `uni.*` 写进模板表达式这类产物坏形态） |
 
-- 另有 **6 个 QA / 审计脚本**同在 `smoke:` job 里，它们**不属于 `smoke_*.py` 系列**，
+- 另有 **10 个 QA / 单元测试脚本**同在 `smoke:` job 里，它们**不属于 `smoke_*.py` 系列**，
   别数漏也别数重：
 
 | 脚本 | 端口 | 守什么 |
@@ -89,11 +98,16 @@
 | `qa3_migration.py` | 不起服务 | 迁移完整性：ORM 列与 `schema_patch.NEW_COLUMNS` 对账 |
 | `qa3_device_binding.py` | 8114 | 设备绑定归属：重启不被绑上平台预设 |
 | `qa3_drop_tables.py` | 不占端口 | 会员遗留五张表必须真删，**掏空实现必变红** |
+| `test_mcp_confirm.py` | 不占端口 | 服务端→设备 MCP 工具通道 + 服药确认（不烧板子、不连真设备） |
+| `test_weather.py` | 不占端口 | 和风天气子系统（进程内，假 HTTP，不耗真实 API 次数） |
+| `test_speech_guard.py` | 不占端口 | 可播性过滤（规划语/工具名）+ 缓冲区尾巴补播 |
+| `test_audio_pacing.py` | 不占端口 | 音频下行节流器（AudioPacer） |
 
 - `mysql-smoke:` job **复跑 2 个**：`smoke_server.py 8100` 与 `smoke_roles.py 8101`
   走真实 MySQL 往返，另加 `eval_persona.py` 与 `qa3_drop_tables.py`。
-  **这是同一批脚本的方言复跑，不是新脚本** —— 所以全仓「不同脚本数」是 8 + 6 = **14 个**，
-  而 CI 里 `python tools/smoke_*.py` 的**调用次数**是 10（SQLite）+ 2（MySQL）= **12 次**。
+  **这是同一批脚本的方言复跑，不是新脚本** —— 所以 `smoke_*.py` 在 CI 里的
+  **调用次数**是 19（SQLite）+ 2（MySQL）= **21 次**，全仓「不同 `smoke_*.py` 脚本数」仍是 **19 个**；
+  连同 10 个 QA/单测脚本，`smoke:` job 内一共 **29 次脚本调用 / 36 个步骤**。
 
 ⚠️ 其余 4 个 `qa3_*` 脚本**刻意不进 MySQL job**——它们直连 `sqlite3` 且 `boot()` 里
 无条件 `env["ELDER_DB"] = f"sqlite:///{DB}"`，会**覆盖掉 CI 传入的 MySQL 连接串**。
