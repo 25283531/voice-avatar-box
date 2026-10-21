@@ -116,6 +116,18 @@
         border-left:1px solid var(--line);box-shadow:-6px 0 24px rgba(15,23,42,.12);
         overflow:auto;padding:16px;z-index:20}
   @media(max-width:820px){.g3,.g4{grid-template-columns:repeat(2,minmax(0,1fr))}}
+  /* ---- 预置字段（由厂商预置自动填、默认只读）---- */
+  /* 为什么要视觉上明确"不可写"：这些字段以前是空输入框，管理员只能猜
+     要不要填，猜错就是「配置看起来正常、语音整条链路静默」。灰底 + 角标
+     让"系统已经填好"变成看得见的事实。 */
+  .presetTag{display:inline-block;margin-left:6px;padding:0 6px;border-radius:999px;
+        background:#e8f1fb;color:#1d6fd0;font-size:11px;font-weight:400;line-height:16px;
+        vertical-align:middle}
+  input.presetLock,select.presetLock{background:#f1f5f9;color:#475569;cursor:not-allowed;
+        border-color:#e2e8f0}
+  .presetHint{font-size:12px;color:#64748b;margin-top:4px;line-height:1.6}
+  .presetHint a{color:#1d6fd0;text-decoration:none}
+  .presetHint a:hover{text-decoration:underline}
 </style>
 </head>
 <body>
@@ -908,7 +920,8 @@
           <div class="grid g2">
             <div><label>名称</label><input v-model="pForm.name" style="width:100%" placeholder="主力大模型" /></div>
             <div><label>能力</label>
-              <select v-model="pForm.kind" style="width:100%">
+              <select v-model="pForm.kind" style="width:100%"
+                      @change="onKindChange">
                 <option value="asr">语音识别 ASR</option>
                 <option value="tts">语音合成 TTS</option>
                 <option value="vad">端点检测 VAD</option>
@@ -982,13 +995,38 @@
                        placeholder="填该服务认识的音色名" />
               </template>
             </div>
-            <div><label>模型</label><input v-model="pForm.model" style="width:100%" /></div>
-            <div v-if="showEndpoint"><label>接口地址</label>
-              <input v-model="pForm.endpoint" style="width:100%" />
+            <!-- 模型：预置厂商给了值就只读灰显；该厂商没有「模型名」这个概念
+                 （腾讯云 TTS 的 ModelType 恒为 1）就整栏隐藏并说明，不要用一个
+                 空输入框把人骗去瞎填。 -->
+            <div v-if="!modelHidden"><label>模型<span v-if="modelFromPreset"
+                 class="presetTag">预设</span></label>
+              <input v-model="pForm.model" style="width:100%"
+                     :disabled="modelLocked"
+                     :class="{'presetLock':modelLocked}" />
+              <div v-if="modelFromPreset" class="presetHint">
+                已按厂商预设填好{{ modelLocked ? '' : '（已解锁，可改）' }}。
+                <a v-if="modelLocked" href="#" @click.prevent="unlockPreset('model')">改成自定义</a>
+              </div>
+            </div>
+            <div v-else class="presetHint" style="align-self:end;padding-bottom:6px">
+              <b>模型：</b>该厂商没有「模型名」这一项，无需填写。
+            </div>
+            <div v-if="showEndpoint"><label>接口地址<span v-if="endpointFromPreset"
+                 class="presetTag">预设</span></label>
+              <input v-model="pForm.endpoint" style="width:100%"
+                     :disabled="endpointLocked"
+                     :class="{'presetLock':endpointLocked}" />
+              <!-- 预设厂商：地址是官方固定域名，填错了整条链路就静默
+                   （2026-10-21 事故：只填密钥没填地址，TTS 一路报错） -->
+              <div v-if="endpointFromPreset" class="presetHint">
+                已自动使用厂商官方地址{{ endpointLocked ? '，无需修改' : '' }}。
+                <a v-if="endpointLocked" href="#" @click.prevent="unlockPreset('endpoint')">改成自定义地址</a>
+                <span v-else>私有化/代理场景才需要改，否则请保持默认。</span>
+              </div>
               <!-- 本地自建服务：地址仍然可编辑（Docker 不同网络命名空间时要改成
                    宿主地址），但「填到 /v1 这一级」的通用提示对它完全不适用，
                    所以两套提示按 localService 切换，不混排。 -->
-              <div v-if="localService" style="font-size:12px;color:#888;margin-top:4px">
+              <div v-else-if="localService" style="font-size:12px;color:#888;margin-top:4px">
                 默认 <code>{{localService.endpoint}}</code>（与助手同机部署）。
                 若模型不在同一个 Docker 网络里，改成宿主地址（如
                 <code>http://10.2.0.16:8080</code>）。不懂就保持默认。
@@ -1017,8 +1055,11 @@
               <select v-model="pForm.enabled" style="width:100%">
                 <option :value="true">启用</option><option :value="false">停用</option>
               </select></div>
-            <div><label>厂商 API 风格</label>
+            <div v-if="!apiStyleHidden"><label>厂商 API 风格<span v-if="apiStyleFromPreset"
+                 class="presetTag">预设</span></label>
               <select v-model="pForm.api_style" style="width:100%"
+                      :disabled="apiStyleLocked"
+                      :class="{'presetLock':apiStyleLocked}"
                       @change="onApiStyleChange">
                 <option value="">OpenAI 兼容（默认）</option>
                 <option value="openai_compatible">OpenAI 兼容</option>
@@ -1036,6 +1077,10 @@
                 <option value="local_asr">本地 ASR（FunASR/SenseVoice，无需密钥）</option>
                 <option value="local_embed">本地向量化（FastEmbed/bge，无需密钥）</option>
               </select></div>
+            <div v-else class="presetHint" style="align-self:end;padding-bottom:6px">
+              <b>厂商 API 风格：</b>由平台预置决定（该厂商用私有协议签名，
+              不在 OpenAI 兼容之列），无需也无法填写。
+            </div>
             <div><label>超时（秒）</label><input v-model.number="pForm.timeout_sec" type="number" min="1" max="600" /></div>
             <div><label>失败重试次数</label><input v-model.number="pForm.max_retries" type="number" min="0" max="5" /></div>
             <div><label>上下文上限 token（0=不限）</label><input v-model.number="pForm.context_window" type="number" min="0" /></div>
@@ -1433,6 +1478,9 @@ createApp({
       remDeviceFilter: '', remUserFilter: '', remBusy: false,
       aBox: null, aForm: null, clipsText:'', lightsText:'',
       pBox: null, pForm: null, paramsText:'',
+      // 预置字段的「手动解锁」状态。默认全 false = 全走厂商预设（只读灰显）。
+      // 只存**前端意图**，不入库：后端保存时仍以表单里的值为准。
+      presetOverride: { endpoint:false, model:false, api_style:false },
       maskDownAt: 0,  // 遮罩 mousedown 时间戳，maskClose 用它区分「短点击」与「拖拽选中」
       // 打开 AI 配置弹窗那一刻的表单快照（editProvider 赋值）。
       // 用途：testVoice 要能识别「表单有未保存改动」，因为测试读的是数据库里
@@ -1450,6 +1498,9 @@ createApp({
       // ⚠️ 必须服务端下发：三家要填的字段差别太大（火山是 AK:SK 两段、
       // Edge 完全不用填），硬编码在前端等于把「每家要什么」抄成第二份真源。
       ttsVendors: [], voicesByVendor: {}, edgeAvailable: true,
+      // 「厂商 API 风格」能存进库的取值集合（服务端 API_STYLES 的下发）。
+      // 供应商级风格（tencent / edge）不在其中 —— 它们只用于调用层分派。
+      apiStyleValues: [],
       // 非 TTS 厂商预置（同一接口的 provider_presets 字段）。
       // 与 ttsVendors 同理走服务端下发，理由同上：厂商→endpoint/模型/免费口径
       // 只有 provider_presets.py 一份真源。字段缺失时回落成空数组（见装载处）。
@@ -1739,6 +1790,14 @@ createApp({
           // 只是不自动填 endpoint —— 后端保存时还会兜一次（归一化）。
           this.localServices = (r.local_services && typeof r.local_services === 'object')
             ? r.local_services : {};
+          // 「厂商 API 风格」里**真正能存进库**的取值集合。
+          // 为什么必须从服务端拿：腾讯云/Edge 的 api_style 是「供应商级」的
+          // （tencent / edge），它们**不在** API_STYLES 白名单里 —— 这是
+          // 2026-10-22 实测撞出来的：前端把 'tencent' 填进那一栏保存，
+          // 后端 ProviderIn 的校验器直接 500「api_style 只能是 …」。
+          // 判据只在服务端一处（model_catalog.API_STYLES），前端不抄第二份。
+          this.apiStyleValues = Array.isArray(r.api_styles)
+            ? r.api_styles.map(x => x.value) : [];
           // 目录到达后要重新拆分：openPreset/editAvatar/openProvider 可能在
           // 目录还空时就把存量音色判成了「不在清单里」，落进自定义框。
           if (this.pEdit) Object.assign(this.pEdit, this.splitVoice(this.pEdit.tts_voice));
@@ -1944,6 +2003,68 @@ createApp({
       const map = this.voicesByVendor || {};
       return map[this.pForm.provider] || [];
     },
+    // ---- 预置字段锁定（2026-10-21 用户反馈：明明只要填密钥，却要填一堆）----
+    // 统一取「当前厂商的预置」：TTS 走 vendorInfo，其余走 providerPreset。
+    // 两者严格互斥，锁定判据只认这一个入口 —— 否则会出现「地址灰了、风格没灰」
+    // 这种半锁状态，比全不锁更让人困惑。
+    activePreset(){
+      return this.vendorInfo || this.providerPreset;
+    },
+    // 预置给这条配置指定的模型名（非 TTS 是 models[kind]，没有该 kind 就是空）
+    presetModelDefault(){
+      const p = this.activePreset;
+      if (!p) return '';
+      if (this.pForm.kind === 'tts') return p.model || '';
+      return (p.models || {})[this.pForm.kind] || '';
+    },
+    // TTS 预置里 model 为空 = 该厂商**没有「模型名」这个概念**
+    // （腾讯云 TTS 的 ModelType 恒为 1、Edge 根本没有模型参数）⇒ 整栏隐藏。
+    // 留一个空输入框只会让人以为漏填了什么。
+    modelHidden(){
+      const v = this.vendorInfo;
+      return !!(v && !v.model);
+    },
+    // 地址来自官方预置（自建服务与「其他/自建」不算：它们的地址本来就要改）
+    endpointFromPreset(){
+      const p = this.activePreset;
+      if (!p || !p.endpoint) return false;
+      if (this.pForm.provider === '__other__') return false;
+      if (this.localService) return false;
+      return true;
+    },
+    endpointLocked(){
+      return this.endpointFromPreset && !this.presetOverride.endpoint;
+    },
+    modelFromPreset(){
+      return !this.modelHidden && !!this.presetModelDefault;
+    },
+    modelLocked(){
+      return this.modelFromPreset && !this.presetOverride.model;
+    },
+    apiStyleFromPreset(){
+      return this.apiStyleStorable;
+    },
+    // 预置里的 api_style 是否**能存进库**。
+    // 腾讯云 / Edge 的 api_style 是「供应商级」的（tencent / edge），只用于
+    // ``asr_tts._tts_dispatch_style`` 分派，不在 API_STYLES 白名单里 ——
+    // 写进那一栏保存会被 ProviderIn 的校验器直接 500。取值集合从服务端下发。
+    apiStyleStorable(){
+      const p = this.activePreset;
+      if (!p || !p.api_style) return false;
+      return (this.apiStyleValues || []).includes(p.api_style);
+    },
+    // 供应商级协议（腾讯云 TC3 签名 / Edge 内置桥）：这一栏没有可选项，
+    // 与其留一个写着「OpenAI 兼容」却实际走 TC3 的下拉（那是**谎报**，
+    // 排查时最费时间），不如整行换成一句说明。
+    apiStyleHidden(){
+      const p = this.activePreset;
+      return !!(p && p.api_style && !this.apiStyleStorable);
+    },
+    // 风格是**派生量**，不是选择题：腾讯云配 openai_compatible 只会得到
+    // 「填对了 endpoint 却报格式不对」。所以预置给了就锁死。
+    apiStyleLocked(){
+      return this.apiStyleFromPreset && !this.presetOverride.api_style;
+    },
     // 本地自建服务（本地 ASR / 本地向量化）：按当前 api_style 取服务端下发的
     // 默认值。**非空即代表"这条配置是本地服务"**——API Key 隐藏、接口地址提示
     // 切换、平台下拉联动都靠它判，判据统一在这一处。
@@ -1967,10 +2088,56 @@ createApp({
       if (this.pForm.provider==='__other__') return true;
       return !!(this.vendorInfo && this.vendorInfo.needs_key);
     },
+    // 换厂商 / 换能力 / 打开弹窗时，把预置字段同步进表单。
+    // ⚠️ 与旧实现的关键差别：旧版只在「值为空」时才填，于是任何一个不走
+    //    @change 的路径（切能力后 provider 残留、存量空串行）都会留下空地址，
+    //    而空地址在语音链路上是**致命**的 —— 2026-10-21 那条腾讯云 TTS 行
+    //    就是这么把整条链路打死的。现在改为「预置说了算，除非管理员手动解锁」。
+    applyPreset(){
+      const p = this.activePreset;
+      if (!p) return;
+      if (this.apiStyleStorable && !this.presetOverride.api_style) {
+        this.pForm.api_style = p.api_style;
+      }
+      if (!this.presetOverride.endpoint && this.endpointFromPreset) {
+        this.pForm.endpoint = p.endpoint;
+      }
+      if (!this.presetOverride.model) {
+        if (this.modelHidden) this.pForm.model = '';
+        else if (this.presetModelDefault) this.pForm.model = this.presetModelDefault;
+      }
+    },
+    // 解锁某个预置字段（私有化/代理场景需要自己填地址）
+    unlockPreset(field){
+      this.presetOverride[field] = true;
+    },
+    resetPresetOverride(){
+      this.presetOverride = { endpoint:false, model:false, api_style:false };
+    },
+    // 换「能力」时必须联动平台下拉。
+    // 真因：blankProvider() 的 provider 是 'deepseek'，用户把能力切成 TTS 后，
+    // `<select>` 里根本没有 deepseek 这一项 —— 浏览器显示成第一项（腾讯云），
+    // 而 v-model 还留着 deepseek。若用户以为「它已经是腾讯云了」直接保存，
+    // 存进去的就是一个**在 TTS 预置里不存在**的厂商，预置全部失效。
+    onKindChange(){
+      const isTts = this.pForm.kind === 'tts';
+      const ttsValues = (this.ttsVendors || []).map(v => v.value);
+      const inTts = ttsValues.includes(this.pForm.provider);
+      const inOthers = (this.providerPresets || []).some(p => p.value === this.pForm.provider);
+      if (isTts && !inTts) {
+        const first = (this.ttsVendors || [])[0];
+        if (first) this.pForm.provider = first.value;
+      } else if (!isTts && inTts && !inOthers) {
+        const first = (this.providerPresets || [])[0];
+        if (first) this.pForm.provider = first.value;
+      }
+      this.resetPresetOverride();
+      this.applyPreset();
+    },
     // 选厂商 → 自动填好该家要的字段。
-    // ⚠️ 只在「值还是空的时候」才填，不覆盖管理员已改过的内容 ——
-    //    否则每次切回上一个厂商，endpoint 就被冲掉，配置根本没法微调。
     onProviderChange(){
+      // 换厂商等于换了一整套预置，之前的「手动解锁」不再有任何意义
+      this.resetPresetOverride();
       const info = this.vendorInfo;
       if (!info) {
         // 非 TTS：走 provider_presets 预置。__other__ / 自部署 / Dify /
@@ -1987,21 +2154,10 @@ createApp({
         // 后端保存时会强制改 kind —— 这里先同步，管理员至少看得见）。
         // 必须放在取模型之前：模型名正是按 kind 去预置表里查的。
         if (preset.kind) this.pForm.kind = preset.kind;
-        if (!this.pForm.endpoint)  this.pForm.endpoint  = preset.endpoint;
-        // api_style 跟随预置**强一致**（不留"只填空值"的活口）：一旦某个
-        // local_* 风格残留下来，比 endpoint 填错更难查（见上一段注释）。
-        if (preset.api_style) this.pForm.api_style = preset.api_style;
-        // 模型按当前 kind 取；该 kind 预置里没有（如 deepseek 没有 rerank）
-        // 就**什么都不做** —— 既不清空也不瞎填，清空会毁掉管理员手填的模型名。
-        if (!this.pForm.model) {
-          const m = (preset.models || {})[this.pForm.kind];
-          if (m) this.pForm.model = m;
-        }
+        this.applyPreset();
         return;
       }
-      if (!this.pForm.endpoint) this.pForm.endpoint = info.endpoint;
-      if (!this.pForm.model)    this.pForm.model    = info.model;
-      if (info.api_style)       this.pForm.api_style = info.api_style;
+      this.applyPreset();
       // 换厂商后音色必然失效（火山只认 BV00x、百炼只认 Cherry）
       this.pForm.params_text_voice = '';
       this.pForm.tts_voice_custom = '';
@@ -2043,6 +2199,27 @@ createApp({
         else { this.pForm.params_text_voice = '__custom__'; this.pForm.tts_voice_custom = savedVoice; }
       }
       this.paramsText = JSON.stringify(this.pForm.params||{}, null, 2);
+      // ---- 预置字段：先判「存量里的值算不算管理员自定义」，再补齐 ----
+      // 打开弹窗时 reset 一次，避免上一次的解锁状态串到这一条。
+      this.resetPresetOverride();
+      const preset = this.activePreset;
+      if (preset) {
+        // 存量行里已经写死的地址/模型若与预置**不同**，说明有人特意改过
+        // （私有化部署、代理网关）。这时保持可编辑且 applyPreset 不去覆盖，
+        // 否则一次「打开就保存」就能把生产地址悄悄换回官方域名。
+        if (this.endpointFromPreset && (this.pForm.endpoint || '').trim()
+            && this.pForm.endpoint !== preset.endpoint) {
+          this.presetOverride.endpoint = true;
+        }
+        if (this.modelFromPreset && (this.pForm.model || '').trim()
+            && this.pForm.model !== this.presetModelDefault) {
+          this.presetOverride.model = true;
+        }
+        // 空着的预置字段就地补齐：管理员**看得见**这条实际打哪个域名，
+        // 也避免「打开→原样保存」把空串再写回库一次。
+        this.applyPreset();
+        this.paramsText = JSON.stringify(this.pForm.params||{}, null, 2);
+      }
       // 打开弹窗那一刻的深拷贝快照，供 testVoice 判断「表单有没有未保存改动」。
       // 必须放在 params_text_voice / tts_voice_custom 归一化**之后**取，否则
       // 快照里存的是归一化前的形态，点测试时立刻被误判成「有改动」。

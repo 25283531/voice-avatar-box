@@ -76,6 +76,9 @@ CASES = (
     ("volcengine", {"provider": "volcengine", "api_style": "volcengine"}),
 )
 
+#: 兜底用例用的单条配置（整段式风格，掉一条不影响另一条）
+SPEC_EDGE = {"provider": "edge", "api_style": "edge"}
+
 _passed = 0
 _failed = 0
 _failures: list[str] = []
@@ -93,9 +96,10 @@ def check(name: str, ok: bool, detail: str = "") -> None:
     print(f"  [{mark}] {name}" + (f" —— {detail}" if detail else ""))
 
 
-def make_row(kind: str, spec: dict[str, str]) -> Any:
+def make_row(kind: str, spec: dict[str, str], *, name: str = "") -> Any:
     return SimpleNamespace(
-        name=f"smoke-{kind}", provider=spec["provider"], api_style=spec["api_style"],
+        name=name or f"smoke-{kind}", provider=spec["provider"],
+        api_style=spec["api_style"],
         endpoint="", api_key="", model="", timeout_sec=5.0, params={},
     )
 
@@ -186,9 +190,13 @@ def _consume_like_session(gen) -> tuple[list[Any], bytes, str]:
 def test_direct_contract(kind: str, spec: dict[str, str], holder: dict) -> None:
     """第 1 层：直接消费 tts_stream 生成器（不经过会话，纯分片契约）。"""
     holder["row"] = make_row(kind, spec)
+    holder["plan"] = [("tts", holder["row"])]
     calls: list[str] = []
 
-    def fake_tts(db: Any, sentence: str, *, voice: str = "", speed: float = 1.0) -> bytes:
+    def fake_tts(db: Any, sentence: str, *, voice: str = "", speed: float = 1.0,
+                 row: Any = None) -> bytes:
+        # ⚠️ 必须收 ``row=``：整段式分支现在走 _tts_atomic_with_fallback，
+        # 它会明确指定"这次试哪一行"（否则兜底循环永远被 resolve_row 拉回第一条）。
         calls.append(sentence)
         return FAKE_PCM
 
@@ -226,6 +234,7 @@ async def _speak_once(spec: dict[str, str], holder: dict, tts_impl) -> tuple[Voi
     logger.addHandler(sink)
     logger.setLevel(logging.INFO)
     holder["row"] = make_row(spec["provider"], spec)
+    holder["plan"] = [("tts", holder["row"])]
     patch = _Patch()
     patch.set(asr_tts, "tts", tts_impl)
     try:
@@ -242,10 +251,12 @@ async def _speak_once(spec: dict[str, str], holder: dict, tts_impl) -> tuple[Voi
 
 def test_session_path(kind: str, spec: dict[str, str], holder: dict) -> None:
     """第 2 层：走真实 ``VoiceSession._speak_sentence``（老人听到声音的那条路）。"""
-    def good_tts(db: Any, sentence: str, *, voice: str = "", speed: float = 1.0) -> bytes:
+    def good_tts(db: Any, sentence: str, *, voice: str = "", speed: float = 1.0,
+                 row: Any = None) -> bytes:
         return FAKE_PCM
 
-    def bad_tts(db: Any, sentence: str, *, voice: str = "", speed: float = 1.0) -> bytes:
+    def bad_tts(db: Any, sentence: str, *, voice: str = "", speed: float = 1.0,
+                row: Any = None) -> bytes:
         raise RuntimeError("模拟上游 TTS 炸掉（smoke）")
 
     # ---- 正常：必须真的有音频包发出去，_tts_ok 必须是 True ----
@@ -288,11 +299,79 @@ def test_session_path(kind: str, spec: dict[str, str], holder: dict) -> None:
           f"日志尾部={sink2.lines[-1] if sink2.lines else '(空)'}")
 
 
+def test_atomic_fallback(holder: dict) -> None:
+    """第 3 层：第一条配置炸掉时必须换下一条，而不是让整条链路静默。
+
+    回归对象（2026-10-21 真机事故）：管理员按预置加了一条「腾讯云 TTS」
+    （priority 6，抢在 Edge 的 10 前面）但密钥/地址没配全。``tts()`` 只取
+    resolve_row 的第一条、**没有按序兜底** ⇒ 库里那条好好的 Edge 永远轮不到，
+    老人听到彻底静默，而 finish() 照打「音频已发」。
+
+    这套用例有鉴别力：把 ``_tts_atomic_with_fallback`` 改回
+    ``return tts(db, ...)``（单条），下面三条一起红。
+    """
+    good = make_row("edge", SPEC_EDGE, name="好的 Edge")
+    bad = make_row("edge", SPEC_EDGE, name="坏掉的那条")
+
+    def picky_tts(db: Any, sentence: str, *, voice: str = "", speed: float = 1.0,
+                  row: Any = None) -> bytes:
+        # ``row is None`` 也算坏：这正好对应"变异版直接调 tts(db, ...) 而不指定行"
+        # —— 兜底逻辑若被删掉，这里必抛，第一条断言立刻红（不留假绿口子）。
+        if row is None or getattr(row, "name", "") == "坏掉的那条":
+            raise asr_tts.VoiceUpstreamError("模拟上游 401（smoke）")
+        return FAKE_PCM
+
+    sink = _LogSink()
+    logger = logging.getLogger("app.voice.asr_tts")
+    old_level = logger.level
+    logger.addHandler(sink)
+    logger.setLevel(logging.INFO)
+    patch = _Patch()
+    patch.set(asr_tts, "tts", picky_tts)
+    holder["row"] = bad
+    holder["plan"] = [("tts", bad), ("tts", good)]
+    try:
+        audio = asr_tts._tts_atomic_with_fallback(None, "今天天气不错。")
+        err = ""
+    except Exception as exc:  # noqa: BLE001
+        audio, err = b"", f"{type(exc).__name__}: {exc}"
+    finally:
+        patch.restore()
+        logger.removeHandler(sink)
+        logger.setLevel(old_level)
+
+    check("[兜底] 第一条失败时仍拿到了音频（换了下一条）",
+          err == "" and audio == FAKE_PCM, f"err={err} len={len(audio)}")
+    check("[兜底] 失败的那条留下了告警日志",
+          any("按序换下一条" in line for line in sink.lines),
+          f"日志={sink.lines}")
+    check("[兜底] 真正换了行之后写了「回落到」",
+          any("回落到" in line for line in sink.lines),
+          f"日志={sink.lines}")
+
+    # ---- 反向：全部失败必须把错误抛出去（不许静默返回空音频）----
+    patch2 = _Patch()
+    patch2.set(asr_tts, "tts", picky_tts)
+    holder["plan"] = [("tts", bad), ("tts", bad)]
+    try:
+        asr_tts._tts_atomic_with_fallback(None, "今天天气不错。")
+        raised = ""
+    except Exception as exc:  # noqa: BLE001
+        raised = type(exc).__name__
+    finally:
+        patch2.restore()
+
+    check("[兜底] 全部候选都失败时抛 VoiceUpstreamError（不返回空音频）",
+          raised == "VoiceUpstreamError", f"raised={raised!r}")
+
+
 def main() -> int:
     # 全局打桩：配置行由用例通过 holder 决定，永不触碰真实 DB / 网络。
-    holder: dict[str, Any] = {"row": None}
+    holder: dict[str, Any] = {"row": None, "plan": []}
     patch = _Patch()
     patch.set(llm_gateway, "resolve_row", lambda db, usage: holder["row"])
+    # 整段式分支走的是 resolve_plan（按序兜底需要**全部**候选，不是第一条）
+    patch.set(llm_gateway, "resolve_plan", lambda db, usage: list(holder["plan"]))
 
     print("── 1. tts_stream 分片契约（进程内直调，零可选依赖）──")
     for kind, spec in CASES:
@@ -301,6 +380,9 @@ def main() -> int:
     print("── 2. 会话真实代码路径：有声音 / 失败不假绿 ──")
     for kind, spec in CASES:
         test_session_path(kind, spec, holder)
+
+    print("── 3. 整段式 TTS 按序兜底（一条坏配置不许打死整条链路）──")
+    test_atomic_fallback(holder)
 
     patch.restore()
 

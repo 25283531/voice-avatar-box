@@ -710,6 +710,176 @@ def t_errors(port: int) -> None:
           "两段" in caught5 or "SecretKey" in caught5, caught5[:140])
 
 
+# ================================================================ I 组：只填密钥也要能用
+def t_endpoint_defaults() -> None:
+    """预置厂商的 endpoint 留空时必须回落到官方域名（2026-10-21 线上事故）。
+
+    事故形状：管理后台按预置新增一条「腾讯云 TTS」，管理员**只填了密钥**
+    —— 这是预置下拉承诺的最短路径。但 ``_row_endpoint`` 见空串直接抛
+    ``VoiceConfigMissingError``，而 ``tts()`` 只取优先级第一条、没有按序
+    兜底 ⇒ 库里那条好用的 Edge 永远轮不到，老人听到彻底静默。
+
+    这几条断言就是"只填密钥也能用"的永久回归：把 ``_row_endpoint`` 的
+    预置回落删掉，I1/I2 立刻红（见 H 组 M5）。
+    """
+    print("\n── I. 预置厂商 endpoint 留空 → 回落官方域名 ──")
+    from app.voice import asr_tts
+
+    def blank(provider: str, name: str = "") -> _Row:
+        return _Row(provider=provider, api_style="tencent", endpoint="",
+                    api_key="AKID:SK", model="", name=name,
+                    timeout_sec=10, params="")
+
+    got = ""
+    try:
+        got = asr_tts._row_endpoint(blank("tencent"))
+    except Exception as exc:  # noqa: BLE001
+        got = f"<{type(exc).__name__}: {exc}>"
+    check("I1 TTS 行只填密钥（endpoint 空）→ 用 tts.tencentcloudapi.com",
+          got == "https://tts.tencentcloudapi.com", got)
+
+    got = ""
+    try:
+        got = asr_tts._row_endpoint(blank("tencent_asr"))
+    except Exception as exc:  # noqa: BLE001
+        got = f"<{type(exc).__name__}: {exc}>"
+    check("I2 ASR 行只填密钥（endpoint 空）→ 用 asr.tencentcloudapi.com",
+          got == "https://asr.tencentcloudapi.com", got)
+
+    # 管理员自己填了地址（私有化 / 代理）必须以他为准，不能被预置覆盖
+    row = blank("tencent")
+    row.endpoint = "https://proxy.internal/tts/"
+    check("I3 自己填过地址时以填的为准（去掉结尾斜杠）",
+          asr_tts._row_endpoint(row) == "https://proxy.internal/tts",
+          asr_tts._row_endpoint(row))
+
+    # 未知厂商 + 空 endpoint：必须报错，且文案要能定位到是哪一行
+    msg = ""
+    try:
+        asr_tts._row_endpoint(blank("acme_gateway"))
+    except Exception as exc:  # noqa: BLE001
+        msg = str(exc)
+    check("I4 未知厂商且没填地址 → 抛错（不许静默）",
+          "没有填写服务地址" in msg, msg[:140])
+    check("I5 报错文案带上 provider（名称没填时也能定位）",
+          "acme_gateway" in msg, msg[:140])
+
+    # ---- 保存时归一化：库里那一行本身就该是自洽的 ----
+    # 只做运行时回落是不够的：管理后台打开它、原样点保存，PATCH 会整体覆盖
+    # 一次，空串又被写回；列表里也永远看不出这条到底打哪个域名。
+    from app.routers.providers import _normalize_preset_service
+    from app.schemas import ProviderIn
+
+    tts_row = ProviderIn(name="", kind="tts", provider="tencent")
+    _normalize_preset_service(tts_row, set())
+    check("I6 保存腾讯云 TTS：endpoint 自动补 tts.tencentcloudapi.com",
+          tts_row.endpoint == "https://tts.tencentcloudapi.com", tts_row.endpoint)
+    check("I7 保存腾讯云 TTS：api_style 保持空（tencent 是供应商级风格，"
+          "不在可存白名单里，写进去会被校验器 500）",
+          tts_row.api_style == "", repr(tts_row.api_style))
+    check("I8 保存腾讯云 TTS：名称为空时补厂商名（不许留「」）",
+          bool((tts_row.name or "").strip()), f"name={tts_row.name!r}")
+    check("I9 保存腾讯云 TTS：model 保持空（该厂商没有模型概念，不许编一个）",
+          tts_row.model == "", f"model={tts_row.model!r}")
+
+    asr_row = ProviderIn(name="", kind="asr", provider="tencent_asr")
+    _normalize_preset_service(asr_row, set())
+    check("I10 保存腾讯云 ASR：endpoint 自动补 asr.tencentcloudapi.com",
+          asr_row.endpoint == "https://asr.tencentcloudapi.com", asr_row.endpoint)
+    check("I11 保存腾讯云 ASR：引擎自动补 16k_zh（不是 8k_）",
+          asr_row.model == "16k_zh", repr(asr_row.model))
+
+    # 管理员自己填的地址绝不能被预置覆盖（私有化/代理是合法需求）
+    custom = ProviderIn(name="我的代理", kind="tts", provider="tencent",
+                        endpoint="https://proxy.internal/tts")
+    _normalize_preset_service(custom, set())
+    check("I12 自己填过地址时归一化不覆盖",
+          custom.endpoint == "https://proxy.internal/tts", custom.endpoint)
+    check("I13 自己填过名称时归一化不覆盖", custom.name == "我的代理", custom.name)
+
+    # 不在预置表里的自建网关：一个字段都不许动
+    unknown = ProviderIn(name="自建", kind="tts", provider="acme_gateway")
+    _normalize_preset_service(unknown, set())
+    check("I14 非预置厂商不被改动（endpoint/model 仍为空）",
+          unknown.endpoint == "" and unknown.model == "",
+          f"endpoint={unknown.endpoint!r} model={unknown.model!r}")
+
+
+def t_fallback_policy() -> None:
+    """兜底口径：ASR 保底=自部署 FunASR，TTS 保底=微软免费 Edge，且**永远最后试**。
+
+    为什么这条必须是断言而不是注释（2026-10-21 事故）
+    ------------------------------------------------
+    兜底配置的**全部价值**是「别人都挂了它还在」，所以它必须零密钥、零自定义
+    端点、零成本。那次事故里，管理员按预置新增一条腾讯云 TTS 但密钥/地址没填全，
+    它按 priority 抢在 Edge 前面 ⇒ 整条链路静默，库里那条免费 Edge 永远轮不到。
+
+    只靠 priority 排序是不可靠的：priority 是可编辑数据。所以代码把
+    ``LAST_RESORT_*_PROVIDERS`` 强制排到末尾 —— 本用例直接验**asr() 的真实
+    尝试顺序**（不是验那个排序小函数，否则改回不排序也能绿）。
+    """
+    print("\n── J. 兜底口径：自部署 ASR / 免费 Edge TTS 永远最后试 ──")
+    import app.llm_gateway as gw
+    from app.voice import asr_tencent, asr_tts
+
+    def row(provider: str, **kw) -> _Row:
+        base = dict(provider=provider, api_style="", endpoint="",
+                    api_key="", model="", name=provider, timeout_sec=3, params="")
+        base.update(kw)
+        return _Row(**base)
+
+    # ---- J1/J2：TTS 侧排序（纯函数，顺序即契约）----
+    tts_plan = [("tts", row("edge", api_style="edge", name="Edge 保底")),
+                ("tts", row("tencent", api_style="tencent", name="腾讯云主力"))]
+    order = [r.name for _k, r in asr_tts._primary_then_last_resort(
+        tts_plan, asr_tts.LAST_RESORT_TTS_PROVIDERS)]
+    check("J1 TTS 保底 = 微软免费 Edge",
+          asr_tts.LAST_RESORT_TTS_PROVIDERS == ("edge",),
+          repr(asr_tts.LAST_RESORT_TTS_PROVIDERS))
+    check("J2 Edge 即使 priority 排最前也被挪到最后",
+          order == ["腾讯云主力", "Edge 保底"], repr(order))
+
+    # ---- J3：ASR 侧真实尝试顺序（走 asr() 本体，不是只测排序函数）----
+    asr_plan = [("asr", row("funasr_local", api_style="local_asr",
+                            endpoint="http://127.0.0.1:8082")),
+                ("asr", row("tencent_asr", api_style="tencent",
+                            endpoint="https://asr.tencentcloudapi.com"))]
+
+    tried: list[str] = []
+    orig_label, orig_plan = asr_tts._row_label, gw.resolve_plan
+    orig_transcribe, orig_post = asr_tencent.transcribe, asr_tts._post_multipart
+
+    def spy_label(r):
+        tried.append(getattr(r, "provider", ""))
+        return orig_label(r)
+
+    def boom(*_a, **_kw):
+        raise asr_tts.VoiceUpstreamError("模拟上游全挂（smoke）")
+
+    asr_tts._row_label = spy_label
+    gw.resolve_plan = lambda db, usage: list(asr_plan)
+    asr_tencent.transcribe = boom
+    asr_tts._post_multipart = boom
+    try:
+        asr_tts.asr(None, b"\x00" * 320)
+        raised = ""
+    except Exception as exc:  # noqa: BLE001
+        raised = type(exc).__name__
+    finally:
+        asr_tts._row_label = orig_label
+        gw.resolve_plan = orig_plan
+        asr_tencent.transcribe = orig_transcribe
+        asr_tts._post_multipart = orig_post
+
+    check("J3 ASR 保底 = 自部署 FunASR",
+          asr_tts.LAST_RESORT_ASR_PROVIDERS == ("funasr_local",),
+          repr(asr_tts.LAST_RESORT_ASR_PROVIDERS))
+    check("J4 云端 ASR 先试、自部署 FunASR 最后试（真实尝试顺序）",
+          tried == ["tencent_asr", "funasr_local"], repr(tried))
+    check("J5 全部失败时抛 VoiceUpstreamError（不静默返回空串）",
+          raised == "VoiceUpstreamError", raised)
+
+
 # ================================================================ H 组：反向变异
 MUTATIONS: dict[str, tuple[str, str, list[str]]] = {
     # 名字: (原文, 替换, 期望变红的断言关键字)
@@ -739,6 +909,28 @@ MUTATIONS: dict[str, tuple[str, str, list[str]]] = {
         "TEXT_LIMIT: Final[int] = 10000\n",
         ["C1 超长无标点文本按 150 字硬切", "E9 超长文本分成多次请求"],
     ),
+    # 删掉「预置厂商 endpoint 回落」—— 模拟 2026-10-21 那次「只填密钥就整条链路挂掉」
+    "M5": (
+        '    preset = _preset_endpoint(row)\n'
+        '    if preset:\n'
+        '        return preset.rstrip("/")\n',
+        "    pass\n",
+        ["I1 TTS 行只填密钥", "I2 ASR 行只填密钥"],
+    ),
+    # 删掉「保存时补 endpoint」—— 管理员只填密钥存进去，库里那行仍然是空串
+    "M6": (
+        '        if not (payload.endpoint or "").strip():\n'
+        '            payload.endpoint = str(entry.get("endpoint") or "")\n',
+        "        pass\n",
+        ["I6 保存腾讯云 TTS"],
+    ),
+    # 删掉「保底排最后」—— 回到「谁 priority 小谁先上」，坏配置又能一票否决
+    "M7": (
+        "    # 自部署 FunASR 是保底，永远排最后（理由见 LAST_RESORT_ASR_PROVIDERS）\n"
+        "    plan = _primary_then_last_resort(plan, LAST_RESORT_ASR_PROVIDERS)\n",
+        "    pass\n",
+        ["J4 云端 ASR 先试"],
+    ),
 }
 
 _MUTATION_TARGETS = {
@@ -746,6 +938,9 @@ _MUTATION_TARGETS = {
     "M2": "server/app/voice/tc3.py",
     "M3": "server/app/voice/asr_tencent.py",
     "M4": "server/app/voice/tts_tencent.py",
+    "M5": "server/app/voice/asr_tts.py",
+    "M6": "server/app/routers/providers.py",
+    "M7": "server/app/voice/asr_tts.py",
 }
 
 
@@ -786,16 +981,16 @@ def _install_mutation_hook(name: str) -> None:
         def find_spec(self, fullname, path=None, target=None):
             if not fullname.startswith("app."):
                 return None
-            mod_name = fullname.rsplit(".", 1)[-1]
-            for candidate in (
-                SERVER / "app" / f"{mod_name}.py",
-                SERVER / "app" / "voice" / f"{mod_name}.py",
-            ):
-                if candidate.exists() and candidate.resolve() == target_path:
-                    loader = _Loader(fullname, str(candidate))
-                    return importlib.util.spec_from_loader(
-                        fullname, loader,
-                        origin=str(candidate))
+            # ⚠️ 必须**按全名推导路径**（app.routers.providers ->
+            # app/routers/providers.py），不能只枚举 app/ 与 app/voice/ 两层。
+            # 曾经只枚举那两层：M6 的目标在 app/routers/ 下，finder 匹配不到，
+            # 模块被正常导入 ⇒ 变异根本没生效 ⇒ 子进程 rc=0、断言全绿，
+            # 表现成「变异检测失败」的假红。这类假红比假绿便宜，但同样浪费时间。
+            candidate = SERVER.joinpath(*fullname.split(".")).with_suffix(".py")
+            if candidate.exists() and candidate.resolve() == target_path:
+                loader = _Loader(fullname, str(candidate))
+                return importlib.util.spec_from_loader(
+                    fullname, loader, origin=str(candidate))
             return None
 
     sys.meta_path.insert(0, _Finder())
@@ -860,6 +1055,8 @@ def main(argv: list[str] | None = None) -> int:
         t_e2e_tts(HTTP_PORT)
         t_e2e_asr(HTTP_PORT)
         t_errors(HTTP_PORT)
+        t_endpoint_defaults()
+        t_fallback_policy()
         if not mutate_name and not args.no_mutation:
             # 变异子进程各用父端口 +100 起自己的假上游
             t_mutations(HTTP_PORT + 100)

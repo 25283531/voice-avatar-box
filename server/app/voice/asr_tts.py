@@ -301,12 +301,54 @@ def _http_error(status: int, detail: str, endpoint: str) -> VoiceUpstreamError:
     return VoiceUpstreamError(f"请求被上游拒绝{short}；常见原因是 endpoint/模型名填错：{endpoint}")
 
 
+def _preset_endpoint(row: Any) -> str:
+    """预置厂商的**官方默认地址**（配置行 endpoint 留空时的唯一来源）。
+
+    为什么必须有这一层（2026-10-21 线上事故）
+    ----------------------------------------
+    管理后台新增一条「腾讯云 TTS」配置，管理员只填了密钥 —— 这是需求明确
+    允许的最短路径，也是预置下拉的卖点。但 ``_row_endpoint`` 见到空串直接
+    抛 :class:`VoiceConfigMissingError`，而 ``tts()`` 只取 ``resolve_row``
+    的第一行、**没有按序兜底**，于是这一行把整条 TTS 链路打死：
+    服务端日志一行 ``TTS 失败，跳过音频``，设备侧 `speaking` 状态照走、
+    老人听到的是彻底静默。表面看是「固件没声音」，实际是配置解析把自己
+    锁死了。
+
+    腾讯云 TTS/ASR、火山的域名都是写死在适配器里的常量，没有「必须手填」
+    的道理；``endpoint`` 的真实语义是**可选覆盖**（私有化/代理）。
+
+    ⚠️ 只查**厂商预置**，不查管理员自己填过的行 —— 这里绝不能猜。
+    """
+    provider = (getattr(row, "provider", "") or "").strip().lower()
+    if not provider:
+        return ""
+    # TTS 厂商预置（腾讯云 / 火山 / 百炼 / Edge…）
+    from .catalog import vendor_entry
+
+    entry = vendor_entry(provider)
+    if entry is not None:
+        return str(entry.get("endpoint") or "").strip()
+    # ASR / LLM / Embedding 的预置（如 tencent_asr → asr.tencentcloudapi.com）
+    from ..provider_presets import preset_entry
+
+    preset = preset_entry(provider)
+    if preset is not None:
+        return str(preset.get("endpoint") or "").strip()
+    return ""
+
+
 def _row_endpoint(row: Any) -> str:
     endpoint = (getattr(row, "endpoint", "") or "").strip().rstrip("/")
-    if not endpoint:
-        raise VoiceConfigMissingError(
-            f"配置「{getattr(row, 'name', '')}」没有填写服务地址（endpoint）")
-    return endpoint
+    if endpoint:
+        return endpoint
+    preset = _preset_endpoint(row)
+    if preset:
+        return preset.rstrip("/")
+    # 报错文案里带上 provider：管理员常见的情况是「名称没填」（预置下拉
+    # 允许只选厂商就保存），此时「配置「」」等于没说，查不出是哪一行。
+    label = ((getattr(row, "name", "") or "").strip()
+             or (getattr(row, "provider", "") or "").strip())
+    raise VoiceConfigMissingError(f"配置「{label}」没有填写服务地址（endpoint）")
 
 
 def _row_key(row: Any) -> str:
@@ -452,6 +494,8 @@ def asr(db: Any, pcm_16k: bytes) -> str:
     plan = resolve_plan(db, "asr")
     if not plan:
         raise VoiceConfigMissingError("asr")
+    # 自部署 FunASR 是保底，永远排最后（理由见 LAST_RESORT_ASR_PROVIDERS）
+    plan = _primary_then_last_resort(plan, LAST_RESORT_ASR_PROVIDERS)
 
     wav = wav_header_bytes(len(pcm_16k), 16000) + pcm_16k
 
@@ -588,7 +632,8 @@ def _secret_pair(row: Any) -> tuple[str, str]:
     return raw, ""
 
 
-def tts(db: Any, sentence: str, *, voice: str = "", speed: float = 1.0) -> bytes:
+def tts(db: Any, sentence: str, *, voice: str = "", speed: float = 1.0,
+        row: Any = None) -> bytes:
     """一句话 -> 24kHz/mono/S16LE 裸 PCM（**统一分发入口**）。
 
     按当前配置行的 ``provider``/``api_style`` 自动切换到对应实现：
@@ -598,11 +643,16 @@ def tts(db: Any, sentence: str, *, voice: str = "", speed: float = 1.0) -> bytes
 
     :param voice: 音色。空串表示**不带 voice 字段**，让厂商用默认
         （见 pick_voice 的回落链）。
+    :param row: 指定用哪一行配置。缺省（None）表示自己按优先级取第一条。
+        给 ``tts_stream`` 的按序兜底用 —— 它必须能明确指定"这一次试哪一行"，
+        否则兜底循环里每次调 tts() 都会被 resolve_row 拉回第一条，
+        表现是「同一条坏配置被重试 N 次、后面好的永远轮不到」。
     :raises VoiceConfigMissingError / VoiceUpstreamError
     """
     from ..llm_gateway import resolve_row
 
-    row = resolve_row(db, "tts")
+    if row is None:
+        row = resolve_row(db, "tts")
     if row is None:
         raise VoiceConfigMissingError("tts")
 
@@ -646,6 +696,98 @@ def tts(db: Any, sentence: str, *, voice: str = "", speed: float = 1.0) -> bytes
             raise VoiceUpstreamError(f"腾讯云 TTS 失败：{exc}") from None
 
     return _tts_openai(row, sentence, voice=voice, speed=speed)
+
+
+#: 「一次调用拿整段音频」的 TTS 风格（没有增量能力，必须等整包返回）。
+#: 单独抽常量是因为它同时驱动两处判据：``tts_stream`` 的分支，
+#: 以及按序兜底时「哪些行可以安全地整段重来」。
+_ATOMIC_TTS_STYLES: Final[tuple[str, ...]] = ("edge", "volcengine", "tencent")
+
+# ---------------------------------------------------------------- 兜底口径
+#: **保底 ASR**：自部署的 FunASR/SenseVoice（provider=funasr_local）。
+LAST_RESORT_ASR_PROVIDERS: Final[tuple[str, ...]] = ("funasr_local",)
+
+#: **保底 TTS**：微软免费 Edge TTS（provider=edge）。
+LAST_RESORT_TTS_PROVIDERS: Final[tuple[str, ...]] = ("edge",)
+
+# 为什么保底要写死在代码里、而不是只靠 ai_providers.priority 排序
+# ------------------------------------------------------------------
+# 兜底配置的**全部价值**是「别人都挂了它还在」，所以它必须满足三条硬性质：
+#   ① 零密钥 ② 零自定义端点 ③ 零调用成本。
+# 只有这两条满足：自部署 FunASR（本机 8082，免密钥）与 Edge TTS（微软免费，
+# 走 edge-tts 库）。云厂商的 key 会过期、额度会用完、endpoint 会被改错 ——
+# 2026-10-21 的事故就是「按预置加了一条腾讯云 TTS，密钥/地址没填全，
+# 它按 priority 抢在 Edge 前面，结果整条链路静默」。让这条坏配置靠排序
+# "自然"排到最后是不可靠的：priority 是可编辑数据，谁都能改错。
+# ⇒ 代码强制把这两个 provider 排到**最后**，无论库里 priority 写成多少。
+# 管理员仍可用 enabled=0 彻底关掉它（那时就真的没有兜底了，属于明知故犯）。
+
+
+def _primary_then_last_resort(plan: list[tuple[str, Any]],
+                              last_resort: tuple[str, ...]
+                              ) -> list[tuple[str, Any]]:
+    """把保底 provider 的行挪到**末尾**，其余保持原有优先级顺序。
+
+    为什么不是"把保底放在第一位"：保底是**最后手段**，不是首选。自部署 ASR
+    的识别质量明显弱于云端（真机实测把「你好小智」听成「你好小志/小池」），
+    Edge 的音色也不如腾讯云大模型音色自然 —— 它们在链路里的位置就是刹车，
+    不是发动机。
+
+    :param plan: ``resolve_plan`` 的返回值（已按 priority, id 排好序）。
+    :param last_resort: 需要挪到末尾的 provider 集合（小写）。
+    :return: 新列表；顺序：先非保底（原顺序），后保底（原顺序）。
+    """
+    primary: list[tuple[str, Any]] = []
+    fallback: list[tuple[str, Any]] = []
+    for item in plan:
+        provider = (getattr(item[1], "provider", "") or "").strip().lower()
+        (fallback if provider in last_resort else primary).append(item)
+    return primary + fallback
+
+
+def _tts_atomic_with_fallback(db: Any, sentence: str, *,
+                              voice: str = "", speed: float = 1.0) -> bytes:
+    """整段式 TTS 的**按序兜底**：第一条失败就换下一条，全失败才抛。
+
+    为什么必须兜底（2026-10-21 事故，与 ASR 那次同形）
+    ----------------------------------------------
+    管理员按预置加了一条「腾讯云 TTS」（priority 6，抢在 Edge 的 10 前面），
+    然后密钥还没配全/地址没填 —— ``tts()`` 只取 ``resolve_row`` 的第一条、
+    **没有按序兜底**，于是这一行把整条语音合成打死：服务端刷
+    ``TTS 失败，跳过音频``，设备侧 ``STATE: speaking`` 照走、`finish()`
+    照打「音频已发」，老人听到的是彻底静默。而库里明明还躺着一条好用的 Edge。
+
+    只在**整段式**风格上做：它们要么整段成功要么整段失败，重试不会产生
+    "半句话已经播出去了"的错位。OpenAI 兼容那条是真流式，中途换行会把
+    前后两个音色拼在一起，**不做**（要做得先缓冲，代价是首帧时延）。
+
+    :return: 第一段成功的音频（24kHz/mono/S16LE）。
+    :raises VoiceUpstreamError: 全部候选都失败时抛**最后一条**的错误。
+    :raises VoiceConfigMissingError: 一条候选都没有。
+    """
+    from ..llm_gateway import resolve_plan
+
+    candidates = [r for _kind, r in _primary_then_last_resort(
+                      resolve_plan(db, "tts"), LAST_RESORT_TTS_PROVIDERS)
+                  if _tts_dispatch_style(r) in _ATOMIC_TTS_STYLES]
+    last_error: Exception | None = None
+    for index, candidate in enumerate(candidates):
+        try:
+            audio = tts(db, sentence, voice=voice, speed=speed, row=candidate)
+        except (VoiceUpstreamError, VoiceConfigMissingError) as exc:
+            last_error = exc
+            log.warning("TTS 配置「%s」失败，按序换下一条：%s",
+                        _row_label(candidate), exc)
+            continue
+        if index:
+            # 回落必须留痕：否则「换了音色/换了厂商」在听感上像灵异事件
+            log.warning("TTS 已回落到配置「%s」（前 %d 条不可用）",
+                        _row_label(candidate), index)
+        return audio
+
+    if last_error is not None:
+        raise last_error
+    raise VoiceConfigMissingError("tts")
 
 
 def _tts_openai(row: Any, sentence: str, *, voice: str, speed: float) -> bytes:
@@ -736,7 +878,7 @@ def tts_stream(db: Any, sentence: str, *, voice: str = "",
     # Edge 的 endpoint 是空串 → 拼出 "/audio/speech" → 连到本机自己 → 失败。
     # 症状是「非流式能出声、流式不出声」，属于最难自查的一类不一致。
     _style = _tts_dispatch_style(row)
-    if _style in ("edge", "volcengine", "tencent"):
+    if _style in _ATOMIC_TTS_STYLES:
         # ⚠️ 这三个分支的 tts() 返回**整段 bytes**，不是分片迭代器。
         # 曾经写成 `for chunk in tts(...)`：bytes 被逐字节迭代 ⇒ chunk 是 int
         # ⇒ 上层 session.py 的 `carry += chunk` 抛
@@ -745,7 +887,7 @@ def tts_stream(db: Any, sentence: str, *, voice: str = "",
         # 这三条路径本身没有增量能力（Edge 要等整段解码完，火山/腾讯云都是
         # 整包 JSON 响应），所以这里**整段 yield 一次**：行为与 tts() 等价，
         # 也不假装流式。
-        yield tts(db, sentence, voice=voice, speed=speed)
+        yield _tts_atomic_with_fallback(db, sentence, voice=voice, speed=speed)
         return
 
     timeout = _row_timeout(row, TTS_TIMEOUT_SEC)

@@ -148,6 +148,90 @@ def _normalize_local_service(payload: ProviderIn, explicit: set[str]) -> bool:
     return True
 
 
+def _normalize_preset_service(payload: ProviderIn, explicit: set[str]) -> None:
+    """预置厂商的「只填密钥就能用」归一化（就地补全 endpoint/model/api_style/name）。
+
+    为什么要做在这里而不只是运行时兜底
+    --------------------------------
+    ``voice/asr_tts._row_endpoint`` 已经能在**调用时**回落到厂商默认地址，
+    但那只解决「能不能跑」。库里躺着一行 ``endpoint='' AND model=''``
+    的配置仍有三个实际代价：
+
+      1. 管理后台打开它、原样点保存，``PATCH`` 会用请求体整体覆盖（见
+         update_provider 的 ``setattr`` 循环），空串又被写回一次；
+      2. 管理员在列表里看不出这条到底打的是哪个域名，只能猜；
+      3. 导出/排障时（``/export/xiaozhi``、readiness 页）拿到的是空串，
+         排查方向直接跑偏。
+
+    所以**保存时补齐**，运行时兜底保留作为第二层（存量行不必手工重存）。
+
+    只填空值，绝不覆盖管理员填过的内容 —— 私有化/代理场景填自己的地址
+    是合法需求；预置只是默认值，不是强制值。本地自建服务
+    （``local_*``）由 :func:`_normalize_local_service` 先处理，那一路的
+    默认值来自 ``LOCAL_SERVICE_DEFAULTS``，本函数看到 endpoint 已非空就跳过。
+
+    :param payload: 请求体（会被就地修正）。
+    :param explicit: 请求体里显式出现过的字段名。目前只用于将来按需区分
+        「没填」与「显式填空串」；保留参数是为了与姊妹函数同签名。
+    """
+    del explicit  # 预留：当前归一化只认「空就补」，无需区分是否显式传了空串
+
+    provider = (payload.provider or "").strip().lower()
+    if not provider:
+        return
+
+    kind = (payload.kind or "").strip()
+
+    # ---- TTS 厂商预置（腾讯云 / 火山 / 百炼 / Edge…）----
+    from ..voice.catalog import vendor_entry
+
+    entry = vendor_entry(provider)
+    if entry is not None:
+        # ⚠️ 只有**可存风格**才写进 api_style 列。
+        # 腾讯云 / Edge 的 api_style 是「供应商级」的（tencent / edge），
+        # 它们既不在 API_STYLES 白名单里，也不该存 —— 调用层
+        # ``asr_tts._tts_dispatch_style`` 是**先认 provider 预置**再认 api_style
+        # （见那段"判据优先级不能换"的注释），写进列反而会被 ProviderIn 的
+        # 校验器直接 500。实测过：写 'tencent' → 400/500「api_style 只能是…」。
+        style = str(entry.get("api_style") or "")
+        if not (payload.api_style or "").strip() and style in API_STYLES:
+            payload.api_style = style
+        if not (payload.endpoint or "").strip():
+            payload.endpoint = str(entry.get("endpoint") or "")
+        # 腾讯云 TTS 没有「模型名」这个概念（ModelType 恒为 1），预置里就是
+        # 空串 —— 这里**不要**给它编一个值出来，留空才是正确形态。
+        if not (payload.model or "").strip():
+            payload.model = str(entry.get("model") or "")
+        if not (payload.name or "").strip():
+            payload.name = str(entry.get("label") or "")
+        return
+
+    # ---- 其余能力（ASR / LLM / Embedding / Rerank / Vision）预置 ----
+    preset = _preset_entry(provider)
+    if preset is None:
+        return
+    preset_style = str(preset.get("api_style") or "")
+    if not (payload.api_style or "").strip() and preset_style in API_STYLES:
+        payload.api_style = preset_style
+    if not (payload.endpoint or "").strip():
+        payload.endpoint = str(preset.get("endpoint") or "")
+    if not (payload.model or "").strip():
+        # 「模型」按**能力**取：同一个厂商在不同 kind 下模型名不同
+        # （如腾讯云的 ASR 是引擎类型 16k_zh）。该 kind 没有预置
+        # （如 deepseek 没有 rerank）就什么都不做 —— 既不清空也不瞎填。
+        models = preset.get("models") or {}
+        payload.model = str(models.get(kind, "") or "")
+    if not (payload.name or "").strip():
+        payload.name = str(preset.get("label") or "")
+
+
+def _preset_entry(provider: str) -> dict | None:
+    """按厂商名取非 TTS 预置条目（找不到返回 None）。"""
+    from ..provider_presets import preset_entry
+
+    return preset_entry(provider)
+
+
 def _clear_query_cache_if_embedding(kind: str | None) -> None:
     """改动了向量模型配置时，清掉记忆检索的**查询向量缓存**。
 
@@ -196,6 +280,7 @@ def create_provider(payload: ProviderIn, db: Session = Depends(get_db),
     """
     explicit = set(payload.model_dump(exclude_unset=True).keys())
     _normalize_local_service(payload, explicit)
+    _normalize_preset_service(payload, explicit)
     if not (payload.kind or "").strip():
         raise HTTPException(
             status.HTTP_400_BAD_REQUEST,
@@ -621,6 +706,7 @@ def update_provider(provider_pk: int, payload: ProviderIn, db: Session = Depends
     """
     explicit = set(payload.model_dump(exclude_unset=True).keys())
     _normalize_local_service(payload, explicit)
+    _normalize_preset_service(payload, explicit)
     p = require_config(db, provider_pk, admin)
     if not (payload.kind or "").strip():
         raise HTTPException(
