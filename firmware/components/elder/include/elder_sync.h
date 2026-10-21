@@ -130,10 +130,44 @@ esp_err_t elder_sync_enqueue_event(uint32_t server_id, time_t due_at,
 /* ---------------------------------------------------------------- 时间 */
 
 /**
- * @brief 用后端下发的 server_time（ISO8601，带 +08:00 偏移）校准本地时钟。
- *        同时把 TZ 固定为 Asia/Shanghai，保证与后端规则一致。
+ * @brief 用后端下发的 server_time（ISO8601，带偏移）校准本地时钟。
+ *
+ * ⚠️ 本函数**只写时钟，不改 TZ**（2026-10-21 改）。时区的归口只有两处：
+ * 开机 ``elder_time_tz_restore()``、心跳 ``elder_time_set_tz_offset()``。
+ * 原先这里会硬编码 ``setenv("TZ","CST-8")``，会把服务端按设备 IP 下发的
+ * 时区在下一次心跳前悄悄覆盖掉。
  */
 esp_err_t elder_time_apply_server_time(const char *iso);
+
+/**
+ * @brief 设置本机时区偏移（分钟，东正西负）并落 NVS。
+ *
+ * 由 ``/api/device/sync`` 响应里的 ``tz_offset_minutes`` 驱动。为什么传数值
+ * 而不是 IANA 名：newlib 没有 tzdata，``setenv("TZ","America/New_York")``
+ * 不报错但 ``tzset()`` 会静默退回 UTC —— 比不设更坏。
+ *
+ * 为什么必须由服务端下发：规则里的 ``times_of_day`` 是**墙上钟点**，提醒
+ * 引擎靠 ``localtime_r()`` 换成绝对时刻。本机 TZ 与规则时区不一致时，
+ * "早上八点吃药"会整体错几个小时，而且**没有任何报错**。规则时区是服务端
+ * 按设备 IP 判定的，固件判不出来。
+ *
+ * @param offset_min  偏移分钟数，合法范围 UTC-12 ~ UTC+14，越界返回
+ *                    ESP_ERR_INVALID_ARG。
+ * @note 固定偏移**不含夏令时规则**：有 DST 的国家在切换那天最多差 1 小时，
+ *       下一次心跳（≤ sync_interval_sec，默认 300s）自愈。
+ */
+esp_err_t elder_time_set_tz_offset(int offset_min);
+
+/**
+ * @brief 从 NVS 恢复时区偏移（无记录则 +480 = UTC+8，与改造前逐字等价）。
+ *
+ * ``elder_sync_init()`` 内部已调用，OTA 校时路径（``ota.cc``）也应调用它
+ * 而不是自己 ``setenv("TZ","CST-8")``。
+ */
+esp_err_t elder_time_tz_restore(void);
+
+/** @brief 当前生效的时区偏移（分钟，东正西负）。 */
+int elder_time_tz_offset(void);
 
 /**
  * @brief 开机恢复时钟：DS3231 → NVS 上次校时 epoch → 放弃（等联网）。

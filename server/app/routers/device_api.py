@@ -6,6 +6,7 @@
 """
 from __future__ import annotations
 
+import logging
 from datetime import timedelta
 from typing import Any
 
@@ -14,9 +15,11 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from .. import models
+from .. import geo
 from ..config import (
     PUBLIC_BASE_URL,
     SCHEDULE_AHEAD_HOURS,
+    TZ,
     VOICE_OTA_PATH,
     VOICE_WS_PATH,
     WS_PUBLIC_BASE_URL,
@@ -43,6 +46,8 @@ from ..schemas import (
 )
 
 router = APIRouter(prefix="/api/device", tags=["device"])
+
+log = logging.getLogger("elder.device_api")
 
 
 def _voice_endpoints(request: Request) -> tuple[str, str]:
@@ -94,6 +99,64 @@ def _voice_endpoints(request: Request) -> tuple[str, str]:
     )
 
 
+_TZ_WARN_ATTR = "_elder_tz_fallback_warned"
+
+
+def _device_tz_for(request: Request, dev: models.Device,
+                   now: Any = None) -> tuple[str, int]:
+    """这台设备该用哪个时区 → ``(IANA 名, 偏移分钟)``。
+
+    为什么抽成独立函数：它有三层回落，而**任何一层没生效都没有症状** ——
+    只是时区悄悄退化成北京。写在 ``sync()`` 里就只能起整套设备鉴权流程才
+    测得到，那种测试最后通常会退化成"接口 200 就算过"。
+
+    取值顺序（与提醒创建时的 ``_reminder_tz`` 前三层一致 —— 不一致就会变成
+    "创建按 A 时区、响铃按 B 时区"，而两边各自的日志都正常）：
+
+      1. 本次请求的 IP（最鲜：设备可能刚换网络，``Device.ip`` 还没更新）
+      2. ``Device.ip``（设备上次来取 token 时记下的）
+      3. ``ELDER_TZ`` 兜底（与改造前逐字一致：判定不出来仍按北京）
+
+    判不出时区**绝不能**让心跳失败 —— 心跳一失败设备就整台离线，代价远大于
+    "时区退回兜底"，所以两条链路都包了 try。
+    """
+    moment = now or local_now()
+
+    # ⚠️ 不能拿"时区名是不是空串"当"判定失败"的判据：``geo.resolve`` **自己**
+    # 就会在最后把空串填成 ``config.TZ.key`` 并把 ``source`` 记成 ``default``。
+    # 所以第一层永远会返回一个非空名字 —— 按空串判会得到一个**永不可达**的
+    # 兜底分支（何况"退化到兜底"这件事恰恰是必须留痕的那类故障）。
+    # 正确判据是 ``source``。
+    tz_name = ""
+    source = ""
+    try:
+        guess = geo.resolve_request(request)
+        tz_name, source = guess.timezone, guess.source
+    except Exception:  # noqa: BLE001  判定失败不阻断心跳
+        tz_name, source = "", ""
+
+    if not tz_name:
+        try:
+            tz_name = geo.device_timezone(dev)
+            source = "device" if tz_name else ""
+        except Exception:  # noqa: BLE001
+            tz_name, source = "", ""
+    if not tz_name:
+        tz_name = TZ.key
+        source = "default"
+
+    if source == "default":
+        # 整条链退化成兜底必须留痕：这是"配置全对"与"链断了"长得完全一样的
+        # 那类故障。只告警一次 —— 心跳每几分钟一次，每次都打等于没有告警。
+        state = getattr(request.app, "state", None)
+        if state is not None and not getattr(state, _TZ_WARN_ATTR, False):
+            setattr(state, _TZ_WARN_ATTR, True)
+            log.warning("设备时区判定退化为 ELDER_TZ（%s）：IP 判定链没给出结论，"
+                        "不在该时区的设备会按 %s 响铃", tz_name, tz_name)
+
+    return tz_name, geo.offset_minutes(tz_name, moment)
+
+
 @router.post("/sync", response_model=DeviceSyncOut)
 def sync(request: Request, fw_version: str = "", hw_model: str = "",
          db: Session = Depends(get_db),
@@ -123,6 +186,10 @@ def sync(request: Request, fw_version: str = "", hw_model: str = "",
                                       models.Reminder.enabled.is_(True))
     ).all()
     now = local_now()
+
+    # 「这台设备现在几点」—— 下发给固件 setenv("TZ")，见 DeviceSyncOut 的说明。
+    # 判定顺序与不阻断心跳的理由都写在 _device_tz_for 里。
+    tz_name, tz_offset = _device_tz_for(request, dev, now)
     wall = now.replace(tzinfo=None)
     # ⚠️ due_at 是**规则时区的裸钟点**，跨时区后 SQL 范围条件不再是绝对时刻。
     # 先按 ±TZ_MARGIN 放宽粗筛（覆盖任何时区），再按绝对时刻精确过滤。
@@ -246,6 +313,8 @@ def sync(request: Request, fw_version: str = "", hw_model: str = "",
         ota_url=ota_url,
         quota=quota,
         tts_voice=voice,
+        timezone=tz_name,
+        tz_offset_minutes=tz_offset,
     )
 
 

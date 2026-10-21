@@ -28,6 +28,15 @@ static const char *TAG = "elder.sync";
 #define NVS_KEY_Q    "evtq"
 #define NVS_KEY_TOK  "token"
 #define NVS_KEY_EPOCH "epoch"   /* 最后一次联网校时的 UTC epoch，无 RTC 时兜底 */
+#define NVS_KEY_TZMIN "tzmin"   /* 服务端下发的时区偏移（分钟，东正西负） */
+
+/* 出厂默认时区偏移：+480 分钟 = UTC+8。
+ * 与改造前写死的 POSIX `CST-8` **逐字等价** —— 这样存量设备（全在国内）
+ * 升级后行为不变，而海外设备在第一次心跳拿到下发值之前也只是暂时按北京
+ * 显示，不会出现"升级瞬间提醒全乱"。
+ * 为什么是偏移而不是 IANA 名：newlib 没有 tzdata，装不下 `Asia/Shanghai`，
+ * 只能按 POSIX TZ 定一个固定偏移（见 elder_time_set_tz_offset）。 */
+#define ELDER_TZ_OFFSET_DEFAULT_MIN (8 * 60)
 
 /* 低于这个时刻认为时钟不可信（未校时/掉电归零）。
  * 与 reminder.c 的 ELDER_MIN_TRUSTED_EPOCH 同值同义 —— 那边是"不响"的闸门，
@@ -67,6 +76,12 @@ static struct {
     char              fw_version[32];
     char              hw_model[24];
     bool              time_synced;
+    /* 当前生效的时区偏移（分钟，东正西负）。语义是"本机 TZ 环境变量的数值形式"：
+     *   * 决定 localtime_r() 把 UTC 解释成几点（提醒引擎全靠它）；
+     *   * 决定 elder_time_iso_local() 输出串里的偏移后缀。
+     * 两者必须同源 —— 曾经一个用 TZ、另一个硬编码 "+08:00"，设备换时区后
+     * 会产出"钟点是纽约的、偏移写着 +08:00"的自相矛盾时间串。 */
+    int               tz_offset_min;
     /* 交互统计的异步投递队列（见 elder_sync_report_interaction 的注释）。
      * 为什么必须异步：这个函数被 SOS、服药确认、提醒超时三条路径同步调用，
      * 而它们分别跑在 elder_input(4096/原 2560)、elder_rmd(3072) 这些**小栈任务**里；
@@ -87,6 +102,9 @@ typedef struct {
 } report_t;
 
 #define ELDER_SYNC_EV_NOW (1 << 0)
+
+/* "服务端没下发时区"的告警只打一次（见 do_sync 第 0 步）。 */
+static bool s_tz_warned;
 
 /* 与 reminder.c 中同款的自实现 CRC32（避免引入额外组件） */
 static uint32_t crc32_simple(const void *data, size_t len)
@@ -264,11 +282,109 @@ esp_err_t elder_time_restore_boot(void)
     return ESP_ERR_NOT_FOUND;
 }
 
+/* ---------------------------------------------------------------- 时区 */
+
+/*
+ * 为什么固件的时区必须由**服务端下发**，而不是自己算
+ * --------------------------------------------------
+ * 规则里的 ``times_of_day`` 是**墙上钟点**（"早上八点吃药"），提醒引擎全靠
+ * ``localtime_r()`` 把它换成绝对时刻后再比"现在几点"。所以本机的 TZ 必须
+ * 等于「这条规则的时区」，否则差几个小时而**毫无报错** —— 接口 201、界面正常，
+ * 只是老人半夜被叫醒。
+ *
+ * 而规则时区是服务端按**设备 IP** 判定的（``geo.device_timezone``）。固件
+ * 判不出自己的 IP 归属地（要先查 IP 库，设备上既没有库也不该联网查第三方），
+ * 所以这件事只能服务端做、再把结论告诉固件。
+ *
+ * 为什么传"分钟偏移"而不是 IANA 名
+ * --------------------------------
+ * newlib **没有 tzdata**，``setenv("TZ","America/New_York")`` 不会报错，
+ * 但 ``tzset()`` 会把它当成无效值、默默退回 UTC —— 比不设更坏。
+ * 能装下的只有 POSIX TZ 形式（``STD<offset>``），所以下发数值偏移。
+ *
+ * 代价（已在 docs/DEPLOY.md §1.15.4 写明）：固定偏移**不含夏令时规则**，
+ * 所以在有 DST 的国家，切换当天会有最多 1 小时误差，直到下一次心跳
+ * （≤ ``sync_interval_sec``，默认 300s）取回新偏移。让固件带 DST 规则表
+ * 要额外几十 KB 且每年都要跟 IANA 更新，不值得 —— 这个误差是自愈的。
+ */
+
+/**
+ * 把"分钟偏移"落到 TZ 环境变量 + g.tz_offset_min。
+ *
+ * POSIX TZ 的偏移符号与直觉**相反**：``CST-8`` 表示 UTC+8。所以东八区要写成
+ * ``LTZ-8:00``（负号），UTC-5 要写成 ``LTZ5:00``（正号）。写反的症状是
+ * 设备时间直接偏离 16 小时，而不是 8 小时。
+ */
+static void tz_apply(int offset_min)
+{
+    /* 夹到合法范围：现实时区在 UTC-12 ~ UTC+14。越界值（比如服务端算错
+     * 或 JSON 被篡改）会让 wall clock 整体乱跳，不如夹住。 */
+    if (offset_min < -12 * 60) offset_min = -12 * 60;
+    if (offset_min > 14 * 60) offset_min = 14 * 60;
+
+    int am = offset_min < 0 ? -offset_min : offset_min;
+    /* 标准名只影响 %Z 的输出，不参与换算；用 LTZ 而不是猜国家缩写，
+     * 免得出现"纽约时区却显示 CST"这种误导日志。 */
+    char tz[24];
+    snprintf(tz, sizeof(tz), "LTZ%c%d:%02d",
+             offset_min >= 0 ? '-' : '+', am / 60, am % 60);
+    setenv("TZ", tz, 1);
+    tzset();
+    g.tz_offset_min = offset_min;
+}
+
+esp_err_t elder_time_set_tz_offset(int offset_min)
+{
+    if (offset_min < -12 * 60 || offset_min > 14 * 60) return ESP_ERR_INVALID_ARG;
+
+    bool changed = (offset_min != g.tz_offset_min);
+    tz_apply(offset_min);
+    if (!changed) return ESP_OK;
+
+    /* 只在下发值与当前不同时才写 NVS：心跳每 5 分钟一次，绝大多数时候
+     * 偏移没变 —— 每次都写会白白磨损 flash（NVS 有擦写寿命）。 */
+    nvs_handle_t h;
+    if (nvs_open(NVS_NS, NVS_READWRITE, &h) == ESP_OK) {
+        nvs_set_i32(h, NVS_KEY_TZMIN, offset_min);
+        nvs_commit(h);
+        nvs_close(h);
+    }
+    int am = offset_min < 0 ? -offset_min : offset_min;
+    ESP_LOGI(TAG, "时区已更新: UTC%c%d:%02d（来自服务端下发）",
+             offset_min >= 0 ? '+' : '-', am / 60, am % 60);
+    return ESP_OK;
+}
+
+esp_err_t elder_time_tz_restore(void)
+{
+    int off = ELDER_TZ_OFFSET_DEFAULT_MIN;
+    nvs_handle_t h;
+    if (nvs_open(NVS_NS, NVS_READONLY, &h) == ESP_OK) {
+        int32_t saved = 0;
+        if (nvs_get_i32(h, NVS_KEY_TZMIN, &saved) == ESP_OK) off = (int)saved;
+        nvs_close(h);
+    }
+    tz_apply(off);
+    return ESP_OK;
+}
+
+int elder_time_tz_offset(void)
+{
+    return g.tz_offset_min;
+}
+
 /*
  * 后端 /api/device/sync 返回的 server_time 是**带偏移的 ISO8601**
  * （Pydantic 序列化 aware datetime，如 "2026-10-15T09:30:00+08:00"）。
  * settimeofday() 需要的是 UTC epoch，因此必须先减掉偏移。
- * 同时把 TZ 固定成 UTC+8，与后端 TZ=Asia/Shanghai 保持一致。
+ *
+ * ⚠️ 本函数**只负责写时钟，不碰 TZ**（2026-10-21 改）。
+ * 原先这里硬编码 `setenv("TZ","CST-8")`，那是"全世界都在东八区"年代的写法；
+ * 现在时区由服务端按设备 IP 下发（见上面"时区"整段的说明），如果在每次校时
+ * 都把它按回 CST-8，会让下发值在**下一次心跳前**被悄悄覆盖 —— 症状是
+ * "时区设对了但过一会儿又变回北京"，极难定位。TZ 的归口只有两处：
+ *   * 开机：``elder_time_tz_restore()``（读 NVS，无则 +480）；
+ *   * 心跳：``elder_time_set_tz_offset()``（服务端下发值）。
  */
 esp_err_t elder_time_apply_server_time(const char *iso)
 {
@@ -322,8 +438,7 @@ esp_err_t elder_time_apply_server_time(const char *iso)
     struct timeval tv = { .tv_sec = utc_epoch, .tv_usec = 0 };
     settimeofday(&tv, NULL);
 
-    /* POSIX TZ：CST-8 = UTC+8，无夏令时 */
-    setenv("TZ", "CST-8", 1);
+    /* 刻意不在这里设 TZ —— 见函数头注释（TZ 只由开机恢复与心跳下发两处改）。 */
     tzset();
 
     g.time_synced = true;
@@ -356,10 +471,18 @@ void elder_time_iso_local(time_t t, char *out, size_t len)
 {
     struct tm tmv;
     localtime_r(&t, &tmv);
-    /* 固定按 UTC+8 输出，与后端 Asia/Shanghai 一致（不依赖 gmtoff 可移植性） */
-    snprintf(out, len, "%04d-%02d-%02dT%02d:%02d:%02d+08:00",
+    /* 偏移后缀必须与 localtime_r 用的 TZ **同源**（都来自 g.tz_offset_min）。
+     * 曾经这里硬编码 "+08:00"，设备换到别的时区后就会输出
+     * "钟点是纽约的、偏移写着 +08:00" 的自相矛盾串 —— 服务端 report_event
+     * 拿它跟 reminder_events.due_at 对账时对不上。
+     * 不读 struct tm 的 tm_gmtoff：newlib 下它要看 _BSD_SOURCE 之类的宏，
+     * 换个 IDF 版本就可能消失（而症状是编译错误指向一个"跟时区无关"的字段）。 */
+    int off = g.tz_offset_min;
+    int am = off < 0 ? -off : off;
+    snprintf(out, len, "%04d-%02d-%02dT%02d:%02d:%02d%c%02d:%02d",
              tmv.tm_year + 1900, tmv.tm_mon + 1, tmv.tm_mday,
-             tmv.tm_hour, tmv.tm_min, tmv.tm_sec);
+             tmv.tm_hour, tmv.tm_min, tmv.tm_sec,
+             off >= 0 ? '+' : '-', am / 60, am % 60);
 }
 
 time_t elder_sync_last_server_time(void)
@@ -832,6 +955,21 @@ static esp_err_t do_sync(void)
         return ESP_ERR_INVALID_RESPONSE;
     }
 
+    /* 0) 时区 —— **必须排在校时之前**。
+     *    顺序反了不会报错，但那一轮"校时完成"日志会用旧时区打印，
+     *    排查跨时区问题时看到的是一行自相矛盾的时间，白绕一圈。 */
+    cJSON *jtz = cJSON_GetObjectItem(root, "tz_offset_minutes");
+    if (cJSON_IsNumber(jtz)) {
+        elder_time_set_tz_offset(jtz->valueint);
+        s_tz_warned = false;
+    } else if (!s_tz_warned) {
+        /* 只告警一次：心跳每 5 分钟一次，每次都打会把串口日志冲掉，
+         * 而"服务端是老版本"这件事不会自己变。 */
+        s_tz_warned = true;
+        ESP_LOGW(TAG, "服务端未下发 tz_offset_minutes（老版本？），"
+                      "沿用本机时区偏移 %d 分钟", g.tz_offset_min);
+    }
+
     /* 1) 校时 —— 提醒准点与否全靠它 */
     cJSON *st = cJSON_GetObjectItem(root, "server_time");
     if (cJSON_IsString(st)) {
@@ -990,6 +1128,12 @@ esp_err_t elder_sync_init(const elder_sync_cfg_t *cfg)
     }
 
     g.ev = xEventGroupCreate();
+
+    /* 时区：memset 已把 tz_offset_min 清成 0（= UTC），这里从 NVS 恢复。
+     * 必须放在 memset 之后、任何 localtime_r 调用之前 —— 少了这一步，
+     * 设备重启后会按 UTC 解释钟点，提醒整体早 8 小时响。 */
+    elder_time_tz_restore();
+
     return ESP_OK;
 }
 

@@ -152,6 +152,7 @@ schedule = None  # type: ignore[assignment]
 models = None   # type: ignore[assignment]
 config = None   # type: ignore[assignment]
 ratelimit = None  # type: ignore[assignment]
+device_api = None  # type: ignore[assignment]
 
 
 def boot_modules() -> None:
@@ -160,7 +161,7 @@ def boot_modules() -> None:
     这不是洁癖：``ELDER_GEO_API`` 在 ``config`` 的模块级被读一次，
     在 import 之后改 ``os.environ`` 只骗得了测试自己。
     """
-    global geo, schedule, models, config, ratelimit
+    global geo, schedule, models, config, ratelimit, device_api
     os.environ["ELDER_GEO_API"] = f"http://127.0.0.1:{FAKE_PORT}/{{ip}}"
     os.environ["ELDER_GEO_TIMEOUT_SEC"] = "3"
     os.environ.pop("ELDER_GEOIP_DB", None)
@@ -173,8 +174,12 @@ def boot_modules() -> None:
     from app import models as _models
     from app import ratelimit as _ratelimit
     from app import schedule as _schedule
-    config, geo, models, ratelimit, schedule = (
-        _config, _geo, _models, _ratelimit, _schedule)
+    # 设备时区下发（心跳响应里的 tz_offset_minutes）。放在这里而不是在用例里
+    # import：路由模块的导入要 app.db / app.deps 都就绪，延迟到用例里会变成
+    # "第一次导入失败导致整组跳过"，而跳过比红更危险。
+    from app.routers import device_api as _device_api
+    config, geo, models, ratelimit, schedule, device_api = (
+        _config, _geo, _models, _ratelimit, _schedule, _device_api)
 
 
 # ============================================================ A. 输入归一化
@@ -554,6 +559,105 @@ class Server:
             pass
 
 
+# ============================================================ G2. 设备时区下发
+class _FakeState:
+    pass
+
+
+class _FakeApp:
+    def __init__(self) -> None:
+        self.state = _FakeState()
+
+
+class _FakeClient:
+    def __init__(self, host: str) -> None:
+        self.host = host
+
+
+class _FakeRequest:
+    """够 ``geo.resolve_request`` / ``ratelimit.client_ip`` 用的最小 Request 替身。"""
+
+    def __init__(self, peer: str = "127.0.0.1",
+                 headers: dict[str, str] | None = None) -> None:
+        self.client = _FakeClient(peer)
+        self.headers = headers or {}
+        self.app = _FakeApp()
+
+
+class _FakeDev:
+    def __init__(self, ip: str = "") -> None:
+        self.ip = ip
+
+
+def t_device_tz() -> None:
+    print("\n── G2. 心跳下发设备时区（固件据此 setenv TZ）──")
+    # 固定两个时刻：一个在美东夏令时内（EDT，-240），一个在标准时内（EST，-300）。
+    # **故意用两个日期**：只测一个的话，"把 -240 写死"也能过 —— 而写死正是
+    # 这个功能最可能的退化形态（夏令时半年错一小时，用户只会说"有时候不准"）。
+    summer = datetime(2026, 10, 21, 14, 0, tzinfo=timezone.utc)
+    winter = datetime(2026, 12, 21, 14, 0, tzinfo=timezone.utc)
+
+    # G9：设备自报时区（私网 IP 判不出国家 ⇒ 采信设备自报，这是 pick_timezone 的规则）
+    tz, off = device_api._device_tz_for(
+        _FakeRequest(headers={"x-client-timezone": "America/New_York"}),
+        _FakeDev(), summer)
+    check("G9 私网 + 设备自报纽约 ⇒ 时区名取自设备", tz == "America/New_York", tz)
+    check("G10 十月的美东偏移是 -240（夏令时）", off == -240, str(off))
+
+    # G11：同一台设备换个日期，偏移必须跟着变 —— 这条是"偏移是算出来的"的证据
+    _tz2, off2 = device_api._device_tz_for(
+        _FakeRequest(headers={"x-client-timezone": "America/New_York"}),
+        _FakeDev(), winter)
+    check("G11 十二月的美东偏移是 -300（标准时）", off2 == -300, str(off2))
+
+    # G12：设备什么都不说、IP 也是内网 ⇒ 兜底 ELDER_TZ，且给出 +480
+    tz3, off3 = device_api._device_tz_for(_FakeRequest(), _FakeDev(), summer)
+    check("G12 判不出时兜底 ELDER_TZ", tz3 == config.TZ.key, tz3)
+    check("G13 兜底时偏移是 +480（不是 0/UTC）", off3 == 480, str(off3))
+
+    # G14：第一层（请求 IP）判不出来时，必须真的去问第二层（Device.ip）。
+    #      两层都打桩成"已知答案"，才能证明第二层**被调用过** —— 只断言
+    #      "最后是 +480" 是测不出这一层的（兜底也是 +480，两者同形）。
+    orig_req = geo.resolve_request
+    orig_dev = geo.device_timezone
+
+    def _no_guess(request, device_tz=None):      # noqa: ANN001
+        raise RuntimeError("模拟请求 IP 判定链失败")
+
+    def _dev_guess(dev):                         # noqa: ANN001
+        return "America/New_York"
+
+    geo.resolve_request = _no_guess                    # type: ignore[assignment]
+    geo.device_timezone = _dev_guess                   # type: ignore[assignment]
+    try:
+        tz4, off4 = device_api._device_tz_for(_FakeRequest(), _FakeDev("8.8.8.8"), summer)
+        check("G14 请求层失败时回落到 Device.ip 判定的时区",
+              tz4 == "America/New_York", tz4)
+        check("G14b 回落层的偏移也跟着算（-240，不是兜底的 +480）", off4 == -240, str(off4))
+    except Exception as exc:                           # noqa: BLE001
+        check("G14 请求层失败时回落到 Device.ip 判定的时区", False, repr(exc))
+    finally:
+        geo.resolve_request = orig_req                 # type: ignore[assignment]
+        geo.device_timezone = orig_dev                 # type: ignore[assignment]
+
+    # G14c：两层都判不出 ⇒ 兜底，且**不抛异常**（心跳不能因此失败）
+    geo.resolve_request = _no_guess                    # type: ignore[assignment]
+    try:
+        tz5, _ = device_api._device_tz_for(_FakeRequest(), _FakeDev(), summer)
+        check("G14c 两层都判不出时兜底而不抛异常", tz5 == config.TZ.key, tz5)
+    except Exception as exc:                           # noqa: BLE001
+        check("G14c 两层都判不出时兜底而不抛异常", False, repr(exc))
+    finally:
+        geo.resolve_request = orig_req                 # type: ignore[assignment]
+
+    # G15：退化到兜底要在 app.state 里留痕（只一次），否则"配置全对"与
+    #      "整条链断了"完全无法区分。
+    req = _FakeRequest()
+    device_api._device_tz_for(req, _FakeDev(), summer)
+    check("G15 退化到兜底时在 app.state 留痕",
+          getattr(req.app.state, device_api._TZ_WARN_ATTR, False) is True)
+
+
 # ============================================================ H. 反向变异
 MUTATIONS: dict[str, tuple[str, str, list[str]]] = {
     # 名字: (原文, 替换, 期望变红的断言关键字)
@@ -584,6 +688,14 @@ MUTATIONS: dict[str, tuple[str, str, list[str]]] = {
         "        return",
         ["E8 同一 /24 命中缓存"],
     ),
+    "M5": (
+        # 设备时区下发退化成"永远用服务端时区"（= 改造前的形态：
+        # 固件 TZ 写死东八区，海外设备整体错小时数）
+        "    moment = now or local_now()\n",
+        "    return TZ.key, geo.offset_minutes(TZ.key, now or local_now())\n"
+        "    moment = now or local_now()\n",
+        ["G9 私网 + 设备自报纽约", "G10 十月的美东偏移"],
+    ),
 }
 
 #: 每个变异改的是哪个文件（相对仓库根）。
@@ -592,6 +704,7 @@ _MUTATION_TARGETS = {
     "M2": "server/app/geo.py",
     "M3": "server/app/schedule.py",
     "M4": "server/app/geo.py",
+    "M5": "server/app/routers/device_api.py",
 }
 
 
@@ -699,6 +812,7 @@ def main(argv: list[str] | None = None) -> int:
         t_trusted_proxy()
         t_resolve()
         t_schedule_tz()
+        t_device_tz()
         with Server(PORT):
             t_http()
         if not mutate_name and not args.no_mutation:

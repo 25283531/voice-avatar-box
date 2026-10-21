@@ -1099,6 +1099,23 @@ class DeviceSyncOut(ORMBase):
     # 放在顶层而不是 avatar 里，因为音色随**角色**变、而 avatar 段描述的是外观 ——
     # 老固件读 avatar.tts_voice 仍然可用（那是形象的默认值），新固件读这里。
     tts_voice: str = ""
+    # 设备该用哪个时区来解释「几点响」（2026-10-21 起下发，见 DEPLOY.md §1.15）
+    #
+    # 为什么必须由服务端下发：固件原本把 TZ 写死 `CST-8`，设备在海外时它
+    # 用北京钟点解释 `times_of_day`（"早上八点吃药"），与规则自己的时区
+    # 差好几个小时 —— 而规则时区是服务端按**设备 IP** 判定的，固件判不出来
+    # （它算不出自己的 IP 归属地），所以只能服务端告诉它。
+    #
+    # 两个字段分工：
+    #   * ``timezone``：IANA 名（如 ``America/New_York``），只给日志/排查/UI 看；
+    #   * ``tz_offset_minutes``：真正给固件用的东西。newlib **没有 tzdata**，
+    #     装不下 IANA 名，只能按 POSIX TZ 定一个固定偏移。
+    #
+    # ⚠️ ``tz_offset_minutes`` 缺省为 ``None`` 而不是 0 —— 0 会被固件当成
+    # "UTC"，把设备整体推到格林尼治时间；None 让固件明确"服务端没说"，
+    # 继续用它 NVS 里的旧值（默认 +480，与改造前逐字一致）。
+    timezone: str = ""
+    tz_offset_minutes: int | None = None
 
 
 # ============================================================ 陪聊时长上报

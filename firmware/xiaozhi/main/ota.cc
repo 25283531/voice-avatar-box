@@ -4,6 +4,7 @@
 #include "assets/lang_config.h"
 
 #include <cJSON.h>
+#include <esp_err.h>
 #include <esp_log.h>
 #include <esp_partition.h>
 #include <esp_ota_ops.h>
@@ -27,6 +28,17 @@
 #include <cstdlib>
 
 #define TAG "Ota"
+
+/* elder 组件的时间接口。
+ * 为什么用 extern "C" 声明而不是 #include "elder_sync.h"：与 main.cc 里
+ * elder_bridge_start / elder_bind_guide_start 完全同一形态 —— main 组件是靠
+ * CMakeLists 末尾的 target_link_libraries(... idf::elder) 连上的，没有把
+ * elder 的 include 目录加进来。加一个 REQUIRES 会牵动整个组件的依赖图，
+ * 而这里只需要两个函数原型。
+ * 签名必须与 firmware/components/elder/include/elder_sync.h 逐字一致，
+ * 改那边的时候要同步改这里（不一致不会报错，只会行为诡异）。 */
+extern "C" esp_err_t elder_time_tz_restore(void);
+extern "C" int elder_time_tz_offset(void);
 
 
 Ota::Ota() {
@@ -225,16 +237,23 @@ esp_err_t Ota::CheckVersion() {
             settimeofday(&tv, NULL);
 
             /* 与 sync.c 保持一致：TZ 未设时 localtime_r() 会按 UTC 解释，
-             * 提醒引擎会整体早 8 小时响。这里幂等设置一次（重复调用无害），
-             * 保证「只走过 OTA 校时、还没走 device/sync」的首次开机也正确。 */
-            setenv("TZ", "CST-8", 1);   /* POSIX TZ：CST-8 = UTC+8，无夏令时 */
-            tzset();
+             * 提醒引擎会整体早 8 小时响。
+             *
+             * ⚠️ 这里**不再硬编码** `setenv("TZ","CST-8")`（2026-10-21 改）：
+             * 时区现在由服务端按设备 IP 下发并存在 NVS（见 elder_sync.c
+             * 的「时区」整段），设备可能在纽约。写死东八区会让"刚开机的这几
+             * 分钟"显示北京时间，等第一次心跳取回真时区才纠正 —— 而这段时间
+             * 恰好是用户开机后最先做唤醒/建日程测试的窗口。
+             * elder_time_tz_restore() 读 NVS，没有记录时回落到 +480，
+             * 与改造前逐字等价。 */
+            elder_time_tz_restore();
 
             /* ⚠️ `%ld` 而不是 `%lld`：本工程开了
              * CONFIG_LIBC_NEWLIB_NANO_FORMAT=y，nano-printf 不支持 %lld，
              * 会原样打出 "(ld)" 字面量。time_t 在 ESP32 是 64 位，但秒级
              * 时间戳到 2038 年前都在 32 位范围内，转 (long) 打印够用。 */
-            ESP_LOGI(TAG, "Server time applied: utc=%ld (TZ=CST-8)", (long)tv.tv_sec);
+            ESP_LOGI(TAG, "Server time applied: utc=%ld (TZ offset %d min)",
+                     (long)tv.tv_sec, elder_time_tz_offset());
             has_server_time_ = true;
         }
     } else {
