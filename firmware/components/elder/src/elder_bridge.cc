@@ -21,7 +21,6 @@
 #include "sdkconfig.h"
 #include "esp_log.h"
 #include "esp_random.h"
-#include "esp_timer.h"
 #include "nvs_flash.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -194,31 +193,35 @@ void OnSpeak(const char *text, void *ctx)
 }
 
 /* ---------------------------------------------------------------- 提醒 */
-
 /* 提醒的节奏：**先响音乐，再念事项**。
  *
- * 为什么用定时器而不是"等播放结束回调"：``PlaySound`` 只是把 OGG 入队给
+ * 为什么用延时任务而不是"等播放结束回调"：`PlaySound` 只是把 OGG 入队给
  * 音频服务，没有任何完成回调可用；按已知时长 + 余量延后，是这套 API 下
  * 唯一确定的顺序保证。余量 400ms 给解码器起播与 I2S 缓冲 —— 宁可晚一点，
  * 也不能让音乐盖住第一句话（老人只听得清开头，被盖住就等于没说）。
  *
- * 另一个必须延后的理由：音乐与语音若同时下发，音频服务里两路 PCM 会争
- * 同一个输出通道，实测是"音乐断续 + 语音只出半句"这种最难查的故障。 */
+ * 另一个必须延后的理由：音乐与语音若同时下发，两路 PCM 会争同一个输出
+ * 通道，实测是"音乐断续 + 语音只出半句"这种最难查的故障。
+ *
+ * ⚠️ **不要改用 esp_timer**：定时器回调跑在 esp_timer 任务里，默认栈只有
+ * CONFIG_ESP_TIMER_TASK_STACK_SIZE（约 3.5KB），而这里往下要走
+ * `elder_ui_announce → Display::ShowNotification`（LVGL 绘制 + 锁 + 字符串
+ * 格式化）—— 栈溢出的表现是随机的 LoadProhibited，事后极难归因。
+ * 专用任务可以自己定栈大小，做完自删，代价只有一次 xTaskCreate。 */
 static constexpr int64_t kChimeMs = 4900 + 400;
+static constexpr uint32_t kAnnounceTaskStack = 5120;
+static constexpr UBaseType_t kAnnounceTaskPrio = 3;   /* 低优先级：不抢音频/网络 */
 
-static esp_timer_handle_t s_announce_timer = nullptr;
-static std::string s_pending_announce;
-
-static void AnnounceTimerCb(void *arg)
+static void AnnounceTask(void *arg)
 {
-    (void)arg;
-    if (s_pending_announce.empty()) {
-        return;
+    auto *text = static_cast<std::string *>(arg);
+    vTaskDelay(pdMS_TO_TICKS(kChimeMs));
+    if (text != nullptr) {
+        // 音乐已经响过 => 传 ELDER_TONE_NONE：离线时不要再多叠一声 popup
+        elder_ui_announce(text->c_str(), ELDER_TONE_NONE);
+        delete text;
     }
-    std::string text;
-    text.swap(s_pending_announce);   // 先取出再播，避免回调里重入写同一个串
-    // 音乐已经响过 ⇒ 传 ELDER_TONE_NONE：离线时不要再多叠一声 popup
-    elder_ui_announce(text.c_str(), ELDER_TONE_NONE);
+    vTaskDelete(nullptr);
 }
 
 static void ScheduleAnnounce(const char *text)
@@ -226,28 +229,15 @@ static void ScheduleAnnounce(const char *text)
     if (!text || !text[0]) {
         return;
     }
-    if (s_announce_timer == nullptr) {
-        esp_timer_create_args_t args = {};
-        args.callback = &AnnounceTimerCb;
-        args.name = "rmd_announce";
-        esp_err_t err = esp_timer_create(&args, &s_announce_timer);
-        if (err != ESP_OK) {
-            ESP_LOGE(TAG, "提醒播报定时器创建失败(%s)，改为立即播报", esp_err_to_name(err));
-            elder_ui_announce(text, ELDER_TONE_NONE);
-            return;
-        }
+    auto *payload = new std::string(text);
+    if (xTaskCreate(AnnounceTask, "rmd_announce", kAnnounceTaskStack,
+                    payload, kAnnounceTaskPrio, nullptr) != pdPASS) {
+        // 建任务失败（堆紧张）：宁可现在就念，也不能"音乐响完了没人说话"
+        ESP_LOGE(TAG, "提醒播报任务创建失败，改为立即播报");
+        elder_ui_announce(payload->c_str(), ELDER_TONE_NONE);
+        delete payload;
     }
-    if (!s_pending_announce.empty()) {
-        ESP_LOGW(TAG, "上一条提醒还没念完（%s），被这一条覆盖",
-                 s_pending_announce.c_str());
-    }
-    s_pending_announce = text;
-    esp_timer_stop(s_announce_timer);   // 未启动时返回 INVALID_STATE，按设计忽略
-    if (esp_timer_start_once(s_announce_timer, kChimeMs * 1000) != ESP_OK) {
-        ESP_LOGE(TAG, "提醒播报定时启动失败，改为立即播报");
-        s_pending_announce.clear();
-        elder_ui_announce(text, ELDER_TONE_NONE);
-    }
+}
 }
 
 int s_arming_id = -1;

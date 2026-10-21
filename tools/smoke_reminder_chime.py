@@ -146,16 +146,23 @@ def main() -> int:
     i_sched = bridge.find("ScheduleAnnounce(text)")
     check("B4 提醒触发时**先响音乐、再排播语音**（顺序即产品语义）",
           -1 < i_tone < i_sched, f"play_tone@{i_tone} Schedule@{i_sched}")
-    check("B5 语音是延后播的（定时器等音乐放完），不是同时下发",
-          "esp_timer_start_once(s_announce_timer" in bridge
-          and "kChimeMs" in bridge)
-    check("B6 生成脚本仍在库（可复现同一段音乐）", GEN.exists(), str(GEN))
+    check("B5 语音是延后播的（专用任务等音乐放完），不是同时下发",
+          "xTaskCreate(AnnounceTask" in bridge
+          and "vTaskDelay(pdMS_TO_TICKS(kChimeMs))" in bridge)
+    # 反向要求：不许用 esp_timer 回调做这件事（默认 3.5KB 栈里跑 LVGL 会溢出，
+    # 症状是随机 LoadProhibited）。只在**可执行代码**里查，注释里提到不算。
+    code_only = "\n".join(line for line in bridge.split("\n")
+                          if not line.lstrip().startswith(("*", "//", "/*")))
+    check("B6 播报不用 esp_timer（3.5KB 栈里跑 LVGL 会随机崩）",
+          "esp_timer_start_once" not in code_only
+          and "esp_timer_create" not in code_only)
+    check("B7 生成脚本仍在库（可复现同一段音乐）", GEN.exists(), str(GEN))
 
     # xiaozhi 侧是生成副本：改了 components/elder 必须同步，否则 CI 的
     # diff -rq 闸门会红。这里提前给一条可读的定位信息。
     twin = ROOT / "firmware/xiaozhi/components/elder/src/elder_bridge.cc"
     if twin.exists():
-        check("B7 生成副本已同步（firmware/xiaozhi/components/elder）",
+        check("B8 生成副本已同步（firmware/xiaozhi/components/elder）",
               "ELDER_TONE_REMINDER" in twin.read_text(encoding="utf-8"),
               "跑 tools/merge_to_xiaozhi.py")
 
