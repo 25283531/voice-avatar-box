@@ -253,6 +253,17 @@ jobs:
           PY
           python tools/smoke_voice.py 8119
 
+      # MQTT+UDP 传输冒烟（F1）：broker 协议 + AES-128-CTR 音频面 + 端到端。
+      # 与 smoke_voice 分开而不是并进去：它**自己起 MQTT broker 与 UDP 口**
+      # （进程内 asyncio server），且自带 4 条反向变异自检（每条变异各起一个
+      # 子进程，内存里改写 mqtt_udp.py）。合进去会让 smoke_voice 的
+      # libopus 前置断言与这边的端口/变异逻辑缠在一起。
+      # 端口 8132 已在 tools/smoke_ports.py 登记；broker/UDP 口
+      # （18183/18884，变异子进程各 +1）不在上游默认段上，不会撞到
+      # runner 上真装了的 mosquitto。
+      - name: MQTT+UDP 传输冒烟（broker / AES 音频面 / 端到端 + 反向变异）
+        run: python tools/run_smoke.py logs/smoke_mqtt_udp.log python tools/smoke_mqtt_udp.py 8132
+
       # 模型接入点冒烟（九种 kind 注册 / usage 平滑过渡 / 四家报文协议切换 /
       # 错误五码分诊 / 密钥脱敏 / 设备下发兜底 / context_window 裁剪）。
       # 为什么必须进 CI（此前它只在本机跑，等于这套断言对 GitHub 上的每个

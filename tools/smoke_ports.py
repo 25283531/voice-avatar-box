@@ -133,6 +133,11 @@ DEFAULT_PORTS: dict[str, int] = {
     # 求助邮箱解析：env → 管理端 SMTP → 空串（不许写死地址）。
     # 两个阶段共用同一个库文件，故不与其他脚本共享端口。
     "smoke_support_email": 8131,
+    # MQTT+UDP 传输（F1）：broker 协议 + AES-128-CTR 音频面 + 端到端一轮。
+    # 进程内还会额外占两个口（MQTT 18183 / UDP 18884，见 smoke_mqtt_udp.py
+    # 顶部注释），与 8132 错开且不在上游默认段（1883/8884）上，免得撞到
+    # 本机真装了的 mosquitto。
+    "smoke_mqtt_udp": 8132,
 }
 
 

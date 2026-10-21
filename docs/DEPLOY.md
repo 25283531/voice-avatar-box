@@ -521,6 +521,97 @@ curl -s "http://<host>:8064/api/providers/resolve?usage=embed" \
 
 ---
 
+### 1.13 MQTT + UDP 传输（F1，**默认关闭**）
+
+小智协议栈的第二条设备通道：**MQTT（TCP）走 JSON 控制面，UDP 走 AES-128-CTR
+加密的 Opus 音频面**。全部实现住在本服务进程内（`server/app/voice/mqtt_udp.py`），
+不引 Node、不装 mosquitto、不转发任何第三方服务器。
+
+#### 1.13.1 默认关闭，以及为什么
+
+`ELDER_MQTT_PORT` 不配（默认 `0`）= broker 不起、OTA 不下发 `mqtt` 段，
+设备继续走 WebSocket，行为与没有这个特性之前逐字一致。
+
+一旦启用，**OTA 响应里出现 `mqtt` 段，固件就优先走 MQTT**
+（`firmware/xiaozhi/main/application.cc:478` 的 `if (ota.HasMqttConfig())`）——
+所以这是**通道切换**，不是可选增强。切换是平滑的（编排层完全复用同一个
+`VoiceSession`，只换传输适配器），但仍然是切换：回退方式就是把这三个变量
+清空重启，设备下一次 OTA（15s 轮询）回到 WS。
+
+#### 1.13.2 三个必须一起配的变量
+
+| 变量 | 默认 | 说明 |
+| --- | --- | --- |
+| `ELDER_MQTT_PORT` | `0`（关） | MQTT broker 监听端口。**唯一的开关**，≤0 一律不起 |
+| `ELDER_MQTT_UDP_PORT` | `MQTT_PORT + 1` | UDP 音频口（1883 → 8884，与上游网关默认值一致） |
+| `ELDER_MQTT_UDP_HOST` | 空 = 用 MQTT 连接的本地地址 | hello 里下发给设备的 UDP 服务器地址 |
+
+还有两个可调的：`ELDER_MQTT_BIND`（监听地址，默认 `0.0.0.0`）、
+`ELDER_MQTT_KEEPALIVE`（默认 240s，服务端按 1.5 倍做读超时）、
+`ELDER_MQTT_MAX_CONNS`（并发连接上限，默认 128）。
+
+compose 里对应还要放行端口（`server/docker-compose.yml` 里已留好注释行，
+取消注释即可）：
+
+```yaml
+ports:
+  - "${ELDER_HTTP_PORT:-8064}:8080"
+  - "${ELDER_MQTT_PORT:-1883}:1883"
+  - "${ELDER_MQTT_UDP_PORT:-8884}:8884/udp"
+```
+
+#### 1.13.3 ⚠️ Phase 1 只有明文 MQTT（已知缺口，不假装支持）
+
+固件的端口语义是**写死的**：连 8883 才走 TLS + cert bundle，连其它端口一律
+明文 TCP（`firmware/xiaozhi/main/net/esp/esp_mqtt.cc:27`）。TLS 需要一张
+**服务端 IP 的短期证书**（固件 cert bundle 只认公开 CA，自签证书它不认），
+那是后续增量，当前**没有实现**。
+
+明文意味着：网络攻击者截获 `mqtt` 段的 HMAC 口令后可以重放，而口令是确定性
+的（截获即长期有效）⇒ 完整后果是「听到老人说话、以助手身份说话」。
+
+⇒ **开启前必须确认 1883/UDP 只暴露在可信网络**（内网 / 防火墙白名单 /
+`ELDER_MQTT_BIND` 绑到内网网卡）。暴露在公网前先做 TLS。
+
+#### 1.13.4 地址推导（两个坑）
+
+1. **MQTT endpoint**：`host` 的推导与 WebSocket 完全同源（`PUBLIC_BASE_URL`
+   优先，否则按请求 Host），所以反代/隧道后面两者一起对、一起错。
+2. **UDP server**：默认取设备那条 MQTT 连接的**服务端本地地址**
+   （它能连上 broker，就说明这个地址对它可达）—— 直暴露（公网 IP:端口）
+   天然正确。**反代 / 隧道后面必须显式配 `ELDER_MQTT_UDP_HOST`**：那种场景
+   sockname 是代理容器的内网地址，设备按它发 UDP 只会打到代理自己身上，
+   症状是「MQTT 连上了、一句话不说」且服务端零报错。
+
+#### 1.13.5 验证（三步，都要做）
+
+```bash
+# 1) broker 起来了（服务端日志）
+docker logs elder-server 2>&1 | grep "MQTT+UDP 传输已启动"
+# 2) 已绑定设备的 OTA 响应带 mqtt 段
+curl -s -X POST http://127.0.0.1:8064/api/voice/ota \
+  -H 'Device-Id: aa:bb:cc:dd:ee:01' -H 'Content-Type: application/json' \
+  -d '{}' | python -m json.tool     # 应出现 "mqtt": {...} 七字段
+# 3) 设备侧日志（串口）
+#    MQTT: "Connected to endpoint" → "Session ID: ..." → 无 "Failed to connect"
+```
+
+自动化覆盖：`tools/smoke_mqtt_udp.py`（CI 里随 server-ci 跑，含 4 条反向
+变异自检）。它覆盖 broker 协议、AES 字节布局与固件逐字段对齐、端到端一轮，
+**不覆盖**真机（TLS、NAT、真实 AEC 下的误触发都要真机验）。
+
+#### 1.13.6 与 WebSocket 通道的分工
+
+| | WebSocket（默认） | MQTT + UDP（F1） |
+| --- | --- | --- |
+| 控制面 | 同一条 WS 连接 | MQTT publish/subscribe |
+| 音频面 | 同一条 WS 连接 | 独立 UDP 口，AES-128-CTR |
+| 传输加密 | TLS（wss） | **Phase 1 无**（见 1.13.3） |
+| 固件选择 | `ota.HasWebsocketConfig()` | `ota.HasMqttConfig()`（优先） |
+| 编排层 | `VoiceSession` | **同一个** `VoiceSession` |
+
+---
+
 ## 2. 接入 MySQL（完整步骤）
 
 ### 2.1 方式 A：让 Compose 起一个 MySQL 容器（overlay 叠加）

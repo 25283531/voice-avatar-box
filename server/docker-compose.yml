@@ -76,12 +76,33 @@ services:
       #   #   若反代确实把源站当明文 HTTP 用，direct 即可。
       # 旧变量 ELDER_VOICE_PUBLIC_BASE（上面那行）仍然有效，与新变量
       # ELDER_PUBLIC_BASE_URL 同时配置时以新变量为准并打 WARNING。
+      # ---------------------------------------------------------------- MQTT+UDP（F1，默认关）
+      # 小智协议栈的第二条通道（MQTT 控制面 + AES-128-CTR 加密的 UDP 音频面）。
+      # **默认关闭**：ELDER_MQTT_PORT 留空 = 不起 broker、OTA 不下发 mqtt 段，
+      # 设备继续走 WebSocket。一旦启用，固件会**优先改走 MQTT**
+      # （application.cc:478），等于一次通道切换，不是可选增强。
+      #
+      # ⚠️ Phase 1 只有**明文 MQTT**（8883 的 TLS 需要服务端 IP 短期证书，
+      # 是已声明的后续增量）。开启前必须确认 1883/UDP 只暴露在可信网络：
+      # 明文信道上截获 HMAC 口令即可完整冒充该设备。
+      # 三个变量都要配（少一个就是半开状态，见 docs/DEPLOY.md §MQTT）：
+      #   ELDER_MQTT_PORT: "1883"
+      #   ELDER_MQTT_UDP_PORT: "8884"
+      #   # 反代/隧道后面必须显式给设备可达的 UDP 地址（默认取 MQTT 连接的
+      #   # 本地地址，直暴露场景才对）：
+      #   ELDER_MQTT_UDP_HOST: "152.136.230.132"
+      # 对应端口也要在下面 ports 里放行（取消注释）：
+      #   - "${ELDER_MQTT_PORT:-1883}:1883"
+      #   - "${ELDER_MQTT_UDP_PORT:-8884}:8884/udp"
     volumes:
       - elder-data:/data
     # 对外只发布一个端口，默认 8064（8080 常与其它服务冲突）。
     # 语音 WebSocket 复用这一个端口，不要再开第二个。
+    # MQTT+UDP（F1）默认关闭；启用时把下面两行取消注释（见上方环境变量注释）。
     ports:
       - "${ELDER_HTTP_PORT:-8064}:8080"
+      # - "${ELDER_MQTT_PORT:-1883}:1883"
+      # - "${ELDER_MQTT_UDP_PORT:-8884}:8884/udp"
     networks: [elder-net]
     security_opt:
       - seccomp:unconfined

@@ -422,7 +422,7 @@ class VoiceSession:
             await self._safe_close(CLOSE_UNAUTHORIZED)
             return
 
-        await self._send_json({
+        hello = {
             "type": "hello",
             "transport": "websocket",
             "session_id": self.session_id,
@@ -430,7 +430,17 @@ class VoiceSession:
                 "sample_rate": config.VOICE_OUTPUT_SAMPLE_RATE,
                 "frame_duration": config.VOICE_FRAME_DURATION_MS,
             },
-        })
+        }
+        # 传输层可改写自己的 hello（MQTT+UDP 传输要把 transport 改 "udp"
+        # 并补 udp:{server,port,key,nonce} 段 —— 固件 mqtt_protocol.cc 的
+        # ParseServerHello 只认 "udp"，udp 段缺一个字段都会让设备停在
+        # 「等待服务器 hello」，10s 后报 SERVER_TIMEOUT）。
+        # 用 getattr 探测而不是 isinstance：WebSocket 没有这个方法 ⇒
+        # WS 路径行为零变化，且新传输不必改这里一行代码。
+        rewrite = getattr(self.ws, "rewrite_hello", None)
+        if callable(rewrite):
+            hello = rewrite(hello) or hello
+        await self._send_json(hello)
         log.info("[%s] 语音会话开始（设备 %s，协议 v%d）",
                  self.session_id, getattr(self.dev, "device_id", "?"),
                  self.protocol_version)

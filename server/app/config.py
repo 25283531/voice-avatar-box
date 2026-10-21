@@ -719,6 +719,34 @@ VOICE_FRAME_DURATION_MS = int(os.getenv("ELDER_VOICE_FRAME_DURATION_MS", "60"))
 # ASR 语言。默认中文：本项目面向中文老人，且多数厂商不传会用默认（英文）。
 VOICE_ASR_LANGUAGE = os.getenv("ELDER_VOICE_ASR_LANGUAGE", "zh")
 
+# ---------------------------------------------------------------- MQTT + UDP 传输（F1）
+# 小智原版协议栈的第二条通道：MQTT（JSON 控制面）+ UDP（AES-128-CTR 加密的
+# Opus 音频面）。**默认关闭**（0 = 不起 broker、OTA 不下发 mqtt 段，设备继续
+# 走 WebSocket）。打开 = 运维显式选择，因为：
+#   1. Phase 1 只做**明文 MQTT**（1883）。凭据（HMAC 签名口令）在明文信道里
+#      传输，网络攻击者可截获后冒充该设备 —— 设备 impersonation 的完整后果是
+#      「听到老人说话、以助手身份说话」。TLS（8883，固件用 cert bundle 校验证书）
+#      需要一张该 IP 的短期证书，是已声明的已知缺口，见 docs/DEPLOY.md §MQTT。
+#   2. 一旦 OTA 响应里出现 mqtt 段，**固件优先选 MQTT**（application.cc:478
+#      `if (ota.HasMqttConfig())`），全部已绑定设备会一起切过去。
+# 因此：开启前必须确认 1883/UDP 口只暴露在可信网络，或先有把握不会误开。
+MQTT_PORT = int(os.getenv("ELDER_MQTT_PORT", "0"))
+# broker 监听地址。默认 0.0.0.0（设备要从设备所在网络连进来）。
+MQTT_BIND_HOST = os.getenv("ELDER_MQTT_BIND", "0.0.0.0").strip() or "0.0.0.0"
+# UDP 音频口。**0 = 由 MQTT_PORT + 1 派生**（1883 → 8884，与上游网关默认值一致）。
+# 派生而不是写死：换 MQTT 口时不必同时记住改这个口，少一类配置漂移。
+MQTT_UDP_PORT = int(os.getenv("ELDER_MQTT_UDP_PORT", "0")) or (MQTT_PORT + 1 if MQTT_PORT > 0 else 0)
+# MQTT keepalive（秒）。与固件 NVS 里存的 keepalive 一致（默认 240）。
+# 服务端按 1.5 倍做读超时，超时即认为连接已死。
+MQTT_KEEPALIVE = int(os.getenv("ELDER_MQTT_KEEPALIVE", "240"))
+# 并发 MQTT 连接上限。无鉴权前的 TCP 连接也要占内存，封顶是廉价的 DoS 防线。
+MQTT_MAX_CONNS = int(os.getenv("ELDER_MQTT_MAX_CONNS", "128"))
+# hello 里下发给设备的 UDP 服务器地址。**空 = 用设备那条 MQTT TCP 连接的
+# 本地地址**（它能连上 broker，就说明这个地址对它可达，直暴露场景天然正确）。
+# 反代 / 隧道后面必须显式配：那种场景 sockname 是代理容器的内网地址，
+# 设备按它发 UDP 只会打到代理自己身上。
+MQTT_UDP_HOST = os.getenv("ELDER_MQTT_UDP_HOST", "").strip()
+
 # 服务端静音兜底阈值：连续静音超过它、且累计语音已达 VOICE_MIN_SPEECH_MS，
 # 就自动 finalize（等价于设备端 VAD 断句）。
 # 为什么需要它：① realtime 模式固件不做 VAD、等我们断句，而我们没有 AEC，

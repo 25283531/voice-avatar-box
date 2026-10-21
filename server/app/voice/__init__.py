@@ -1,4 +1,4 @@
-"""自研语音链路（V1）：WebSocket 音频会话 + 设备 OTA 端点。
+"""自研语音链路（V1）：WebSocket 音频会话 + 设备 OTA 端点 + MQTT/UDP 传输。
 
 模块划分
 --------
@@ -8,6 +8,8 @@
 ``asr_tts.py``        OpenAI 兼容的 ASR / TTS 客户端 + 音色回落链
 ``session.py``         一次连接一个 :class:`VoiceSession`（状态机 + 全链路编排）
 ``prompts.py``         语音专用基础口令与固定话术
+``mqtt_udp.py``        F1：MQTT broker + UDP 音频网关 + WS 形状传输适配器
+                       （**默认关闭**，``ELDER_MQTT_PORT`` 门控，见该模块注释）
 =====================  ====================================================
 
 接线约定
@@ -24,6 +26,10 @@
 3. **realtime 模式按 auto 处理**：我们没有 AEC，服务端 VAD 只做能量判断。
 4. **激活 v2（HMAC）不支持**：``POST /api/voice/ota/activate`` 直接 400。
 5. **音频只在 24kHz/mono/60ms 一档**，不协商（固件按我们声明的解）。
+6. **MQTT+UDP 默认关闭且 Phase 1 只有明文**：``ELDER_MQTT_PORT=0``（默认）
+   时 broker 不起、OTA 不下发 mqtt 段；开启后 1883 上凭据可被网络攻击者
+   截获重放，TLS（8883 + IP 短期证书）是已声明的后续增量，见
+   ``mqtt_udp.py`` 模块注释与 docs/DEPLOY.md。
 """
 from __future__ import annotations
 
@@ -49,6 +55,7 @@ from ..security import (
 # 关闭码与 VoiceSession 从本包**再导出**：调用方（main.py 的接线、冒烟）
 # 只需要 `from app.voice import attach`，不该再去摸 session 的内部名字。
 # 用 `as` 形式是显式再导出（ruff 的 F401 对 `X as X` 视为有意导出）。
+from .mqtt_udp import mqtt_section
 from .session import (
     CLOSE_DEVICE_MISMATCH as CLOSE_DEVICE_MISMATCH,
     CLOSE_UNAUTHORIZED as CLOSE_UNAUTHORIZED,
@@ -241,6 +248,39 @@ def _now():
     import datetime as _dt
 
     return _dt.datetime.now(_dt.timezone.utc)
+
+
+def _mqtt_endpoint_host(request: Request) -> str:
+    """MQTT broker 的**设备可达主机名/IP**。
+
+    口径与 ``device_api._voice_endpoints`` 完全一致：显式配了
+    ``ELDER_PUBLIC_BASE_URL`` 用它的主机名（部署在反代/隧道后面时唯一
+    正确的值），否则按请求头现场推导。刻意不复刻推导逻辑，而是复用同一
+    个来源：两处一旦漂移，会出现「WS 能连、MQTT 连不上」而这种只在特定
+    拓扑下出现的故障，本地开发（同源）永远复现不了。
+    """
+    if config.PUBLIC_BASE_URL:
+        from urllib.parse import urlparse
+        return urlparse(config.PUBLIC_BASE_URL).hostname or ""
+    return (request.headers.get("host") or "").split(":")[0]
+
+
+def _mqtt_section(mac: str, request: Request) -> dict[str, Any] | None:
+    """OTA 响应的 ``mqtt`` 段；**未启用（``ELDER_MQTT_PORT<=0``）时返回 None**。
+
+    ⚠️ 一旦返回该段，固件 ``application.cc:478`` 会**优先选 MQTT**、
+    放弃 WebSocket —— 所以这不是「可选增强」，是通道切换，默认必须关。
+    只给**已绑定**设备（调用方保证）：凭据本身不需要绑定，但会话鉴权要，
+    给未绑定设备发 mqtt 段等于发一条它用不了的通道。
+    """
+    if config.MQTT_PORT <= 0:
+        return None
+    host = _mqtt_endpoint_host(request)
+    if not host:
+        log.warning("MQTT 已启用但推导不出设备可达的 broker 主机，"
+                    "本设备不下发 mqtt 段（继续走 WS）")
+        return None
+    return mqtt_section(mac, host)
 
 
 def _firmware_section() -> dict[str, Any] | None:
@@ -455,6 +495,14 @@ async def ota_check(
             firmware = _firmware_section()
             if firmware is not None:
                 payload["firmware"] = firmware
+            # MQTT+UDP 通道（F1）：**仅在 ELDER_MQTT_PORT>0 时**出现。
+            # 它一出现，固件就优先走 MQTT（application.cc:478）——
+            # 这是运维的显式选择，不是默认行为。
+            mqtt = _mqtt_section(mac, request)
+            if mqtt is not None:
+                payload["mqtt"] = mqtt
+                log.info("OTA：设备 %s 追加下发 mqtt 段（%s），设备将改走 MQTT+UDP",
+                         mac, mqtt["endpoint"])
             log.info("OTA：设备 %s 已绑定（owner=%s），下发 WS 通道、不发激活码",
                      mac, dev.owner_id)
             return JSONResponse(content=payload)
@@ -646,3 +694,36 @@ def attach(app: FastAPI) -> None:
     _ATTACHED = True
     log.info("语音链路已注册：WS %s，OTA %s",
              config.VOICE_WS_PATH, config.VOICE_OTA_PATH)
+
+
+# ================================================================ MQTT+UDP 传输（F1）
+#: 运行中的 MQTT/UDP 服务端实例。None = 未启用或未启动。
+_transports: Any = None
+
+
+async def start_transports() -> None:
+    """启动 MQTT broker + UDP 网关（``ELDER_MQTT_PORT>0`` 才真起）。
+
+    由 ``main.py`` 的 lifespan 调用，**不在 import 期起**：import 时没有
+    事件循环，且冒烟脚本要能显式控制启停。幂等：重复调用直接返回。
+    """
+    global _transports
+    if config.MQTT_PORT <= 0:
+        return
+    if _transports is not None:
+        return
+    from .mqtt_udp import MqttUdpServer
+    _transports = MqttUdpServer()
+    await _transports.start()
+
+
+async def stop_transports() -> None:
+    """停止 MQTT/UDP 传输并清空实例。幂等。"""
+    global _transports
+    if _transports is None:
+        return
+    server, _transports = _transports, None
+    try:
+        await server.stop()
+    except Exception:  # noqa: BLE001  停机路径不能反抛
+        log.warning("MQTT+UDP 传输停止异常", exc_info=True)

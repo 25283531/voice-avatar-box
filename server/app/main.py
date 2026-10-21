@@ -505,10 +505,15 @@ async def lifespan(app: FastAPI):
     from . import scheduler
 
     task = asyncio.create_task(scheduler.run_forever())
+    # MQTT+UDP 传输（F1）：ELDER_MQTT_PORT>0 才起（默认 0 = 关，设备继续
+    # 走 WebSocket）。放在 lifespan 里而不是 import 期：broker 要绑端口、
+    # 要事件循环，且冒烟脚本靠这个显式控制启停。
+    await _voice.start_transports()
     log.info("%s v%s started", APP_NAME, APP_VERSION)
     try:
         yield
     finally:
+        await _voice.stop_transports()
         task.cancel()
 
 
