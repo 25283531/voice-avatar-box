@@ -2425,6 +2425,104 @@ def t_parse_when_units() -> None:
     # prompt 里的硬约束拦不住，所以 session.py 有一道代码闸门；这里验它。
     t_false_success_gate()
     t_dismiss_and_watchdog()
+    t_asr_silence_trim()
+
+
+def t_asr_silence_trim() -> None:
+    """12j. 送 ASR 前裁掉头尾静音（P1：首句响应时间）。
+
+    实测依据（生产主机，2026-10-21）：本地 FunASR 延迟 ≈ 280ms +
+    230ms/秒音频 —— 音频长度线性进 ASR 耗时。而 _pcm 装的是从
+    listen start 到 finalize 的全部音频，老人开口前 1~2s + 尾部静音
+    阈值全在里面，每轮白等 0.2~0.7s。
+    """
+    import types
+
+    from app.voice import session as S
+    from app.voice import opus_codec
+
+    frame_ms = S.config.VOICE_FRAME_DURATION_MS or 60
+
+    def _mk(speech: bool) -> bytes:
+        """一帧 PCM：语音帧用大幅值正弦（RMS≈0.3），静音帧用零。"""
+        if speech:
+            n = 16000 * frame_ms // 1000
+            import struct
+            return b"".join(
+                struct.pack("<h", int(10000 * ((i % 64) / 32.0 - 1)))
+                for i in range(n))
+        return b"\x00\x00" * (16000 * frame_ms // 1000)
+
+    def _session(first: int, last: int, n: int) -> types.SimpleNamespace:
+        s = types.SimpleNamespace()
+        s.session_id = "SMOKE-TRIM"
+        s._first_speech_frame = first
+        s._last_speech_frame = last
+        s._trim_silence_edges = types.MethodType(
+            S.VoiceSession._trim_silence_edges, s)
+        return s
+
+    # ---- ① 头 10 帧静音 + 20 帧语音 + 15 帧静音 → 只留语音 ± pad ----
+    pcm = [_mk(False)] * 10 + [_mk(True)] * 20 + [_mk(False)] * 15
+    out = _session(10, 29, len(pcm))._trim_silence_edges(list(pcm))
+    check("12j · 头尾静音被裁掉，只留语音帧 ± 2 帧 pad",
+          len(out) == 24, f"in={len(pcm)} out={len(out)} want=24")
+
+    # ---- ② 裁掉总量不足 300ms（5 帧）就原样发：不担切片风险 ----
+    pcm2 = [_mk(False)] * 2 + [_mk(True)] * 20 + [_mk(False)] * 2
+    out2 = _session(2, 21, len(pcm2))._trim_silence_edges(list(pcm2))
+    check("12j · 边缘静音不足 300ms 时原样发（切片有风险，没收益不担）",
+          len(out2) == len(pcm2), f"in={len(pcm2)} out={len(out2)}")
+
+    # ---- ③ 一句都没说：原样返回（保持「送全段→识别为空」的既有语义）----
+    pcm3 = [_mk(False)] * 30
+    out3 = _session(-1, -1, len(pcm3))._trim_silence_edges(list(pcm3))
+    check("12j · 无语音帧时原样返回（不改「识别为空」的既有行为）",
+          len(out3) == len(pcm3), f"in={len(pcm3)} out={len(out3)}")
+
+    # ---- ④ 句中长停顿不许裁：first..last 之间整段保留 ----
+    #    老人说话慢，句中停顿 >600ms 常见；只裁边缘，不碰中间。
+    pcm4 = ([_mk(True)] * 5 + [_mk(False)] * 20 + [_mk(True)] * 5)
+    out4 = _session(0, 29, len(pcm4))._trim_silence_edges(list(pcm4))
+    check("12j · 句中长停顿不裁（first..last 之间整段保留）",
+          len(out4) == len(pcm4), f"in={len(pcm4)} out={len(out4)}")
+
+    # ---- ⑤ pad 必须存在：贴边裁会把慢语速老人的词头切一半 ----
+    #    把 pad 打到 0 做变异：同样的输入应当得到更短（且更危险）的输出。
+    real_pad = S._TRIM_PAD_FRAMES
+    S._TRIM_PAD_FRAMES = 0
+    try:
+        out5 = _session(10, 29, len(pcm))._trim_silence_edges(list(pcm))
+    finally:
+        S._TRIM_PAD_FRAMES = real_pad
+    check("12j ★ pad 是真实防线（pad=0 变异后输出更短，说明断言能抓到切除词头）",
+          len(out5) == 20 and len(out5) < len(out),
+          f"pad0_out={len(out5)} normal_out={len(out)}")
+
+    # ---- ⑥ _feed_vad 集成：语音帧区间由 VAD 顺手记录，不引入第二次能量计算 ----
+    s6 = types.SimpleNamespace()
+    s6.session_id = "SMOKE-TRIM-VAD"
+    s6._pcm = []
+    s6._noise_floor = S._NOISE_FLOOR_INIT
+    s6._ms_since_loud = 10 ** 9
+    s6._max_closed_pause_ms = 0
+    s6._speech_ms = 0
+    s6._silence_ms = 0
+    s6._first_speech_frame = -1
+    s6._last_speech_frame = -1
+    s6._feed_vad = types.MethodType(S.VoiceSession._feed_vad, s6)
+    for i in range(30):
+        p = _mk(i >= 8 and i < 25)
+        s6._pcm.append(p)
+        s6._feed_vad(p, frame_ms)
+    check("12j · _feed_vad 记录首/末语音帧（8..24），供裁剪使用",
+          s6._first_speech_frame == 8 and s6._last_speech_frame == 24,
+          f"first={s6._first_speech_frame} last={s6._last_speech_frame}")
+    out6 = _session(s6._first_speech_frame, s6._last_speech_frame,
+                    len(s6._pcm))._trim_silence_edges(list(s6._pcm))
+    check("12j · VAD 区间喂给裁剪：30 帧 → 21 帧（8-2 .. 24+2）",
+          len(out6) == 21, f"out={len(out6)} want=21")
+
 
 
 def t_false_success_gate() -> None:

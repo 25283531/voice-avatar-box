@@ -105,6 +105,17 @@ _ENTER_FACTOR: Final[float] = 2.0           # enter 门限 = 底噪 × 2
 _KEEP_FACTOR: Final[float] = 1.3            # keep  门限 = 底噪 × 1.3
 _PAUSE_MARGIN_MS: Final[int] = 500          # 自适应阈值的固定余量
 
+# ---- 送 ASR 前裁掉头尾静音（P1：首句响应时间，2026-10-21）----
+# 实测（生产主机容器内 → 宿主 FunASR 8082）：ASR 延迟 ≈ 280ms 基座
+# + 230ms/秒音频，**音频长度线性进耗时**。而 _pcm 里装的是从 listen start
+# 到 finalize 的全部音频：老人从唤醒到开口常有 1~2s，尾部还要等够静音
+# 阈值（VOICE_SILENCE_MS 起）—— 每轮 1~3s 是纯静音，白等 0.2~0.7s。
+# VAD 每帧能量本来就在 _feed_vad 里算过，这里只按记录到的语音帧区间切片，
+# 不引入第二次能量计算（同一事实两份实现必然分叉）。
+_TRIM_PAD_FRAMES: Final[int] = 2             # 语音区间前后各留 2 帧 = 120ms，防切掉词头/词尾
+_TRIM_MIN_SAVE_MS: Final[int] = 300          # 裁掉总量不足 300ms 就原样发：切片有风险
+                                              # （VAD 误判会切掉轻声的词），没收益不担风险
+
 # 每轮对话记 Interaction 的 kind。用 DIALOG（=1）而不是新值：
 # schemas.InteractionReportIn.kind 是 int，取值集合由
 # models.InteractionKind 定义，新增枚举值要连 APP 统计口径一起改。
@@ -277,6 +288,10 @@ class VoiceSession:
         self._noise_floor: float = _NOISE_FLOOR_INIT   # 房间底噪跟随值
         self._ms_since_loud: int = 10 ** 9             # 距最后一个 enter 级帧多久
         self._max_closed_pause_ms: int = 0             # 本轮"停顿后又继续"的最长停顿
+        # 本轮首个/末个被判为语音的帧序号（_pcm 下标，-1 = 还没说过话）。
+        # 送 ASR 前按这个区间裁头尾静音，见 _TRIM_PAD_FRAMES 注释。
+        self._first_speech_frame: int = -1
+        self._last_speech_frame: int = -1
 
         # 会话内对话历史（[{"role":..,"content":..}]），仅内存，不落库；
         # 跨连接的历史由记忆模块管（recent_turns），这里不重复存一份。
@@ -610,6 +625,9 @@ class VoiceSession:
              且长度够长，记入"最长句中停顿"供自适应用。
         """
         rms = opus_codec.pcm_rms(pcm)
+        # 本帧在 _pcm 里的下标（调用方先 append 再喂进来）。语音帧区间用于
+        # ASR 前的头尾静音裁剪，见 _TRIM_PAD_FRAMES。
+        frame_idx = len(self._pcm) - 1
         # 1) 底噪跟随。慢升（0.1%/帧）保证 5 秒的正常说话也只把底噪抬一点点，
         #    不会把门限顶到语音能量之上；快降（2%/帧）保证安静下来后迅速回落。
         if rms < self._noise_floor:
@@ -628,12 +646,18 @@ class VoiceSession:
             self._speech_ms += frame_ms
             self._silence_ms = 0
             self._ms_since_loud = 0
+            if self._first_speech_frame < 0:
+                self._first_speech_frame = frame_idx
+            self._last_speech_frame = frame_idx
         elif rms >= keep and self._ms_since_loud <= config.VOICE_SOFT_GRACE_MS:
             # 3) 软语音：开口后的轻声延续。**不刷新 _ms_since_loud** ——
             #    刷新它等于让持续底噪无限续期，会话永远不结束。
             self._speech_ms += frame_ms
             self._silence_ms = 0
             self._ms_since_loud += frame_ms
+            if self._first_speech_frame < 0:
+                self._first_speech_frame = frame_idx
+            self._last_speech_frame = frame_idx
         else:
             # 4) 静音
             self._silence_ms += frame_ms
@@ -731,6 +755,8 @@ class VoiceSession:
             self._noise_floor = _NOISE_FLOOR_INIT
             self._ms_since_loud = 10 ** 9
             self._max_closed_pause_ms = 0
+            self._first_speech_frame = -1
+            self._last_speech_frame = -1
 
     def _on_abort(self, obj: dict[str, Any]) -> None:
         reason = obj.get("reason", "")
@@ -786,6 +812,8 @@ class VoiceSession:
         self._noise_floor = _NOISE_FLOOR_INIT
         self._ms_since_loud = 10 ** 9
         self._max_closed_pause_ms = 0
+        self._first_speech_frame = -1
+        self._last_speech_frame = -1
         self._abort = False
         self._t0 = time.monotonic()
         self.state = "listening"
@@ -886,11 +914,15 @@ class VoiceSession:
         # ``_frames``（Opus 裸包）保留在成员上不清：abort 时 _on_abort 要清它，
         # 而这里只用 ``_pcm``（已解码）送 ASR。故意不把 frames 传下去 ——
         # 下游只需要 PCM，多传一个参数就多一处"该清哪个"的歧义。
+        # ⚠️ 裁剪必须作用于**上面这份局部拷贝**：self._pcm 紧接着就被清空，
+        # 写成 self._trim_silence_edges(list(self._pcm)) 会把空列表送给 ASR
+        # （静默故障：识别为空 → 念「我没听清」，没有任何报错）。
         pcm = list(self._pcm)
         self._frames.clear()
         self._pcm.clear()
 
         started = time.monotonic()
+        pcm = self._trim_silence_edges(pcm)
         try:
             await self._run_turn(pcm, started)
         except Exception as exc:  # noqa: BLE001
@@ -900,6 +932,45 @@ class VoiceSession:
         finally:
             if self.state == "thinking":
                 self.state = "idle"
+
+    def _trim_silence_edges(self, pcm: list[bytes]) -> list[bytes]:
+        """裁掉头尾静音再送 ASR（P1：首句响应时间）。
+
+        实测（生产主机）：本地 FunASR 延迟 ≈ 280ms + 230ms/秒音频，
+        **音频长度线性进 ASR 耗时**。而 ``_pcm`` 装的是从 listen start 到
+        finalize 的全部音频：老人从唤醒到开口常有 1~2s，尾部还要等够静音
+        阈值（``VOICE_SILENCE_MS`` 起）—— 每轮 1~3s 是纯静音，白等
+        0.2~0.7s。语音帧区间由 ``_feed_vad`` 顺手记录（不引入第二次
+        能量计算，同一事实两份实现必然分叉）。
+
+        三条保守性设计：
+        1. 前后各留 ``_TRIM_PAD_FRAMES`` 帧（120ms）—— 老人语速慢，
+           词头能量建立需要时间，贴边裁会把第一个字切掉一半；
+        2. 裁掉总量不足 ``_TRIM_MIN_SAVE_MS`` 就原样发 —— 切片有风险
+           （VAD 误判会切掉轻声的词），没收益不担风险；
+        3. 一轮里没记录到任何语音帧 ⇒ 原样返回。此时 ``_speech_ms``
+           通常也不够，看门狗根本不会走到这里；设备主动 stop 的
+           空轮则保持原行为（送全段 → ASR 返回空 → 念「我没听清」），
+           不因本改动改变语义。
+        """
+        if self._first_speech_frame < 0 or self._last_speech_frame < 0:
+            return pcm
+        n = len(pcm)
+        if n == 0:
+            return pcm
+        start = max(0, self._first_speech_frame - _TRIM_PAD_FRAMES)
+        end = min(n - 1, self._last_speech_frame + _TRIM_PAD_FRAMES)
+        if end < start:
+            return pcm
+        saved_frames = start + (n - 1 - end)
+        frame_ms = config.VOICE_FRAME_DURATION_MS or 60
+        if saved_frames * frame_ms < _TRIM_MIN_SAVE_MS:
+            return pcm
+        trimmed = pcm[start:end + 1]
+        log.info("[%s] ASR 前裁掉头尾静音 %d 帧（%dms）：%d 帧 → %d 帧",
+                 self.session_id, saved_frames, saved_frames * frame_ms,
+                 n, len(trimmed))
+        return trimmed
 
     async def _run_turn(self, pcm: list[bytes], started: float) -> str:
         t_asr = _now_ms()
