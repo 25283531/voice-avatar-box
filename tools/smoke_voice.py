@@ -1585,7 +1585,13 @@ async def t_local_asr(ids: dict) -> None:
     import websockets
 
     await _settle()
+    # ⚠️ 2026-10-22：本地 ASR 现在是**保底**（`asr_tts.LAST_RESORT_ASR_PROVIDERS`），
+    # 代码强制把它排到最后，不管 priority 写多少。所以本组要验「本地协议」时，
+    # 必须把云端那条停用 —— 否则第一优先级的云端行会先命中，
+    # 三条断言会一起红，而红的原因与"协议写错了"毫无关系（那是假红）。
+    # 反过来，这个改动本身也要有断言兜住：见本条最后一组断言。
     _set_asr_local_enabled(ids["asr_local_pk"], True)
+    _set_llm_enabled([ids["asr_pk"]], False)
     local_before = UP.get("asr_local_calls")
     openai_before = UP.get("asr_calls")
     headers = {"Authorization": f"Bearer {ids['token']}",
@@ -1618,6 +1624,7 @@ async def t_local_asr(ids: dict) -> None:
                     break
     finally:
         _set_asr_local_enabled(ids["asr_local_pk"], False)
+        _set_llm_enabled([ids["asr_pk"]], True)
 
     check("第 15 条 · 请求真打到本地协议的 /asr",
           UP.last_asr_path.endswith("/asr") and UP.get("asr_local_calls") > local_before,
@@ -1627,6 +1634,19 @@ async def t_local_asr(ids: dict) -> None:
     check("第 15 条 · OpenAI 兼容 ASR 一次都没被调用（resolve 选对了行）",
           UP.get("asr_calls") == openai_before,
           f"{openai_before} -> {UP.get('asr_calls')}")
+
+    # ---- 兜底口径（2026-10-22 用户拍板）：本地 ASR 是保底，永远最后试 ----
+    # 上面三条验的是"协议对不对"，这一条验的是"顺序对不对"。
+    # 两者分开：协议错了要改适配器，顺序错了要改排序 —— 混在一起红起来没法归因。
+    from types import SimpleNamespace as _NS
+    from app.voice import asr_tts as _at
+
+    sample = [("asr", _NS(provider="funasr_local")),
+              ("asr", _NS(provider="tencent_asr"))]
+    order = [r.provider for _k, r in _at._primary_then_last_resort(
+        sample, _at.LAST_RESORT_ASR_PROVIDERS)]
+    check("第 15 条 · 本地 ASR 是保底（排云端之后，不看 priority）",
+          order == ["tencent_asr", "funasr_local"], repr(order))
 
 
 async def t_quota(ids: dict) -> None:
