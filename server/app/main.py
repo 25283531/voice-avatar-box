@@ -34,7 +34,8 @@ from .config import (
 from .db import SessionLocal, get_db, init_db
 from .models import Avatar
 from .routers import (admin_presets, avatars, auth, chat_quota, device_api, devices,
-                      home, mail, providers, reminders, roles, stats, support, usage)
+                      home, mail, providers, reminders, roles, stats, support, usage,
+                      weather as weather_router)
 from .schema_patch import run_all as run_schema_upgrade
 from .security import hash_password, verify_password
 # 记忆的 router 单独导入，**不从 .memory 包里取**：
@@ -547,6 +548,13 @@ for r in (mail.admin_router, mail.auth_router, support.router, support.admin_rou
 # ⚠️ 记忆模块本身只提供 memory.bridge 的两个钩子供语音链路调用；
 # server/app/voice/ 尚未落地，所以这里只注册 HTTP 接口，不假装接线了语音（见 bridge.py）。
 for r in (memory_router.router, memory_router.admin_router):
+    app.include_router(r)
+
+# 天气（和风）：/api/weather/now、/api/weather/daily、/api/weather/status。
+# 与语音工具 get_weather **共用同一个 service 与同一张缓存表** —— 老人听到的和
+# 家属在 APP 上看到的必须是同一份数据，否则"网页是新的、设备是旧的"迟早发生。
+# 天气是可选子系统：没配和风凭据时接口照常可用，只是返回"还没开通"。
+for r in (weather_router.router,):
     app.include_router(r)
 
 # 语音链路（自研，server/app/voice/）：WS 会话端点 + 设备 OTA 端点。

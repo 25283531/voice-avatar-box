@@ -302,6 +302,13 @@ jobs:
       # LLM 话术」三层一次跑通，不连真设备、不占端口。
       - name: MCP 工具通道 + 服药确认
         run: python tools/run_smoke.py logs/smoke_mcp_confirm.log python tools/test_mcp_confirm.py
+      # 和风天气：按需缓存 + 降级 + 预热。用假 client，不消耗真实 API 次数、
+      # 不需要任何凭据（缺 PyJWT/cryptography 时脚本会明确"跳过"而不是假绿）。
+      # 为什么必须进 CI：这个子系统的核心承诺是「60 分钟内同一城市只调一次上游」，
+      # 而缓存写错、TTL 写成 0、预热条件写反，现象**全都是「天气照样能查到」**——
+      # 功能测试看不出来，只有调用计数和账单能发现。T4/T6 就是那两个计数器。
+      - name: 和风天气按需缓存（计费红线 + 降级 + 预热）
+        run: python tools/run_smoke.py logs/smoke_weather.log python tools/test_weather.py
       # 会员制遗留五张表必须**真的**被删掉。
       # 这条门禁是补 875b38c 留下的洞：当时删表函数整个被掏空，全仓 CI 依然全绿
       # （qa3_migration 的老库 DDL 根本不建这五张表，删表分支恒为空操作）。

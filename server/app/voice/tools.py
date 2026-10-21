@@ -144,6 +144,43 @@ TOOL_DEFS: list[dict[str, Any]] = [
             "parameters": {"type": "object", "properties": {}},
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_weather",
+            # ⚠️ 新增工具**一律追加到末尾**：TOOL_DEFS 会拼进每次请求的 tools
+            # 字段，插在中间会让后面所有工具定义整体位移，服务端的 prompt
+            # 前缀缓存全部失效（每次请求都全量计费）。这条与 D47 里
+            # 「MCP 工具放工具表末尾」是同一条纪律。
+            "description": (
+                "查询真实天气。老人问「今天天气怎么样」「明天冷不冷」"
+                "「用不用带伞」「外面下雨吗」时**必须**调用，不能凭印象回答 —— "
+                "天气每天都在变，编一个温度会让老人穿错衣服出门。\n"
+                "选 kind：只说现在/今天 → now；提到明天/后天/这几天 → daily。\n"
+                "城市：老人没提就别问，留空即可（用这台设备的常驻城市）；"
+                "只有他明确说了别的城市才填 city。\n"
+                "返回里的 message 是可以直接念给老人听的一句话，不要改写数字。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "city": {
+                        "type": "string",
+                        "description": "城市名，如「平顶山」。老人没提城市就留空",
+                    },
+                    "kind": {
+                        "type": "string",
+                        "enum": ["now", "daily"],
+                        "description": "now=实时天气；daily=今明后三天预报",
+                    },
+                    "days": {
+                        "type": "integer",
+                        "description": "kind=daily 时的天数，1-3，默认 3",
+                    },
+                },
+            },
+        },
+    },
 ]
 
 #: 工具执行出错时喂回 LLM 的 JSON 里，need_clarify=True 表示"必须让老人澄清"。
@@ -526,6 +563,8 @@ def execute_tool(db: Any, device_pk: int, name: str,
             return _toggle_reminder(db, device_pk, args)
         if name == "confirm_reminder":
             return _confirm_reminder(db, device_pk, device_call)
+        if name == "get_weather":
+            return _get_weather(db, device_pk, args)
         return {"ok": False, "message": f"没有叫「{name}」的工具"}
     except Exception as exc:  # noqa: BLE001  兜底：工具失败不崩会话
         log.warning("工具 %s 执行失败：%s: %s", name, type(exc).__name__, exc)
@@ -715,3 +754,34 @@ def _toggle_reminder(db: Any, device_pk: int, args: dict[str, Any]) -> dict[str,
                 f"{_clock_phrase(nxt.hour * 60 + nxt.minute)}")
     return {"ok": True, "id": int(r.id), "title": r.title, "enabled": bool(r.enabled),
             "message": f"已经{state}「{r.title}」{tail}，请用一句话告知老人"}
+
+
+# ================================================================ 天气
+def _get_weather(db: Any, device_pk: int, args: dict[str, Any]) -> dict[str, Any]:
+    """查天气。真正的逻辑在 ``app/weather/service.py``，这里只做参数翻译。
+
+    为什么 ``import`` 放在函数内（而不是模块顶部）
+    --------------------------------------------
+    天气是**可选子系统**：没配和风密钥时服务该正常跑，提醒照响。天气模块会
+    拉 PyJWT + cryptography（约 10MB，且签名相关依赖出问题的方式通常很吵）。
+    把它放在函数内，最坏情况只是「问天气时这一条工具报错」，**不会**连带
+    整个语音链路的 tools 模块 import 失败 —— 那会让提醒、确认服药一起瘫痪。
+    这是「可选功能不得拖垮主链路」的具体落实，不是随手写的延迟导入。
+    """
+    from ..weather import get_daily, get_now
+
+    kind = str(args.get("kind") or "now").strip().lower()
+    city = str(args.get("city") or "").strip()
+
+    # 设备对象只用来读 settings["weather_city"]（常驻城市）。
+    # 取不到就传 None，service 层会回落到 ELDER_WEATHER_DEFAULT_CITY。
+    device = db.get(models.Device, device_pk)
+
+    if kind == "daily":
+        try:
+            days = int(args.get("days") or 3)
+        except (TypeError, ValueError):
+            days = 3
+        return get_daily(db, city, days=days, device=device)
+
+    return get_now(db, city, device=device)

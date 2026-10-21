@@ -1267,3 +1267,49 @@ class PatchMeta(Base):
     patch_id: Mapped[str] = mapped_column(String(64), primary_key=True)
     applied_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow)
+
+
+# ================================================================ 天气缓存
+class WeatherCache(Base):
+    """和风天气的**按需**缓存（不拉全国，只存真被问过的城市）。
+
+    为什么不放进程内字典
+    ------------------
+    uvicorn 可能多 worker、发版会重启。进程内缓存一重启就清空，于是每次发版
+    后老人问「今天天气」都要现场等一次上游往返（1~2 秒，语音链路里很刺耳）。
+    落库之后「哪些城市被问过」是**跨重启、跨 worker** 的事实。
+
+    为什么 ``payload`` 存**上游原始 JSON**，不存加工后的口语
+    ------------------------------------------------------
+    两个理由，都是真实会发生的场景：
+      1. 口语化文案几乎一定会改（老人听不懂「体感 33.6 度」这种说法）。
+         改文案时**不该**顺带把缓存全清掉、逼所有城市重新计费；
+      2. 和风返回的字段远多于我们当前用到的（紫外线、能见度、露点…）。
+         将来想用新字段，直接读老缓存就行，不必为一次代码改动再打一遍 API。
+
+    计费口径：``hits`` 只统计**真实命中**（不含预热写入），用来在预热任务里
+    排序 —— 问得多的城市优先保新鲜，冷门城市自然沉底甚至过期淘汰。
+    """
+
+    __tablename__ = "weather_cache"
+    __table_args__ = (
+        # 主查询是「按 key 找未过期的那一条」，两列联合索引让过期判断也走索引
+        Index("ix_weather_cache_key_exp", "cache_key", "expires_at"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    #: 形如 ``now:101180101`` / ``daily:101180101:3`` / ``geo:平顶山``
+    cache_key: Mapped[str] = mapped_column(String(128), unique=True, index=True)
+    #: 城市名（已归一化），预热任务按它聚合；也方便运维直接 SELECT 看表
+    city_name: Mapped[str] = mapped_column(String(64), default="", index=True)
+    #: 上游原始 JSON 文本
+    payload: Mapped[str] = mapped_column(Text, default="")
+    fetched_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow)
+    #: 过期时刻。到点后**不删行**，只是不再被命中（见 weather/cache.py 的说明）
+    expires_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, index=True)
+    #: 最近一次被真实请求命中的时刻 —— 预热任务的筛选依据
+    last_hit_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, index=True)
+    hits: Mapped[int] = mapped_column(Integer, default=0)

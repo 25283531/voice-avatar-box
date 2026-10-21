@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from datetime import timedelta
 
 from sqlalchemy import select
@@ -44,6 +45,58 @@ _SCHEDULER_HEALTH: dict[str, object] = {
 def scheduler_health() -> dict[str, object]:
     """返回周期任务健康快照的副本（只读，避免调用方改到内部状态）。"""
     return dict(_SCHEDULER_HEALTH)
+
+
+# ================================================================ 天气预热
+#: 预热的独立节奏（秒）。**不跟随 SCHEDULER_INTERVAL_SEC**：
+#: 后者是给「排期补全/超时升级」用的，通常 60 秒一轮；天气缓存 TTL 是 60 分钟，
+#: 每 60 秒去扫一遍候选城市纯属空转（而且日志会变成噪音）。10 分钟一轮
+#: 相对 60 分钟 TTL 有 6 次机会，足够覆盖一次上游抖动。
+WARM_INTERVAL_SEC = 600
+
+#: 上次预热尝试的时刻（wall clock）。模块级状态：scheduler 是单进程单循环。
+_last_warm_at: float = 0.0
+
+
+def _warm_weather(session: Session, *, force: bool = False) -> None:
+    """按需预热天气缓存。绝不遍历全国，只续「最近被问过且快过期」的城市。
+
+    ⚠️ ``import`` 放函数内：天气是可选子系统，它的依赖（PyJWT/cryptography）
+    不该成为**服务启动**的必要条件。放在这里，最坏情况是预热这一步报错，
+    提醒排期/超时升级照常跑（``run_forever`` 对每轮异常都有兜底）。
+    """
+    global _last_warm_at
+    now_ts = time.time()
+    if not force and now_ts - _last_warm_at < WARM_INTERVAL_SEC:
+        return
+    _last_warm_at = now_ts
+
+    try:
+        from .weather import load_config
+        from .weather import service as weather_service
+
+        cfg = load_config()
+        if not cfg.configured:
+            # 未配置是常态（很多人先只用提醒功能），打日志会每 10 分钟刷一条
+            return
+        weather_service.warm_recent(session, cfg=cfg)
+    except Exception as exc:  # noqa: BLE001  预热失败绝不能拖垮 scheduler
+        log.warning("天气预热出错（不影响提醒）：%s: %s", type(exc).__name__, exc)
+        try:
+            session.rollback()
+        except Exception:  # noqa: BLE001
+            pass
+        return
+
+    # 顺带清理很久没人问的缓存行（同一节奏，一天最多删几十行）
+    try:
+        from .weather import cache as weather_cache
+
+        removed = weather_cache.purge_stale(session)
+        if removed:
+            log.info("天气缓存清理：删除 %d 条长期未使用的记录", removed)
+    except Exception as exc:  # noqa: BLE001
+        log.debug("天气缓存清理失败（忽略）：%s", exc)
 
 
 def _tick(session: Session) -> None:
@@ -91,6 +144,9 @@ def _tick(session: Session) -> None:
     except Exception as exc:  # noqa: BLE001
         log.warning("mark offline failed: %s", exc)
         session.rollback()
+
+    # 4) 天气按需预热（内部自带 10 分钟节流；未配置天气时直接跳过）
+    _warm_weather(session)
 
 
 async def run_forever() -> None:

@@ -58,6 +58,9 @@ tools/_orig_*
 tools/_tmp_*
 # 本地会话/记忆数据，不进仓库
 .workbuddy/
+# AI 助手的工作区记忆（memory/ 日志、临时产物）。与 .workbuddy/ 同一性质：
+# 是本机会话状态，不是项目内容 —— 提交上去只会给 review 添噪音。
+.workbuddy-ai/
 Setup Log*.txt
 .DS_Store
 Thumbs.db
