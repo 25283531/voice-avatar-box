@@ -751,6 +751,17 @@ VOICE_MIN_SPEECH_MS = int(os.getenv("ELDER_VOICE_MIN_SPEECH_MS", "300"))
 # 单轮收听的安全上限（毫秒）：老人说着说着离开/卡住时，兜底 finalize，
 # 避免会话永远挂在 listening。60s 足够任何正常单句，又不会无限挂住。
 VOICE_MAX_LISTEN_MS = int(os.getenv("ELDER_VOICE_MAX_LISTEN_MS", "60000"))
+# 老人说「退下吧 / 不聊了 / 你去休息吧」之后，服务端静默多久（秒）。
+#
+# 为什么需要它（2026-10-21 真机反馈）：设备处于 realtime 连续收听模式
+# （CONFIG_USE_DEVICE_AEC=y ⇒ kListeningModeRealtime，这一态**不跑唤醒词**），
+# 老人喊"退下吧"之后麦克风仍在推流。原先服务端没有任何"结束对话"概念，
+# 静音看门狗每 60s 拿一段环境噪声送 ASR → 识别为空 → 念"抱歉，我没听清"，
+# 老人听到的是音箱永远在自言自语。
+#
+# 这一段冷却里 _on_binary 直接丢弃上行音频、也不重新武装监听，
+# 老人至少能得到安静。冷却结束自动恢复（见 session.py 的 idle 态兜底）。
+VOICE_DISMISS_COOLDOWN_SEC = int(os.getenv("ELDER_VOICE_DISMISS_COOLDOWN_SEC", "180"))
 
 # ---- 语音能量门限（老人轻声 / 远场）----
 # 旧实现只有一个门限 _SILENCE_RMS=0.01（-40dBFS）：高于它算语音。

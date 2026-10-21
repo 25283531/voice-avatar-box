@@ -181,6 +181,51 @@ UNSPEAKABLE_REPLY_FALLBACK: Final[str] = "这个我一时没说明白，您再�
 #: 混在一起会让"整段回复都被拦下"的兜底话术被误触发。
 _PUNCT_ONLY: Final[re.Pattern[str]] = re.compile(r"[。！？!?；;…、，,\s]+")
 
+#: 「假成功」措辞识别。命中 = 模型在对老人宣称某件事已经办好了。
+#:
+#: 为什么需要它（2026-10-21 生产事故）
+#: ----------------------------------
+#: 老人说"两分钟后提醒我吃药"，``create_reminder`` 因时间解析失败返回
+#: ``ok=false``，模型第二轮却回"记好了，两分钟后提醒您"。生产库
+#: ``reminders`` 表里**一条都没建成**（interactions id=18/19 的 tool_calls
+#: 都是 create_reminder ok=false），老人以为建好了，到点什么都没发生。
+#:
+#: prompt 里那条硬约束是**软**的（模型照样违反），所以这里加一道代码闸门。
+#: 口径：动词 + 完成态（好了/上了/下了/住了/妥了），或"已经+动词"。
+#: 刻意**不**匹配"查到了/看到了/想好了"这类非操作词 —— 那些不是承诺。
+_SUCCESS_CLAIM_RE: Final[re.Pattern[str]] = re.compile(
+    r"(?:记|建|创建|安排|设|设置|定|加|写|添加|办|办妥|搞定)"
+    r"(?:好|上|下|住|妥|了|定)|"
+    r"已经(?:帮您)?(?:记|建|创建|安排|设|设置|定|加|写|添加|提醒)")
+
+#: 会改写老人提醒状态的工具。只有这些工具失败时才启动上面的闸门 ——
+#: 把"任何工具失败"都算上会让同轮里成功的天气查询连带被拦，那是误伤。
+_REMINDER_TOOLS: Final[frozenset[str]] = frozenset(
+    {"create_reminder", "delete_reminder", "toggle_reminder", "confirm_reminder"})
+
+#: 「结束对话」的口语。命中就不调 LLM，直接念一句再见并进入冷却。
+#:
+#: 为什么必须有（2026-10-21 真机反馈）：设备处于 realtime 连续收听模式，
+#: 这一态**不跑唤醒词**，老人喊"退下吧"之后麦克风仍在推流。服务端原先
+#: 没有"结束对话"这个概念，于是每 60s 拿环境噪声送一次 ASR、念一次
+#: "抱歉，我没听清"—— 老人听到的是音箱永远在自言自语。
+#:
+#: 刻意收得很紧：只认明确的告别/驱散，不认"好了""行吧"这类也可能是
+#: 肯定回答的词。宁可漏认（退回原来的行为），也不要误把"好的，记一下"
+#: 当成告别。
+_DISMISS_RE: Final[re.Pattern[str]] = re.compile(
+    r"退下|退下吧|下去|走开|走吧|一边去|去休息|休息吧|睡吧|睡觉吧|"
+    r"不聊|不聊了|别聊|不用聊|不说了|别说了|不要再说了|闭嘴|"
+    r"安静|静音|别出声|不出声|再见|拜拜|晚安|走了|出去")
+
+#: 告别话术。**只有一句**：老人已经不想聊了，多说一个字都是骚扰。
+_DISMISS_REPLY: Final[str] = "好的，您先忙，有需要再叫我。"
+
+#: 闸门拦住假成功句之后，改念给老人的话。工具返回里通常自带一句人话
+#: （"没听出具体时间…请老人像「明天早上八点」那样再说一遍"），优先用它；
+#: 拿不到时才用这句兜底。
+_CLAIM_FALLBACK: Final[str] = "我没太听清，您再说一遍具体时间好吗？"
+
 
 def _speech_clean(sentence: str) -> str:
     """去掉 Markdown 噪音，返回**可以直接念**的文本。"""
@@ -255,6 +300,12 @@ class VoiceSession:
         self._watchdog_task: asyncio.Task | None = None
 
         self._t0: float = 0.0               # 本轮 listen start 时刻
+
+        # 「退下吧」冷却截止时刻（monotonic 秒）。非零且未到期时，
+        # _on_binary 丢弃上行音频、_on_listen 不重新武装 ——
+        # 老人在连续收听模式下喊"退下吧"，要真的能让他清静一会儿。
+        # 到期后由 idle 态收到音频的那条兜底自动恢复。
+        self._dismissed_until: float = 0.0
 
         # 当前这一轮的播报器（_ReplySpeaker）。abort 时要能立刻丢掉它
         # 队列里还没发出去的音频帧 —— 否则老人已经喊停了，音箱还在
@@ -506,6 +557,11 @@ class VoiceSession:
     # ================================================================ 上行
     def _on_binary(self, data: bytes) -> None:
         """收一个二进制帧。type==1（JSON over binary）按 JSON 解析。"""
+        if self._dismissed_until and time.monotonic() < self._dismissed_until:
+            # 「退下吧」冷却期：老人已经明确不想聊了，realtime 模式下
+            # 设备仍在推流，这里直接丢弃，既不送 ASR 也不重新武装。
+            # 到期后由下面 idle 态那条兜底自动恢复。
+            return
         if self.state == "idle" and self._continuous():
             # 连续对话会话里，设备还在推流但服务端已回 idle —— 就是
             # _rearm_listening 注释里那个死锁。设备以为我们在听，我们
@@ -649,6 +705,14 @@ class VoiceSession:
             mode = str(obj.get("mode") or "auto")
             self._listen_mode = mode
             log.info("[%s] listen start（mode=%s）", self.session_id, mode)
+            if self._dismissed_until and time.monotonic() < self._dismissed_until:
+                # 冷却期内设备每次进入 listening 都会重发 start
+                # （realtime 模式的固件行为）。重新武装等于把"退下吧"
+                # 撤销掉，这里必须挡住。
+                log.info("[%s] 退下吧冷却中（还剩 %.0fs），忽略 listen start",
+                         self.session_id,
+                         self._dismissed_until - time.monotonic())
+                return
             self._rearm_listening()
         elif state == "stop":
             log.info("[%s] listen stop", self.session_id)
@@ -756,9 +820,30 @@ class VoiceSession:
                     return
                 # 收听超时兜底：阈值再自适应也有上限，而这一个管的是
                 # "一直不满足条件"的极端情形（老人离开、设备持续送接近
-                # 门限的能量）。到了就直接 finalize，ASR 认出多少算多少。
+                # 门限的能量）。
+                #
+                # ⚠️⚠️ 2026-10-21 真机事故：这个分支**必须**先问一句
+                # "这 60 秒里到底有没有人说话"。原先它无条件
+                # ``_start_turn()``，于是连续对话模式下每 60s 就拿一段
+                # 环境噪声送 ASR → 识别为空 → 念 EMPTY_UTTERANCE_REPLY
+                # （"抱歉，我没听清，您能再说一遍吗？"）→ 设备回到
+                # listening → 60s 后再来一遍。老人听到的是音箱**永远在
+                # 自言自语**，而服务端日志一切正常（每一轮都有始有终）。
+                #
+                # 判据与上面那个静音分支保持一致：累计语音要达到
+                # VOICE_MIN_SPEECH_MS。达不到就只重新武装（清计数器 +
+                # 重启看门狗），**不**起一轮 —— 一句都没说却送 ASR，
+                # 得到的必然是"我没听清"。
                 elapsed_ms = int((time.monotonic() - self._t0) * 1000)
                 if elapsed_ms >= config.VOICE_MAX_LISTEN_MS:
+                    if self._speech_ms < config.VOICE_MIN_SPEECH_MS:
+                        log.info("[%s] 收听超 %ds 但一句都没说（累计语音 %dms "
+                                 "< %dms），重新武装而不送 ASR",
+                                 self.session_id,
+                                 config.VOICE_MAX_LISTEN_MS // 1000,
+                                 self._speech_ms, config.VOICE_MIN_SPEECH_MS)
+                        self._rearm_listening()
+                        return
                     log.info("[%s] 收听超 %ds 兜底 finalize（累计语音 %dms）",
                              self.session_id, config.VOICE_MAX_LISTEN_MS // 1000,
                              self._speech_ms)
@@ -840,6 +925,27 @@ class VoiceSession:
             # 更空的客套，且白花一次配额与 token），直接念固定回复。
             log.info("[%s] 识别结果为空", self.session_id)
             await self._speak_reply(EMPTY_UTTERANCE_REPLY, started)
+            return ""
+
+        # ---- 「退下吧」：明确结束对话 ----
+        # 不调 LLM（模型会在告别上客套三四句，老人更烦），直接念一句再见，
+        # 然后进入冷却：冷却期内丢弃上行音频、不重新武装监听。
+        # 为什么值得单独一条而不是塞进 LLM：realtime 模式下设备不跑唤醒词，
+        # 不主动闭嘴的话老人没有任何办法让音箱安静下来。
+        if _DISMISS_RE.search(utterance):
+            log.info("[%s] 老人要求结束对话：%s", self.session_id, utterance)
+            self._dismissed_until = (time.monotonic()
+                                     + config.VOICE_DISMISS_COOLDOWN_SEC)
+            # 清掉可能残留的听音缓冲，冷却结束后不该把这段当新的一句。
+            self._frames.clear()
+            self._pcm.clear()
+            self._speech_ms = 0
+            self._silence_ms = 0
+            if self._watchdog_task is not None and not self._watchdog_task.done():
+                self._watchdog_task.cancel()
+                self._watchdog_task = None
+            await self._speak_reply(_DISMISS_REPLY, started)
+            self.state = "idle"
             return ""
 
         log.info("[%s] 识别：%s", self.session_id, utterance)
@@ -942,6 +1048,16 @@ class VoiceSession:
                         "name": str((call.get("function") or {}).get("name") or ""),
                         "ok": bool(outcome.get("ok")),
                     })
+                    # ---- 假成功闸门的燃料 ----
+                    # 提醒类工具失败 ⇒ 记下名字与人话，_speak_sentence 靠它
+                    # 拦下"记好了/已经建好"这类措辞。只记**提醒类**：
+                    # 同轮里天气查询失败不该顺带拦掉正常的天气播报。
+                    if not outcome.get("ok"):
+                        _tname = str((call.get("function") or {}).get("name") or "")
+                        if _tname in _REMINDER_TOOLS:
+                            speaker.failed_tools.add(_tname)
+                            speaker._fail_message = str(
+                                outcome.get("message") or "") or speaker._fail_message
                     messages.append({
                         "role": "tool",
                         "tool_call_id": str(call.get("id") or ""),
@@ -1187,6 +1303,8 @@ class VoiceSession:
         tts_max_pending = int(getattr(speaker, "max_pending", 0) or 0)
         dropped = int(getattr(speaker, "dropped", 0) or 0)
         dropped_reasons = list(getattr(speaker, "dropped_reasons", []) or [])
+        claim_blocked = int(getattr(speaker, "claim_blocked", 0) or 0)
+        failed_tools = sorted(getattr(speaker, "failed_tools", set()) or set())
         ttft = list(timing.get("ttft_ms") or [])
         rounds = list(timing.get("round_ms") or [])
         frame_ms = int(config.VOICE_FRAME_DURATION_MS or 60)
@@ -1197,11 +1315,16 @@ class VoiceSession:
         # 不需要去翻 Interaction 表算减法。
         log.info("[%s] 时延 asr=%dms ttft=%s round=%s tool=%dms "
                  "首帧=%dms tts=%dms 帧间隔峰值=%dms 积压峰值=%d帧 "
-                 "总=%dms 轮数=%d 丢弃句=%d",
+                 "总=%dms 轮数=%d 丢弃句=%d 假成功拦下=%d",
                  self.session_id, t_asr, ttft or "-", rounds or "-",
                  int(timing.get("tool_ms") or 0), tts_first_ms, tts_total_ms,
                  tts_max_gap, tts_max_pending,
-                 elapsed_ms, len(results), dropped)
+                 elapsed_ms, len(results), dropped, claim_blocked)
+        if claim_blocked:
+            # 单独一行 WARNING：这是"老人以为建好了其实没建"的事故痕迹，
+            # 混在 INFO 里没人看。出现一次就该查一次模型为什么谎报成功。
+            log.warning("[%s] 本轮拦下 %d 句假成功播报（失败工具 %s）",
+                        self.session_id, claim_blocked, failed_tools)
         if tts_max_gap > gap_warn_ms:
             # 每帧 frame_ms 音频，间隔超过 3 帧就意味着设备在这一大段里
             # **没有声音可播**。这条 WARNING 是"断断续续"的判决书：它在
@@ -1256,9 +1379,12 @@ class VoiceSession:
                     "tts_max_pending": tts_max_pending,
                     "total_ms": elapsed_ms,
                     "dropped_sentences": dropped,
+                    "claim_blocked": claim_blocked,
                 }
                 if dropped_reasons:
                     meta["dropped_reasons"] = sorted(set(dropped_reasons))
+                if failed_tools:
+                    meta["failed_tools"] = failed_tools
                 if tool_trace:
                     meta["tool_calls"] = tool_trace
                 db.add(_m.Interaction(
@@ -1368,6 +1494,15 @@ class _ReplySpeaker:
         # ---- 2026-10-21 新增：可播性过滤与下行耗时埋点 ----
         self.dropped = 0          # 被安检拦下的句数（不可播的规划语/工具名）
         self.dropped_reasons: list[str] = []   # 拦截原因标签，进 meta
+        # ---- 假成功闸门（2026-10-21）----
+        # 本轮哪些提醒类工具失败了。非空 ⇒ _speak_sentence 会拦下
+        # "记好了/已经建好"这类措辞，改念工具给的澄清原因。
+        self.failed_tools: set[str] = set()
+        self.claim_blocked = 0    # 被闸门拦下的句数（进 meta 与日志）
+        self._claim_fallback_done = False
+        #: 工具失败时给老人的人话（取最近一次失败工具的 message）。
+        #: 假成功闸门改念的就是这一句。
+        self._fail_message = ""
         self.tts_first_ms = 0     # 首帧音频发出耗时（从 speaker 创建算起）
         self.tts_ms = 0           # 全部合成下发累计耗时
         self.max_gap_ms = 0       # 相邻两帧的最大间隔（>60ms 即供给不足）
@@ -1421,7 +1556,8 @@ class _ReplySpeaker:
             await self._speak_sentence(tail)
 
     # ---------------------------------------------------------------- 播放
-    async def _speak_sentence(self, sentence: str) -> None:
+    async def _speak_sentence(self, sentence: str, *,
+                              _allow_claim: bool = False) -> None:
         s = self._s
         if s._abort:
             log.info("[%s] 播报被打断，丢弃句子 %r", s.session_id, sentence[:20])
@@ -1442,6 +1578,23 @@ class _ReplySpeaker:
             self.dropped_reasons.append(reason)
             log.warning("[%s] 丢弃不可播报的句子（%s）：%r",
                         s.session_id, reason, sentence[:80])
+            return
+
+        # ---- 假成功闸门 ----
+        # 本轮有提醒类工具失败，而模型这句话在宣称"已经办好了"。
+        # prompt 里的硬约束拦不住（模型照样违反，见文件头部事故记录），
+        # 所以在这里拦：宁可少说一句，也不能让老人以为提醒建好了。
+        # 注意递归调用时传 _allow_claim=True —— 兜底话术本身是反问句，
+        # 不含成功措辞，但显式放开比"赌它不命中"更诚实。
+        if (not _allow_claim and self.failed_tools
+                and _SUCCESS_CLAIM_RE.search(text)):
+            self.claim_blocked += 1
+            log.warning("[%s] 拦住假成功播报（本轮失败工具 %s）：%r",
+                        s.session_id, sorted(self.failed_tools), text[:80])
+            if not self._claim_fallback_done:
+                self._claim_fallback_done = True
+                await self._speak_sentence(
+                    self._fail_message or _CLAIM_FALLBACK, _allow_claim=True)
             return
 
         if not self._started:

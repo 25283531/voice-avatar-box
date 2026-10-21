@@ -68,6 +68,9 @@ TOOL_DEFS: list[dict[str, Any]] = [
                         "description": (
                             "时间，老人原话或 ISO 时间，如「明天早上八点」「晚上八点半」"
                             "「每周三早上八点」「每天」「早饭后」。"
+                            "**原话照抄，不要自己换算成几点几分** —— 服务端认识"
+                            "「两分钟后」「半小时后」「一个小时后」「一刻钟后」"
+                            "这类相对时间。听不出具体时间时才填空。"
                         ),
                     },
                     "repeat": {
@@ -359,6 +362,44 @@ def parse_when(text: str, now: datetime | None = None) -> ParsedWhen:
 
     # ---- 2. 一天之内的时刻 ----
     minutes: int | None = None
+
+    # ---- 1.5 相对时间：「两分钟后」「半小时后」「一个小时后」「一刻钟后」----
+    # 为什么必须有这一段（2026-10-21 生产事故）
+    # ----------------------------------------
+    # 老人不说"几点几分"，说的是"两分钟后提醒我吃药"。原先这个句式落到
+    # 下面"没听出具体时间"→ 工具 ok=false → 模型却在第二轮回"记好了"，
+    # 生产库 reminders 表里**一条都没建成**（interactions id=18/19 的
+    # tool_calls 都是 create_reminder ok=false）。老人以为建好了，到点
+    # 什么都没发生 —— 这是本项目最贵的一类故障（假成功）。
+    #
+    # 口径：
+    #   * 「N分钟/N小时/半小时/一刻钟 + 后|以后」→ 按 now 折算成今天的时刻；
+    #   * 跨过午夜由下面第 3 节的 `due > now` 判断自动滚到明天，不用特殊处理；
+    #   * 超过 24 小时的"相对时间"（"三天后"）交给第 3 节的日期分支，
+    #     这里只管一天以内 —— 混在一起会出现"三天后算成今天 15:00"这种错；
+    #   * 歧义句式（待会/一会儿/马上/现在）**仍然反问，不猜**。
+    rel = re.search(
+        r"(?:(\d+|[零一二两俩三四五六七八九十]+)\s*个?\s*(分钟|小时|钟头)"
+        r"|(半)\s*个?\s*小时"
+        r"|(一刻钟))(?:之?后|以后)", s)
+    if rel and minutes is None:
+        unit = rel.group(2)
+        qty = _cn_number(rel.group(1) or "") if rel.group(1) else None
+        if unit == "分钟":
+            delta_min = qty if qty else 1
+        elif unit in ("小时", "钟头"):
+            delta_min = (qty if qty else 1) * 60
+        elif rel.group(3):          # "半小时后"
+            delta_min = 30
+        else:                       # "一刻钟后"
+            delta_min = 15
+        if delta_min > 24 * 60:
+            return ParsedWhen(
+                ok=False,
+                reason=(f"老人说的「{text}」超过一天，请按「明天早上八点」"
+                        f"那样说一个具体时间"))
+        minutes = (now.hour * 60 + now.minute + delta_min) % (24 * 60)
+
     # 2a. 饭后约定（显式带早/午/晚的才认；光说"饭后"要反问）
     meal = re.search(r"(早|午|晚)饭(?:后|以后)", s)
     if meal:
@@ -452,6 +493,12 @@ def parse_when(text: str, now: datetime | None = None) -> ParsedWhen:
             target = today + timedelta(days=2)
         elif re.search(r"明天|明日|明儿", s):
             target = today + timedelta(days=1)
+        elif (m := re.search(r"(\d+|[零一二两俩三四五六七八九十]+)\s*天(?:之?后|以后)", s)):
+            # 「三天后早上八点」。原先这里落到"没给日期"分支，静默排成
+            # **明天** —— 老人白等两天才发现提醒没响。同一个"日期没说清
+            # 就猜"的家族，一起修掉。
+            n = _cn_number(m.group(1)) or 1
+            target = today + timedelta(days=max(1, n))
         elif re.search(r"昨天|昨日", s):
             return ParsedWhen(ok=False, reason="老人说的是过去的时间，无法创建提醒，"
                                                "请确认是不是明天的同一个时间")

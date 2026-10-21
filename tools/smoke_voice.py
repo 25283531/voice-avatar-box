@@ -2325,9 +2325,9 @@ def _cfg_less(name: str, bound: float) -> bool:
 
 def t_parse_when_units() -> None:
     print("── 12f. 口语时间解析单元断言（歧义必须 ok=False）──")
-    from app.schedule import local_now
-
+    from app.schedule import TZ, local_now
     from app.voice.tools import parse_when
+    from datetime import datetime, timedelta
 
     tomorrow = _tomorrow()
     day_after = (local_now().date() + timedelta(days=3)).isoformat()
@@ -2369,6 +2369,229 @@ def t_parse_when_units() -> None:
     p = parse_when("待会提醒我")
     check("12f · 「待会」相对时间 → ok=False 反问具体几点",
           not p.ok, f"ok={p.ok}")
+
+    # ---- 12g. 相对时间（2026-10-21 生产事故后补）----
+    # 老人说"两分钟后提醒我吃药"，原先落到"没听出具体时间"→ 工具 ok=false
+    # → 模型却回"记好了"→ 生产库 reminders 一条都没建成（interactions
+    # id=18/19 的 tool_calls 都是 create_reminder ok=false）。
+    # 所以：①相对时间必须真解析出来；②跨午夜必须自己滚到明天。
+    _now = local_now()
+
+    def _expect_rel(minutes_ahead: int) -> str:
+        t = (_now.hour * 60 + _now.minute + minutes_ahead) % (24 * 60)
+        return f"{t // 60:02d}:{t % 60:02d}"
+
+    p = parse_when("两分钟后")
+    check("12g ★ 「两分钟后」→ 必须解析成 now+2min（原先直接失败）",
+          p.ok and p.times_of_day == [_expect_rel(2)],
+          f"ok={p.ok} times={p.times_of_day} want={_expect_rel(2)}")
+
+    p = parse_when("半小时后")
+    check("12g · 「半小时后」→ now+30min",
+          p.ok and p.times_of_day == [_expect_rel(30)], f"times={p.times_of_day}")
+
+    p = parse_when("一个小时后")
+    check("12g · 「一个小时后」→ now+60min（量词「个」必须认）",
+          p.ok and p.times_of_day == [_expect_rel(60)], f"times={p.times_of_day}")
+
+    p = parse_when("一刻钟后")
+    check("12g · 「一刻钟后」→ now+15min",
+          p.ok and p.times_of_day == [_expect_rel(15)], f"times={p.times_of_day}")
+
+    p = parse_when("10分钟后")
+    check("12g · 「10分钟后」→ 阿拉伯数字也要认",
+          p.ok and p.times_of_day == [_expect_rel(10)], f"times={p.times_of_day}")
+
+    # 跨午夜：now 取 23:58 时"两分钟后"应是明天 00:00。
+    late = datetime(2026, 10, 21, 23, 58, tzinfo=TZ)
+    p = parse_when("两分钟后", late)
+    want_date = (late + timedelta(minutes=2)).date().isoformat()
+    check("12g ★ 跨午夜「两分钟后」→ 必须滚到明天（不然老人白等一天）",
+          p.ok and p.once_date == want_date and p.times_of_day == ["00:00"],
+          f"date={p.once_date} want={want_date} times={p.times_of_day}")
+
+    p = parse_when("三天后早上八点")
+    check("12g ★ 「三天后早上八点」→ 必须 +3 天（原先静默排成明天，白等两天）",
+          p.ok and p.once_date == (local_now().date() + timedelta(days=3)).isoformat()
+          and p.times_of_day == ["08:00"],
+          f"ok={p.ok} date={p.once_date} times={p.times_of_day}")
+
+    p = parse_when("三天后")
+    check("12g · 「三天后」缺时刻 → 反问（不许默认几点）",
+          not p.ok, f"ok={p.ok}")
+
+    # ---- 12h. 假成功闸门 ----
+    # 工具失败时模型谎报"记好了"，是 2026-10-21 最贵的一类故障。
+    # prompt 里的硬约束拦不住，所以 session.py 有一道代码闸门；这里验它。
+    t_false_success_gate()
+    t_dismiss_and_watchdog()
+
+
+def t_false_success_gate() -> None:
+    print("── 12h. 假成功闸门（工具失败时不许对老人说「记好了」）──")
+    import asyncio
+    import types
+
+    from app.voice import session as S
+
+    class _Pacer:
+        def add_json(self, o): pass
+        def add_audio(self, p): pass
+        pending = 0
+        def reset(self): pass
+        async def start(self): pass
+        async def stop(self, drain=True): pass
+        async def wait_idle(self, timeout=None): return True
+        broken = False
+
+    s = types.SimpleNamespace()
+    s.session_id = "SMOKE"
+    s._abort = False
+    s.state = "idle"
+    s._send_json = lambda *a, **k: None
+    s._send_audio = lambda *a, **k: None
+
+    sp = S._ReplySpeaker.__new__(S._ReplySpeaker)
+    sp._s = s
+    sp._buf = ""
+    sp._started = False
+    sp._tts_ok = True
+    sp._voice = ""
+    sp._voice_loaded = True
+    sp.sentence_count = 0
+    sp.pushed_chars = 0
+    sp.dropped = 0
+    sp.dropped_reasons = []
+    sp.failed_tools = set()
+    sp.claim_blocked = 0
+    sp._claim_fallback_done = False
+    sp._fail_message = ""
+    sp.tts_first_ms = 0
+    sp.tts_ms = 0
+    sp.max_gap_ms = 0
+    sp._last_frame_at = 0.0
+    sp._t0 = 0.0
+    sp.max_pending = 0
+    sp._pacer = _Pacer()
+
+    spoken: list[str] = []
+
+    async def _fake_stream(text: str) -> None:
+        spoken.append(text)
+
+    sp._stream_sentence = _fake_stream
+
+    async def _run() -> None:
+        # ① 工具失败 + 谎报成功 ⇒ 必须拦下，并改念工具给的澄清原因
+        sp.failed_tools = {"create_reminder"}
+        sp._fail_message = "没听出具体时间，请老人像「明天早上八点」那样再说一遍"
+        await sp._speak_sentence("记好了，两分钟后提醒您吃药")
+        check("12h ★ 假成功句必须被拦下（这是本次事故的核心）",
+              sp.claim_blocked == 1 and not any("记好了" in t for t in spoken),
+              f"claim_blocked={sp.claim_blocked} spoken={spoken}")
+        check("12h ★ 拦下后必须改念工具给的澄清原因（不能静音）",
+              any("没听出具体时间" in t for t in spoken), f"spoken={spoken}")
+
+        # ② 没有工具失败时，同一句必须照念（否则正常复述被误伤）
+        spoken.clear()
+        sp.failed_tools = set()
+        sp._claim_fallback_done = False
+        await sp._speak_sentence("记好了，明天早上八点提醒您吃药")
+        check("12h · 无工具失败时正常复述不得被误拦",
+              spoken == ["记好了，明天早上八点提醒您吃药"], f"spoken={spoken}")
+
+        # ③ 工具失败但说的是反问 ⇒ 照念
+        spoken.clear()
+        sp.failed_tools = {"create_reminder"}
+        await sp._speak_sentence("您说的是几点几分？")
+        check("12h · 反问句不得被误拦", spoken == ["您说的是几点几分？"],
+              f"spoken={spoken}")
+
+        # ④ 天气成功 + 提醒失败：天气播报不得被连带拦掉
+        spoken.clear()
+        sp.failed_tools = {"create_reminder"}
+        sp._claim_fallback_done = False
+        await sp._speak_sentence("平顶山今天晴，最高十八度，出门不冷")
+        check("12h · 同轮里非提醒内容不得被连带误拦",
+              spoken == ["平顶山今天晴，最高十八度，出门不冷"],
+              f"spoken={spoken}")
+
+    asyncio.run(_run())
+
+
+def t_dismiss_and_watchdog() -> None:
+    print("── 12i. 「退下吧」结束对话 + 看门狗不拿环境噪声送 ASR ──")
+    import asyncio
+    import types
+
+    from app.config import VOICE_MAX_LISTEN_MS, VOICE_MIN_SPEECH_MS
+    from app.voice import session as S
+
+    # ---- ① 告别词识别 ----
+    dismiss_yes = ["退下吧", "你退下吧", "你可以退下了", "去休息吧", "不聊了",
+                   "别说了", "安静", "再见", "拜拜", "晚安", "你走吧"]
+    dismiss_no = ["你好小智", "现在几点了", "提醒我两分钟后吃药",
+                  "明天早上八点叫我", "好的", "知道了", "今天天气怎么样"]
+    for t in dismiss_yes:
+        check(f"12i ★ 「{t}」必须识别为结束对话", bool(S._DISMISS_RE.search(t)),
+              "未命中")
+    for t in dismiss_no:
+        check(f"12i · 「{t}」不得被误判为结束对话",
+              not S._DISMISS_RE.search(t), "误命中")
+
+    # ---- ② 看门狗：一句都没说时不得起一轮 ----
+    async def _run() -> None:
+        s = types.SimpleNamespace()
+        s.session_id = "SMOKE-WD"
+        s.state = "listening"
+        s._speech_ms = 0
+        s._silence_ms = 0
+        s._t0 = 0.0
+        s._abort = False
+        armed = []
+        turned = []
+        s._rearm_listening = lambda: armed.append(1)
+        s._start_turn = lambda: turned.append(1)
+        s._silence_threshold_ms = lambda: 10 ** 9   # 静音分支永远不满足
+        # 真方法：看门狗是 VoiceSession 的方法，必须绑到这个假对象上跑，
+        # 否则测的只是一个同名的 lambda（假绿）。
+        s._silence_watchdog = types.MethodType(
+            S.VoiceSession._silence_watchdog, s)
+        # 把 60s 上限压到 400ms，测试才跑得动
+        real_max = S.config.VOICE_MAX_LISTEN_MS
+        S.config.VOICE_MAX_LISTEN_MS = 400
+        try:
+            await asyncio.wait_for(s._silence_watchdog(), timeout=5)
+        finally:
+            S.config.VOICE_MAX_LISTEN_MS = real_max
+        check("12i ★ 一句都没说时看门狗必须重新武装，而不是送 ASR"
+              "（原先每 60s 念一次「我没听清」）",
+              armed and not turned, f"armed={len(armed)} turned={len(turned)}")
+
+        # ---- ③ 有语音时才允许兜底 finalize ----
+        s2 = types.SimpleNamespace()
+        s2.session_id = "SMOKE-WD2"
+        s2.state = "listening"
+        s2._speech_ms = VOICE_MIN_SPEECH_MS + 500
+        s2._silence_ms = 0
+        s2._t0 = 0.0
+        s2._abort = False
+        armed2 = []
+        turned2 = []
+        s2._rearm_listening = lambda: armed2.append(1)
+        s2._start_turn = lambda: turned2.append(1)
+        s2._silence_threshold_ms = lambda: 10 ** 9
+        s2._silence_watchdog = types.MethodType(
+            S.VoiceSession._silence_watchdog, s2)
+        try:
+            await asyncio.wait_for(s2._silence_watchdog(), timeout=5)
+        finally:
+            S.config.VOICE_MAX_LISTEN_MS = real_max
+        check("12i · 确实说过话时，超时兜底照旧 finalize（不能修成永不识别）",
+              turned2 and not armed2, f"armed={len(armed2)} turned={len(turned2)}")
+
+    asyncio.run(_run())
+
 
 
 # ================================================================ main
