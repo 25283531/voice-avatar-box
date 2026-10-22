@@ -936,6 +936,18 @@ VOICE_IDLE_STANDBY_SEC = int(
 # 老人至少能得到安静。冷却结束自动恢复（见 session.py 的 idle 态兜底）。
 VOICE_DISMISS_COOLDOWN_SEC = int(os.getenv("ELDER_VOICE_DISMISS_COOLDOWN_SEC", "180"))
 
+# 「结束对话」关键词命中后，走哪条路（2026-10-22 用户需求）。
+#
+#   "weak"（默认）强判据直接待机，弱判据交给大模型结合上下文复核；
+#   "all"         所有命中都交给大模型复核（延迟换准确率）；
+#   "off"         旧行为：命中即待机（不调 LLM）。
+#
+# 判据分档见 session.py 的 ``_DISMISS_STRONG_RE`` / ``_DISMISS_WEAK_RE``：
+# 强档是"只对设备说才成立"的祈使句，弱档是"必须看上下文"的词
+# （走了 / 出去 / 休息吧 / 不用了 / 安静）。
+VOICE_DISMISS_LLM_VERIFY = os.getenv(
+    "ELDER_VOICE_DISMISS_LLM_VERIFY", "weak").strip().lower()
+
 # ---- 语音能量门限（老人轻声 / 远场）----
 # 旧实现只有一个门限 _SILENCE_RMS=0.01（-40dBFS）：高于它算语音。
 # 两个失效模式：① 轻声老人/离设备远，整句 RMS 都在 0.01 以下 ⇒

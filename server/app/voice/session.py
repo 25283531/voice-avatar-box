@@ -229,24 +229,73 @@ _SUCCESS_CLAIM_RE: Final[re.Pattern[str]] = re.compile(
 _REMINDER_TOOLS: Final[frozenset[str]] = frozenset(
     {"create_reminder", "delete_reminder", "toggle_reminder", "confirm_reminder"})
 
-#: 「结束对话」的口语。命中就不调 LLM，直接念一句再见并进入冷却。
+#: 「结束对话」的关键词，**分两档**（2026-10-22 用户需求：既要多认、又不能误认）。
 #:
 #: 为什么必须有（2026-10-21 真机反馈）：设备处于 realtime 连续收听模式，
 #: 这一态**不跑唤醒词**，老人喊"退下吧"之后麦克风仍在推流。服务端原先
 #: 没有"结束对话"这个概念，于是每 60s 拿环境噪声送一次 ASR、念一次
 #: "抱歉，我没听清"—— 老人听到的是音箱永远在自言自语。
 #:
-#: 刻意收得很紧：只认明确的告别/驱散，不认"好了""行吧"这类也可能是
-#: 肯定回答的词。宁可漏认（退回原来的行为），也不要误把"好的，记一下"
-#: 当成告别。
+#: 为什么分两档（2026-10-22 用户原话）：「对待机的词义识别添加多个词汇，
+#: 尽量使用大模型来识别待机意图，语句中出现关键词的时候，提交给大模型答复时，
+#: 让大模型根据上下文来分析用户是不是让进入待机状态……这样可以避免因关键词
+#: 出现而误进入待机，也能尽量多的识别出待机意图。」
+#:
+#:   * ``_DISMISS_STRONG_RE``：**只对设备说才成立**的祈使句（"退下""待机"
+#:     "闭嘴""别出声"）。这类话在正常陪聊里几乎不会出现，命中即待机，
+#:     不必等一次 LLM 往返（老人说完"退下吧"，多等 2 秒才安静是折磨）。
+#:   * ``_DISMISS_WEAK_RE``：**必须看上下文**才成立的词（"走了""出去"
+#:     "休息吧""不用了""安静"）。它们既可能是让设备停，也可能是
+#:     "他走了""我明天要出去""孩子睡了，安静点""不用了，我不吃"。
+#:     命中后**不直接待机**，而是照常走一轮 LLM，并在 system 里加一段
+#:     复核提示、把 ``enter_standby`` 工具放开给它 —— 由模型结合上下文判。
+#:
+#: 分档模式由 ``config.VOICE_DISMISS_LLM_VERIFY`` 控制（weak/all/off）。
+_DISMISS_STRONG_RE: Final[re.Pattern[str]] = re.compile(
+    r"退下|下去吧|一边去|待机|待命|进入待机|"
+    r"闭嘴|静音|别出声|不出声|"
+    r"让我安静|让我清静|我想静静")
+#: 弱判据。刻意**不收**「好了/行了/知道了/好/嗯」这类通用应答 ——
+#: 它们几乎每轮都会出现，命中即调一次复核，纯属白烧 token 和首句时延。
+_DISMISS_WEAK_RE: Final[re.Pattern[str]] = re.compile(
+    r"走开|走吧|你走|出去|走了|我走了|要出门|"
+    r"休息吧|去休息|你休息|歇着吧|歇会儿|歇一会|"
+    r"睡吧|睡觉吧|我睡了|我要睡了|要睡了|该睡了|去睡了|困了|"
+    r"不聊|别聊|不用聊|聊到这儿|聊到这|先这样吧|就这样吧|到此为止|"
+    r"不说了|别说了|不用说了|不要再说了|别讲了|别念了|别吵了|别嚷嚷|"
+    r"小点声|安静|再见|拜拜|晚安|"
+    r"你忙|不用管我|别管我|"
+    r"不用了|没事了|别放了|停一下|停止播放")
+
+#: 兼容名：旧代码/旧测试里只关心"是不是命中"，不关心档位。
 _DISMISS_RE: Final[re.Pattern[str]] = re.compile(
-    r"退下|退下吧|下去|走开|走吧|一边去|去休息|休息吧|睡吧|睡觉吧|"
-    # 2026-10-22 需求 7：用户点名要的四种说法（待机吧 / 退下吧 / 晚安吧 /
-    # 我睡了）。「待机」「待命」原先完全没认，老人说"待机吧"设备会当成
-    # 一句正常的话去调 LLM，答一句"好的"然后继续听。
-    r"待机|待机吧|待命|我睡了|要睡了|去睡了|休息了|先这样吧|"
-    r"不聊|不聊了|别聊|不用聊|不说了|别说了|不要再说了|闭嘴|"
-    r"安静|静音|别出声|不出声|再见|拜拜|晚安|走了|出去")
+    f"(?:{_DISMISS_STRONG_RE.pattern})|(?:{_DISMISS_WEAK_RE.pattern})")
+
+#: 服务端侧待机工具名。与设备 MCP 的 ``self.elder.standby`` 是两回事：
+#: 这个是给**大模型**调的（判意图），那个是**下发给固件**的（真停麦）。
+_STANDBY_TOOL_NAME: Final[str] = "enter_standby"
+
+
+def _dismiss_tier(utterance: str) -> str:
+    """返回命中档位：``"strong"`` / ``"weak"`` / ``""``（未命中）。"""
+    if _DISMISS_STRONG_RE.search(utterance):
+        return "strong"
+    if _DISMISS_WEAK_RE.search(utterance):
+        return "weak"
+    return ""
+
+
+#: 命中弱判据时追加到 system 的复核提示。**只在命中那一轮注入** ——
+#: 每轮都塞的话，模型会变得爱管闲事，正常聊天也想让设备待机。
+_STANDBY_VERIFY_HINT: Final[str] = (
+    "【本轮特别提示】老人这句话里出现了可能表示「结束对话」的说法。"
+    "请你**结合上面的对话上下文**判断他的真实意图：\n"
+    "  · 如果他确实是在让你停下 / 待机 / 别再说话了 → 调用 enter_standby，"
+    "然后只说一句很短的道别（10 个字以内），不要再提问、不要再展开；\n"
+    "  · 如果这句话不是对你说的（在跟别人讲话、在说电视里的人），"
+    "或者只是在叙述事实（「他走了」「我明天要出去」）、只是随口应答"
+    "（「不用了」「没事了」），→ **绝对不要**调用 enter_standby，"
+    "照常自然地回答他，也不要提这件事。")
 
 #: 告别话术。**只有一句**：老人已经不想聊了，多说一个字都是骚扰。
 _DISMISS_REPLY: Final[str] = "好的，您先忙，有需要再叫我。"
@@ -426,6 +475,21 @@ class VoiceSession:
         # 老人在连续收听模式下喊"退下吧"，要真的能让他清静一会儿。
         # 到期后由 idle 态收到音频的那条兜底自动恢复。
         self._dismissed_until: float = 0.0
+
+        # ---- 「结束对话」意图复核（2026-10-22 用户需求）----
+        # 本轮命中了待机关键词、且走"交大模型复核"那条路时为非空（档位名）。
+        # 生命周期只在**一轮**之内：
+        #   * ``_run_turn`` 开头清空 → 命中时置位；
+        #   * 模型正常答完（含被 abort）→ 清空，表示"模型判了不是待机"；
+        #   * 一轮失败（LLM 未配置/异常/空回复）→ **保持置位**，由
+        #     ``_finalize`` 的 finally 兜底待机。老人说了"退下吧"，最差也
+        #     得让音箱安静下来，不能因为模型挂了就继续念"我没听清"。
+        self._dismiss_candidate: str = ""
+        # 模型本轮调用了 enter_standby。**不能当场下发设备命令** —— 那一轮
+        # 的告别语还没念（工具调用发生在生成回复之前），先切 idle 的话
+        # 告别语会把设备顶回 speaking，最后又落回 listening（就是
+        # _enter_standby 注释里那个坑）。所以只置标志，念完再切。
+        self._standby_requested: bool = False
 
         # 当前这一轮的播报器（_ReplySpeaker）。abort 时要能立刻丢掉它
         # 队列里还没发出去的音频帧 —— 否则老人已经喊停了，音箱还在
@@ -1344,10 +1408,31 @@ class VoiceSession:
         except Exception as exc:  # noqa: BLE001
             log.exception("[%s] 本轮异常：%s: %s", self.session_id,
                           type(exc).__name__, exc)
-            await self._send_alert("刚才没处理好，请您再说一遍")
+            # 同上：命中待机关键词时留给 finally 的兜底念告别语，
+            # 这里再说一句"没处理好"就是两句互相打架。
+            if not self._dismiss_candidate:
+                await self._send_alert("刚才没处理好，请您再说一遍")
         finally:
             if self.state == "thinking":
                 self.state = "idle"
+            # ---- 兜底：命中待机关键词，但这一轮没能走到"模型判定"----
+            # （LLM 未配置 / 调用异常 / 回复为空 / 播报前就崩了）
+            #
+            # 老人说了"退下吧"，最差也得让音箱安静下来。不兜的话，LLM 一挂
+            # 关键词就永远不生效 —— 又回到"音箱永远在自言自语"那个老毛病。
+            # 判据用 ``_dismiss_candidate`` 是否**还**置位：_run_turn 在
+            # "模型正常答完"和"被老人抢话打断"两条路上都会清掉它，
+            # 所以走到这里还置位 = 这一轮确实没结论。
+            if self._dismiss_candidate and not self._standby_requested:
+                self._dismiss_candidate = ""
+                log.info("[%s] 待机复核未完成（本轮失败），按关键词直接待机",
+                         self.session_id)
+                try:
+                    await self._enter_standby("待机复核未完成（本轮失败）",
+                                              farewell=_DISMISS_REPLY)
+                except Exception as exc:  # noqa: BLE001
+                    log.warning("[%s] 兜底待机失败：%s: %s", self.session_id,
+                                type(exc).__name__, exc)
 
     def _trim_silence_edges(self, pcm: list[bytes]) -> list[bytes]:
         """裁掉头尾静音再送 ASR（P1：首句响应时间）。
@@ -1389,6 +1474,9 @@ class VoiceSession:
         return trimmed
 
     async def _run_turn(self, pcm: list[bytes], started: float) -> str:
+        # 每轮重置"待机复核"状态（见 __init__ 里这两个字段的说明）。
+        self._dismiss_candidate = ""
+        self._standby_requested = False
         t_asr = _now_ms()
         pcm_all = b"".join(pcm)
 
@@ -1455,20 +1543,27 @@ class VoiceSession:
             await self._speak_reply(EMPTY_UTTERANCE_REPLY, started)
             return ""
 
-        # ---- 「退下吧」：明确结束对话 ----
-        # 不调 LLM（模型会在告别上客套三四句，老人更烦），直接念一句再见，
-        # 然后进入待机。为什么值得单独一条而不是塞进 LLM：realtime 模式下
-        # 设备不跑唤醒词，不主动闭嘴的话老人没有任何办法让音箱安静下来。
+        # ---- 「结束对话」意图（2026-10-22 改：关键词 → 分档 → 必要时大模型复核）----
+        # 不调 LLM 直接待机的老路只留给**强判据**：模型会在告别上客套三四句，
+        # 老人更烦；而 realtime 模式下设备不跑唤醒词，不主动闭嘴的话老人
+        # 没有任何办法让音箱安静下来。
         #
-        # 待机动作抽到 :meth:`_enter_standby`：会话空闲超时
-        # （``VOICE_IDLE_STANDBY_SEC``）走的是**同一条**路径，只是不念告别语。
-        # 两处各写一份必然分叉 —— 之前就分叉过（空闲那条只会"重新武装"，
-        # 永远不会待机）。
-        if _DISMISS_RE.search(utterance):
-            log.info("[%s] 老人要求结束对话：%s", self.session_id, utterance)
-            await self._enter_standby("老人要求结束对话",
-                                      farewell=_DISMISS_REPLY)
-            return ""
+        # 弱判据命中**不在这里动手**，而是置 ``_dismiss_candidate``，让这一轮
+        # 照常走 LLM（system 里追加 _STANDBY_VERIFY_HINT，工具表里放开
+        # enter_standby）。这样「他走了」「我明天要出去」「孩子睡了，安静点」
+        # 这类话不会再把设备误送进待机 —— 模型看得到上下文，判得比正则准。
+        tier = _dismiss_tier(utterance)
+        if tier:
+            mode = config.VOICE_DISMISS_LLM_VERIFY
+            if mode == "off" or (mode == "weak" and tier == "strong"):
+                log.info("[%s] 老人要求结束对话（%s 档直判，模式 %s）：%s",
+                         self.session_id, tier, mode, utterance)
+                await self._enter_standby("老人要求结束对话",
+                                          farewell=_DISMISS_REPLY)
+                return ""
+            self._dismiss_candidate = tier
+            log.info("[%s] 命中待机关键词（%s 档），交大模型复核意图：%s",
+                     self.session_id, tier, utterance)
 
         # ---- 有效内容：刷新会话空闲锚点 ----
         # 放在 dismiss 判据**之后**：老人说"退下吧"不该把空闲计时器续期，
@@ -1540,6 +1635,9 @@ class VoiceSession:
             system = system + "\n\n" + line
         if memory_ctx:
             system = system + "\n\n" + memory_ctx
+        # ---- 待机意图复核提示（只在命中弱判据的那一轮注入）----
+        if self._dismiss_candidate:
+            system = system + "\n\n" + _STANDBY_VERIFY_HINT
 
         messages: list[dict[str, str]] = [{"role": "system", "content": system}]
         messages.extend(self._history[-config.VOICE_HISTORY_TURNS * 2:])
@@ -1625,24 +1723,32 @@ class VoiceSession:
         except ConfigMissingError:
             log.warning("[%s] 未配置 LLM", self.session_id)
             await speaker.close()   # 只收协程，不发协议消息（原行为不变）
-            await self._send_alert(LLM_NOT_CONFIGURED_MESSAGE)
+            # 命中待机关键词时不念这句：_finalize 的兜底会紧接着念告别语，
+            # 老人会听到"请让家人配置好语音识别"+"好的您先忙"两句互相打架。
+            if not self._dismiss_candidate:
+                await self._send_alert(LLM_NOT_CONFIGURED_MESSAGE)
             return utterance
         except Exception as exc:  # noqa: BLE001
             log.warning("[%s] LLM 调用失败：%s: %s", self.session_id,
                         type(exc).__name__, exc)
             await speaker.close()
-            await self._send_alert("我刚才走神了，请您再说一遍")
+            if not self._dismiss_candidate:
+                await self._send_alert("我刚才走神了，请您再说一遍")
             return utterance
 
         t_llm = _now_ms() - t_llm
         if not reply:
             if self._abort:
-                # 打断轮：已播的由 speaker 收尾，不进历史不记账
+                # 打断轮：已播的由 speaker 收尾，不进历史不记账。
+                # 老人是抢话打断的 ⇒ 他还在聊，绝不是要待机：清掉候选，
+                # 否则 _finalize 的兜底会在他抢话之后把设备送进待机。
+                self._dismiss_candidate = ""
                 await speaker.finish()
                 return utterance
             log.warning("[%s] LLM 返回空文本", self.session_id)
             await speaker.close()
-            await self._send_alert("我没想好怎么回答，请您再说一遍")
+            if not self._dismiss_candidate:
+                await self._send_alert("我没想好怎么回答，请您再说一遍")
             return utterance
 
         # ---- 补播缓冲区尾巴（**这是 2026-10-21 修掉的一个静音 bug**）----
@@ -1680,6 +1786,18 @@ class VoiceSession:
         # ---- 收尾播报：流式过程中已播的句子不管，这里发 tts stop
         #    （或空回复的 start/stop 配对，设备靠它回落 idle）。
         await speaker.finish()
+
+        # ---- 模型判定待机：**念完告别语之后**再切固件 ----
+        # 顺序不能反（理由见 _enter_standby 的 docstring）：先切 idle 的话，
+        # 刚念的告别语会把设备顶回 speaking，最后又落回 listening。
+        if self._standby_requested:
+            await self._enter_standby("大模型判定老人要结束对话")
+            return utterance
+
+        # 正常答完 ⇒ 模型判了"这句不是要待机"，清掉候选。
+        # 不清的话 _finalize 的 finally 会把它当"本轮没完成"再兜底待机一次，
+        # 那正好把"大模型复核"这件事整个作废。
+        self._dismiss_candidate = ""
         return utterance
 
     async def _chat_round(self, messages: list[dict[str, Any]],
@@ -1755,6 +1873,28 @@ class VoiceSession:
         raw_args = fn.get("arguments") or "{}"
         log.info("[%s] 工具调用：%s(%s)", self.session_id, name,
                  str(raw_args)[:200])
+
+        # ---- enter_standby：模型判定「老人要结束对话」（2026-10-22 需求）----
+        #
+        # **只在命中待机关键词的那一轮放行**。理由：误判的代价不对称 ——
+        # 该停没停只是多听一会儿，不该停却停了是"老人怎么喊都没反应"
+        # （realtime 模式下设备停了推流、只剩 WakeNet）。模型再准，也不
+        # 把这条生杀权完全交给它。
+        if name == _STANDBY_TOOL_NAME:
+            if not self._dismiss_candidate:
+                log.info("[%s] 本轮没有待机关键词，拒绝模型发起的待机",
+                         self.session_id)
+                return {"ok": False,
+                        "message": "现在不需要待机。请照常自然地回答老人，"
+                                   "不要提这件事。"}
+            self._standby_requested = True
+            log.info("[%s] 模型判定为待机意图（%s 档关键词），"
+                     "本轮念完即下发待机命令",
+                     self.session_id, self._dismiss_candidate)
+            return {"ok": True,
+                    "message": "已确认，本轮结束后设备就会待机。"
+                               "现在只说一句很短的道别（10 个字以内），"
+                               "不要再提问，也不要再展开任何内容。"}
 
         def _run() -> dict[str, Any]:
             with SessionLocal() as db:

@@ -3091,6 +3091,7 @@ def t_false_success_gate() -> None:
 def t_dismiss_and_watchdog() -> None:
     print("── 12i. 「退下吧」结束对话 + 看门狗不拿环境噪声送 ASR ──")
     import asyncio
+    import time
     import types
 
     from app.config import VOICE_MAX_LISTEN_MS, VOICE_MIN_SPEECH_MS
@@ -3108,6 +3109,29 @@ def t_dismiss_and_watchdog() -> None:
         check(f"12i · 「{t}」不得被误判为结束对话",
               not S._DISMISS_RE.search(t), "误命中")
 
+    # ---- ①b 分档（2026-10-22 用户需求：关键词 → 大模型复核意图）----
+    # 强档：只对设备说才成立的祈使句，命中即待机（不等 LLM 往返）。
+    for t in ["退下吧", "待机", "待机吧", "闭嘴", "别出声", "静音"]:
+        check(f"12i ★ 「{t}」必须判为强档（命中即待机）",
+              S._dismiss_tier(t) == "strong", f"tier={S._dismiss_tier(t)!r}")
+    # 弱档：必须看上下文的词，命中后交给大模型判（不能直接待机）。
+    for t in ["我走了", "我明天要出去", "去休息吧", "不用了", "安静",
+              "再见", "我睡了", "先这样吧"]:
+        check(f"12i ★ 「{t}」必须判为弱档（交大模型结合上下文判）",
+              S._dismiss_tier(t) == "weak", f"tier={S._dismiss_tier(t)!r}")
+    # 通用应答不得进任何档：它们几乎每轮都出现，进了就是白烧 token。
+    for t in ["今天天气怎么样", "好的", "知道了", "提醒我吃药", "嗯"]:
+        check(f"12i · 「{t}」不得命中任何档",
+              S._dismiss_tier(t) == "", f"tier={S._dismiss_tier(t)!r}")
+
+    # ---- ①c 工具表：模型靠 enter_standby 下待机 ----
+    from app.voice.tools import TOOL_DEFS
+    names = [d["function"]["name"] for d in TOOL_DEFS]
+    check("12i ★ enter_standby 必须注册进 TOOL_DEFS", "enter_standby" in names,
+          f"names={names}")
+    check("12i · enter_standby 必须追加在工具表末尾（保住 prompt 前缀缓存）",
+          names and names[-1] == "enter_standby", f"last={names[-1] if names else None}")
+
     # ---- ② 看门狗：一句都没说时不得起一轮 ----
     async def _run() -> None:
         s = types.SimpleNamespace()
@@ -3117,6 +3141,9 @@ def t_dismiss_and_watchdog() -> None:
         s._silence_ms = 0
         s._t0 = 0.0
         s._abort = False
+        # 空闲锚点必须是"刚刚"，否则会先撞上 VOICE_IDLE_STANDBY_SEC 那条
+        # 待机分支，测的就不是"重新武装"了。
+        s._last_active_at = time.monotonic()
         armed = []
         turned = []
         s._rearm_listening = lambda: armed.append(1)
@@ -3153,6 +3180,7 @@ def t_dismiss_and_watchdog() -> None:
         s2._rearm_listening = lambda: armed2.append(1)
         s2._start_turn = lambda: (turned2.append(1), True)[1]   # 同上的 True
         s2._silence_threshold_ms = lambda: 10 ** 9
+        s2._last_active_at = time.monotonic()
         s2._silence_watchdog = types.MethodType(
             S.VoiceSession._silence_watchdog, s2)
         try:
@@ -3185,12 +3213,43 @@ def t_dismiss_and_watchdog() -> None:
         s3._rearm_listening = lambda: None
         s3._start_turn = _start_turn_flaky
         s3._silence_threshold_ms = lambda: 0
+        s3._last_active_at = time.monotonic()
         s3._silence_watchdog = types.MethodType(
             S.VoiceSession._silence_watchdog, s3)
         await asyncio.wait_for(s3._silence_watchdog(), timeout=5)
         check("12i ★ 旧轮收尾中（_start_turn=False）看门狗继续等而不退出"
               "（barge 交接轮靠它收尾；若改成 return，本断言 1≠3 会红）",
               len(turned3) == 3, f"start_turn 调用 {len(turned3)} 次")
+
+        # ---- ⑤ 会话空闲超时：必须进待机，而不是无限重新武装 ----
+        # 这是 2026-10-22 用户反馈「硬件一直在监听，根本没有进入过待机」的
+        # 门禁断言：锚点 `_last_active_at` 停在很久以前 ⇒ 看门狗必须调
+        # `_enter_standby`，而且**不得**走重新武装那条（走那条就是无限循环）。
+        s4 = types.SimpleNamespace()
+        s4.session_id = "SMOKE-WD4"
+        s4.state = "listening"
+        s4._speech_ms = 0                 # 一句都没说
+        s4._silence_ms = 0
+        s4._t0 = time.monotonic()
+        s4._abort = False
+        s4._last_active_at = time.monotonic() - 10 ** 6
+        armed4, turned4, standby4 = [], [], []
+
+        async def _fake_standby(reason, farewell=""):
+            standby4.append(reason)
+
+        s4._rearm_listening = lambda: armed4.append(1)
+        s4._start_turn = lambda: (turned4.append(1), True)[1]
+        s4._silence_threshold_ms = lambda: 10 ** 9
+        s4._enter_standby = _fake_standby
+        s4._silence_watchdog = types.MethodType(
+            S.VoiceSession._silence_watchdog, s4)
+        await asyncio.wait_for(s4._silence_watchdog(), timeout=5)
+        check("12i ★ 会话空闲超时（VOICE_IDLE_STANDBY_SEC）必须进待机，"
+              "不得无限重新武装（原先只 rearm ⇒ 设备永远在监听）",
+              bool(standby4) and not armed4 and not turned4,
+              f"standby={standby4} armed={len(armed4)} "
+              f"turned={len(turned4)}")
 
     asyncio.run(_run())
 
