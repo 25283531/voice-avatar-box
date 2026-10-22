@@ -411,6 +411,16 @@ class VoiceSession:
 
         self._t0: float = 0.0               # 本轮 listen start 时刻
 
+        # 最后一次"有效内容"的时刻（monotonic 秒）。锚点是 **ASR 认出非空
+        # 文本** 那一刻（``_run_turn`` 里刷新），唤醒词也刷新一次（老人刚
+        # 喊完唤醒词，那 120s 当然要从现在算起）。
+        #
+        # ⚠️ 与 ``_t0`` 的区别是这条设计的全部要点：``_t0`` 是"本轮收听
+        # 窗口起点"，``_rearm_listening()`` 会重置它 ⇒ 用它做空闲判据的话，
+        # 每 60s 自己清零一次，永远等不到超时（真机表现就是"一直在监听"）。
+        # 本字段**只由有效内容刷新**，重新武装不碰它，所以能跨窗口累计。
+        self._last_active_at: float = time.monotonic()
+
         # 「退下吧」冷却截止时刻（monotonic 秒）。非零且未到期时，
         # _on_binary 丢弃上行音频、_on_listen 不重新武装 ——
         # 老人在连续收听模式下喊"退下吧"，要真的能让他清静一会儿。
@@ -979,6 +989,16 @@ class VoiceSession:
             log.warning("设备请求播报「%s」，但正在对话中 → 跳过（不打断）", text)
             return
         log.info("设备请求播报：%s", text)
+        # ---- 定时提醒 / 设备主动关心 = "唤醒"的一种 ----
+        # 待机（退下吧 or 空闲超时）期间 ``_dismissed_until`` 有效，此时服务端
+        # 会丢弃所有上行音频、并挡住设备重发的 listen start。提醒念完之后
+        # 老人想回一句"知道了"，那句话会被静默吃掉，设备只能干等冷却结束
+        # （默认 180s）—— 表现是"提醒响了，我说话它不理我"。
+        # 所以主动播报前先解待机，并把空闲锚点续到现在。
+        if self._dismissed_until:
+            log.info("设备主动播报，解除待机冷却")
+        self._dismissed_until = 0.0
+        self._last_active_at = time.monotonic()
         try:
             # 提示音乐**不在这里发**：它是固件内置的一段固定 OGG
             # （firmware/xiaozhi/main/assets/common/reminder_chime.ogg，
@@ -1022,6 +1042,10 @@ class VoiceSession:
             if self._dismissed_until:
                 log.info("[%s] 唤醒词到达，解除待机", self.session_id)
             self._dismissed_until = 0.0
+            # 唤醒词也是"有效内容"：老人刚喊完，那 120s 空闲当然从现在算起。
+            # 不刷的话会出现"刚唤醒就立刻被判空闲待机"（上一场对话的锚点
+            # 还停在几分钟前）。
+            self._last_active_at = time.monotonic()
             self._frames.clear()
             self._pcm.clear()
             self._speech_ms = 0
@@ -1118,20 +1142,95 @@ class VoiceSession:
             self._watchdog_task.cancel()
         self._watchdog_task = asyncio.create_task(self._silence_watchdog())
 
+    async def _enter_standby(self, reason: str, farewell: str = "") -> None:
+        """让设备真正进入待机：念完（可选的）告别语 → 固件切 idle。
+
+        **两条入口共用这一个实现**，别各写一份（同一事实两处实现必然分叉）：
+
+          * 「退下吧 / 你去休息吧 / 不聊了」——``farewell`` 非空，先念一句
+            告别语再待机；
+          * 会话空闲超时（``VOICE_IDLE_STANDBY_SEC``）——``farewell`` 为空，
+            静默待机：老人只是没说话，突然冒一句"我先待机了"反而是打扰。
+
+        为什么必须动**固件**而不只是服务端闭嘴（2026-10-21 真机实测）：
+        设备侧 ``CONFIG_USE_DEVICE_AEC=y`` ⇒ ``aec_mode_ = kAecOnDeviceSide``
+        ⇒ ``SetListeningMode(kListeningModeRealtime)``。realtime 模式下设备
+        播报完自动回 listening，而那一态 ``EnableWakeWordDetection(false)``
+        （application.cc:809）—— 唤醒词是关的。只靠服务端"不应答"的话，
+        老人再喊唤醒词设备根本听不见，实测聋过 164 秒。
+        只有 ``self.elder.standby`` 会把设备切到 ``kDeviceStateIdle``，
+        停掉上行推流并**重新打开 WakeNet**，下一次唤醒词才有效。
+
+        顺序不能反：先念告别语、后调固件。反过来的话设备已经 idle，
+        告别语会把它顶回 speaking，最后又落回 listening。
+        """
+        log.info("[%s] 进入待机：%s", self.session_id, reason)
+        # 服务端这一层的静默（固件没切成功时的兜底）：冷却期内 _on_binary
+        # 直接丢弃上行音频、_on_listen 不重新武装。
+        self._dismissed_until = (time.monotonic()
+                                 + config.VOICE_DISMISS_COOLDOWN_SEC)
+        self._frames.clear()
+        self._pcm.clear()
+        self._speech_ms = 0
+        self._silence_ms = 0
+        self._reset_speech_window()
+        # 先把 state 落下，待机期间后续到达的上行帧一律按"非 listening"丢弃。
+        self.state = "idle"
+        # 看门狗自停：本函数会从**看门狗内部**被调用（空闲超时那条入口），
+        # 那时 cancel(self._watchdog_task) 取消的就是当前 task —— 会立刻在
+        # 下一处 await 抛 CancelledError，把告别语和设备命令一起带走。
+        # 症状是"说了退下吧，设备既没待机也没吭声"，极难定位。
+        task = self._watchdog_task
+        if task is not None and not task.done() \
+                and task is not asyncio.current_task():
+            task.cancel()
+        self._watchdog_task = None
+        if farewell:
+            await self._speak_reply(farewell, time.monotonic())
+        try:
+            await self.call_device_tool("self.elder.standby", timeout=3.0)
+            log.info("[%s] 设备已切换待机（等下一次唤醒词）", self.session_id)
+        except Exception as exc:  # noqa: BLE001
+            # 待机是"少做一件事"，绝不能因为它失败而影响老人已经听到的话。
+            log.info("[%s] 设备侧待机命令未成功（%s: %s）→ 仅服务端静默，"
+                     "%d 秒后兜底恢复",
+                     self.session_id, type(exc).__name__, exc,
+                     config.VOICE_DISMISS_COOLDOWN_SEC)
+
     async def _silence_watchdog(self) -> None:
         """连续静音达到阈值就自动 finalize（等价于设备端 VAD 断句）。
 
         阈值是**自适应**的（:meth:`_silence_threshold_ms`）：本轮出现过长
-        停顿就多等。另有两道安全阀：
+        停顿就多等。另有三道安全阀：
           * ``VOICE_MAX_LISTEN_MS``：老人说着离开/卡住时兜底，不让会话
             永远挂在 listening（realtime 模式下设备不自己发 stop）；
           * ``VOICE_MIN_SPEECH_MS``：一句都没说就不触发，防止底噪被当成
-            一整句送 ASR。
+            一整句送 ASR；
+          * ``VOICE_IDLE_STANDBY_SEC``（2026-10-22 新增）：整场会话连续
+            这么久没有有效内容 → 进待机，而不是无限重新武装。
         """
         try:
             while self.state == "listening":
                 await asyncio.sleep(0.2)
                 if self.state != "listening":
+                    return
+                # ---- 会话级空闲 → 待机（用户 2026-10-22 需求）----
+                #
+                # 为什么必须放在最前面、而且每 0.2s 判一次：
+                # 下面那个 ``elapsed_ms >= VOICE_MAX_LISTEN_MS`` 分支要等
+                # 满 60s 才进得来，若把它当空闲判据，待机最早也要 60s 后
+                # 才可能触发，且每次重新武装都会把窗口清零 —— 就是"一直
+                # 监听、从没进过待机"的真机现象。
+                #
+                # 两个附加条件都是必需的：
+                #   * ``_speech_ms < VOICE_MIN_SPEECH_MS``：老人正在说话
+                #     （或刚开口）时不能待机，否则说到一半被掐掉；
+                #   * ``_last_active_at`` 只在有效识别时刷新，重新武装不碰。
+                if (self._speech_ms < config.VOICE_MIN_SPEECH_MS
+                        and time.monotonic() - self._last_active_at
+                        >= config.VOICE_IDLE_STANDBY_SEC):
+                    await self._enter_standby(
+                        f"连续 {config.VOICE_IDLE_STANDBY_SEC}s 没有有效内容")
                     return
                 threshold = self._silence_threshold_ms()
                 if self._silence_ms >= threshold and \
@@ -1358,49 +1457,23 @@ class VoiceSession:
 
         # ---- 「退下吧」：明确结束对话 ----
         # 不调 LLM（模型会在告别上客套三四句，老人更烦），直接念一句再见，
-        # 然后进入冷却：冷却期内丢弃上行音频、不重新武装监听。
-        # 为什么值得单独一条而不是塞进 LLM：realtime 模式下设备不跑唤醒词，
-        # 不主动闭嘴的话老人没有任何办法让音箱安静下来。
+        # 然后进入待机。为什么值得单独一条而不是塞进 LLM：realtime 模式下
+        # 设备不跑唤醒词，不主动闭嘴的话老人没有任何办法让音箱安静下来。
+        #
+        # 待机动作抽到 :meth:`_enter_standby`：会话空闲超时
+        # （``VOICE_IDLE_STANDBY_SEC``）走的是**同一条**路径，只是不念告别语。
+        # 两处各写一份必然分叉 —— 之前就分叉过（空闲那条只会"重新武装"，
+        # 永远不会待机）。
         if _DISMISS_RE.search(utterance):
             log.info("[%s] 老人要求结束对话：%s", self.session_id, utterance)
-            self._dismissed_until = (time.monotonic()
-                                     + config.VOICE_DISMISS_COOLDOWN_SEC)
-            # 清掉可能残留的听音缓冲，冷却结束后不该把这段当新的一句。
-            self._frames.clear()
-            self._pcm.clear()
-            self._speech_ms = 0
-            self._silence_ms = 0
-            if self._watchdog_task is not None and not self._watchdog_task.done():
-                self._watchdog_task.cancel()
-                self._watchdog_task = None
-            await self._speak_reply(_DISMISS_REPLY, started)
-            # ---- 需求 7：念完告别语，让**设备**真正进入待机 ----
-            #
-            # 两层配合，缺一不可（2026-10-22 用户原话：「语音答复之后就要进入
-            # 待机，在下次语音唤醒之前，不再监听声音和答复」）：
-            #
-            #   1. 固件层（self.elder.standby）：把设备切到 kDeviceStateIdle
-            #      ⇒ 停掉上行推流，并**重新打开 WakeNet**。realtime（连续
-            #      对话）模式下设备播完会回 listening，而那一态 WakeNet 是
-            #      关的 —— 只靠服务端"不应答"的话，老人再喊唤醒词设备听不见，
-            #      实测聋过 164 秒。
-            #   2. 服务端层（self._dismissed_until）：即使固件没切（老版本固件、
-            #      或者工具调用失败），本端也不再应答、不重新武装监听。
-            #      **必须调完再说**：先调固件再念告别语的话，设备已经 idle，
-            #      告别语会把它顶回 speaking，最后又落回 listening。
-            #
-            # 超时 3 秒、失败只记日志：待机是"少做一件事"，绝不能因为它失败
-            # 而让老人听不到那句"好的，您先忙"。
-            try:
-                await self.call_device_tool("self.elder.standby", timeout=3.0)
-                log.info("[%s] 设备已切换待机（等下一次唤醒词）", self.session_id)
-            except Exception as exc:  # noqa: BLE001
-                log.info("[%s] 设备侧待机命令未成功（%s: %s）→ 仅服务端静默，"
-                         "%d 秒后兜底恢复",
-                         self.session_id, type(exc).__name__, exc,
-                         config.VOICE_DISMISS_COOLDOWN_SEC)
-            self.state = "idle"
+            await self._enter_standby("老人要求结束对话",
+                                      farewell=_DISMISS_REPLY)
             return ""
+
+        # ---- 有效内容：刷新会话空闲锚点 ----
+        # 放在 dismiss 判据**之后**：老人说"退下吧"不该把空闲计时器续期，
+        # 那一刻会话已经结束了。放在 ASR 空结果之后同理（空识别不是内容）。
+        self._last_active_at = time.monotonic()
 
         log.info("[%s] 识别：%s", self.session_id, utterance)
         await self._send_json({"type": "stt", "text": utterance})
