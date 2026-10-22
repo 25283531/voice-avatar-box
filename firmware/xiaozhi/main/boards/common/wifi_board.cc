@@ -15,7 +15,6 @@
 #include <wifi_station.h>
 #include <wifi_configuration_ap.h>
 #include <ssid_manager.h>
-#include "afsk_demod.h"
 
 static const char *TAG = "WifiBoard";
 

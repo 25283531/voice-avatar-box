@@ -2,7 +2,6 @@
 #include "system_info.h"
 #include "settings.h"
 #include "display/display.h"
-#include "display/oled_display.h"
 #include "assets/lang_config.h"
 
 #include <esp_log.h>
@@ -159,11 +158,10 @@ std::string Board::GetSystemInfoJson() {
     auto display = GetDisplay();
     if (display) {
         json += R"("display":{)";
-        if (dynamic_cast<OledDisplay*>(display)) {
-            json += R"("monochrome":)" + std::string("true") + R"(,)";
-        } else {
-            json += R"("monochrome":)" + std::string("false") + R"(,)";
-        }
+        /* 2026-10-22 OLED 已从编译列表移除（本板只用 LCD）⇒ monochrome 固定 false。
+         * 原来用 dynamic_cast<OledDisplay*> 判断，但 oled_display.cc 不再编译后
+         * typeinfo 缺失会链接失败。 */
+        json += R"("monochrome":)" + std::string("false") + R"(,)";
         json += R"("width":)" + std::to_string(display->width()) + R"(,)";
         json += R"("height":)" + std::to_string(display->height()) + R"(,)";
         json.pop_back(); // Remove the last comma

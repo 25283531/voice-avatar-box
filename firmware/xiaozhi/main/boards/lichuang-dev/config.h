@@ -58,39 +58,5 @@
 #define DISPLAY_BACKLIGHT_PIN GPIO_NUM_42
 #define DISPLAY_BACKLIGHT_OUTPUT_INVERT true
 
-/* Camera pins */
-#define CAMERA_PIN_PWDN GPIO_NUM_NC
-#define CAMERA_PIN_RESET GPIO_NUM_NC
-#define CAMERA_PIN_XCLK GPIO_NUM_5
-#define CAMERA_PIN_SIOD GPIO_NUM_1
-#define CAMERA_PIN_SIOC GPIO_NUM_2
-
-#define CAMERA_PIN_D7 GPIO_NUM_9
-#define CAMERA_PIN_D6 GPIO_NUM_4
-#define CAMERA_PIN_D5 GPIO_NUM_6
-#define CAMERA_PIN_D4 GPIO_NUM_15
-#define CAMERA_PIN_D3 GPIO_NUM_17
-#define CAMERA_PIN_D2 GPIO_NUM_8
-#define CAMERA_PIN_D1 GPIO_NUM_18
-#define CAMERA_PIN_D0 GPIO_NUM_16
-#define CAMERA_PIN_VSYNC GPIO_NUM_3
-#define CAMERA_PIN_HREF GPIO_NUM_46
-#define CAMERA_PIN_PCLK GPIO_NUM_7
-
-#define XCLK_FREQ_HZ 20000000
-
-/* 摄像头的 SCCB（I2C）地址。
- *
- * 值来自 esp_cam_sensor 组件：sensors/gc0308/include/gc0308.h 的
- * GC0308_SCCB_ADDR。这里**刻意抄一份常量**而不是 include 那个头文件 ——
- * esp_cam_sensor 是 esp_video 的**私有**依赖（idf_component.yml 里
- * `require: private`），它的头文件不保证出现在 main 组件的 include 路径上，
- * 直接 include 会在别人换组件版本时突然编译失败。
- *
- * 用途：InitializeCamera() 在上电后先拿它探一次总线，探不到就跳过初始化
- * （详见 lichuang_dev_board.cc 里 InitializeCamera 的注释）。
- * ⚠️ 换摄像头模组时，这个地址必须跟着换。 */
-#define CAMERA_SCCB_ADDR 0x21
-
 
 #endif // _BOARD_CONFIG_H_

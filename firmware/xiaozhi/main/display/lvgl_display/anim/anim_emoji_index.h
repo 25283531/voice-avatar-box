@@ -2,7 +2,7 @@
 //
 // 素材：Noto Animated Emoji (https://fonts.google.com/noto/specimen/Noto+Emoji)
 //       版权所有 Google，许可 CC BY 4.0。
-//       512x512 GIF 按运动量自适应抽帧，缩放到 64x64，
+//       512x512 GIF 按运动量自适应抽帧，缩放到 48x48，
 //       转 LVGL LV_COLOR_FORMAT_RGB565A8（前 w*h*2 的 RGB565，后 w*h 的 alpha）。
 //
 // frame_ms 是这个动画每一帧该停多久（ms），时间轴与原 GIF 一致。
@@ -22,22 +22,21 @@ struct AnimEmojiEntry {
     uint16_t size;         // 边长
 };
 
-static constexpr uint16_t kAnimEmojiFrameSize = 64;
+static constexpr uint16_t kAnimEmojiFrameSize = 48;
 
 static const AnimEmojiEntry kAnimEmojiTable[] = {
-    {"panda", 0u, 59u, 12288u, 0u, 64u},
+    {"panda", 0u, 39u, 6912u, 0u, 48u},
 };
 
 static constexpr size_t kAnimEmojiCount = sizeof(kAnimEmojiTable) / sizeof(kAnimEmojiTable[0]);
 
-static constexpr size_t kAnimEmojiBlobSize = 724992u;
+static constexpr size_t kAnimEmojiBlobSize = 269568u;
 
 // 各帧停留时长（ms），下标以 AnimEmojiEntry::ms_off 为基
 static const uint16_t kAnimEmojiFrameMs[] = {
-    240u, 30u, 30u, 30u, 30u, 60u, 30u, 30u, 30u, 30u, 30u, 30u, 30u, 30u, 30u, 30u, 30u, 30u,
-    30u, 30u, 60u, 30u, 30u, 30u, 30u, 30u, 30u, 30u, 30u, 30u, 30u, 30u, 30u, 30u, 30u, 30u,
-    30u, 30u, 30u, 30u, 30u, 30u, 30u, 30u, 30u, 30u, 30u, 30u, 30u, 30u, 30u, 30u, 30u, 30u,
-    60u, 30u, 30u, 30u, 360u,
+    240u, 30u, 30u, 180u, 60u, 30u, 30u, 30u, 30u, 30u, 30u, 30u, 30u, 30u, 180u, 90u, 60u, 30u,
+    30u, 30u, 30u, 30u, 30u, 30u, 30u, 30u, 30u, 90u, 60u, 30u, 30u, 30u, 30u, 60u, 30u, 30u,
+    60u, 120u, 390u,
 };
 
 static constexpr size_t kAnimEmojiFrameMsCount = sizeof(kAnimEmojiFrameMs) / sizeof(kAnimEmojiFrameMs[0]);

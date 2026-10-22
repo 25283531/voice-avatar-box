@@ -1,20 +1,11 @@
 # Define source files
 set(SOURCES "audio/audio_codec.cc"
             "audio/audio_service.cc"
-            "audio/codecs/no_audio_codec.cc"
             "audio/codecs/box_audio_codec.cc"
             "audio/codecs/es8311_audio_codec.cc"
-            "audio/codecs/es8374_audio_codec.cc"
-            "audio/codecs/es8388_audio_codec.cc"
-            "audio/codecs/es8389_audio_codec.cc"
-            "audio/codecs/dummy_audio_codec.cc"
             "audio/processors/audio_debugger.cc"
-            "led/single_led.cc"
-            "led/circular_strip.cc"
-            "led/gpio_led.cc"
             "display/display.cc"
             "display/lcd_display.cc"
-            "display/oled_display.cc"
             "display/lvgl_display/lvgl_display.cc"
             # emote（表情引擎）已于 2026-10-20 **整体删除**（源文件、依赖都删了）。
             # 用户问「现在能调用吗」——不能：本产品固定走 LVGL 界面
@@ -31,9 +22,7 @@ set(SOURCES "audio/audio_codec.cc"
             "display/lvgl_display/gif/lvgl_gif.cc"
             "display/lvgl_display/gif/gifdec.c"
             "display/lvgl_display/jpg/image_to_jpeg.cpp"
-            "display/lvgl_display/jpg/jpeg_to_image.c"
             "protocols/protocol.cc"
-            "protocols/mqtt_protocol.cc"
             "protocols/websocket_protocol.cc"
             "mcp_server.cc"
             "system_info.cc"
@@ -57,14 +46,22 @@ set(INCLUDE_DIRS "." "display" "display/lvgl_display" "display/lvgl_display/jpg"
 # 这两个目录的文件与上游 MIT 代码逐字一致，只改了目录（见 net/README.md）。
 file(GLOB NET_SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/net/*.cc)
 file(GLOB NET_ESP_SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/net/esp/*.cc)
+# 2026-10-22 MQTT 协议删除（固定走 WebSocket）：esp_mqtt.cc 不再编译。
+list(FILTER NET_ESP_SOURCES EXCLUDE REGEX "/esp_mqtt\\.cc$")
 list(APPEND SOURCES ${NET_SOURCES} ${NET_ESP_SOURCES})
 
 # Add board common files
 file(GLOB BOARD_COMMON_SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/boards/common/*.cc)
-# boards/common 下这两个是 4G 模组的板级实现，本板（WiFi）不用。
-# 它们 #include <at_modem.h>，而 esp-ml307 组件已被删除 ⇒ 必须排除，
-# 否则编译直接失败。排除后 4G 相关目标码也不再进固件。
-list(FILTER BOARD_COMMON_SOURCES EXCLUDE REGEX "/(ml307|dual_network)_board\\.cc$")
+# boards/common 下这些本板不用（2026-10-22 精简）：
+#   · ml307_board / dual_network_board —— 4G 板级实现，#include <at_modem.h> 会编译失败
+#   · esp32_camera —— 摄像头（已删 esp_video/esp_cam_sensor/esp_new_jpeg 依赖）
+#   · axp2101 / sy6970 —— 其他板的电源管理芯片
+#   · knob —— 旋钮编码器
+#   · afsk_demod —— AFSK 解调（wifi_board.cc 已不再 #include）
+#   · press_to_talk_mcp_tool —— 按住说话 MCP 工具
+#   · sleep_timer / power_save_timer / adc_battery_monitor / system_reset —— 其他板外设
+# 只保留：board / wifi_board / button / i2c_device / backlight
+list(FILTER BOARD_COMMON_SOURCES EXCLUDE REGEX "/(ml307|dual_network|esp32_camera)_board?\\.cc$|/(axp2101|sy6970|knob|afsk_demod|press_to_talk_mcp_tool|sleep_timer|power_save_timer|adc_battery_monitor|system_reset)\\.cc$")
 list(APPEND SOURCES ${BOARD_COMMON_SOURCES})
 list(APPEND INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/boards/common)
 
@@ -707,12 +704,7 @@ file(GLOB COMMON_SOUNDS ${CMAKE_CURRENT_SOURCE_DIR}/assets/common/*.ogg)
 # If target chip is ESP32, exclude specific files to avoid build errors
 if(CONFIG_IDF_TARGET_ESP32)
     list(REMOVE_ITEM SOURCES "audio/codecs/box_audio_codec.cc"
-                             "audio/codecs/es8388_audio_codec.cc"
-                             "audio/codecs/es8389_audio_codec.cc"
                              "led/gpio_led.cc"
-                             "${CMAKE_CURRENT_SOURCE_DIR}/boards/common/esp32_camera.cc"
-                             "display/lvgl_display/jpg/image_to_jpeg.cpp"
-                             "display/lvgl_display/jpg/jpeg_to_image.c"
                              )
 endif()
 
