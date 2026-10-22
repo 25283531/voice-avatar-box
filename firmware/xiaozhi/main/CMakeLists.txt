@@ -21,7 +21,6 @@ set(SOURCES "audio/audio_codec.cc"
             "display/lvgl_display/lvgl_image.cc"
             "display/lvgl_display/gif/lvgl_gif.cc"
             "display/lvgl_display/gif/gifdec.c"
-            "display/lvgl_display/jpg/image_to_jpeg.cpp"
             "protocols/protocol.cc"
             "protocols/websocket_protocol.cc"
             "mcp_server.cc"
@@ -54,14 +53,15 @@ list(APPEND SOURCES ${NET_SOURCES} ${NET_ESP_SOURCES})
 file(GLOB BOARD_COMMON_SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/boards/common/*.cc)
 # boards/common 下这些本板不用（2026-10-22 精简）：
 #   · ml307_board / dual_network_board —— 4G 板级实现，#include <at_modem.h> 会编译失败
-#   · esp32_camera —— 摄像头（已删 esp_video/esp_cam_sensor/esp_new_jpeg 依赖）
+#   · esp32_camera —— 摄像头（已删 esp_video/esp_cam_sensor/esp_new_jpeg 依赖）。
+#     注意文件名是 esp32_camera.cc，**没有** _board 后缀，正则不能写成 esp32_camera_board?
 #   · axp2101 / sy6970 —— 其他板的电源管理芯片
 #   · knob —— 旋钮编码器
 #   · afsk_demod —— AFSK 解调（wifi_board.cc 已不再 #include）
 #   · press_to_talk_mcp_tool —— 按住说话 MCP 工具
 #   · sleep_timer / power_save_timer / adc_battery_monitor / system_reset —— 其他板外设
 # 只保留：board / wifi_board / button / i2c_device / backlight
-list(FILTER BOARD_COMMON_SOURCES EXCLUDE REGEX "/(ml307|dual_network|esp32_camera)_board?\\.cc$|/(axp2101|sy6970|knob|afsk_demod|press_to_talk_mcp_tool|sleep_timer|power_save_timer|adc_battery_monitor|system_reset)\\.cc$")
+list(FILTER BOARD_COMMON_SOURCES EXCLUDE REGEX "/(ml307|dual_network)_board\\.cc$|/(esp32_camera|axp2101|sy6970|knob|afsk_demod|press_to_talk_mcp_tool|sleep_timer|power_save_timer|adc_battery_monitor|system_reset)\\.cc$")
 list(APPEND SOURCES ${BOARD_COMMON_SOURCES})
 list(APPEND INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/boards/common)
 
