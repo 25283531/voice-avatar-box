@@ -3,7 +3,6 @@
 #include "esp_tcp.h"
 #include "esp_ssl.h"
 #include "esp_udp.h"
-#include "esp_mqtt.h"
 #include "http_client.h"
 #include "web_socket.h"
 
@@ -33,7 +32,10 @@ std::unique_ptr<Udp> EspNetwork::CreateUdp(int connect_id) {
 }
 
 std::unique_ptr<Mqtt> EspNetwork::CreateMqtt(int connect_id) {
-    return std::make_unique<EspMqtt>();
+    /* 2026-10-22 MQTT 协议删除（固定走 WebSocket）：esp_mqtt.cc 不再编译。
+     * 这里必须保留函数体（接口纯虚要求 override），但恒返回 nullptr。
+     * 全仓已无调用方（application.cc 协议选择已固定 WebSocketProtocol）。 */
+    return nullptr;
 }
 
 std::unique_ptr<WebSocket> EspNetwork::CreateWebSocket(int connect_id) {
