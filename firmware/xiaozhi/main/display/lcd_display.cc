@@ -1270,6 +1270,32 @@ void LcdDisplay::SetTheme(Theme* theme) {
     lv_obj_set_style_text_font(screen, text_font, 0);
     lv_obj_set_style_text_color(screen, lvgl_theme->text_color(), 0);
 
+    /* ⚠️ 字幕/状态标签必须在这里补一次字体（2026-10-22 真机事故）
+     *
+     * 时序：SetupUI() 在 Application 启动早期跑，那时 assets 分区还没挂载
+     * （Assets::Apply() 在 application.cc:182 才执行），theme 里是**编译进
+     * 固件的** font_puhui_basic_20_4 —— 只有 788 个字形，基本只覆盖
+     * assets/locales/*/language.json 里的界面文案。
+     *
+     * 而这两个 label 在 SetupUI 里是**显式**设字体的（不靠继承），所以
+     * Assets::Apply() 之后 SetTheme() 只改 screen 的字体，改不到它们：
+     * 屏幕表现为「字幕里大部分汉字不显示，只剩 不/用/了/有/时/点/度 这类
+     * 恰好出现在界面文案里的字」，真机截图 2026-10-22 已实证
+     * （服务端原文「明天平顶山少云，十二到十九度…」→ 屏上只剩「少，到度，点。」）。
+     *
+     * 修在这里而不是把 SetupUI 挪到 assets 之后：SetTheme 是主题切换/资源
+     * 热更新的统一入口，补在这里对「开机首次加载」和「后续换主题」两条路
+     * 都成立，也不会打乱 SetupUI 与 LVGL 初始化的先后依赖。 */
+    if (chat_message_label_ != nullptr) {
+        lv_obj_set_style_text_font(chat_message_label_, text_font, 0);
+    }
+    if (status_label_ != nullptr) {
+        lv_obj_set_style_text_font(status_label_, text_font, 0);
+    }
+    if (notification_label_ != nullptr) {
+        lv_obj_set_style_text_font(notification_label_, text_font, 0);
+    }
+
     // Set background image
     if (lvgl_theme->background_image() != nullptr) {
         lv_obj_set_style_bg_image_src(container_, lvgl_theme->background_image()->image_dsc(), 0);
