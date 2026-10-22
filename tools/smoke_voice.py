@@ -2704,6 +2704,11 @@ def t_barge_in() -> None:
             s8._first_speech_frame = 5
             s8._last_speech_frame = 9
             s8._barge_handover = True
+            # _finalize 的 finally 现在会读这两个字段做"待机兜底"：
+            # 桩对象漏了就是 AttributeError，整段 12l 崩掉。空串/False
+            # 表示"本轮没有待机候选"，与正常答完的一轮等价。
+            s8._dismiss_candidate = ""
+            s8._standby_requested = False
             ran = []
 
             async def _run_turn_stub(pcm, started) -> str:
@@ -2736,6 +2741,8 @@ def t_barge_in() -> None:
                 s8b._first_speech_frame = 5
                 s8b._last_speech_frame = 9
                 s8b._barge_handover = False
+                s8b._dismiss_candidate = ""
+                s8b._standby_requested = False
                 ran2 = []
 
                 async def _run_turn_stub2(pcm, started) -> str:

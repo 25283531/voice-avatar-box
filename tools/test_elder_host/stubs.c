@@ -132,6 +132,8 @@ static int s_tone_count;
 static int s_rgb_count;
 static int s_rgb_pending;
 static int s_rgb_escalate;
+/* 提醒闪烁（漏服后一直闪，与「升级成红灯」是两件事，分开计） */
+static int s_rgb_nag;
 static int s_rgb_done;
 /* 「只屏显不发声」的通知（未校时提示走这条）。单独计数，不并进 tone：
  * 并进去的话「播了提示音」与「只是安静地在屏幕上说了句状态」无法区分，
@@ -142,6 +144,7 @@ int  stub_tone_count(void) { return s_tone_count; }
 int  stub_rgb_count(void) { return s_rgb_count; }
 int  stub_rgb_pending_count(void) { return s_rgb_pending; }
 int  stub_rgb_escalate_count(void) { return s_rgb_escalate; }
+int  stub_rgb_nag_count(void) { return s_rgb_nag; }
 int  stub_rgb_done_count(void) { return s_rgb_done; }
 int  stub_notice_count(void) { return s_notice_count; }
 void stub_fx_reset(void)
@@ -150,6 +153,7 @@ void stub_fx_reset(void)
     s_rgb_count = 0;
     s_rgb_pending = 0;
     s_rgb_escalate = 0;
+    s_rgb_nag = 0;
     s_rgb_done = 0;
     s_notice_count = 0;
 }
@@ -166,6 +170,10 @@ void elder_ui_notice(const char *t, const char *emotion)
 void elder_rgb_med_done(void) { s_rgb_count++; s_rgb_done++; }
 void elder_rgb_med_pending(void) { s_rgb_count++; s_rgb_pending++; }
 void elder_rgb_med_escalate(void) { s_rgb_count++; s_rgb_escalate++; }
+/* b7c5618 给 reminder.c:258 加了漏服闪烁调用，但宿主测试的桩没跟上
+ * ⇒ server-ci 的「elder 断网链路宿主测试」自那时起一直是红的
+ * （undefined reference to `elder_rgb_reminder_nag_start`）。 */
+void elder_rgb_reminder_nag_start(void) { s_rgb_count++; s_rgb_nag++; }
 
 /* ---------------- FreeRTOS 任务（丢弃，不启动死循环） ---------------- */
 

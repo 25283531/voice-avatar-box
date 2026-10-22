@@ -48,6 +48,8 @@ int  stub_rgb_count(void);
 int  stub_rgb_pending_count(void);
 int  stub_rgb_escalate_count(void);
 int  stub_rgb_done_count(void);
+/* 漏服后的闪烁提醒次数（elder_rgb_reminder_nag_start）。 */
+int  stub_rgb_nag_count(void);
 /* 「只屏显不发声」的通知次数（elder_ui_notice）。与 tone 分开计：
  * 未校时提示必须**看得见但不响**，两者混在一起就测不出这条区分。 */
 int  stub_notice_count(void);
