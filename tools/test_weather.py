@@ -463,7 +463,15 @@ def test_tool_wiring() -> None:
 
     names = [d["function"]["name"] for d in voice_tools.TOOL_DEFS]
     check("get_weather" in names, "T8-1 get_weather 必须注册进 TOOL_DEFS")
-    eq(names[-1], "get_weather", "T8-2 ★ 新工具必须追加在末尾（保住 prompt 前缀缓存）")
+    # T8-2 钉的是**纪律**，不是快照：「新工具必须追加在末尾，不许插到中间」。
+    #
+    # 原来写的是 `eq(names[-1], "get_weather")` —— 那等于把"get_weather 恰好是
+    # 最后一个"当成不变式。2026-10-22 加了 enter_standby（同样追加在末尾）之后
+    # 这条就红了，而它要防的错（把新工具插到 get_weather 前面，让后面所有工具
+    # 定义整体位移、prompt 前缀缓存全失效）根本没发生。
+    # ⇒ 改成"相对顺序"：get_weather 必须排在它之前那批工具之后。
+    eq(names.index("get_weather") > names.index("confirm_reminder"), True,
+       "T8-2 ★ 新工具必须追加在末尾（保住 prompt 前缀缓存）")
 
     # 设备常驻城市：写在 settings JSON 里，不改表结构
     fresh_db()
