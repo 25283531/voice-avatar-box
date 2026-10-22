@@ -665,7 +665,11 @@ static void test_nvs_crc_rejects_corrupt(void)
     printf("  [INFO] 已翻转 NVS 第 %zu 字节（items[0].hour: 8 -> %u）\n",
            hour_off, (unsigned)(8u ^ 0xFFu));
 
+    /* 灯计数必须在这里清零：T9 前面的用例会点亮待确认/闪灯，
+     * 不清零的话下面「不得点灯」的断言拿到的是别人的计数，
+     * 要么恒假要么恒真，两条路都是假绿。 */
     rec_reset();
+    stub_fx_reset();
     elder_reminder_init(rec_cb, NULL);
     t = tbl();
     check("CRC 不匹配时整表被丢弃（不得半信半疑地留一半）",
@@ -680,10 +684,13 @@ static void test_nvs_crc_rejects_corrupt(void)
           t && t->done_today == 0 && t->pending_today == 0,
           det("done=0x%04x pending=0x%04x —— 坏数据里的「已完成」会让子女端看到假绿",
               t ? t->done_today : 0xFFFF, t ? t->pending_today : 0xFFFF));
+    /* escalate 这条自 2026-10-21 起就再也不会被调用（红灯改由 nag 负责），
+     * 单看它等于恒真；必须同时钉住真正会点灯的 nag，断言才有效。 */
     check("丢弃坏表后不得凭空触发任何提醒（更不能按乱码时刻响）",
-          g_trans_n == 0 && stub_rgb_escalate_count() == 0,
-          det("重启后发生了 %d 次状态转移，红灯 escalate=%d", g_trans_n,
-              stub_rgb_escalate_count()));
+          g_trans_n == 0 && stub_rgb_escalate_count() == 0
+             && stub_rgb_nag_count() == 0,
+          det("重启后发生了 %d 次状态转移，红灯 escalate=%d nag=%d", g_trans_n,
+              stub_rgb_escalate_count(), stub_rgb_nag_count()));
 
     /* ---- 丢弃之后引擎必须还能用：坏表只是「降级到空表」，
      * 不是把设备卡死。重新同步一次就应恢复正常 ---- */
@@ -909,8 +916,9 @@ static void test_restart_no_refire(void)
           det("pending_today=0x%04x —— 已服药者被要求再吃一次",
               t->pending_today));
     check("重启后也不该重复点亮待确认红灯",
-          stub_rgb_pending_count() == 0,
-          det("med_pending 被点亮 %d 次", stub_rgb_pending_count()));
+          stub_rgb_pending_count() == 0 && stub_rgb_nag_count() == 0,
+          det("med_pending 被点亮 %d 次，nag 闪灯 %d 次",
+              stub_rgb_pending_count(), stub_rgb_nag_count()));
 
     /* ---- 反向：跨到第二天必须重新响，否则就修成了「永不响」 ---- */
     stub_time_set(1772661600L + 86400 + 2 * 3600);   /* 次日 08:00 */
