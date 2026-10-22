@@ -316,10 +316,20 @@ void OnReminder(const elder_rmd_item_t *item, elder_rmd_state_t st, void *ctx)
          * 全屏文字里**多一行确认提示**：老人看到"该吃药了"之后的第一反应
          * 是"我该怎么办"。只写任务、不写怎么确认，等于把下一步留成空白 ——
          * 而这正是按键/SOS 都取消之后最容易卡住的地方。
-         * 提示不进 TTS：语音只念事项本身，多念一句"请说吃过了"很吵。 */
+         * 提示不进 TTS：语音只念事项本身，多念一句"请说吃过了"很吵。
+         *
+         * ⚠️ 2026-10-22 两处修正：
+         *  ① 确认话术**必须按类型分开**。原来不管什么提醒都写「说「我吃过了」」，
+         *     于是「喝水」提醒的屏上写着"说「我吃过了」"—— 老人照念反而答非所问，
+         *     而且服务端的确认正则按语义分档，对不上就是白念。
+         *  ② 删掉「或按一下按钮」。用户明确说 GPIO11 还没接开关，屏幕上让人
+         *     按按钮，老人只会摸半天找不到 —— 提示不能指向不存在的操作。
+         *     （开关接上后要同时改回这里和服务端 session.py 的 _PENDING_REMINDER_HINT。） */
+        const char *how_to_confirm = (item->type == ELDER_RMD_TYPE_MEDICINE)
+                                         ? "说「我吃过了」" : "说「弄好了」";
         char screen_text[160];
-        snprintf(screen_text, sizeof(screen_text),
-                 "%s\n\n说「我吃过了」\n或按一下按钮", text);
+        snprintf(screen_text, sizeof(screen_text), "%s\n\n%s", text,
+                 how_to_confirm);
         elder_ui_show_reminder(screen_text);
 
         /* 1) 先响固件内置的提醒音乐（约 4.9 秒，离线也有声音）
