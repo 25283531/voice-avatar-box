@@ -51,6 +51,8 @@ MAIN_CMAKE = XIAOZHI / "main" / "CMakeLists.txt"
 MAIN_CC = XIAOZHI / "main" / "main.cc"
 SDK_DEFAULTS = XIAOZHI / "sdkconfig.defaults"
 LCD_DISPLAY_CC = XIAOZHI / "main" / "display" / "lcd_display.cc"
+LCD_DISPLAY_H = XIAOZHI / "main" / "display" / "lcd_display.h"
+MCP_SERVER_CC = XIAOZHI / "main" / "mcp_server.cc"
 
 BEGIN = "# >>> BEGIN elder-companion overlay (由 tools/merge_to_xiaozhi.py 注入，勿手改) >>>"
 END = "# <<< END elder-companion overlay <<<"
@@ -480,6 +482,18 @@ def check() -> int:
     # 会红，避免「布局悄悄回退」还照样出包。重贴步骤见 README「上游定制补丁」节。
     layout_ok = LCD_DISPLAY_CC.is_file() and "elder-layout-70-30" in LCD_DISPLAY_CC.read_text(encoding="utf-8")
     ok &= layout_ok
+    # 需求 8（2026-10-22）：全屏大字提醒。同样是**直接改上游**的两处
+    # （lcd_display.h 加声明、lcd_display.cc 加实现），上游 sync 会一起冲掉。
+    # 两个文件都要守：只冲掉头文件时，症状是链接期
+    # "no member named 'ShowReminder'"；只冲掉实现则反过来 —— 两者都不该
+    # 等到编译 8 分钟后才发现。
+    remind_h_ok = LCD_DISPLAY_H.is_file() and "elder-reminder-fullscreen" in LCD_DISPLAY_H.read_text(encoding="utf-8")
+    remind_cc_ok = LCD_DISPLAY_CC.is_file() and "elder-reminder-fullscreen" in LCD_DISPLAY_CC.read_text(encoding="utf-8")
+    ok &= remind_h_ok and remind_cc_ok
+    # 需求 7（2026-10-22）：待机。mcp_server.cc 里注册 self.elder.standby，
+    # 也是直接改上游的定制。
+    standby_ok = MCP_SERVER_CC.is_file() and "elder_enter_standby" in MCP_SERVER_CC.read_text(encoding="utf-8")
+    ok &= standby_ok
     print("[merge] 合并状态:", "已合并" if ok else "未合并/不完整")
     print(f"  components/elder : {'OK' if ELDER_DST.is_dir() else 'MISSING'}")
     print(f"  main/CMakeLists  : {'OK' if MAIN_CMAKE.is_file() and BEGIN in MAIN_CMAKE.read_text(encoding='utf-8') else 'MISSING'}")
@@ -487,6 +501,9 @@ def check() -> int:
     print(f"  sdkconfig.defaults: {'OK' if SDK_DEFAULTS.is_file() and BEGIN in SDK_DEFAULTS.read_text(encoding='utf-8') else 'MISSING'}")
     print(f"  display/lcd_display.cc: {'OK' if lcd_ok else 'MISSING'}")
     print(f"  lcd_display.cc 70/30 布局: {'OK' if layout_ok else 'MISSING（被上游同步冲掉？按 README「上游定制补丁」节重贴）'}")
+    print(f"  lcd_display.h 全屏提醒: {'OK' if remind_h_ok else 'MISSING（需求 8）'}")
+    print(f"  lcd_display.cc 全屏提醒: {'OK' if remind_cc_ok else 'MISSING（需求 8）'}")
+    print(f"  mcp_server.cc 待机工具: {'OK' if standby_ok else 'MISSING（需求 7）'}")
     return 0 if ok else 2
 
 

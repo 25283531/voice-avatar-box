@@ -68,6 +68,29 @@ void elder_rgb_med_pending(void);   /* 长亮红 */
 void elder_rgb_med_done(void);      /* 长亮绿（默认 60s 后回落） */
 void elder_rgb_med_escalate(void);  /* 快速闪烁红 */
 
+/* ------------------------------------------------- 需求 8：提醒的闪灯节奏
+ *
+ * 用户 2026-10-22 原话：「定时任务提醒时，应该红灯闪烁（闪烁10秒，
+ * 10分钟后再闪烁10秒，2小时内以此重复。2小时后不再亮灯。）」
+ *
+ * 为什么节奏放在**灯效模块内部**而不是让上层每 10 分钟调一次 request：
+ *   1. 上层要自己做这件事就必须再起一个任务或定时器 —— 本仓已经因为
+ *      "回调跑在 esp_timer 任务里、栈只有 3.5KB" 出过随机 LoadProhibited
+ *      （见 elder_bridge.cc 的 ScheduleAnnounce 注释），能不加任务就不加；
+ *   2. rgb_task 本来就每 30ms 醒一次，判断"现在是不是该闪"是零成本的；
+ *   3. 节奏只有一份真源。上层若另算一遍，"2 小时后关闭"就有两个判据，
+ *      迟早分叉成"灯还闪、界面已经没了"。
+ *
+ * 语义：
+ *   * nag_start() 从**调用时刻**起算 2 小时，每 10 分钟的前 10 秒红灯闪；
+ *   * 2 小时到点后灯自然熄灭（不需要上层记得来关）；
+ *   * 期间若老人确认完成（med_done）或出现更高优先级的灯效
+ *     （ELDER_RGB_PRIO_MED_PEND 及以上，例如求助告警），nag 让位；
+ *   * nag_stop() 立即停（确认完成时调）。
+ */
+void elder_rgb_reminder_nag_start(void);
+void elder_rgb_reminder_nag_stop(void);
+
 #ifdef __cplusplus
 }
 #endif

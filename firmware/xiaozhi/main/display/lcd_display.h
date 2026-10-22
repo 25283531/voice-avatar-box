@@ -79,6 +79,24 @@ public:
     
     // Set whether to hide chat messages/subtitles
     void SetHideSubtitle(bool hide);
+
+    // >>> BEGIN elder-reminder-fullscreen (2026-10-22，需求 8) >>>
+    /* 全屏显示一条提醒内容（图片区不再显示，用整屏大字）。
+     *
+     * 为什么放在 LcdDisplay 而不是基类 Display：
+     *   基类 display.h 是上游文件，加虚函数会牵动所有子类（OLED / Emote /
+     *   RGB……全部要跟着实现一遍）。而"全屏大字提醒"只对这块 320x240 的
+     *   屏有意义，所以只在本类暴露，由 elder_bridge 用 dynamic_cast 取到
+     *   （本工程 -frtti 已开）。代价：没有屏/不是这台机时拿不到 overlay，
+     *   但那条路径本来就不该显示全屏提醒。
+     *
+     * 显隐由调用方控制（elder_ui 负责 4 小时倒计时），本类不管计时。
+     */
+    void ShowReminder(const char* text);
+    void HideReminder();
+    lv_obj_t* reminder_overlay_ = nullptr;   /* 懒创建，全屏不透明 */
+    lv_obj_t* reminder_label_ = nullptr;
+    // <<< END elder-reminder-fullscreen <<<
 };
 
 // SPI LCD display

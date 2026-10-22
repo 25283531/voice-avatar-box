@@ -30,6 +30,7 @@
 #include "display.h"
 #include "device_state_event.h"
 #include "assets/lang_config.h"   // Lang::Sounds::OGG_* 内置提示音（离线可用）
+#include "lcd_display.h"          // 需求 8：全屏提醒（ShowReminder/HideReminder）
 
 #include "elder_board.h"
 #include "elder_rgb.h"
@@ -87,6 +88,41 @@ void OnNotify(const char *text, const char *emotion, void *ctx)
     if (emotion && emotion[0]) {
         display->SetEmotion(emotion);
     }
+}
+
+/* ---- 需求 8：全屏大字提醒 ----
+ *
+ * 为什么用 dynamic_cast 而不是给基类 Display 加虚函数：display.h 是上游
+ * 文件，加一个纯虚函数等于要求 OLED / Emote / RGB 各实现一遍（它们根本
+ * 没有"全屏大字"这个概念）。这块屏才有意义，所以只对 LcdDisplay 生效。
+ * 本工程开了 RTTI（编译参数 -frtti），dynamic_cast 可用。
+ *
+ * 拿不到 LcdDisplay 时**静默返回**：无屏设备上本来就没有全屏提醒，
+ * 提醒该做的其他事（闪灯、语音、回执）一点也不能少 —— 所以这里不能
+ * 抛错让上层中断。 */
+LcdDisplay *AsLcdDisplay()
+{
+    auto *display = Board::GetInstance().GetDisplay();
+    if (display == nullptr) return nullptr;
+    return dynamic_cast<LcdDisplay *>(display);
+}
+
+void OnShowReminder(const char *text, void *ctx)
+{
+    (void)ctx;
+    auto *lcd = AsLcdDisplay();
+    if (lcd == nullptr) {
+        ESP_LOGW(TAG, "当前显示不是 LcdDisplay，全屏提醒降级为屏显通知");
+        return;
+    }
+    lcd->ShowReminder(text ? text : "");
+}
+
+void OnHideReminder(void *ctx)
+{
+    (void)ctx;
+    auto *lcd = AsLcdDisplay();
+    if (lcd != nullptr) lcd->HideReminder();
 }
 
 /* ---------------------------------------------------------------- 提示音 */
@@ -258,6 +294,18 @@ void OnReminder(const elder_rmd_item_t *item, elder_rmd_state_t st, void *ctx)
         } else {
             snprintf(text, sizeof(text), "%s时间到了", item->label);
         }
+
+        /* 需求 8：屏幕图片不再显示，全屏大字显示任务内容，直到确认或 4 小时。
+         *
+         * 全屏文字里**多一行确认提示**：老人看到"该吃药了"之后的第一反应
+         * 是"我该怎么办"。只写任务、不写怎么确认，等于把下一步留成空白 ——
+         * 而这正是按键/SOS 都取消之后最容易卡住的地方。
+         * 提示不进 TTS：语音只念事项本身，多念一句"请说吃过了"很吵。 */
+        char screen_text[160];
+        snprintf(screen_text, sizeof(screen_text),
+                 "%s\n\n说「我吃过了」\n或按一下按钮", text);
+        elder_ui_show_reminder(screen_text);
+
         /* 1) 先响固件内置的提醒音乐（约 4.9 秒，离线也有声音）
          * 2) 音乐放完再念事项内容（在线 TTS；离线只屏显+说明）
          * 两步分开而不是"边响边说"：见 ScheduleAnnounce 上方的注释。 */
@@ -266,10 +314,14 @@ void OnReminder(const elder_rmd_item_t *item, elder_rmd_state_t st, void *ctx)
         break;
     }
     case ELDER_RMD_DONE:
+        elder_ui_hide_reminder();          /* 确认完成 ⇒ 全屏提醒立刻收起 */
         elder_ui_set_state(ELDER_UI_CONFIRMED, 8000);
         elder_ui_play_tone(ELDER_TONE_SUCCESS);
         break;
     case ELDER_RMD_ESCALATED:
+        /* 超时升级：**不收全屏提醒**（用户明确要求"没确认就一直显示"），
+         * 只换表情 + 响一声感叹音。灯也不再改成"一直闪"——
+         * 交给 elder_rgb 的 2 小时节奏，见 reminder.c 的说明。 */
         elder_ui_set_state(ELDER_UI_MISSED, 0);
         elder_ui_play_tone(ELDER_TONE_EXCLAMATION);
         break;
@@ -283,22 +335,32 @@ void OnReminder(const elder_rmd_item_t *item, elder_rmd_state_t st, void *ctx)
 
 /* ---------------------------------------------------------------- 按键 */
 
-/* 找第一条「今天还没确认」的服药提醒。
- * 返回下标，没有则 -1。抽成函数的原因：短按直接确认、长按挂窗口两条路
- * 必须用**同一套判据**，否则会出现「长按能确认、短按确认到别的条」。 */
-int FirstUndoneMedicine()
+/* 找第一条「今天还没确认」的提醒，**服药优先**，其次日程。
+ * 返回下标，没有则 -1。抽成函数的原因：短按直接确认、长按挂窗口、
+ * 语音确认三条路必须用**同一套判据**，否则会出现「长按能确认、短按确认到
+ * 别的条」这种对不上的行为。
+ *
+ * 2026-10-22 需求 8 把它从"只看服药"扩展到"任意提醒"：
+ * 现在日程提醒也会全屏显示并要求"语音/按键确认完成"，判据若仍只认服药，
+ * 老人对日程说「做完了」会被回一句"没有待确认的提醒"。
+ * **服药优先**是为了不动老行为：两条都待确认时，确认的仍是药那一条
+ * （药漏了是真事故，日程漏了不是）。 */
+int FirstUndoneReminder()
 {
     const elder_rmd_table_t *tbl = nullptr;
     if (elder_reminder_list(&tbl) != ESP_OK || tbl == nullptr) {
         return -1;
     }
+    int fallback = -1;
     for (uint8_t i = 0; i < tbl->count && i < ELDER_REMINDER_MAX; i++) {
-        if (tbl->items[i].type != ELDER_RMD_TYPE_MEDICINE) continue;
         if (!tbl->items[i].enabled) continue;
         if (tbl->done_today & (1u << i)) continue;   /* 已完成的不必再确认 */
-        return (int)i;
+        if (tbl->items[i].type == ELDER_RMD_TYPE_MEDICINE) {
+            return (int)i;                            /* 服药优先，见到就返回 */
+        }
+        if (fallback < 0) fallback = (int)i;
     }
-    return -1;
+    return fallback;
 }
 
 /* method 区分「按键确认」与「语音确认」（ELDER_CFM_BUTTON / ELDER_CFM_VOICE）。
@@ -331,9 +393,16 @@ void OnKey(elder_key_event_t ev, void *ctx)
         int idx = -1;
         if (elder_input_confirm_window_active() && s_arming_id >= 0) {
             idx = s_arming_id;
-        } else if (elder_ui_get_state() == ELDER_UI_REMINDER) {
-            /* 老人听到「该吃药了」，直接按一下就行 —— 这是本按键的主用途 */
-            idx = FirstUndoneMedicine();
+        } else if (elder_ui_reminder_showing() ||
+                   elder_ui_get_state() == ELDER_UI_REMINDER) {
+            /* 老人听到「该吃药了」，直接按一下就行 —— 这是本按键的主用途。
+             *
+             * 判据要**同时**看"全屏提醒是否在显示"：全屏提醒会挂 4 小时，
+             * 而 ELDER_UI_REMINDER 这个表情态 30 秒就自动回落 IDLE。
+             * 只看表情态的话，老人 30 秒后才去按按钮，这一下会被当成
+             * "开始对话"（ToggleChatState），全屏提醒照旧挂着 ——
+             * 用户的诉求「按键确认任务完成」直接失效。 */
+            idx = FirstUndoneReminder();
             if (idx >= 0) {
                 elder_input_open_confirm_window();   /* 让界面立刻进确认态 */
                 s_arming_id = idx;
@@ -355,7 +424,7 @@ void OnKey(elder_key_event_t ev, void *ctx)
         break;
 
     case ELDER_KEY_EV_RELEASE: {
-        int idx = FirstUndoneMedicine();
+        int idx = FirstUndoneReminder();
         if (idx >= 0) {
             s_arming_id = idx;
             elder_input_open_confirm_window();
@@ -408,20 +477,52 @@ void OnDeviceStateChanged(DeviceState prev, DeviceState cur)
  *   没有任何办法确认 ⇒ 15 分钟后升级 ESCALATED ⇒ 回执 ELDER_EV_MISSED ⇒
  *   子女端每条提醒都收到「老人漏服」的假告警。这条通道是把闭环接回来。
  *
- * 与按键**共用** FirstUndoneMedicine() 判据：两条路若各写一套，
+ * 与按键**共用** FirstUndoneReminder() 判据：两条路若各写一套，
  * 会出现「按键确认第 1 条、语音确认第 3 条」的错乱。
  *
  * 返回：0 = 确认成功；-1 = 当前没有待确认的服药提醒（不是错误，
  *       老人可能只是顺口说了句「吃过了」，此时不要让 LLM 报错）。 */
 extern "C" int elder_confirm_pending_medicine(void)
 {
-    int idx = FirstUndoneMedicine();
+    int idx = FirstUndoneReminder();
     if (idx < 0) {
         ESP_LOGW(TAG, "语音确认请求：当前没有待确认的服药提醒，忽略");
         return -1;
     }
     ConfirmMedicine(idx, ELDER_CFM_VOICE);
     return 0;
+}
+
+/* ------------------------------------------------------- 待机（需求 7） */
+
+/* 老人说「待机吧 / 退下吧 / 晚安吧 / 我睡了」→ 服务端念完告别语后调本函数。
+ *
+ * 为什么必须落到**设备状态机**上，不能只在服务端"不响应"：
+ *   realtime（连续对话）模式下，设备播报完回到 kDeviceStateListening，
+ *   这一态 **WakeNet 是关的**（见 application.cc 的 SetDeviceState）。
+ *   服务端只做到"不再应答"的话，老人再喊唤醒词设备根本听不见 ——
+ *   实测过一次 ASR 失败后设备聋了 164 秒（2026-10-20）。
+ *   ⇒ 真正的"待机"只能是 kDeviceStateIdle：那里 EnableVoiceProcessing(false)
+ *     停掉上行推流、EnableWakeWordTracking/EnableWakeWordDetection(true)
+ *     把唤醒词重新打开，下一次"你好小智"才叫得应。
+ *
+ * 为什么走 Schedule 而不是直接 SetDeviceState：
+ *   MCP 工具回包跑在协议收包任务里，而 SetDeviceState 会碰 LVGL
+ *   （display->SetStatus / SetEmotion）。跨任务直接动 LVGL 不加锁，
+ *   症状是随机的 LoadProhibited。Schedule 把它排进主事件循环，
+ *   那里本来就是唯一动界面的线程。
+ *
+ * 为什么不顺手调 StopListening()：那个函数会向服务端发 `listen stop`，
+ *   服务端收到 `stop` 会**立刻 finalize 一轮**（拿当前缓冲去识别）。
+ *   老人刚说完"退下吧"，这一轮会把他自己的告别话再识别一次
+ *   ⇒ 多一轮空回复，正好破坏"待机"的语义。只切状态、不发消息。 */
+extern "C" void elder_enter_standby(void)
+{
+    auto &app = Application::GetInstance();
+    ESP_LOGI(TAG, "进入待机：关闭收音、重新打开唤醒词（下次唤醒前不监听不应答）");
+    app.Schedule([]() {
+        Application::GetInstance().SetDeviceState(kDeviceStateIdle);
+    });
 }
 
 /* ---------------------------------------------------------------- 入口 */
@@ -467,6 +568,8 @@ extern "C" void elder_bridge_start(void)
     hooks.play_tone = OnPlayTone;
     hooks.speak = OnSpeak;
     hooks.is_online = OnIsOnline;
+    hooks.show_reminder = OnShowReminder;
+    hooks.hide_reminder = OnHideReminder;
     hooks.ctx = nullptr;
     elder_ui_set_hooks(&hooks);
     elder_ui_set_state(ELDER_UI_IDLE, 0);

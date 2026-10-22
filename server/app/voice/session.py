@@ -241,6 +241,10 @@ _REMINDER_TOOLS: Final[frozenset[str]] = frozenset(
 #: 当成告别。
 _DISMISS_RE: Final[re.Pattern[str]] = re.compile(
     r"退下|退下吧|下去|走开|走吧|一边去|去休息|休息吧|睡吧|睡觉吧|"
+    # 2026-10-22 需求 7：用户点名要的四种说法（待机吧 / 退下吧 / 晚安吧 /
+    # 我睡了）。「待机」「待命」原先完全没认，老人说"待机吧"设备会当成
+    # 一句正常的话去调 LLM，答一句"好的"然后继续听。
+    r"待机|待机吧|待命|我睡了|要睡了|去睡了|休息了|先这样吧|"
     r"不聊|不聊了|别聊|不用聊|不说了|别说了|不要再说了|闭嘴|"
     r"安静|静音|别出声|不出声|再见|拜拜|晚安|走了|出去")
 
@@ -342,6 +346,13 @@ class VoiceSession:
         self._pcm: list[bytes] = []
         self._speech_ms: int = 0            # 累计有语音的时长
         self._silence_ms: int = 0           # 连续静音时长
+        # 「连续语音段」的两个值（见 config.VOICE_MIN_SPEECH_RUN_MS 的说明）。
+        # _speech_run_ms 是**当前**这一段有多长，静音帧一到就清零；
+        # _max_speech_run_ms 记本轮最长的那一段。
+        # 光看 _speech_ms（累计）挡不住环境噪声：60 秒里零星几下关门、
+        # 电视声加起来就过 300ms，于是"一句都没说"照样送 ASR → 念"没听清"。
+        self._speech_run_ms: int = 0
+        self._max_speech_run_ms: int = 0
 
         # ---- 服务端 VAD 状态（老人语速慢 / 轻声 / 远场，见常量区注释）----
         self._noise_floor: float = _NOISE_FLOOR_INIT   # 房间底噪跟随值
@@ -751,6 +762,9 @@ class VoiceSession:
                 self._max_closed_pause_ms = max(self._max_closed_pause_ms,
                                                 self._silence_ms)
             self._speech_ms += frame_ms
+            self._speech_run_ms += frame_ms
+            self._max_speech_run_ms = max(self._max_speech_run_ms,
+                                          self._speech_run_ms)
             self._silence_ms = 0
             self._ms_since_loud = 0
             self._mark_speech_frame(frame_idx)
@@ -758,6 +772,9 @@ class VoiceSession:
             # 3) 软语音：开口后的轻声延续。**不刷新 _ms_since_loud** ——
             #    刷新它等于让持续底噪无限续期，会话永远不结束。
             self._speech_ms += frame_ms
+            self._speech_run_ms += frame_ms
+            self._max_speech_run_ms = max(self._max_speech_run_ms,
+                                          self._speech_run_ms)
             self._silence_ms = 0
             self._ms_since_loud += frame_ms
             self._mark_speech_frame(frame_idx)
@@ -765,6 +782,9 @@ class VoiceSession:
             # 4) 静音
             self._silence_ms += frame_ms
             self._ms_since_loud += frame_ms
+            # 连续语音段到此为止。**累计值不清**（_speech_ms 仍代表本轮
+            # 一共说了多久），只清"这一段连续说了多久"。
+            self._speech_run_ms = 0
 
     def _silence_threshold_ms(self) -> int:
         """本轮的自适应静音阈值（见常量区注释的第三件套）。"""
@@ -996,6 +1016,12 @@ class VoiceSession:
             # （设备随后会发 listen start，这里不清也行，但清了更稳：
             # 唤醒前若有残余帧，会被当成这一句的开头）。
             log.info("[%s] 唤醒词：%s", self.session_id, obj.get("text"))
+            # 需求 7：唤醒词是「待机」的**唯一出口**。老人说了"待机吧"之后
+            # 一直不响应，直到他自己再喊一次唤醒词 —— 那正是本分支。
+            # 放在最前面清：下面那些缓冲重置与此事无关，别让顺序成为隐患。
+            if self._dismissed_until:
+                log.info("[%s] 唤醒词到达，解除待机", self.session_id)
+            self._dismissed_until = 0.0
             self._frames.clear()
             self._pcm.clear()
             self._speech_ms = 0
@@ -1348,6 +1374,31 @@ class VoiceSession:
                 self._watchdog_task.cancel()
                 self._watchdog_task = None
             await self._speak_reply(_DISMISS_REPLY, started)
+            # ---- 需求 7：念完告别语，让**设备**真正进入待机 ----
+            #
+            # 两层配合，缺一不可（2026-10-22 用户原话：「语音答复之后就要进入
+            # 待机，在下次语音唤醒之前，不再监听声音和答复」）：
+            #
+            #   1. 固件层（self.elder.standby）：把设备切到 kDeviceStateIdle
+            #      ⇒ 停掉上行推流，并**重新打开 WakeNet**。realtime（连续
+            #      对话）模式下设备播完会回 listening，而那一态 WakeNet 是
+            #      关的 —— 只靠服务端"不应答"的话，老人再喊唤醒词设备听不见，
+            #      实测聋过 164 秒。
+            #   2. 服务端层（self._dismissed_until）：即使固件没切（老版本固件、
+            #      或者工具调用失败），本端也不再应答、不重新武装监听。
+            #      **必须调完再说**：先调固件再念告别语的话，设备已经 idle，
+            #      告别语会把它顶回 speaking，最后又落回 listening。
+            #
+            # 超时 3 秒、失败只记日志：待机是"少做一件事"，绝不能因为它失败
+            # 而让老人听不到那句"好的，您先忙"。
+            try:
+                await self.call_device_tool("self.elder.standby", timeout=3.0)
+                log.info("[%s] 设备已切换待机（等下一次唤醒词）", self.session_id)
+            except Exception as exc:  # noqa: BLE001
+                log.info("[%s] 设备侧待机命令未成功（%s: %s）→ 仅服务端静默，"
+                         "%d 秒后兜底恢复",
+                         self.session_id, type(exc).__name__, exc,
+                         config.VOICE_DISMISS_COOLDOWN_SEC)
             self.state = "idle"
             return ""
 

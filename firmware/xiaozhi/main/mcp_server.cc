@@ -24,6 +24,8 @@
 // 老人服药确认：由 elder 组件导出（定义在 components/elder/src/elder_bridge.cc）。
 // 项目里 elder 没有对外头文件，沿用 main.cc 的裸 extern "C" 声明模式。
 extern "C" int elder_confirm_pending_medicine(void);
+/* 需求 7：进入待机（关收音、重开唤醒词）。服务端在念完告别语后调它。 */
+extern "C" void elder_enter_standby(void);
 // <<< END elder-companion overlay <<<
 
 McpServer::McpServer() {
@@ -150,6 +152,33 @@ void McpServer::AddCommonTools() {
         [](const PropertyList& properties) -> ReturnValue {
             (void)properties;
             return elder_confirm_pending_medicine() == 0;
+        });
+
+    /* 需求 7：待机。
+     *
+     * 服务端在「退下吧 / 待机吧 / 晚安吧 / 我睡了」这类**明确要求结束对话**
+     * 的话之后，念完告别语、再调这个工具把设备切到 idle：
+     * 停掉麦克风推流、把 WakeNet 重新打开。
+     *
+     * 为什么必须有一块固件侧的配合（而不是服务端单方面停响应）：realtime
+     * （连续对话）模式下，设备播报完会回 kDeviceStateListening，而那一态
+     * **WakeNet 是关的**。服务端只"不再应答"的话，老人再喊唤醒词设备根本
+     * 听不见 —— 一次实测聋了 164 秒（见 elder_bridge.cc 的 elder_enter_standby）。
+     *
+     * 也注册成工具（而不只是服务端内部命令）的好处：老人说「让我安静会儿」
+     * 这种不在正则表里的说法，LLM 也能自己判断并调用它。
+     * 描述刻意写窄，避免模型在正常对话里随手调。 */
+    AddTool("self.elder.standby",
+        "Put the device into standby: stop listening through the microphone and "
+        "wait for the wake word again.\n"
+        "Call this only when the user explicitly wants to END the conversation "
+        "(for example \"待机吧\", \"退下吧\", \"晚安吧\", \"我睡了\", \"别说话了\").\n"
+        "Do NOT call it to answer a question or when the user is still talking.",
+        PropertyList(),
+        [](const PropertyList& properties) -> ReturnValue {
+            (void)properties;
+            elder_enter_standby();
+            return true;
         });
     // <<< END elder-companion overlay <<<
 

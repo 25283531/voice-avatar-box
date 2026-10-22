@@ -30,6 +30,18 @@ typedef struct {
 
 #define ELDER_RGB_SLOTS 8
 
+/* ---- 需求 8：提醒的闪灯节奏（见 elder_rgb.h 的接口注释） ----
+ *
+ * 只用 xTaskGetTickCount 的毫秒数，不另起定时器。三个常量都是"用户原话
+ * 里的数字"，改它们就等于改产品行为，别顺手调：
+ *   每 10 分钟一次 → NAG_PERIOD_MS
+ *   每次亮 10 秒   → NAG_BLINK_MS
+ *   2 小时后不再亮 → NAG_TOTAL_MS
+ */
+#define ELDER_NAG_PERIOD_MS (10u * 60u * 1000u)
+#define ELDER_NAG_BLINK_MS  (10u * 1000u)
+#define ELDER_NAG_TOTAL_MS  (2u * 60u * 60u * 1000u)
+
 static struct {
     rmt_channel_handle_t  chan;
     rmt_encoder_handle_t  enc;
@@ -38,6 +50,10 @@ static struct {
     TaskHandle_t          task;
     slot_t                slots[ELDER_RGB_SLOTS];
     bool                  ready;
+
+    /* 提醒闪灯：active 为真时由 rgb_task 自己算"这一帧该不该亮" */
+    bool                  nag_active;
+    uint32_t              nag_start_ms;
 } g;
 
 /* ---------------- 灯效计算 ---------------- */
@@ -59,8 +75,8 @@ static uint32_t hsv2rgb(uint16_t h, uint8_t s, uint8_t v)
     }
 }
 
-/* 取当前应当生效的最高优先级请求 */
-static bool active_slot(slot_t *out, uint32_t now_ms)
+/* 取当前应当生效的最高优先级请求；best_prio 回带该请求的优先级（-1 = 没有） */
+static bool active_slot(slot_t *out, uint32_t now_ms, int *best_prio)
 {
     slot_t *best = NULL;
     for (int i = 0; i < ELDER_RGB_SLOTS; i++) {
@@ -72,6 +88,7 @@ static bool active_slot(slot_t *out, uint32_t now_ms)
         }
         if (!best || s->prio > best->prio) best = s;
     }
+    if (best_prio) *best_prio = best ? best->prio : -1;
     if (!best) return false;
     *out = *best;
     return true;
@@ -122,7 +139,29 @@ static void rgb_task(void *arg)
         uint32_t color = 0;
 
         if (xSemaphoreTake(g.lock, pdMS_TO_TICKS(50)) == pdTRUE) {
-            if (active_slot(&s, now)) color = fx_color(&s, now);
+            int prio = -1;
+            if (active_slot(&s, now, &prio)) {
+                color = fx_color(&s, now);
+            }
+
+            /* 需求 8：提醒闪灯（每 10 分钟的前 10 秒，共 2 小时）。
+             *
+             * 优先级刻意排在"服药未确认 / 求助告警"之下：老人正按着求助键
+             * 或系统在报漏服时，灯不该被提醒节奏抢走。
+             * 计时全部用 tick 毫秒数相减 —— 不另起定时器、不加任务，
+             * 原因见 elder_rgb.h 里 nag_start 的注释。 */
+            if (g.nag_active && prio < (int)ELDER_RGB_PRIO_MED_PEND) {
+                uint32_t el = now - g.nag_start_ms;
+                if (el >= ELDER_NAG_TOTAL_MS) {
+                    /* 2 小时到点：灯自己熄灭。**不依赖上层来关** ——
+                     * 上层要记得关，就一定会有忘记关的那一次。 */
+                    g.nag_active = false;
+                    ESP_LOGI(TAG, "提醒闪灯已满 2 小时，熄灭");
+                } else if ((el % ELDER_NAG_PERIOD_MS) < ELDER_NAG_BLINK_MS) {
+                    /* 0.5s 亮 / 0.5s 灭，10 秒共 10 个周期 */
+                    color = ((now % 500u) < 250u) ? 0xFF0000u : 0u;
+                }
+            }
             xSemaphoreGive(g.lock);
         }
 
@@ -236,6 +275,7 @@ void elder_rgb_med_pending(void)
 }
 void elder_rgb_med_done(void)
 {
+    elder_rgb_reminder_nag_stop();          /* 已确认 ⇒ 闪灯节奏立刻停 */
     elder_rgb_release(ELDER_RGB_PRIO_MED_PEND);
     elder_rgb_release(ELDER_RGB_PRIO_ALARM);
     elder_rgb_request(ELDER_RGB_PRIO_MED_PEND, ELDER_FX_SOLID, 0x00FF00, 60000);
@@ -243,4 +283,27 @@ void elder_rgb_med_done(void)
 void elder_rgb_med_escalate(void)
 {
     elder_rgb_request(ELDER_RGB_PRIO_ALARM, ELDER_FX_BLINK_FAST, 0xFF0000, 0);
+}
+
+/* ---- 需求 8：提醒的闪灯节奏 ---- */
+void elder_rgb_reminder_nag_start(void)
+{
+    if (!g.ready) return;
+    xSemaphoreTake(g.lock, portMAX_DELAY);
+    g.nag_active = true;
+    g.nag_start_ms = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
+    xSemaphoreGive(g.lock);
+    ESP_LOGI(TAG, "提醒闪灯开始：每 %u 分钟闪 %u 秒，共 %u 小时",
+             (unsigned)(ELDER_NAG_PERIOD_MS / 60000),
+             (unsigned)(ELDER_NAG_BLINK_MS / 1000),
+             (unsigned)(ELDER_NAG_TOTAL_MS / 3600000));
+}
+
+void elder_rgb_reminder_nag_stop(void)
+{
+    if (!g.ready) return;
+    xSemaphoreTake(g.lock, portMAX_DELAY);
+    if (g.nag_active) ESP_LOGI(TAG, "提醒闪灯停止");
+    g.nag_active = false;
+    xSemaphoreGive(g.lock);
 }

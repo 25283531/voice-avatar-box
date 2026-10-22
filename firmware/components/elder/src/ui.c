@@ -14,7 +14,15 @@ static struct {
     bool             has_hooks;
     elder_ui_state_t state;
     int64_t          expire_us;   /* 0 = 常驻 */
+
+    /* 需求 8：全屏提醒。showing 为真时 reminder_expire_us 是 4 小时后的绝对
+     * 时刻；到点由 elder_ui_tick() 收掉（见 elder_ui.h 的三层分工说明）。 */
+    bool             reminder_showing;
+    int64_t          reminder_expire_us;
 } g;
+
+/* 需求 8：全屏提醒最长显示多久。用户原话「持续时间 4 个小时」。 */
+#define ELDER_UI_REMINDER_HOLD_US (4LL * 60 * 60 * 1000 * 1000)
 
 /* 状态 → EAF 情绪名（与 main/boards/lichuang-dev/emote.json 对齐） */
 static const char *const EMOTION[] = {
@@ -109,9 +117,20 @@ esp_err_t elder_ui_set_state(elder_ui_state_t st, uint32_t hold_ms)
     return ESP_OK;
 }
 
-/* 保持时长到期 → 回落到待机 */
+/* 保持时长到期 → 回落到待机；全屏提醒满 4 小时 → 收掉 */
 void elder_ui_tick(void)
 {
+    /* 需求 8：4 小时到点自动收掉全屏提醒。
+     *
+     * 放在这里而不是让上层计时：tick 由 sync 任务循环驱动（离线时也能跑），
+     * 是组件里唯一"一定会被周期性调用"的地方。精度只到一次 sync 周期
+     * （秒级到分钟级），对"4 小时的屏显"完全够用 —— 不值得为它再起一个任务。 */
+    if (g.reminder_showing && g.reminder_expire_us &&
+            esp_timer_get_time() >= g.reminder_expire_us) {
+        ESP_LOGI(TAG, "全屏提醒已满 4 小时，自动收掉");
+        elder_ui_hide_reminder();
+    }
+
     if (!g.expire_us) return;
     if (esp_timer_get_time() < g.expire_us) return;
 
@@ -120,6 +139,42 @@ void elder_ui_tick(void)
     g.state = ELDER_UI_IDLE;
     ESP_LOGI(TAG, "状态 %d 保持结束，回落 IDLE", (int)from);
     push_emotion(ELDER_UI_IDLE);
+}
+
+/* ------------------------------------------------------- 需求 8：全屏提醒 */
+
+esp_err_t elder_ui_show_reminder(const char *text)
+{
+    if (!text || !text[0]) return ESP_ERR_INVALID_ARG;
+
+    g.reminder_showing = true;
+    g.reminder_expire_us = esp_timer_get_time() + ELDER_UI_REMINDER_HOLD_US;
+
+    if (!g.has_hooks || !g.hooks.show_reminder) {
+        /* 无屏设备 / 钩子尚未注入：仍然记状态。**不要在这里 return 错误** ——
+         * 调用方（提醒回调）不该因为"这块板子没有屏"而少做别的事
+         * （闪灯、语音、回执都还要照做）。 */
+        ESP_LOGW(TAG, "全屏提醒无实现（%s），仅记录状态", text);
+        return ESP_OK;
+    }
+    ESP_LOGI(TAG, "全屏提醒：%s", text);
+    g.hooks.show_reminder(text, g.hooks.ctx);
+    return ESP_OK;
+}
+
+void elder_ui_hide_reminder(void)
+{
+    if (!g.reminder_showing && !g.reminder_expire_us) return;
+    g.reminder_showing = false;
+    g.reminder_expire_us = 0;
+    if (!g.has_hooks || !g.hooks.hide_reminder) return;
+    ESP_LOGI(TAG, "全屏提醒收起");
+    g.hooks.hide_reminder(g.hooks.ctx);
+}
+
+bool elder_ui_reminder_showing(void)
+{
+    return g.reminder_showing;
 }
 
 void elder_ui_play_tone(elder_tone_t tone)

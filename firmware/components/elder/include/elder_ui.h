@@ -67,6 +67,14 @@ typedef struct {
     /* 查询当前是否联网（离线时 speak 不可用，应改用 play_tone）。可为 NULL */
     bool (*is_online)(void *ctx);
 
+    /* 全屏显示一条提醒内容（需求 8：图片不再显示，用较大字体全屏显示）。
+     * text 为任务内容（如"该吃降压药了"），由实现方决定字号与排版。
+     * 可为 NULL —— 无屏设备上是空操作，业务代码不必分支。 */
+    void (*show_reminder)(const char *text, void *ctx);
+
+    /* 收掉全屏提醒，恢复正常界面。可为 NULL */
+    void (*hide_reminder)(void *ctx);
+
     void *ctx;
 } elder_ui_hooks_t;
 
@@ -117,6 +125,34 @@ void elder_ui_notice(const char *text, const char *emotion);
  * @brief 内部计时器 tick；由本组件自有任务驱动，外部无需调用。
  */
 void elder_ui_tick(void);
+
+/* ------------------------------------------------- 需求 8：全屏提醒
+ *
+ * 用户 2026-10-22 原话：「屏幕的图片不再显示，用较大的字体在屏幕上全屏
+ * 显示任务内容。在用户没有进行语音确认任务完成，或者按键确认任务完成，
+ * 就持续显示任务内容。持续时间 4 个小时。」
+ *
+ * 三层分工（**别把计时往上层搬**）：
+ *   * 上层（elder_bridge）只在「到点」调一次 show，「确认完成」调一次 hide；
+ *   * 4 小时到点由本组件的 elder_ui_tick() 负责收掉 —— 让调用方自己记得
+ *     "4 小时后关掉"，就必然会有忘记关的那一次（手机屏保同理）；
+ *   * 具体怎么画（字号、是否隐藏图片）是 hooks.show_reminder 的事，
+ *     组件本身不认识 LVGL。
+ */
+
+/**
+ * @brief 全屏显示一条提醒，并开始 4 小时倒计时。
+ *
+ * 重复调用是安全的：内容会被替换、倒计时**重新**开始 4 小时
+ * （同一条提醒每 10 分钟还会闪灯闪 2 小时，但那不发这条）。
+ */
+esp_err_t elder_ui_show_reminder(const char *text);
+
+/** 收掉全屏提醒（确认完成 / 按键确认 / 4 小时到点都会走这里） */
+void elder_ui_hide_reminder(void);
+
+/** 当前是否正在全屏显示提醒（上层据此判断"这一下短按该不该当成确认"） */
+bool elder_ui_reminder_showing(void);
 
 #ifdef __cplusplus
 }

@@ -322,6 +322,15 @@ LcdDisplay::~LcdDisplay() {
     if (preview_image_ != nullptr) {
         lv_obj_del(preview_image_);
     }
+    /* >>> BEGIN elder-reminder-fullscreen >>> 懒创建的 overlay 也要在这里删：
+     * 它挂在 screen 下，不随任何子对象一起释放；漏掉就是一块 320x240 的
+     * 不透明遮罩留在屏上（表现为"重启后屏幕全黑，只有状态栏")。 */
+    if (reminder_overlay_ != nullptr) {
+        lv_obj_del(reminder_overlay_);
+        reminder_overlay_ = nullptr;
+        reminder_label_ = nullptr;
+    }
+    /* <<< END elder-reminder-fullscreen <<< */
     if (chat_message_label_ != nullptr) {
         lv_obj_del(chat_message_label_);
     }
@@ -817,6 +826,27 @@ void LcdDisplay::SetupUI() {
     auto icon_font = lvgl_theme->icon_font()->font();
     auto large_icon_font = lvgl_theme->large_icon_font()->font();
 
+    /* ---- 字幕不显示定因诊断（2026-10-22）----
+     * 打印字体指针、line_height、以及用「待」字做一次真实 glyph 查表。
+     * 如果 get_glyph_dsc 返回 false，就是字库/struct 布局问题；
+     * 如果返回 true 但 line_height=0，是描述符损坏。 */
+    {
+        lv_font_glyph_dsc_t gd;
+        bool ok = false;
+        if (text_font != nullptr && text_font->get_glyph_dsc != nullptr) {
+            ok = text_font->get_glyph_dsc(text_font, &gd, 0x5F85 /* 待 */, 0);
+        }
+        ESP_LOGW("FontDiag", "text_font=%p lh=%d bl=%d glyph_dsc_fn=%p bitmap_fn=%p",
+                 (const void*)text_font,
+                 text_font ? text_font->line_height : -1,
+                 text_font ? text_font->base_line : -1,
+                 text_font ? (const void*)text_font->get_glyph_dsc : nullptr,
+                 text_font ? (const void*)text_font->get_glyph_bitmap : nullptr);
+        ESP_LOGW("FontDiag", "test glyph U+5F85(待): ok=%d adv_w=%d box=%dx%d ofs=%d,%d",
+                 (int)ok, (int)gd.adv_w, (int)gd.box_w, (int)gd.box_h,
+                 (int)gd.ofs_x, (int)gd.ofs_y);
+    }
+
     auto screen = lv_screen_active();
     lv_obj_set_style_text_font(screen, text_font, 0);
     lv_obj_set_style_text_color(screen, lvgl_theme->text_color(), 0);
@@ -944,6 +974,7 @@ void LcdDisplay::SetupUI() {
     lv_label_set_long_mode(status_label_, LV_LABEL_LONG_SCROLL_CIRCULAR);
     lv_obj_set_style_text_align(status_label_, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_set_style_text_color(status_label_, lvgl_theme->text_color(), 0);
+    lv_obj_set_style_text_font(status_label_, text_font, 0);  /* 显式设，不靠继承 */
     lv_label_set_text(status_label_, Lang::Strings::INITIALIZING);
     lv_obj_align(status_label_, LV_ALIGN_CENTER, 0, 0);
 
@@ -980,6 +1011,7 @@ void LcdDisplay::SetupUI() {
     lv_label_set_long_mode(chat_message_label_, LV_LABEL_LONG_WRAP); // Auto wrap mode
     lv_obj_set_style_text_align(chat_message_label_, LV_TEXT_ALIGN_CENTER, 0); // Center text alignment
     lv_obj_set_style_text_color(chat_message_label_, lvgl_theme->text_color(), 0);
+    lv_obj_set_style_text_font(chat_message_label_, text_font, 0);  /* 显式设，不靠继承 */
     lv_obj_align(chat_message_label_, LV_ALIGN_CENTER, 0, 0); // Vertically and horizontally centered in bottom_bar_
 
     low_battery_popup_ = lv_obj_create(screen);
@@ -1039,8 +1071,15 @@ void LcdDisplay::SetChatMessage(const char* role, const char* content) {
     last_ui_change_tick_ = lv_tick_get();
     DisplayLockGuard lock(this);
     if (chat_message_label_ == nullptr) {
+        ESP_LOGW("FontDiag", "SetChatMessage: chat_message_label_ is NULL!");
         return;
     }
+    ESP_LOGW("FontDiag", "SetChatMessage role=%s content_len=%d label=%p w=%d h=%d",
+             role ? role : "(null)",
+             content ? (int)strlen(content) : -1,
+             (void*)chat_message_label_,
+             (int)lv_obj_get_width(chat_message_label_),
+             (int)lv_obj_get_height(chat_message_label_));
     lv_label_set_text(chat_message_label_, content);
 }
 #endif
@@ -1359,3 +1398,73 @@ void LcdDisplay::SetHideSubtitle(bool hide) {
         }
     }
 }
+
+// >>> BEGIN elder-reminder-fullscreen (2026-10-22 需求 8) >>>
+/* 全屏大字提醒。
+ *
+ * 为什么覆盖整屏、且**必须不透明**：用户原话是「屏幕的图片不再显示」——
+ * 半透明会让中间那张表情图透出来，看起来像"提醒叠在屏保上"，
+ * 老人第一反应是"设备坏了"，而不是"有事要做"。
+ *
+ * 为什么把 label 宽度设成半屏再放大 2 倍：这块屏只有 320x240、
+ * 字库最大 20px（30px 的 font_puhui_basic_30_4 约 1.7MB，app 分区
+ * 余量只有 ~472KB，装不下 —— 见 2026-10-22 的体积核算）。
+ * LVGL 9 的 transform_scale 对**任意对象**生效（走 layer 绘制，
+ * lv_refr.c:1278），所以先用 20px 排版再整块放大：
+ *   * 宽度按半屏排 ⇒ 放大 2 倍后正好铺满全屏宽度；
+ *   * overflow_visible 必须开，否则放大后的字会被 overlay 的
+ *     绘制区域裁掉（症状是"只在中间看到半行字"）。
+ * 放大的代价是边缘略糊，但 40px 的糊字比 20px 的清晰字在 1-2 米外
+ * 更容易看清 —— 这一条是给老人看的，不是给截图看的。
+ */
+void LcdDisplay::ShowReminder(const char* text) {
+    DisplayLockGuard lock(this);
+    auto lvgl_theme = static_cast<LvglTheme*>(current_theme_);
+    auto screen = lv_screen_active();
+    if (screen == nullptr || lvgl_theme == nullptr) {
+        return;
+    }
+
+    if (reminder_overlay_ == nullptr) {
+        reminder_overlay_ = lv_obj_create(screen);
+        lv_obj_set_size(reminder_overlay_, LV_HOR_RES, LV_VER_RES);
+        lv_obj_align(reminder_overlay_, LV_ALIGN_TOP_LEFT, 0, 0);
+        lv_obj_set_style_radius(reminder_overlay_, 0, 0);
+        lv_obj_set_style_border_width(reminder_overlay_, 0, 0);
+        lv_obj_set_style_pad_all(reminder_overlay_, 0, 0);
+        lv_obj_set_style_bg_color(reminder_overlay_, lvgl_theme->background_color(), 0);
+        lv_obj_set_style_bg_opa(reminder_overlay_, LV_OPA_COVER, 0);
+        /* 放大后的字要能画出 overlay 之外 → 不裁剪子对象 */
+        lv_obj_add_flag(reminder_overlay_, LV_OBJ_FLAG_OVERFLOW_VISIBLE);
+        lv_obj_clear_flag(reminder_overlay_, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_set_style_layout(reminder_overlay_, LV_LAYOUT_NONE, 0);
+
+        reminder_label_ = lv_label_create(reminder_overlay_);
+        /* 半屏宽排版，2 倍放大后正好铺满（见函数头注释） */
+        lv_obj_set_width(reminder_label_, LV_HOR_RES / 2);
+        lv_label_set_long_mode(reminder_label_, LV_LABEL_LONG_WRAP);
+        lv_obj_set_style_text_align(reminder_label_, LV_TEXT_ALIGN_CENTER, 0);
+        lv_obj_set_style_text_color(reminder_label_, lvgl_theme->text_color(), 0);
+        lv_obj_set_style_transform_scale_x(reminder_label_, 512, 0);  /* 256 = 1x */
+        lv_obj_set_style_transform_scale_y(reminder_label_, 512, 0);
+        lv_obj_center(reminder_label_);
+    }
+
+    lv_label_set_text(reminder_label_, (text != nullptr) ? text : "");
+    lv_obj_remove_flag(reminder_overlay_, LV_OBJ_FLAG_HIDDEN);
+    /* 每次都要提到最前：期间可能新建了别的对象（通知、预览图），
+     * 后建的对象会盖在 overlay 上面，表现是"字被吃掉一半"。 */
+    lv_obj_move_foreground(reminder_overlay_);
+    ESP_LOGI(TAG, "全屏提醒：%s", (text != nullptr) ? text : "");
+}
+
+void LcdDisplay::HideReminder() {
+    DisplayLockGuard lock(this);
+    if (reminder_overlay_ == nullptr) {
+        return;
+    }
+    /* 只隐藏、不删除：删除后下次要重建（LVGL 对象创建在 PSRAM 碎片化时
+     * 会失败），而这块 overlay 常驻只占一个对象 + 一个 label。 */
+    lv_obj_add_flag(reminder_overlay_, LV_OBJ_FLAG_HIDDEN);
+}
+// <<< END elder-reminder-fullscreen <<<

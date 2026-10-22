@@ -236,11 +236,26 @@ static void set_state(int idx, elder_rmd_state_t st)
              st == ELDER_RMD_ESCALATED ? "ESCALATED" :
              st == ELDER_RMD_SKIPPED ? "SKIPPED" : "IDLE");
 
-    /* 需求 11：服药未完成 → 红灯长亮；完成 → 绿灯 */
-    if (g.table.items[idx].type == ELDER_RMD_TYPE_MEDICINE) {
-        if (st == ELDER_RMD_DONE)        elder_rgb_med_done();
-        else if (st == ELDER_RMD_PENDING) elder_rgb_med_pending();
-        else if (st == ELDER_RMD_ESCALATED) elder_rgb_med_escalate();
+    /* 需求 8（2026-10-22 用户拍板，**覆盖**原「需求 11 红灯长亮」）：
+     *
+     *   「定时任务提醒时，应该红灯闪烁（闪烁10秒，10分钟后再闪烁10秒，
+     *     2小时内以此重复。2小时后不再亮灯。）」
+     *
+     * 与旧行为的差别，两条都是刻意的：
+     *   1. 旧：服药未确认 → **长亮**红灯直到确认。新：每 10 分钟闪 10 秒，
+     *      2 小时后**不再亮灯**。长亮在夜里尤其刺眼，而且"确认之前一直亮"
+     *      会让老人分不清"这是刚响的那条"还是"昨天没确认的那条"。
+     *   2. 旧：超时升级 → 一直快速闪红。新：ESCALATED **不动灯**，
+     *      让 nag 按自己的 2 小时节奏走完。否则升级一旦发生，
+     *      第 2 小时之后的"不再亮灯"就永远不成立（两套判据互相打架）。
+     *
+     * 日程提醒（非服药）同样给闪灯：用户的 8 说的是"定时任务提醒"，
+     * 没把它限定在服药上。
+     */
+    if (st == ELDER_RMD_DONE) {
+        elder_rgb_med_done();            /* 内部会先 nag_stop()，再绿 60s */
+    } else if (st == ELDER_RMD_PENDING) {
+        elder_rgb_reminder_nag_start();
     }
 
     if (st == ELDER_RMD_DONE) {

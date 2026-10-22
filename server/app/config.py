@@ -882,6 +882,23 @@ VOICE_PAUSE_MIN_MS = int(os.getenv("ELDER_VOICE_PAUSE_MIN_MS", "600"))
 # 触发兜底前至少要听到这么多语音，防止"一句都没说就静音触发"把环境噪声
 # 当成一整句送去 ASR（结果是识别出一串乱码，老人莫名其妙）。
 VOICE_MIN_SPEECH_MS = int(os.getenv("ELDER_VOICE_MIN_SPEECH_MS", "300"))
+# **连续**语音至少这么长，才承认"真的有人在说话"（毫秒）。
+#
+# 为什么光有 VOICE_MIN_SPEECH_MS 不够（2026-10-22 用户反馈 2）：
+# 「在没有唤醒的情况下，画面切换到了待命状态，并且隔一会儿就会说一句
+#   抱歉我没有听清（收到杂音）。」
+#
+# VOICE_MIN_SPEECH_MS 是**累计值**：60 秒收听窗口里，屋里的电视声、椅子
+# 摩擦、关门声各顶 1-2 帧（60ms/帧），加起来轻松超过 300ms。于是
+# "一句都没说"的判据形同虚设 —— 环境噪声照样被当成一整句送去 ASR，
+# 识别为空 → 念 EMPTY_UTTERANCE_REPLY。
+#
+# 人的一句话在 VAD 眼里是**连续**的能量段（60ms 一帧连着一二十帧），
+# 噪声是零星孤立的尖峰。所以加这道"最长连续语音段"判据：
+#   * 400ms ≈ 7 帧连续 ⇒ 连"嗯""好"这种短应答也能过（~300-500ms）；
+#   * 一次关门/咳嗽最多 1-2 帧（60-120ms），过不了。
+# 两个判据是**并且**关系：累计够长 + 有一段连续够长。
+VOICE_MIN_SPEECH_RUN_MS = int(os.getenv("ELDER_VOICE_MIN_SPEECH_RUN_MS", "400"))
 # 单轮收听的安全上限（毫秒）：老人说着说着离开/卡住时，兜底 finalize，
 # 避免会话永远挂在 listening。60s 足够任何正常单句，又不会无限挂住。
 VOICE_MAX_LISTEN_MS = int(os.getenv("ELDER_VOICE_MAX_LISTEN_MS", "60000"))
