@@ -187,9 +187,19 @@ def _parse_facts(raw: str) -> list[Fact]:
         text = fenced.group(1).strip()
 
     data: Any = None
+    # ① 先按整段解析。② 失败时用 raw_decode **只吃掉第一个 JSON 值**，
+    #    忽略后面的废话。
+    #
+    # 2026-10-22 真机日志：`Extra data: line 1 column 3 (char 2)` —— 模型
+    # 返回的是 `{}` 或 `[]` 后面又跟了一段说明文字。原实现第二道兜底只找
+    # `[` 到 `]`，遇到 `{}` 打头的输出直接找不到方括号，于是**每轮都跳过**，
+    # 记忆一条都没写进去（日志里永远是 "-> 0 条事实"）。
+    # raw_decode 正是为"JSON 后面还有多余字符"设计的，比截取区间稳。
+    decoder = json.JSONDecoder()
     try:
-        data = json.loads(text)
+        data = decoder.raw_decode(text)[0]
     except (json.JSONDecodeError, ValueError):
+        # ③ 最后再试一次：截取第一个 `[` 到最后一个 `]`（JSON 前面有废话时）
         start, end = text.find("["), text.rfind("]")
         if start >= 0 and end > start:
             try:
@@ -198,7 +208,8 @@ def _parse_facts(raw: str) -> list[Fact]:
                 log.warning("事实提取：返回内容不是合法 JSON，本次跳过（%s）", exc)
                 return []
         else:
-            log.warning("事实提取：返回内容里找不到 JSON 数组，本次跳过")
+            log.warning("事实提取：返回内容里找不到 JSON，本次跳过（前 80 字：%s）",
+                        text[:80])
             return []
 
     if isinstance(data, dict):

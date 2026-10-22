@@ -285,6 +285,74 @@ def _dismiss_tier(utterance: str) -> str:
     return ""
 
 
+# ---------------------------------------------------------------- 提醒确认兜底
+#
+# 2026-10-22 真机事故：老人说「我已经喝完水了」，服务端时延日志里
+# ``tool=0ms`` —— **大模型压根没调 confirm_reminder**，于是设备侧一直
+# 不知道"办完了"，全屏提醒挂着不退，老人对着一屏白字等了 20 分钟。
+#
+# 工具描述里已经写了"必须调用"，但把这条生杀权完全交给模型是不可接受的：
+# 漏调的后果是**屏上一直白、老人以为设备坏了**，而且不会自愈（4 小时才收）。
+#
+# 所以加一层服务端兜底，与待机关键词同一套思路：
+#   * 只认**强确认**措辞 —— 「喝完了/吃过了/药吃了」这种离开提醒语境就不成立的；
+#   * **不认**「好了/知道了/行」—— 那在正常聊天里到处都是，
+#     误判的后果是"没吃药却被记成吃了"，比漏记危险得多；
+#   * 模型自己调过就不再调第二次（看 tool_trace）；
+#   * 调了但设备说没有待确认的提醒（返回 false）也无害，只是白跑一次。
+_CONFIRM_RE: Final[re.Pattern[str]] = re.compile(
+    r"吃过了|吃过药了|药吃了|药吃完了|吃了药|把药吃了|"
+    r"喝完了|喝过了|水喝了|把水喝了|喝掉了|"
+    r"吃完了|吃好了|吃掉了|"
+    r"做完了|办完了|弄完了|完成了|搞定了")
+
+
+#: 有未确认提醒时追加到 system 的状态提示。
+#:
+#: 为什么必须由服务端"告诉"模型，而不是靠工具描述自证：
+#: 用户 2026-10-22 反馈「语音创建提醒时工具调用完全正常」，说明工具链没问题，
+#: 差别在**上下文** —— 创建时老人说「提醒我八点吃药」，意图自明；而
+#: 「我已经喝完水了」在模型眼里就是一句闲聊，它不知道屏上正挂着一条提醒。
+#: 把状态摆到 system 里，模型才有依据去调 confirm_reminder。
+_PENDING_REMINDER_HINT: Final[str] = (
+    "【当前状态】设备上有一条**已响铃、尚未确认**的提醒：「{title}」。"
+    "屏幕正全屏显示它的内容，老人不确认就一直不会消失。\n"
+    "他只要表示这件事已经办完（「我吃过了」「喝完了」「弄好了」），"
+    "就**必须调用 confirm_reminder**，不能只口头答应 —— 不调用的话屏幕不会退，"
+    "老人会以为设备坏了。\n"
+    "他如果问「怎么关掉/怎么消掉」，告诉他按一下设备上的按钮，"
+    "或者直接说一声办完了。"
+)
+
+
+def _pending_reminder_label(device_pk: int) -> str:
+    """设备上「已响铃、尚未确认」的提醒标题；没有则返回空串。
+
+    数据源是 ``reminder_events.state == FIRED`` —— 设备响铃时会回传
+    ``state=1``，确认后变 CONFIRMED，超时变 MISSED。所以这一条查询
+    恰好等价于「屏幕现在是不是正挂着一条提醒」。
+
+    任何异常都吞掉返回空串：这条提示是**加分项**，查不到就不注入，
+    绝不能因为它把整轮对话打挂。
+    """
+    try:
+        with SessionLocal() as db:
+            row = db.execute(
+                select(_m.Reminder.title)
+                .join(_m.ReminderEvent,
+                      _m.ReminderEvent.reminder_id == _m.Reminder.id)
+                .where(_m.ReminderEvent.device_id == device_pk,
+                       _m.ReminderEvent.state == int(_m.EventState.FIRED))
+                .order_by(_m.ReminderEvent.due_at.desc())
+                .limit(1)
+            ).first()
+            return str(row[0]) if row and row[0] else ""
+    except Exception:  # noqa: BLE001
+        log.debug("查询待确认提醒失败（不影响本轮对话）", exc_info=True)
+        return ""
+
+
+
 #: 命中弱判据时追加到 system 的复核提示。**只在命中那一轮注入** ——
 #: 每轮都塞的话，模型会变得爱管闲事，正常聊天也想让设备待机。
 _STANDBY_VERIFY_HINT: Final[str] = (
@@ -490,6 +558,13 @@ class VoiceSession:
         # 告别语会把设备顶回 speaking，最后又落回 listening（就是
         # _enter_standby 注释里那个坑）。所以只置标志，念完再切。
         self._standby_requested: bool = False
+
+        # 本轮命中了"强确认"措辞（喝完了/吃过了…）。模型若没自己调
+        # confirm_reminder，由服务端补一刀 —— 理由见 _CONFIRM_RE 上方注释。
+        self._confirm_candidate: bool = False
+        # 设备上「已响铃未确认」的提醒标题（每轮开头查一次）。
+        # 非空时 system 里会多一段状态说明，模型才知道该调 confirm_reminder。
+        self._pending_reminder: str = ""
 
         # 当前这一轮的播报器（_ReplySpeaker）。abort 时要能立刻丢掉它
         # 队列里还没发出去的音频帧 —— 否则老人已经喊停了，音箱还在
@@ -1477,6 +1552,9 @@ class VoiceSession:
         # 每轮重置"待机复核"状态（见 __init__ 里这两个字段的说明）。
         self._dismiss_candidate = ""
         self._standby_requested = False
+        # 提醒确认状态同理：上一轮命中过"喝完了"不代表这一轮也算。
+        self._confirm_candidate = False
+        self._pending_reminder = ""
         t_asr = _now_ms()
         pcm_all = b"".join(pcm)
 
@@ -1570,6 +1648,16 @@ class VoiceSession:
         # 那一刻会话已经结束了。放在 ASR 空结果之后同理（空识别不是内容）。
         self._last_active_at = time.monotonic()
 
+        # ---- 屏上是否正挂着一条待确认的提醒 ----
+        # 两个用途：① 注入 system 让模型知道该调 confirm_reminder；
+        # ② 模型漏调时由服务端补一刀（见下面 _confirm_candidate 的收尾）。
+        self._pending_reminder = _pending_reminder_label(self.dev.id)
+        self._confirm_candidate = bool(_CONFIRM_RE.search(utterance))
+        if self._pending_reminder:
+            log.info("[%s] 设备上有待确认提醒「%s」，已注入 system%s",
+                     self.session_id, self._pending_reminder,
+                     "；本轮命中强确认措辞" if self._confirm_candidate else "")
+
         log.info("[%s] 识别：%s", self.session_id, utterance)
         await self._send_json({"type": "stt", "text": utterance})
         t_asr = _now_ms() - t_asr
@@ -1638,6 +1726,12 @@ class VoiceSession:
         # ---- 待机意图复核提示（只在命中弱判据的那一轮注入）----
         if self._dismiss_candidate:
             system = system + "\n\n" + _STANDBY_VERIFY_HINT
+        # ---- 有未确认提醒时告诉模型"屏上还挂着一条" ----
+        # 不注入的话模型把「我已经喝完了」当闲聊，不调 confirm_reminder，
+        # 屏幕就永远不退（2026-10-22 真机：白屏挂了 20 分钟）。
+        if self._pending_reminder:
+            system = system + "\n\n" + _PENDING_REMINDER_HINT.format(
+                title=self._pending_reminder)
 
         messages: list[dict[str, str]] = [{"role": "system", "content": system}]
         messages.extend(self._history[-config.VOICE_HISTORY_TURNS * 2:])
@@ -1787,6 +1881,28 @@ class VoiceSession:
         #    （或空回复的 start/stop 配对，设备靠它回落 idle）。
         await speaker.finish()
 
+        # ---- 确认兜底：模型漏调 confirm_reminder 时由服务端补一刀 ----
+        #
+        # 2026-10-22 真机：老人说「我已经喝完水了」，时延日志里 tool=0ms，
+        # 模型一个字都没调，全屏提醒在白屏上挂了 20 分钟没退。工具链本身是好的
+        # （用户反馈"语音建提醒时工具调用正常"），坏的是**模型没意识到屏上
+        # 还挂着东西**。system 里已经注入了状态，这里再兜一层：
+        #   * 只在"有待确认提醒 + 本轮命中强确认措辞"时补；
+        #   * 模型自己调过就不重复（看 tool_trace）；
+        #   * 放在 speaker.finish() 之后 —— 先让老人听到"好的"，
+        #     再让屏幕收起来，顺序反了会出现"屏先空、话后到"。
+        if (self._pending_reminder and self._confirm_candidate
+                and not any(t.get("name") == "confirm_reminder"
+                            for t in tool_trace)):
+            try:
+                ok = await self.call_device_tool(
+                    "self.elder.confirm_reminder", timeout=3.0)
+                log.info("[%s] 模型未调用 confirm_reminder，服务端兜底补调：%s",
+                         self.session_id, ok)
+            except Exception:  # noqa: BLE001  设备没响应不该影响对话
+                log.warning("[%s] 兜底确认失败（设备无响应）", self.session_id,
+                            exc_info=True)
+
         # ---- 模型判定待机：**念完告别语之后**再切固件 ----
         # 顺序不能反（理由见 _enter_standby 的 docstring）：先切 idle 的话，
         # 刚念的告别语会把设备顶回 speaking，最后又落回 listening。
@@ -1798,6 +1914,7 @@ class VoiceSession:
         # 不清的话 _finalize 的 finally 会把它当"本轮没完成"再兜底待机一次，
         # 那正好把"大模型复核"这件事整个作废。
         self._dismiss_candidate = ""
+        self._confirm_candidate = False
         return utterance
 
     async def _chat_round(self, messages: list[dict[str, Any]],

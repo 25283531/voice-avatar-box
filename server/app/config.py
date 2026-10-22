@@ -870,7 +870,14 @@ VOICE_SILENCE_MS = int(os.getenv("ELDER_VOICE_SILENCE_MS", "2000"))
 # 自适应阈值上限（毫秒）。本轮对话里若出现过"停顿后又继续说"的长停顿，
 # 说明这位老人说话慢、停顿长，断句阈值按 VOICE_PAUSE_FACTOR 放大，
 # 但不超过这个上限 —— 否则一句不停地说下去会让阈值无限膨胀。
-VOICE_SILENCE_MAX_MS = int(os.getenv("ELDER_VOICE_SILENCE_MAX_MS", "6000"))
+#
+# **2026-10-22 调档 6000 → 3500ms**：真机时延日志里首轮断句等了
+# `连续静音 6120ms ≥ 阈值 6000ms`，这一段占了首句 11s 里的 6.1s，
+# 是"首句延迟 10 秒以上"的最大单项。6 秒的静默等待在陪伴场景里不可接受：
+# 老人说完之后会以为设备没听见，往往又重复一遍，反而把一轮对话拖得更长。
+# 3500ms 仍然远高于普通人句末停顿（<1s），截断风险可控；
+# 若现场仍出现"话说一半被判完"，用 ELDER_VOICE_SILENCE_MAX_MS 回调即可。
+VOICE_SILENCE_MAX_MS = int(os.getenv("ELDER_VOICE_SILENCE_MAX_MS", "3500"))
 # 停顿自适应系数：观察到的最长"句中停顿"（停顿后又继续说话的那次）P 毫秒，
 # 则本轮阈值 = max(VOICE_SILENCE_MS, min(VOICE_SILENCE_MAX_MS, P*系数+500))。
 # 1.5 的依据：VAD 端点判决要留出"停顿后还会接着说"的余量，取实测停顿的

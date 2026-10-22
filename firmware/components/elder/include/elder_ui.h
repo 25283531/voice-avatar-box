@@ -106,6 +106,20 @@ elder_tone_t elder_ui_tone_of(elder_ui_state_t st);
  */
 void elder_ui_announce(const char *text, elder_tone_t tone);
 
+/**
+ * @brief 只**念**（TTS），不刷屏显。
+ *
+ * 为什么单独开一个入口（2026-10-22 需求）：
+ * 提醒流程是「先响固定音乐 4.9s，再念事项内容」。announce() 会先调 notify
+ * 刷一次屏显 —— 而刷屏显要拿 LVGL 锁、要重排整屏，实测卡掉 1.5 秒，
+ * 正好卡在音乐结束到 TTS 开始之间，于是老人听到的间隔被撑到 2 秒以上
+ * （用户原话「有 1 秒的间隔就够了」）。
+ *
+ * 提醒场景下屏显早就由 elder_ui_show_reminder() 做过了，这里再刷一次纯属
+ * 重复劳动 —— 所以把「念」和「显示」拆开，音乐结束那一刻直接发 TTS。
+ */
+void elder_ui_speak(const char *text);
+
 /** 直接播放本地提示音（离线兜底） */
 void elder_ui_play_tone(elder_tone_t tone);
 

@@ -244,7 +244,21 @@ void OnSpeak(const char *text, void *ctx)
  * `elder_ui_announce → Display::ShowNotification`（LVGL 绘制 + 锁 + 字符串
  * 格式化）—— 栈溢出的表现是随机的 LoadProhibited，事后极难归因。
  * 专用任务可以自己定栈大小，做完自删，代价只有一次 xTaskCreate。 */
-static constexpr int64_t kChimeMs = 4900 + 400;
+/* 提醒音乐多长（毫秒）→ 到点后开始念事项内容。
+ *
+ * 2026-10-22 实测（串口日志 151442 响铃 / 158282 才开始 TTS）：
+ * 原来写 4900+400，但真正卡住间隔的不是这个常数，而是 AnnounceTask 里
+ * 先调 elder_ui_announce() 的 **notify 刷屏**（要抢 LVGL 锁重排整屏，
+ * 实测吃掉约 1.5 秒）。用户听到的间隔因此被撑到 2 秒以上。
+ *
+ * 改法：AnnounceTask 改用 elder_ui_speak()（只念不刷屏，屏显早已由
+ * show_reminder 做过），常数同时收回 4900 —— 让 TTS 请求**正好在音乐
+ * 结束时发出**，剩下的间隔就只有 TTS 首帧时延（约 0.8~1.2 秒），
+ * 符合用户「有 1 秒的间隔就够了」。
+ *
+ * ⚠️ 不要再把 400 加回去：那是给"刷屏耗时"留的余量，刷屏已经不在
+ * 关键路径上了，留着只会白白拉长间隔。 */
+static constexpr int64_t kChimeMs = 4900;
 static constexpr uint32_t kAnnounceTaskStack = 5120;
 static constexpr UBaseType_t kAnnounceTaskPrio = 3;   /* 低优先级：不抢音频/网络 */
 
@@ -253,8 +267,10 @@ static void AnnounceTask(void *arg)
     auto *text = static_cast<std::string *>(arg);
     vTaskDelay(pdMS_TO_TICKS(kChimeMs));
     if (text != nullptr) {
-        // 音乐已经响过 => 传 ELDER_TONE_NONE：离线时不要再多叠一声 popup
-        elder_ui_announce(text->c_str(), ELDER_TONE_NONE);
+        /* 只念不刷屏：屏上已经是全屏提醒了，再刷一次既重复又拖慢间隔。
+         * 离线时 elder_ui_speak 会降级成一声提示音（音乐已经响过，
+         * 这里只是保证"有反馈"，不叠加 TTS）。 */
+        elder_ui_speak(text->c_str());
         delete text;
     }
     vTaskDelete(nullptr);

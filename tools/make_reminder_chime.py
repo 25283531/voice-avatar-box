@@ -57,16 +57,27 @@ _NOTE = {
 
 #: (音名 或 "rest", 时长秒)
 MELODY = (
-    ("E5", 0.40), ("G5", 0.40), ("A5", 0.65),
+    ("E4", 0.40), ("G4", 0.40), ("A4", 0.65),
     ("rest", 0.22),
-    ("A5", 0.40), ("G5", 0.40), ("E5", 0.40), ("D5", 0.45),
-    ("C5", 1.25),
+    ("A4", 0.40), ("G4", 0.40), ("E4", 0.40), ("D4", 0.45),
+    ("C4", 1.25),
 )
 
-_HARMONICS = ((1, 1.00), (2, 0.32), (3, 0.10))
-_ATTACK_SEC = 0.008
-_DECAY_RATE = 3.0
-_PEAK = 0.45          # 留余量，两个音交叠处不削波
+# 2026-10-22 用户反馈「太刺耳、太突然」，四处一起改（只改音色不改乐句）：
+#   1. 整体降一个八度：E5/G5/A5(659~880Hz) → E4/G4/A4(330~440Hz)。
+#      高音区 + 泛音是"刺耳"的主因，降八度比调音量有效得多；
+#   2. 泛音大幅削弱：2 次 0.32→0.18、3 次 0.10→0.04。八音盒的"亮"
+#      来自高次谐波，对老人（高频听力普遍衰退、对 2~4kHz 更敏感）反而更吵；
+#   3. 起音 8ms → 60ms 且改成 sin^2 曲线：8ms 是"啪"一下，60ms 是"渐入"，
+#      这是"太突然"的直接原因；
+#   4. 峰值 0.45 → 0.30、衰减 3.0 → 2.2：整体更轻、余音更长，不那么"凶"。
+_HARMONICS = ((1, 1.00), (2, 0.18), (3, 0.04))
+_ATTACK_SEC = 0.060
+_DECAY_RATE = 2.2
+_PEAK = 0.30          # 各音符之间的相对电平（绝对电平由 _TARGET_PEAK 统一收）
+#: 归一化后的目标峰值（占满刻度的比例）。0.55 ≈ -5dBFS：
+#: 既留足余量不削波，又不至于小到老人听不见。
+_TARGET_PEAK = 0.55
 
 
 def _add_note(buf: list[float], freq: float, dur: float) -> None:
@@ -92,8 +103,14 @@ def _add_note(buf: list[float], freq: float, dur: float) -> None:
     decay = math.exp(-_DECAY_RATE / SAMPLE_RATE)
     limit = len(buf)
     env = 0.0
+    half_pi = math.pi / 2.0
     for i in range(n):
-        env = (i / attack) if i < attack else env * decay
+        if i < attack:
+            # sin^2 渐入：一阶导在起点为 0，听感上没有"起点那一下"
+            r = math.sin(half_pi * i / attack)
+            env = r * r
+        else:
+            env = env * decay
         if i >= limit:
             break
         buf[i] += wave[i % period] * env * _PEAK
@@ -106,6 +123,22 @@ def synth_pcm() -> bytes:
     for name, dur in MELODY:
         if name != "rest":
             _add_note(buf, _NOTE[name], dur + 0.25)
+    # ---- 归一化 + 首尾淡入淡出 ----
+    # 2026-10-22：衰减从 3.0 放到 2.2 之后音符重叠变多，固定 _PEAK 会叠到
+    # 削波（实测 peak 打满 32768）—— 削波是方波，比原来的高音更刺耳，
+    # 正好和"柔和一点"的目标相反。所以改成**先合成、再按实际峰值归一化**：
+    # 固定 _PEAK 只负责各音符之间的相对比例，绝对电平由这里统一收。
+    peak = max((abs(v) for v in buf), default=0.0)
+    if peak > 1e-6:
+        scale = _TARGET_PEAK / peak
+        buf = [v * scale for v in buf]
+    # 首尾各 40ms 淡入淡出：缓冲区两端直接跳变会有"咔"声（尤其播放开始时）
+    edge = max(1, int(SAMPLE_RATE * 0.04))
+    for i in range(min(edge, len(buf))):
+        g = i / edge
+        buf[i] *= g
+        buf[-1 - i] *= g
+
     # ⚠️ 不要用 struct.pack("<%dh" % n, *buf)：11 万个样本当可变参数展开，
     # 光打包就要 2.6 秒（合成本身只占 0.1 秒）。array 批量构造快两个数量级。
     out = array("h", (max(-32768, min(32767, int(v * 32767.0))) for v in buf))

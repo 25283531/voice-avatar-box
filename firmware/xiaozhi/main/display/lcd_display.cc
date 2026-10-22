@@ -1447,16 +1447,10 @@ void LcdDisplay::SetHideSubtitle(bool hide) {
  * 半透明会让中间那张表情图透出来，看起来像"提醒叠在屏保上"，
  * 老人第一反应是"设备坏了"，而不是"有事要做"。
  *
- * 为什么把 label 宽度设成半屏再放大 2 倍：这块屏只有 320x240、
- * 字库最大 20px（30px 的 font_puhui_basic_30_4 约 1.7MB，app 分区
- * 余量只有 ~472KB，装不下 —— 见 2026-10-22 的体积核算）。
- * LVGL 9 的 transform_scale 对**任意对象**生效（走 layer 绘制，
- * lv_refr.c:1278），所以先用 20px 排版再整块放大：
- *   * 宽度按半屏排 ⇒ 放大 2 倍后正好铺满全屏宽度；
- *   * overflow_visible 必须开，否则放大后的字会被 overlay 的
- *     绘制区域裁掉（症状是"只在中间看到半行字"）。
- * 放大的代价是边缘略糊，但 40px 的糊字比 20px 的清晰字在 1-2 米外
- * 更容易看清 —— 这一条是给老人看的，不是给截图看的。
+ * ⚠️ 字号：2026-10-22 第一版用 transform_scale 把 20px 放大 2 倍，真机
+ * **整屏纯白、一个字都没有**（详见下面 label 创建处的注释）。现在退回
+ * 原生 20px 全宽排版。要真正的大字，正确做法是往 assets 分区加一套
+ * 30px 的 cbin 字库（分区 8MB、已用 1.59MB，余量充足），而不是缩放。
  */
 void LcdDisplay::ShowReminder(const char* text) {
     DisplayLockGuard lock(this);
@@ -1481,11 +1475,29 @@ void LcdDisplay::ShowReminder(const char* text) {
         lv_obj_set_style_layout(reminder_overlay_, LV_LAYOUT_NONE, 0);
 
         reminder_label_ = lv_label_create(reminder_overlay_);
-        /* 半屏宽排版，2 倍放大后正好铺满（见函数头注释） */
-        lv_obj_set_width(reminder_label_, LV_HOR_RES / 2);
+        /* ⚠️ 2026-10-22 真机事故：这里原本用 transform_scale 放大 2 倍
+         * （半屏宽排版 + 512 缩放）。真机表现是**整屏纯白、一个字都没有**
+         * ——覆盖层画出来了，label 却没画出来，日志里连一条 LVGL 警告都没有。
+         *
+         * 缩放走的是 lv_refr.c 的 LV_LAYER_TYPE_TRANSFORM 分支：先
+         * layer_get_area() 求变换后区域，求不出就 `return` **静默跳过整个对象**
+         * （lv_refr.c:1218 那个 res != LV_RESULT_OK 的 return）。
+         * 本工程 LV_USE_MATRIX / LV_DRAW_TRANSFORM_USE_MATRIX 都是 n，
+         * 走的是老的逐像素变换路径 —— 这条路在本仓从未被验证过（全工程
+         * 只有这一处用 transform_scale）。
+         *
+         * 结论：**先用确定能显示的原生字库把字画出来**，字小可以改，
+         * 白屏等于老人什么都看不见。字号问题另案处理（assets 分区还有
+         * 6.4MB 空余，可以放一套 30px 的 cbin 字库，不受 app 分区限制）。
+         *
+         * 布局取全宽而不是半宽：不缩放之后半宽排版会让每行只剩 8 个字，
+         * 4 行字挤在中间，反而不如全宽两行好读。 */
+        lv_obj_set_size(reminder_label_, LV_HOR_RES - 16, LV_VER_RES - 16);
         lv_label_set_long_mode(reminder_label_, LV_LABEL_LONG_WRAP);
         lv_obj_set_style_text_align(reminder_label_, LV_TEXT_ALIGN_CENTER, 0);
         lv_obj_set_style_text_color(reminder_label_, lvgl_theme->text_color(), 0);
+        /* 行距放宽：20px 字在 240 高的屏上只占 4 行，加行距更好认 */
+        lv_obj_set_style_text_line_space(reminder_label_, 8, 0);
         /* 字体**显式设**，不靠从 screen 继承 —— 与 status_label_/chat_message_label_
          * 同一条纪律（见 SetTheme 里 2026-10-22 字幕缺字的注释）。
          * 全屏提醒恰恰是最不能缺字的地方：老人只看到「该吃 了」这种残句，
@@ -1494,8 +1506,6 @@ void LcdDisplay::ShowReminder(const char* text) {
             lv_obj_set_style_text_font(reminder_label_,
                                        lvgl_theme->text_font()->font(), 0);
         }
-        lv_obj_set_style_transform_scale_x(reminder_label_, 512, 0);  /* 256 = 1x */
-        lv_obj_set_style_transform_scale_y(reminder_label_, 512, 0);
         lv_obj_center(reminder_label_);
     }
 

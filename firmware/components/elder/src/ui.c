@@ -226,3 +226,17 @@ void elder_ui_announce(const char *text, elder_tone_t tone)
         elder_ui_play_tone(tone);
     }
 }
+
+void elder_ui_speak(const char *text)
+{
+    if (!text || !text[0]) return;
+
+    if (online_now() && g.has_hooks && g.hooks.speak) {
+        ESP_LOGI(TAG, "在线播报（不刷屏）: %s", text);
+        g.hooks.speak(text, g.hooks.ctx);
+    } else {
+        /* 离线时提醒内容已经全屏显示了，这里只需要一声提示音 */
+        ESP_LOGW(TAG, "离线兜底播报（TTS 不可用）: %s", text);
+        elder_ui_play_tone(ELDER_TONE_POPUP);
+    }
+}
