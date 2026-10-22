@@ -2977,6 +2977,11 @@ def t_asr_silence_trim() -> None:
     s6._max_closed_pause_ms = 0
     s6._speech_ms = 0
     s6._silence_ms = 0
+    # b7c5618 给 _feed_vad 加了"最长连续语音段"判据（VOICE_MIN_SPEECH_RUN_MS），
+    # 桩对象漏了这两个字段 ⇒ _feed_vad 一进高能量分支就 AttributeError，
+    # 整个 12j 段崩掉、server-ci 从那时起一直是红的。补上。
+    s6._speech_run_ms = 0
+    s6._max_speech_run_ms = 0
     s6._first_speech_frame = -1
     s6._last_speech_frame = -1
     s6._mark_speech_frame = types.MethodType(
