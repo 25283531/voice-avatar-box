@@ -423,9 +423,10 @@ static void test_next_day_fires_again(void)
 /* reminder.c:222 `if (state == PENDING && (now_min - due) >= 15)`。
  *
  * 为什么这是医疗级的一条：ESCALATED 是**「漏服了、人要介入」的唯一信号**。
- * 它同时驱动两件事：
- *   1. elder_rgb_med_escalate() —— 老人眼前的红灯；
- *   2. elder_sync_on_reminder_state() 上报 ELDER_EV_MISSED —— 子女端收到告警。
+ * 它驱动 elder_sync_on_reminder_state() 上报 ELDER_EV_MISSED（子女端告警）。
+ * ⚠️ 需求 8（2026-10-22）之后它**不再点灯**：老人眼前的红灯统一由
+ * `elder_rgb_reminder_nag_start()` 按「闪 10s / 每 10min / 2 小时后停」负责，
+ * 两套判据同时点灯会让「2 小时后不再亮灯」永远不成立。
  * 这一行静默失效的后果比「二次响铃」更隐蔽也更危险：老人漏服药，
  * 设备一声不吭，子女端也永远收不到告警 —— 两边都以为一切正常。
  *
@@ -447,9 +448,10 @@ static void test_escalate_after_15min(void)
     stub_fx_reset();
     elder_reminder_tick_once();
     check("08:00 到点触发为 PENDING",
-          g_last_st[0] == ELDER_RMD_PENDING && stub_rgb_pending_count() == 1,
-          det("状态=%s，红灯 pending=%d escalate=%d", state_name(g_last_st[0]),
-              stub_rgb_pending_count(), stub_rgb_escalate_count()));
+          g_last_st[0] == ELDER_RMD_PENDING
+              && stub_rgb_nag_count() == 1,
+          det("状态=%s，闪灯 nag=%d escalate=%d", state_name(g_last_st[0]),
+              stub_rgb_nag_count(), stub_rgb_escalate_count()));
 
     /* 14 分钟：还没到阈值，绝不能提前升级。
      * 提前升级 = 老人刚把药放进嘴里就收到子女端「漏服」告警，
@@ -468,18 +470,29 @@ static void test_escalate_after_15min(void)
           g_last_st[0] == ELDER_RMD_ESCALATED,
           det("状态=%s —— 升级失效 = 老人漏服药无人知晓（设备不响、子女端不告警）",
               state_name(g_last_st[0])));
-    check("升级必须真的点亮红灯（elder_rgb_med_escalate）",
-          stub_rgb_escalate_count() == 1,
-          det("escalate 红灯亮了 %d 次（老人眼前的告警）", stub_rgb_escalate_count()));
+    /* 需求 8（2026-10-22 用户拍板）**覆盖**了原来的「升级就快速闪红」：
+     * ESCALATED 刻意**不动灯**，交给 nag 按自己的「闪 10s / 每 10min / 2 小时后
+     * 不再亮」节奏走。两套点灯判据同时存在会互相打架 —— 升级一旦发生，
+     * 「2 小时后不再亮灯」就永远不成立。
+     * 所以这条断言从「升级必须点亮红灯」改成「升级不得额外点灯」：
+     * 它仍然钉着"红灯告警这件事由谁负责"，只是责任人从 escalate 换成了 nag。 */
+    check("升级为 ESCALATED 时不动灯（点灯交给 nag，见需求 8）",
+          stub_rgb_escalate_count() == 0 && stub_rgb_nag_count() == 1,
+          det("escalate=%d nag=%d —— ESCALATED 额外点灯会让"
+              "「2 小时后不再亮灯」永远不成立",
+              stub_rgb_escalate_count(), stub_rgb_nag_count()));
 
     /* 升级态是「持续告警」，不是一次性事件：再过 10 分钟仍应是 ESCALATED，
      * 且不得回落成 PENDING（回落 = 红灯熄灭 = 又变成没人管）。 */
     stub_time_advance(10 * 60);      /* 08:25 */
     elder_reminder_tick_once();
-    check("08:25 仍保持 ESCALATED（告警持续，不回落）",
-          g_last_st[0] == ELDER_RMD_ESCALATED && stub_rgb_escalate_count() == 1,
-          det("状态=%s，escalate 红灯累计 %d 次（回落或反复重闪都是错的行为）",
-              state_name(g_last_st[0]), stub_rgb_escalate_count()));
+    check("08:25 仍保持 ESCALATED（告警持续，不回落、也不重复点灯）",
+          g_last_st[0] == ELDER_RMD_ESCALATED
+              && stub_rgb_escalate_count() == 0 && stub_rgb_nag_count() == 1,
+          det("状态=%s，escalate=%d nag=%d（回落=灯灭没人管；"
+              "反复点灯=2 小时后仍亮）",
+              state_name(g_last_st[0]), stub_rgb_escalate_count(),
+              stub_rgb_nag_count()));
 
     /* 升级态下 done_today 绝不能被置位 —— 否则子女端看到的是「已服药」，
      * 与刚发出的 MISSED 告警自相矛盾，等于把漏服悄悄抹掉。 */
@@ -487,7 +500,7 @@ static void test_escalate_after_15min(void)
     check("升级态不得被记成「已完成」",
           t && (t->done_today & 1u) == 0 && (t->pending_today & 1u) != 0,
           det("%s（done 有位 = 子女端以为已服药，漏服被悄悄抹掉）", dump_tbl(t)));
-    check("漏服期间仍算「有未完成的服药」（红灯必须保持长亮）",
+    check("漏服期间仍算「有未完成的服药」（红灯告警必须还在进行中）",
           elder_reminder_has_pending_medicine(),
           "has_pending_medicine()=false -> 红灯熄灭，没人知道药没吃");
 
@@ -560,10 +573,10 @@ static void test_confirm_window_timeout(void)
           g_last_st[0] == ELDER_RMD_PENDING,
           det("状态=%s —— 卡在 CONFIRM_WIN = 红灯永不升级、子女端永远收不到漏服告警",
               state_name(g_last_st[0])));
-    check("回退到 PENDING 时红灯重新点亮（med_pending）",
-          stub_rgb_pending_count() == 2,
-          det("pending 红灯累计 %d 次（应为 2：触发 1 次 + 回退 1 次）",
-              stub_rgb_pending_count()));
+    check("回退到 PENDING 时闪灯重新开始（nag_start）",
+          stub_rgb_nag_count() == 2,
+          det("nag 累计 %d 次（应为 2：触发 1 次 + 回退 1 次）",
+              stub_rgb_nag_count()));
     check("回退绝不能被记成已完成",
           (tbl()->done_today & 1u) == 0,
           det("%s（超时回退若被写成 DONE = 长按了一下就凭空记一次服药）",
@@ -573,13 +586,13 @@ static void test_confirm_window_timeout(void)
           "has_pending_medicine()=false -> 红灯熄灭，漏服无人知晓");
 
     /* 计时器必须被清掉：否则下一次 tick 会拿一个早已过期的 deadline 反复回退 */
-    int pend_before = stub_rgb_pending_count();
+    int nag_before = stub_rgb_nag_count();
     stub_time_advance(5);
     elder_reminder_tick_once();
     check("deadline 已清零，不会反复触发回退",
-          stub_rgb_pending_count() == pend_before && g_last_st[0] == ELDER_RMD_PENDING,
-          det("pending 红灯 %d -> %d，状态=%s",
-              pend_before, stub_rgb_pending_count(), state_name(g_last_st[0])));
+          stub_rgb_nag_count() == nag_before && g_last_st[0] == ELDER_RMD_PENDING,
+          det("nag %d -> %d，状态=%s",
+              nag_before, stub_rgb_nag_count(), state_name(g_last_st[0])));
 
     /* 回退之后必须还能重新 arm：老人返回来再按一次是有意义的动作。
      * 判据必须用「是否真的发生了第二次进入 CONFIRM_WIN 的转移」，
@@ -1342,10 +1355,10 @@ static void test_restart_catchup_still_rings(void)
           saw(0, ELDER_RMD_PENDING) == 1,
           det("开机后 PENDING 次数 = %d（应为 1）—— 漏服药且三方都以为没事，"
               "这是比重复服药更隐蔽的事故", saw(0, ELDER_RMD_PENDING)));
-    check("补响后红灯点亮（med_pending），家人看得见",
-          stub_rgb_pending_count() >= 1,
-          det("med_pending %d 次 —— 补响了却没灯 = 老人不知道该吃药",
-              stub_rgb_pending_count()));
+    check("补响后闪灯开始（nag_start），家人看得见",
+          stub_rgb_nag_count() >= 1,
+          det("nag %d 次 —— 补响了却没灯 = 老人不知道该吃药",
+              stub_rgb_nag_count()));
     check("补响后被记为待办（子女端能看到这条未完成）",
           (tbl()->pending_today & 1u) != 0,
           det("%s —— 红灯不亮 = 漏服无人知晓", dump_tbl(tbl())));
@@ -1373,9 +1386,14 @@ static void test_restart_catchup_still_rings(void)
           saw(0, ELDER_RMD_ESCALATED) >= 1,
           det("ESCALATED %d 次 —— 补响后免于升级 = 漏服药静默通过",
               saw(0, ELDER_RMD_ESCALATED)));
-    check("elder_rgb_med_escalate() 被调用（子女端会收到 MISSED 告警）",
-          stub_rgb_escalate_count() >= 1,
-          det("红灯升级 %d 次", stub_rgb_escalate_count()));
+    /* 子女端的 MISSED 告警走 elder_sync_on_reminder_state()，**不走红灯**：
+     * 需求 8 之后 ESCALATED 不再额外点灯（见 T7 的同款说明）。
+     * 这条断言因此改成「升级不得额外点灯」—— 它钉的仍是
+     * "升级时到底有没有多亮一次灯"，只是期望值从 1 变成 0。 */
+    check("升级不额外点灯（灯由 nag 统一负责，见需求 8）",
+          stub_rgb_escalate_count() == 0,
+          det("红灯升级 %d 次（额外点灯会让 2 小时后仍亮）",
+              stub_rgb_escalate_count()));
 
     /* 补响只发生一次：再 tick 若干次不得重复响 */
     int pend_after = saw(0, ELDER_RMD_PENDING);
