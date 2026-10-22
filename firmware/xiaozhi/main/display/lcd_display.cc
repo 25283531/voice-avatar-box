@@ -1275,7 +1275,10 @@ void LcdDisplay::SetTheme(Theme* theme) {
      * 时序：SetupUI() 在 Application 启动早期跑，那时 assets 分区还没挂载
      * （Assets::Apply() 在 application.cc:182 才执行），theme 里是**编译进
      * 固件的** font_puhui_basic_20_4 —— 只有 788 个字形，基本只覆盖
-     * assets/locales/*/language.json 里的界面文案。
+     * assets/locales/<lang>/language.json 里的界面文案。
+     * （这里刻意不写 glob 通配的星号斜杠：那个两字符组合会把本段块注释
+     *   提前闭合，后面的中文标点全被当成代码 —— 2026-10-22 CI 就是这么
+     *   炸的：extended character 。is not valid in an identifier。）
      *
      * 而这两个 label 在 SetupUI 里是**显式**设字体的（不靠继承），所以
      * Assets::Apply() 之后 SetTheme() 只改 screen 的字体，改不到它们：
