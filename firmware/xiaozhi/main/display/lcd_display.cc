@@ -1298,6 +1298,18 @@ void LcdDisplay::SetTheme(Theme* theme) {
     if (notification_label_ != nullptr) {
         lv_obj_set_style_text_font(notification_label_, text_font, 0);
     }
+    /* 全屏提醒的 label 是**运行时懒创建**的：换主题时它可能已经存在
+     * （提醒挂着、用户又切了主题），也可能还没建（下次 ShowReminder 会用
+     * 新主题的字体新建）。两条路都要覆盖，否则就是上一段注释里那种
+     * 「改了字体但屏上不变」。 */
+    if (reminder_label_ != nullptr) {
+        lv_obj_set_style_text_font(reminder_label_, text_font, 0);
+        lv_obj_set_style_text_color(reminder_label_, lvgl_theme->text_color(), 0);
+    }
+    if (reminder_overlay_ != nullptr) {
+        lv_obj_set_style_bg_color(reminder_overlay_,
+                                  lvgl_theme->background_color(), 0);
+    }
 
     // Set background image
     if (lvgl_theme->background_image() != nullptr) {
@@ -1474,6 +1486,14 @@ void LcdDisplay::ShowReminder(const char* text) {
         lv_label_set_long_mode(reminder_label_, LV_LABEL_LONG_WRAP);
         lv_obj_set_style_text_align(reminder_label_, LV_TEXT_ALIGN_CENTER, 0);
         lv_obj_set_style_text_color(reminder_label_, lvgl_theme->text_color(), 0);
+        /* 字体**显式设**，不靠从 screen 继承 —— 与 status_label_/chat_message_label_
+         * 同一条纪律（见 SetTheme 里 2026-10-22 字幕缺字的注释）。
+         * 全屏提醒恰恰是最不能缺字的地方：老人只看到「该吃 了」这种残句，
+         * 比什么都不显示更糟 —— 他可能按错事去办。 */
+        if (lvgl_theme->text_font() != nullptr) {
+            lv_obj_set_style_text_font(reminder_label_,
+                                       lvgl_theme->text_font()->font(), 0);
+        }
         lv_obj_set_style_transform_scale_x(reminder_label_, 512, 0);  /* 256 = 1x */
         lv_obj_set_style_transform_scale_y(reminder_label_, 512, 0);
         lv_obj_center(reminder_label_);

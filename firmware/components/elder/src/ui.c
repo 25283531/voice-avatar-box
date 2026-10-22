@@ -71,9 +71,15 @@ void elder_ui_set_hooks(const elder_ui_hooks_t *hooks)
     }
     g.hooks = *hooks;
     g.has_hooks = true;
-    ESP_LOGI(TAG, "hooks: emotion=%d notify=%d tone=%d speak=%d",
+    /* show/hide_reminder 必须一起打出来：需求 8 的「全屏大字」完全依赖这两个
+     * 钩子，它们没注入时 elder_ui_show_reminder() 只记状态、屏上什么都不变
+     * （见该函数里的注释）。开机日志里少打这两项，现场就只能靠"猜"为什么
+     * 提醒响了但屏幕没字。 */
+    ESP_LOGI(TAG, "hooks: emotion=%d notify=%d tone=%d speak=%d "
+                  "show_reminder=%d hide_reminder=%d",
              g.hooks.set_emotion != NULL, g.hooks.notify != NULL,
-             g.hooks.play_tone != NULL, g.hooks.speak != NULL);
+             g.hooks.play_tone != NULL, g.hooks.speak != NULL,
+             g.hooks.show_reminder != NULL, g.hooks.hide_reminder != NULL);
 
     /* 钩子变更时把当前形象立刻推一次，避免切换后屏幕停在旧表情 */
     if (g.hooks.set_emotion) {
