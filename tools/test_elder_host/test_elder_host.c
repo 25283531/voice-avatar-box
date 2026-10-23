@@ -13,6 +13,9 @@
  *   T10 上电首 tick 不做跨天重置 —— 否则每次上电都产生一次假「漏服」
  *   T11 重启后不得二次响铃 —— 见 test_restart_no_refire 上方的失效链推演
  *   T12 到点后很久才开机 —— 不补响、不升级，判 SKIPPED（与 T11-6 反向成对）
+ *   T13 语音确认（MCP 工具）—— 落 DONE、记 VOICE 来源、此后不得再报漏服
+ *   T14 晚开机 50 分钟 —— 要补响，但不得一响就判漏服（15 分钟从响铃起算）
+ *   T15 确认选中正在响铃的那条 —— 喝水响了，说「弄好了」别记到吃药上
  *
  * 全程**没有任何网络调用**：这正是要验证的场景。
  */
@@ -143,6 +146,25 @@ static elder_rmd_item_t mk_med(uint8_t hour, uint8_t minute, const char *label,
     it.minute = minute;
     it.type = ELDER_RMD_TYPE_MEDICINE;
     it.rtype = 0;            /* 后端 ReminderType.MEDICINE */
+    it.schedule_kind = 1;    /* DAILY */
+    it.repeat_mask = 0x7F;   /* 每天 */
+    it.enabled = true;
+    it.server_id = server_id;
+    snprintf(it.label, sizeof(it.label), "%s", label);
+    return it;
+}
+
+/* 造一条日程提醒（如喝水）。本地 type 只有 SCHEDULE/MEDICINE 两种，
+ * 喝水在设备侧就是日程；rtype=2 对齐后端 ReminderType.WATER。 */
+static elder_rmd_item_t mk_sched(uint8_t hour, uint8_t minute, const char *label,
+                                 uint32_t server_id)
+{
+    elder_rmd_item_t it;
+    memset(&it, 0, sizeof(it));
+    it.hour = hour;
+    it.minute = minute;
+    it.type = ELDER_RMD_TYPE_SCHEDULE;
+    it.rtype = 2;            /* 后端 ReminderType.WATER */
     it.schedule_kind = 1;    /* DAILY */
     it.repeat_mask = 0x7F;   /* 每天 */
     it.enabled = true;
@@ -1611,6 +1633,115 @@ static void test_late_boot_no_instant_escalate(void)
               saw(0, ELDER_RMD_ESCALATED)));
 }
 
+/* ---- T15：语音/按键确认必须选中「正在响铃」的那条（2026-10-22 用户实报）----
+ *
+ * 场景：设备上「喝水」提醒正在响铃，老人说「弄好了」，确认却记到了另一条
+ * 「吃鼻炎药」上，喝水提醒依然未确认、继续被注入系统提示词。
+ * 根因：elder_bridge.cc 的 FirstUndoneReminder() 按「服药优先」启发式选
+ * 目标，见到第一条 ELDER_RMD_TYPE_MEDICINE 就返回 —— 正在响铃的日程
+ * 提醒永远选不中。修复：新增 elder_reminder_first_ringing()，取
+ * fired_due_at 最大（最近触发）的那条，FirstUndoneReminder() 优先问它。
+ *
+ * 为什么能在宿主上钉它：这个 bug 的判定逻辑 100% 在 reminder.c 侧
+ * （状态集合 + fired_due_at 比较），elder_bridge.cc 只是调用方；
+ * 而「两条同时待确认、其中一条正在响」这个状态组合在真机上要等两个
+ * 不同时刻的提醒先后触发，受控时钟几秒就能构造出来。
+ *
+ * 变异提示：把 elder_reminder_first_ringing() 的 `>` 改成 `<`、
+ * 或把 fired_due_at 比较删掉（改成取第一条响铃的），本组必须变红。 */
+static void test_first_ringing_picks_ringing(void)
+{
+    printf("\n[T15] 确认必须落在正在响铃的那条（喝水响了别记到吃药上）\n");
+    stub_nvs_init();
+    stub_time_set(1772661600L);      /* 06:00，可信时钟 */
+    rec_reset();
+    elder_reminder_init(rec_cb, NULL);
+
+    /* 下标 0 = 08:00 降压药（服药）；下标 1 = 10:00 喝水（日程）。
+     * 先加服药：用户实报场景里"另一条吃药提醒"正是先一步触发的。 */
+    elder_rmd_item_t med = mk_med(8, 0, "降压药", 0);
+    elder_rmd_item_t water = mk_sched(10, 0, "喝水", 0);
+    check("新增两条提醒（服药 + 喝水）",
+          elder_reminder_add(&med) == ESP_OK && elder_reminder_add(&water) == ESP_OK,
+          det("%s", dump_tbl(tbl())));
+    const elder_rmd_table_t *t = tbl();
+    int med_idx = find_idx(t, 8, 0, "降压药");
+    int water_idx = find_idx(t, 10, 0, "喝水");
+    check("前置：喝水是日程类型（不是服药）",
+          t && t->items[water_idx].type == ELDER_RMD_TYPE_SCHEDULE, NULL);
+    check("未到点时没有正在响铃的提醒",
+          elder_reminder_first_ringing() == -1, NULL);
+
+    /* 08:00 服药先响；10:00 喝水后响。间隔 2 小时 > 15 分钟，
+     * 服药这条到 10:00 已被推成 ESCALATED —— 与用户实报时
+     * "另一条老提醒还挂着"一致，且 ESCALATED 也在响铃集合里。 */
+    stub_time_advance(2 * 3600);     /* 08:00 */
+    rec_reset();
+    elder_reminder_tick_once();
+    stub_time_advance(2 * 3600);     /* 10:00 */
+    rec_reset();
+    elder_reminder_tick_once();
+    t = tbl();
+    check("前置：08:00 服药已响（此刻已升级）",
+          (t->pending_today & (1u << med_idx)) != 0,
+          det("%s", dump_tbl(t)));
+    check("前置：10:00 喝水已响（PENDING）",
+          (t->pending_today & (1u << water_idx)) != 0,
+          det("%s", dump_tbl(t)));
+
+    /* ★ 核心断言：正在响铃（fired_due_at 更大）的是喝水，必须选它。
+     * 选成服药就是用户实报的 bug：确认记错，喝水继续挂着。 */
+    check("★两条都待确认时，选中正在响铃的喝水（不是服药）",
+          elder_reminder_first_ringing() == water_idx,
+          det("first_ringing=%d（喝水 idx=%d，服药 idx=%d）",
+              elder_reminder_first_ringing(), water_idx, med_idx));
+    check("★判据确实是 fired_due_at：喝水的触发时刻更新",
+          t->items[water_idx].fired_due_at > t->items[med_idx].fired_due_at,
+          det("喝水 fired_due_at=%lld，服药 fired_due_at=%lld",
+              (long long)t->items[water_idx].fired_due_at,
+              (long long)t->items[med_idx].fired_due_at));
+
+    /* 老人对喝水说「弄好了」→ 确认必须落在喝水上 */
+    check("语音确认喝水成功",
+          elder_reminder_confirm_ex((uint8_t)water_idx, ELDER_CFM_VOICE) == ESP_OK,
+          NULL);
+    check("喝水已确认（DONE）后不再被选中，改选中服药",
+          elder_reminder_first_ringing() == med_idx,
+          det("first_ringing=%d（应为服药 idx=%d）",
+              elder_reminder_first_ringing(), med_idx));
+
+    /* 服药也确认掉 → 没有任何响铃（DONE 不算响铃） */
+    check("两条都确认后，没有正在响铃的提醒",
+          elder_reminder_confirm_ex((uint8_t)med_idx, ELDER_CFM_VOICE) == ESP_OK
+              && elder_reminder_first_ringing() == -1,
+          det("first_ringing=%d（应为 -1）", elder_reminder_first_ringing()));
+
+    /* ---- 反向：不能修成「永远返回 -1」或「永远不选服药」----
+     * 新的一天只有服药在响时，必须选它。否则真到了只剩一条服药在响的
+     * 场景，语音确认会回"没有待确认的提醒"，闭环断裂。 */
+    stub_time_set(1772661600L + 86400 + 2 * 3600);   /* 次日 08:00 */
+    rec_reset();
+    elder_reminder_tick_once();
+    t = tbl();
+    check("反向：新的一天只有服药在响，选中服药",
+          elder_reminder_first_ringing() == med_idx,
+          det("first_ringing=%d（应为服药 idx=%d）—— 修成永远 -1 = "
+              "只剩一条服药在响时语音确认失效",
+              elder_reminder_first_ringing(), med_idx));
+
+    /* CONFIRM_WIN（长按后的 30s 窗口）也算响铃中：老人在窗口内
+     * 说「弄好了」必须能确认到正在窗口里的那条。 */
+    elder_reminder_arm_confirm((uint8_t)med_idx);
+    check("CONFIRM_WIN 状态同样算正在响铃",
+          elder_reminder_first_ringing() == med_idx,
+          det("first_ringing=%d（应为服药 idx=%d）",
+              elder_reminder_first_ringing(), med_idx));
+    elder_reminder_confirm_ex((uint8_t)med_idx, ELDER_CFM_VOICE);
+    check("窗口内确认后同样回到 -1",
+          elder_reminder_first_ringing() == -1,
+          det("first_ringing=%d（应为 -1）", elder_reminder_first_ringing()));
+}
+
 int main(void)
 {
     /* 时区必须与固件一致（elder_bridge.cc 同样固定 CST-8）：
@@ -1638,6 +1769,7 @@ int main(void)
     test_stale_skip_no_false_missed();
     test_voice_confirm_no_false_missed();
     test_late_boot_no_instant_escalate();
+    test_first_ringing_picks_ringing();
 
     printf("\n=== %d 通过 / %d 失败 ===\n", g_pass, g_fail);
     return g_fail ? 1 : 0;

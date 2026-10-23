@@ -361,7 +361,7 @@ void OnReminder(const elder_rmd_item_t *item, elder_rmd_state_t st, void *ctx)
 
 /* ---------------------------------------------------------------- 按键 */
 
-/* 找第一条「今天还没确认」的提醒，**服药优先**，其次日程。
+/* 找第一条「今天还没确认」的提醒。**正在响铃的优先**，其次服药优先。
  * 返回下标，没有则 -1。抽成函数的原因：短按直接确认、长按挂窗口、
  * 语音确认三条路必须用**同一套判据**，否则会出现「长按能确认、短按确认到
  * 别的条」这种对不上的行为。
@@ -369,10 +369,19 @@ void OnReminder(const elder_rmd_item_t *item, elder_rmd_state_t st, void *ctx)
  * 2026-10-22 需求 8 把它从"只看服药"扩展到"任意提醒"：
  * 现在日程提醒也会全屏显示并要求"语音/按键确认完成"，判据若仍只认服药，
  * 老人对日程说「做完了」会被回一句"没有待确认的提醒"。
- * **服药优先**是为了不动老行为：两条都待确认时，确认的仍是药那一条
- * （药漏了是真事故，日程漏了不是）。 */
+ *
+ * 2026-10-22 用户实报 bug（喝水提醒响铃时说「弄好了」，确认记到了吃药
+ * 提醒上）：根因是下面的循环"见到第一条服药就返回"，正在响铃的日程
+ * 提醒永远选不中。所以现在的优先级是：
+ *   ① 先问 elder_reminder_first_ringing()：此刻有提醒在响就确认它
+ *      （fired_due_at 最大 = 最近触发的那条，正是老人刚回应的那条）；
+ *   ② 都没有在响时，才退回服药优先启发式 —— 两条都待确认时确认药那一条
+ *      （药漏了是真事故，日程漏了不是），不动老行为。 */
 int FirstUndoneReminder()
 {
+    int ringing = elder_reminder_first_ringing();
+    if (ringing >= 0) return ringing;
+
     const elder_rmd_table_t *tbl = nullptr;
     if (elder_reminder_list(&tbl) != ESP_OK || tbl == nullptr) {
         return -1;

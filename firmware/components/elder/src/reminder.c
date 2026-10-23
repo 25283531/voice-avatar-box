@@ -743,6 +743,43 @@ bool elder_reminder_has_pending_medicine(void)
     return false;
 }
 
+/* 当前**正在响铃**的提醒下标；没有则 -1。
+ *
+ * 为什么需要它（2026-10-22 用户实报 bug）：
+ *   设备上「喝水」提醒正在响铃，老人说「弄好了」，确认却记到了另一条
+ *   「吃鼻炎药」上，喝水提醒依然未确认、继续被注入系统提示词。
+ *   根因在 elder_bridge.cc 的 FirstUndoneReminder()：它按「服药优先」
+ *   启发式选目标，循环里见到第一条 ELDER_RMD_TYPE_MEDICINE 就返回 ——
+ *   正在响铃的日程（喝水）提醒永远选不中。
+ *
+ * 判据与 elder_reminder_has_pending_medicine() 的「响铃中」状态集合
+ * 保持一致（PENDING / CONFIRM_WIN / ESCALATED 三者都算这一轮还没完结），
+ * 并要求 enabled —— 停用的提醒不发声，自然也不能被确认。
+ *
+ * 多条同时响铃时取 fired_due_at **最大**的那条：fired_due_at 是本次
+ * 触发的到期时刻（unix 秒，见 elder_rmd_item_t），最大 = 最近触发 =
+ * 此刻正在发声的那条。老人说「弄好了」回应的一定是刚响的那条。 */
+int elder_reminder_first_ringing(void)
+{
+    int best = -1;
+    int64_t best_due = 0;
+    for (int i = 0; i < g.table.count && i < ELDER_REMINDER_MAX; i++) {
+        if (!g.table.items[i].enabled) continue;
+        if (g.state[i] != ELDER_RMD_PENDING &&
+            g.state[i] != ELDER_RMD_CONFIRM_WIN &&
+            g.state[i] != ELDER_RMD_ESCALATED) {
+            continue;
+        }
+        /* 严格大于：fired_due_at 相等（同一分钟触发的两条）时保留下标
+         * 更小的那条，行为确定，不依赖遍历顺序之外的偶然因素。 */
+        if (best < 0 || g.table.items[i].fired_due_at > best_due) {
+            best = (int)i;
+            best_due = g.table.items[i].fired_due_at;
+        }
+    }
+    return best;
+}
+
 int32_t elder_reminder_next_in_sec(void)
 {
     time_t now = time(NULL);

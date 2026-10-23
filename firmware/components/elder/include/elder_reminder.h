@@ -196,6 +196,19 @@ void elder_reminder_arm_confirm(uint8_t id);
 bool elder_reminder_has_pending_medicine(void);
 
 /**
+ * @brief 当前**正在响铃**的提醒下标（语音/按键确认的优选目标）；没有则 -1。
+ *
+ * 「响铃中」= state ∈ {PENDING, CONFIRM_WIN, ESCALATED} 且 enabled，
+ * 与 elder_reminder_has_pending_medicine() 同一套状态集合；
+ * 多条同时响铃时取 fired_due_at 最大（最近触发）的那条。
+ *
+ * 存在的理由（2026-10-22 用户实报）：喝水提醒正在响铃，老人说「弄好了」，
+ * 确认却记到了另一条吃鼻炎药上。确认必须落在**此刻正在响**的那条，
+ * 这是 elder_bridge.cc 的 FirstUndoneReminder() 选目标时的第一优先级。
+ */
+int elder_reminder_first_ringing(void);
+
+/**
  * @brief 获取下一条待触发提醒距现在的秒数（-1 表示无）
  */
 int32_t elder_reminder_next_in_sec(void);
