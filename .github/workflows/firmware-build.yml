@@ -173,7 +173,7 @@ jobs:
       # 因此这里**只缓存 ccache**（ccache 按内容哈希自校验，陈旧不会改变产物），
       # 组件树每次按清单/锁文件干净下载。代价是每次多花一两分钟下载。
       - name: 缓存 ccache（managed_components 不进缓存，见上方事故注释）
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: /root/.ccache
           key: ccache-${{ inputs.idf_version || 'v5.5.1' }}-${{ github.sha }}
