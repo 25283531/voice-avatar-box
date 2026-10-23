@@ -260,8 +260,8 @@ jobs:
           fi
           echo "managed_components 里没有 lvgl（正确：走 override_path）"
 
-          # ② override 源的真实版本
-          SRC=../third_party/lvgl
+          # ② override 源的真实版本（相对 PROJECT_DIR=firmware/xiaozhi 往上两级是仓库根）
+          SRC=../../third_party/lvgl
           test -d "$SRC" || { echo "::error::找不到 override 源 $SRC（tools/fetch_lvgl.py 没跑？）"; exit 1; }
           VH=$SRC/lv_version.h
           test -f "$VH" || { echo "::error::找不到 $VH"; exit 1; }
