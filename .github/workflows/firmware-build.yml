@@ -136,15 +136,52 @@ jobs:
           set -e
           python3 tools/prebuild_check.py --strict
 
-      - name: 缓存 IDF 组件与 ccache
+      # ⚠️⚠️ managed_components **刻意不进缓存**（2026-10-23 白屏事故根因）。
+      #
+      # 事故链条：
+      #   1) 缓存恢复是"整棵目录树替换"，而 IDF 对**已经在 managed_components 里**
+      #      的组件只按目录内 idf_component.yml 的版本号判断要不要重下，**不校验
+      #      内容哈希** ⇒ 缓存里躺着的旧树会被直接采用（日志原话：
+      #      "Using component placed at .../managed_components/lvgl__lvgl"）。
+      #   2) 本次缓存里的 lvgl__lvgl 实际是 **LVGL 9.6 的目录树**（存在 9.3 没有的
+      #      include/lvgl/ 这一层），而锁文件/清单要求 9.3.0。
+      #   3) 于是**编译期头文件来自 9.6**。9.6 的 lv_font_t 把 dsc/fallback/
+      #      user_data 挪到了最前面：
+      #        9.3: get_glyph_dsc@0 get_glyph_bitmap@4 release_glyph@8
+      #             line_height@12 base_line@16 dsc@24            (sizeof 36)
+      #        9.6: dsc@0 fallback@4 user_data@8
+      #             get_glyph_dsc@12 get_glyph_bitmap@16 release_glyph@20
+      #             line_height@24 base_line@28 cap_height@32 ... (sizeof 44)
+      #   4) cbin 字库（78/xiaozhi-fonts 的 .bin）是按 **9.3 布局**生成的 ⇒
+      #      cbin_font_create 把文件偏移 0 的 0 当成 dsc（空指针）、把偏移 24 的
+      #      dsc 字段值 36 当成 line_height ⇒ 字形一个都查不到 ⇒
+      #      **白屏 / 字幕消失 / 图片不显示**（用户侧三个现象全部由此而来）。
+      #   CI 日志里的 include 链就是铁证：
+      #      lvgl__lvgl/include/lvgl/lvgl.h ← lvgl__lvgl/lvgl.h（9.6 的转发头）
+      #
+      # 因此这里**只缓存 ccache**（ccache 按内容哈希自校验，缓存陈旧不会改变产物），
+      # 组件树每次按 dependencies.lock 干净下载。代价是每次多花一两分钟下载，
+      # 换来的是"编进固件的组件版本可证明"。
+      - name: 缓存 ccache（managed_components 不进缓存，见上方事故注释）
         uses: actions/cache@v4
         with:
-          path: |
-            firmware/xiaozhi/managed_components
-            /root/.ccache
-          key: idf-${{ inputs.idf_version || 'v5.5.1' }}-${{ hashFiles('firmware/xiaozhi/dependencies.lock', 'firmware/xiaozhi/main/idf_component.yml') }}
+          path: /root/.ccache
+          key: ccache-${{ inputs.idf_version || 'v5.5.1' }}-${{ github.sha }}
           restore-keys: |
-            idf-${{ inputs.idf_version || 'v5.5.1' }}-
+            ccache-${{ inputs.idf_version || 'v5.5.1' }}-
+
+      # 防御第二层：旧 key 的缓存里存过整棵 managed_components（含那份 9.6 的 lvgl），
+      # 只要有任何一条旧缓存被恢复回来，这里一律删掉，让它按锁文件重新下载。
+      - name: 清掉任何被缓存带回来的 managed_components
+        run: |
+          set -e
+          if [ -d "$PROJECT_DIR/managed_components" ]; then
+            echo "::warning::缓存里带回了 managed_components，删除后按 dependencies.lock 重新下载"
+            ls "$PROJECT_DIR/managed_components" | head -5
+            rm -rf "$PROJECT_DIR/managed_components"
+          else
+            echo "无 managed_components（正常：组件树每次干净下载）"
+          fi
 
       # ⚠️ sdkconfig 与 build/ **刻意不进缓存**：runner 是干净环境，
       #    sdkconfig 每次由 idf.py set-target 从 sdkconfig.defaults + Kconfig
@@ -159,6 +196,35 @@ jobs:
           cd "$PROJECT_DIR"
           idf.py set-target "$IDF_TARGET"
           grep -E 'CONFIG_BOARD_TYPE|CONFIG_ELDER_SERVER_URL|CONFIG_USE_EMOTE|CONFIG_SPIRAM' sdkconfig | head -12 || true
+
+      # ⚠️ 组件树闸门（2026-10-23 白屏事故的机械防线）：
+      # 判据不看版本号（版本号可以被"混装目录"骗过去），只看**目录形态**：
+      #   LVGL 9.3.0 的组件根是 lvgl.h + src/lvgl.h，**没有** include/lvgl/ 这层；
+      #   LVGL 9.6+ 才有 include/lvgl/lvgl.h（根目录 lvgl.h 变成一行转发头）。
+      # 一旦出现 include/lvgl/，说明编译期头文件不是锁文件钉的那份 9.3 ——
+      # cbin 字库的 lv_font_t 布局对不上，必然是白屏，直接红掉别产出固件。
+      - name: 组件树自检（lvgl 必须是锁文件钉的 9.3 树，不能是 9.6 的）
+        shell: bash
+        run: |
+          set -e
+          cd "$PROJECT_DIR"
+          WANT=$(grep -A8 'lvgl/lvgl:' dependencies.lock | grep -m1 '    version:' | awk '{print $2}')
+          echo "dependencies.lock 要求 lvgl = ${WANT:-<解析失败>}"
+          test -n "$WANT" || { echo "::error::锁文件里读不到 lvgl 版本"; exit 1; }
+          HAVE=$(grep -m1 '^version:' managed_components/lvgl__lvgl/idf_component.yml | awk '{print $2}' | tr -d "'\"")
+          echo "managed_components 里 lvgl = $HAVE"
+          if [ "$HAVE" != "$WANT" ]; then
+            echo "::error::组件树版本与锁文件不一致（缓存污染？）：$HAVE != $WANT"
+            exit 1
+          fi
+          if [ -e managed_components/lvgl__lvgl/include/lvgl/lvgl.h ]; then
+            echo "::error::managed_components/lvgl__lvgl 是 9.6+ 的目录树（存在 include/lvgl/lvgl.h），"
+            echo "::error::与锁文件要求的 $WANT 不符 —— 编译期会用 9.6 的 lv_font_t 布局，"
+            echo "::error::cbin 字库会被读错（dsc→空指针、line_height→36），屏上必然白屏。"
+            exit 1
+          fi
+          echo "lvgl 目录形态正确（无 include/lvgl/，是 $WANT 的树）"
+
 
       # ⚠️ 第二次自检，位置在 set-target **之后**。
       #
