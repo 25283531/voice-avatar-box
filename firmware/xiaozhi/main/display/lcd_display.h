@@ -97,6 +97,23 @@ public:
     lv_obj_t* reminder_overlay_ = nullptr;   /* 懒创建，全屏不透明 */
     lv_obj_t* reminder_label_ = nullptr;
     // <<< END elder-reminder-fullscreen <<<
+
+    // >>> BEGIN elder-idle-panda (2026-10-22 需求 7：待机立即播熊猫) >>>
+    /* 进入待机时**立即**开播动态熊猫，不等防烧屏的 60 秒。
+     *
+     * 需求原话（2026-10-22）：「进入待机状态强制切换到待机动态熊猫图案，
+     * 以便区分硬件是否在监听声音，让用户知道是否需要唤醒词进行唤醒。」
+     *
+     * 与 AntiBurnInStep() 的本质区别：那条路径开头有
+     * `if (lv_tick_elaps(last_ui_change_tick_) < ANTI_BURN_IDLE_MS) return;`
+     * —— 界面刚变过（SetEmotion("neutral") 正是界面变化）之后的 60 秒内
+     * 一律跳过，而"进待机"恰好每次都紧跟一次 SetEmotion，于是熊猫永远
+     * 播不上。用户看到的待机屏与"死机"无从区分。
+     *
+     * 由 elder_bridge.cc 调用（dynamic_cast 拿到本类时）；无屏/非本板卡
+     * 时拿不到本类，静默不播，待机本身不受影响。 */
+    void PlayIdleAnimation();
+    // <<< END elder-idle-panda <<<
 };
 
 // SPI LCD display

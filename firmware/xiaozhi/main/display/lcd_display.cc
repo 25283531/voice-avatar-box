@@ -1243,6 +1243,64 @@ void LcdDisplay::AntiBurnInStep() {
     }
 }
 
+// >>> BEGIN elder-idle-panda (2026-10-22 需求 7：待机立即播熊猫) >>>
+/* 进入待机：立即开播动态熊猫，**不**等防烧屏的 60 秒。
+ *
+ * 需求原话（2026-10-22）：「进入待机状态强制切换到待机动态熊猫图案，
+ * 以便区分硬件是否在监听声音，让用户知道是否需要唤醒词进行唤醒。」
+ *
+ * 为什么不能靠 AntiBurnInStep()：那条路径开头有
+ *   if (lv_tick_elaps(last_ui_change_tick_) < ANTI_BURN_IDLE_MS) return;
+ * 界面刚变过（SetEmotion("neutral") 正是界面变化）之后的 60 秒内一律
+ * 跳过，而"进待机"恰好每次都紧跟一次 SetEmotion —— 熊猫永远播不上。
+ *
+ * 纪律与 SetEmotion 相同：一进函数就重置防烧屏计时。界面确实变过了
+ * （静态表情 -> 熊猫动画），不重置的话轮播的「60 秒无操作」判据会从
+ * 错误的起点算起。放在最前面：下面有多个分支会提前返回，漏掉哪个
+ * 都会让计时错乱。
+ *
+ * 动图不可用（帧数据缺失/描述符池分配失败）时只打 WARN 退回静态
+ * 表情，**不调 SetEmotion**：那会再把动画 Stop 一次（此刻本来就没在
+ * 播，纯属浪费），且静态表情此刻已在屏上，没有切换的必要。 */
+void LcdDisplay::PlayIdleAnimation() {
+    /* 界面变化 ⇒ 重置防烧屏空闲计时（见 StartAntiBurnInTimer）。 */
+    last_ui_change_tick_ = lv_tick_get();
+
+    /* 先把可能正在播的 GIF 表情停掉，再换熊猫。
+     *
+     * AnimEmojiPlayer 的帧定时器与 gif_controller_ 的帧回调都往
+     * emoji_image_ 上怼，两个同时跑就是 SetEmotion 注释里写的
+     * 「表情闪一下就变了」甚至花屏。SetEmotion 每次都会清
+     * gif_controller_，进待机的主路径（状态变化事件）必经 SetEmotion，
+     * 通常这里已经是空的；但 elder_bridge 在「设备已经是 idle 又说了一
+     * 次待机」时也会直接调本函数，那条路径没有 SetEmotion 兜底，
+     * 所以必须自己清。AntiBurnInStep 不需要这步 —— 它只在界面 60 秒
+     * 无变化后跑，那期间任何 SetEmotion 都已经清过 GIF 了。
+     *
+     * AnimEmojiPlayer 不用在这里停：PlayDefault → Play() 第一行就是
+     * Stop()（anim_emoji_player.cc:128），自带。 */
+    if (gif_controller_) {
+        DisplayLockGuard lock(this);
+        gif_controller_->Stop();
+        gif_controller_.reset();
+    }
+
+    auto& anim = AnimEmojiPlayer::Get();
+    if (anim.Available() && emoji_image_ != nullptr) {
+        DisplayLockGuard lock(this);
+        if (anim.PlayDefault(emoji_image_)) {
+            if (emoji_label_ != nullptr) {
+                lv_obj_add_flag(emoji_label_, LV_OBJ_FLAG_HIDDEN);
+            }
+            lv_obj_remove_flag(emoji_image_, LV_OBJ_FLAG_HIDDEN);
+            ESP_LOGI(TAG, "待机屏保：立即播放熊猫 \"%s\"", anim.DefaultName());
+            return;
+        }
+    }
+    ESP_LOGW(TAG, "待机屏保：动图不可用，退回静态表情（防烧屏轮播仍会尝试）");
+}
+// <<< END elder-idle-panda <<<
+
 void LcdDisplay::SetTheme(Theme* theme) {
     DisplayLockGuard lock(this);
     
