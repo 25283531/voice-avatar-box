@@ -518,7 +518,19 @@ void AudioService::EnableVoiceProcessing(bool enable) {
         }
 
         /* We should make sure no audio is playing */
-        ResetDecoder();
+        /* 2026-10-23 修复「后台日志上的语句并没有全部在设备上语音说出来」：
+         * 这里原调用 ResetDecoder()，而 ResetDecoder 除了重置解码器状态，
+         * 还会把 audio_decode_queue_ / audio_playback_queue_ **全部清空**。
+         * 调用链：服务端发完最后一个 opus 包才发 tts stop → 设备
+         * SetDeviceState(kDeviceStateListening) → EnableVoiceProcessing(true)
+         * → ResetDecoder() ⇒ 此刻队列里还没播完的尾音（可达数百毫秒，
+         * 短句甚至是整句）被一把清掉，表现就是「日志里有、设备没念完」。
+         *
+         * 只重置解码器状态：OpusDecoderWrapper::ResetState 内部自带互斥锁，
+         * 不需要 audio_queue_mutex_。队列里的尾音随播放任务自然排空 ——
+         * 紧随其后的 audio_input_need_warmup_ = true 本来就会给上行 AFE
+         * 一段预热时间，不会出现「麦克风当场录到尾音」的竞争。 */
+        opus_decoder_->ResetState();
         audio_input_need_warmup_ = true;
         audio_processor_->Start();
         xEventGroupSetBits(event_group_, AS_EVENT_AUDIO_PROCESSOR_RUNNING);
