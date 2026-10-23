@@ -1085,17 +1085,17 @@ void LcdDisplay::SetChatMessage(const char* role, const char* content) {
      * （或 ls≠0 / 有 padding）。把 label 的**解析后**字体与排版参数
      * 全部打出来 —— 注意打的是 label 自己，不是 theme 里的字体。 */
     {
-        const lv_font_t* label_font = lv_obj_get_style_text_font(chat_message_label_, 0);
+        const lv_font_t* label_font = lv_obj_get_style_text_font(chat_message_label_, LV_PART_MAIN);
         ESP_LOGW("FontDiag", "chat label font=%p lh=%d bl=%d ls=%d les=%d long=%d pad=%d,%d style_h=%d",
                  (const void*)label_font,
                  label_font ? label_font->line_height : -1,
                  label_font ? label_font->base_line : -1,
-                 (int)lv_obj_get_style_text_line_space(chat_message_label_, 0),
-                 (int)lv_obj_get_style_text_letter_space(chat_message_label_, 0),
+                 (int)lv_obj_get_style_text_line_space(chat_message_label_, LV_PART_MAIN),
+                 (int)lv_obj_get_style_text_letter_space(chat_message_label_, LV_PART_MAIN),
                  (int)lv_label_get_long_mode(chat_message_label_),
-                 (int)lv_obj_get_style_pad_top(chat_message_label_, 0),
-                 (int)lv_obj_get_style_pad_bottom(chat_message_label_, 0),
-                 (int)lv_obj_get_style_height(chat_message_label_, 0));
+                 (int)lv_obj_get_style_pad_top(chat_message_label_, LV_PART_MAIN),
+                 (int)lv_obj_get_style_pad_bottom(chat_message_label_, LV_PART_MAIN),
+                 (int)lv_obj_get_style_height(chat_message_label_, LV_PART_MAIN));
     }
     lv_label_set_text(chat_message_label_, content);
     /* 同步跑一次布局，打「这段文字 + 当前字体」的真实高度：与函数开头
