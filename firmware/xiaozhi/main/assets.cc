@@ -166,6 +166,28 @@ bool Assets::Apply() {
                 ESP_LOGE(TAG, "Failed to load fonts.bin");
                 return false;
             }
+            /* 2026-10-23 白屏/字幕消失运行时诊断。
+             * 字体文件头铁证 line_height=25（fw2 包逐字节核对 + esptool 实读
+             * 设备 flash 双证），而真机 chat label 高 36 —— 36 不是 25 的
+             * 任何行数（lv_text_get_size：y = n*lh + (n-1)*ls，本 label ls=0）。
+             * 只剩两种可能：运行时字体对象被改写 / label 用的不是这个对象。
+             * 这里打创建瞬间快照，SetTheme 与 SetChatMessage 两侧各打一份，
+             * 三个指针 + line_height 全部对上即可定位。 */
+            {
+                const lv_font_t* f = text_font->font();
+                lv_font_glyph_dsc_t gd;
+                bool ok = false;
+                if (f->get_glyph_dsc != nullptr) {
+                    ok = f->get_glyph_dsc(f, &gd, 0x5F85 /* 待 */, 0);
+                }
+                ESP_LOGW(TAG, "FontDiag: Apply cbin font=%p lh=%d bl=%d dsc=%p",
+                         (const void*)f, f->line_height, f->base_line, (const void*)f->dsc);
+                ESP_LOGW(TAG, "FontDiag: Apply cbin glyph 待: ok=%d adv=%d box=%dx%d ofs=%d,%d",
+                         (int)ok, (int)gd.adv_w, (int)gd.box_w, (int)gd.box_h,
+                         (int)gd.ofs_x, (int)gd.ofs_y);
+                ESP_LOGW(TAG, "FontDiag: Apply themes light=%p dark=%p font=%p",
+                         (void*)light_theme.get(), (void*)dark_theme.get(), (const void*)f);
+            }
             if (light_theme != nullptr) {
                 light_theme->set_text_font(text_font);
             }

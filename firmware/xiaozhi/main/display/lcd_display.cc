@@ -1080,7 +1080,30 @@ void LcdDisplay::SetChatMessage(const char* role, const char* content) {
              (void*)chat_message_label_,
              (int)lv_obj_get_width(chat_message_label_),
              (int)lv_obj_get_height(chat_message_label_));
+    /* 2026-10-23 诊断：h=36 之谜。文件里 line_height=25，而这里 h=36，
+     * 数学上只可能是 label 实际字体的 line_height 运行时读出来不是 25
+     * （或 ls≠0 / 有 padding）。把 label 的**解析后**字体与排版参数
+     * 全部打出来 —— 注意打的是 label 自己，不是 theme 里的字体。 */
+    {
+        const lv_font_t* label_font = lv_obj_get_style_text_font(chat_message_label_, 0);
+        ESP_LOGW("FontDiag", "chat label font=%p lh=%d bl=%d ls=%d les=%d long=%d pad=%d,%d style_h=%d",
+                 (const void*)label_font,
+                 label_font ? label_font->line_height : -1,
+                 label_font ? label_font->base_line : -1,
+                 (int)lv_obj_get_style_text_line_space(chat_message_label_, 0),
+                 (int)lv_obj_get_style_text_letter_space(chat_message_label_, 0),
+                 (int)lv_label_get_long_mode(chat_message_label_),
+                 (int)lv_obj_get_style_pad_top(chat_message_label_, 0),
+                 (int)lv_obj_get_style_pad_bottom(chat_message_label_, 0),
+                 (int)lv_obj_get_style_height(chat_message_label_, 0));
+    }
     lv_label_set_text(chat_message_label_, content);
+    /* 同步跑一次布局，打「这段文字 + 当前字体」的真实高度：与函数开头
+     * 打的上一次高度对照，才能把 25→36 的跳变钉死在哪一侧。 */
+    lv_obj_update_layout(chat_message_label_);
+    ESP_LOGW("FontDiag", "after set_text+layout: w=%d h=%d",
+             (int)lv_obj_get_width(chat_message_label_),
+             (int)lv_obj_get_height(chat_message_label_));
 }
 #endif
 
@@ -1313,6 +1336,15 @@ void LcdDisplay::SetTheme(Theme* theme) {
     auto text_font = lvgl_theme->text_font()->font();
     auto icon_font = lvgl_theme->icon_font()->font();
     auto large_icon_font = lvgl_theme->large_icon_font()->font();
+
+    /* 2026-10-23 诊断：SetTheme 是把 theme 的字体刷到各 label 的唯一
+     * 入口。打出来的指针/lh 与 Assets::Apply 创建字体时的快照对照：
+     * 三个指针一致而 label 仍高 36 ⇒ 字体对象运行时被改写；
+     * 指针不一致 ⇒ 字体刷到了别的 theme 对象上。 */
+    ESP_LOGW("FontDiag", "SetTheme theme=%p text_font=%p lh=%d bl=%d",
+             (const void*)lvgl_theme, (const void*)text_font,
+             text_font ? text_font->line_height : -1,
+             text_font ? text_font->base_line : -1);
 
     if (text_font->line_height >= 40) {
         lv_obj_set_style_text_font(mute_label_, large_icon_font, 0);
