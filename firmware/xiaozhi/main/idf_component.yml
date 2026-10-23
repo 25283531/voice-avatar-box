@@ -26,7 +26,7 @@ dependencies:
   # 链接，只要它们在 SRCS 里就会整个塞进固件、不被 gc 回收。
   # WiFi 侧的 7 个源文件 + 8 个头文件已搬进 main/net/（逐字未改），
   # 见 net/README.md。
-  78/xiaozhi-fonts: ~1.5.5
+  78/xiaozhi-fonts: '==1.5.5'   # 精确钉死，理由见下方 lvgl 处的长注释
   espressif/led_strip: ~3.0.1
   espressif/esp_codec_dev: ~1.5
   espressif/esp-sr: ~2.2.0
@@ -42,7 +42,16 @@ dependencies:
   espressif/esp_lcd_touch_gt1151: ^1
   waveshare/esp_lcd_touch_cst9217: ^1.0.3
   espressif/esp_lcd_touch_cst816s: ^1.0.6
-  lvgl/lvgl: ~9.3.0
+  # ⚠️ 精确钉死，不要改回 ~9.3.0 / ^9.3.0（2026-10-23 白屏事故）。
+  # 原因：`~9.3.0` 语义是 >=9.3.0,<9.4.0，本意已经够紧，但当 dependencies.lock
+  # 失效（CI 注入 elder 后清单集合变化 → "Manifest files have changed"）时，
+  # 组件管理器会重新求解，实测把 lvgl 抬到了 9.6.0~1（CI run 39910735989 日志：
+  # [38/44] lvgl/lvgl (9.3.0) 已落盘，[39/44] lvgl/lvgl (9.6.0~1) 又被下载覆盖）。
+  # 9.6 的 lv_font_t 是 44 字节且字段重排（dsc@0 / line_height@24），而
+  # 78/xiaozhi-fonts 的 cbin 字库按 9.3 布局（36 字节，dsc@24 / line_height@12）
+  # 生成，cbin_font_create 用 malloc_cpy 按 sizeof(lv_font_t) 盲拷 ⇒
+  # dsc 读成空指针、line_height 读成 36 ⇒ 字形零命中 ⇒ 白屏/字幕消失/图片不显示。
+  lvgl/lvgl: '==9.3.0'
   esp_lvgl_port: ~2.6.0
   espressif/esp_io_expander_tca95xx_16bit: ^2.0.0
   # 2026-10-20 删除 emote 表情引擎及其链路依赖（用户确认「不能调用就删除」）：
