@@ -6,7 +6,17 @@ build/
 .devcontainer/
 sdkconfig.old
 sdkconfig
-dependencies.lock
+# dependencies.lock 刻意入库（2026-10-23）：这份 .gitignore 继承自上游
+# xiaozhi-esp32，原来把它和 managed_components/ 一起忽略 ⇒ CI 每次**无锁编译**，
+# 按 main/idf_component.yml 的 ~x.y.z 范围从注册表动态解析。后果：
+#   · ~1.5.5 语义是 >=1.5.5,<1.6.0，78 发布 1.5.6 后 CI 静默换组件而本地不变；
+#   · CI 缓存 restore-keys 是前缀匹配，manifest 变更后会恢复旧组件目录，
+#     而 IDF 对已存在组件只按版本号判断、不重新校验内容哈希。
+# 二者合成一类事故：「本地分析的代码 ≠ CI 编进固件的代码」——白屏排查里
+# 最贵的一类怀疑。入库后组件版本+component_hash 被钉死（CI 缓存 key 本就
+# 含它的哈希），升级依赖变成显式改锁文件的动作。
+# managed_components/（507M）仍然忽略：内容由锁文件保证，见
+# .github/workflows/firmware-build.yml 的缓存步骤注释。
 .env
 releases/
 main/assets/lang_config.h
