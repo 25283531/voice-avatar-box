@@ -175,7 +175,7 @@ bool Assets::Apply() {
              * 三个指针 + line_height 全部对上即可定位。 */
             {
                 const lv_font_t* f = text_font->font();
-                lv_font_glyph_dsc_t gd;
+                lv_font_glyph_dsc_t gd = {};
                 bool ok = false;
                 if (f->get_glyph_dsc != nullptr) {
                     ok = f->get_glyph_dsc(f, &gd, 0x5F85 /* 待 */, 0);
@@ -186,7 +186,7 @@ bool Assets::Apply() {
                          (int)ok, (int)gd.adv_w, (int)gd.box_w, (int)gd.box_h,
                          (int)gd.ofs_x, (int)gd.ofs_y);
                 ESP_LOGW(TAG, "FontDiag: Apply themes light=%p dark=%p font=%p",
-                         (void*)light_theme.get(), (void*)dark_theme.get(), (const void*)f);
+                         (void*)light_theme, (void*)dark_theme, (const void*)f);
             }
             if (light_theme != nullptr) {
                 light_theme->set_text_font(text_font);
