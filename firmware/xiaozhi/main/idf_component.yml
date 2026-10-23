@@ -42,16 +42,31 @@ dependencies:
   espressif/esp_lcd_touch_gt1151: ^1
   waveshare/esp_lcd_touch_cst9217: ^1.0.3
   espressif/esp_lcd_touch_cst816s: ^1.0.6
-  # ⚠️ 精确钉死，不要改回 ~9.3.0 / ^9.3.0（2026-10-23 白屏事故）。
-  # 原因：`~9.3.0` 语义是 >=9.3.0,<9.4.0，本意已经够紧，但当 dependencies.lock
-  # 失效（CI 注入 elder 后清单集合变化 → "Manifest files have changed"）时，
-  # 组件管理器会重新求解，实测把 lvgl 抬到了 9.6.0~1（CI run 39910735989 日志：
-  # [38/44] lvgl/lvgl (9.3.0) 已落盘，[39/44] lvgl/lvgl (9.6.0~1) 又被下载覆盖）。
-  # 9.6 的 lv_font_t 是 44 字节且字段重排（dsc@0 / line_height@24），而
-  # 78/xiaozhi-fonts 的 cbin 字库按 9.3 布局（36 字节，dsc@24 / line_height@12）
-  # 生成，cbin_font_create 用 malloc_cpy 按 sizeof(lv_font_t) 盲拷 ⇒
-  # dsc 读成空指针、line_height 读成 36 ⇒ 字形零命中 ⇒ 白屏/字幕消失/图片不显示。
-  lvgl/lvgl: '==9.3.0'
+  # ⚠️ lvgl 必须走 override_path（本地目录），**不要**改回从注册表拉（2026-10-23 白屏事故）。
+  #
+  # 为什么不能只写版本约束：`==9.3.0` / `~9.3.0` / `9.3.0` 三种写法语义上都只匹配
+  # 9.3.0（本机 idf-component-manager 2.5.2 实测，只有 ^9.3.0 和 >=8,<10 会匹配
+  # 9.6.0~1）。但 CI 容器里的管理器在 "Manifest files have changed, solving
+  # dependencies." 触发的**重新求解**路径上把这条约束丢了，只剩
+  # espressif/esp_lvgl_port 要求的 `>=8,<10`，于是每次解析到注册表最新版
+  # 9.6.0~1 并覆盖刚下好的 9.3.0（run 39910735989 与 39911711545 两次复现，
+  # 后者已经写着 ==9.3.0 仍然被抬走）。
+  #
+  # 后果：9.6 的 lv_font_t 是 44 字节且字段重排（dsc@0 / line_height@24），
+  # 而 78/xiaozhi-fonts 的 cbin 字库是按 9.3 布局（36 字节，dsc@24 /
+  # line_height@12）生成的二进制镜像，cbin_font_create 用 malloc_cpy 盲拷
+  # ⇒ dsc 读成空指针、line_height 读成 36 ⇒ 字形零命中 ⇒ 白屏/字幕消失/图片不显示。
+  # 且 lv_font_fmt_txt_dsc_t 在 9.3/9.6 之间也变了（cmap_num 由 9 位位域变成
+  # 完整 u16，尾部新增 are_glyphs_dynamic_loaded），glyph_dsc/cmaps 数组是 LVGL
+  # 自己按编译期结构体读的 —— 从我们这边"兼容 9.6"做不到，编译期必须就是 9.3.0。
+  #
+  # 解法：override_path 指向本地目录时组件管理器走 LocalSource，**根本不去注册表**，
+  # 也就不存在被求解器抬版本的可能。该目录由 tools/fetch_lvgl.py 准备（CI 与本机
+  # 共用，下载后按内容校验 version/lv_version.h/目录形态），不进 git。
+  # 路径相对**本清单所在目录**（firmware/xiaozhi/main/）→ 仓库根/third_party/lvgl。
+  lvgl/lvgl:
+    version: '==9.3.0'
+    override_path: '../../../third_party/lvgl'
   esp_lvgl_port: ~2.6.0
   espressif/esp_io_expander_tca95xx_16bit: ^2.0.0
   # 2026-10-20 删除 emote 表情引擎及其链路依赖（用户确认「不能调用就删除」）：

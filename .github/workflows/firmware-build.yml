@@ -198,6 +198,28 @@ jobs:
       #    重新生成。若把本地那份 build/（含指向第三方 OTA 的 sdkconfig）
       #    缓存进来，坏配置会被静默烧进固件 —— 宁可每次多花几十秒重新生成。
 
+      # ⚠️ LVGL 走 override_path，**必须**在 set-target 之前把本地副本准备好。
+      #
+      # 为什么不用版本约束（2026-10-23 白屏事故的最终结论）：
+      #   清单里写 ==9.3.0 语义上只匹配 9.3.0，但组件管理器在
+      #   "Manifest files have changed, solving dependencies." 的重新求解路径上
+      #   把这条约束丢了，只剩 esp_lvgl_port 的 >=8,<10，于是每次解析到注册表
+      #   最新版 9.6.0~1 并覆盖已落盘的 9.3.0（run 39910735989 / 39911711545
+      #   两次复现，后者清单里已经写着 ==9.3.0 仍被抬走）。
+      #   9.6 的 lv_font_t 是 44 字节且字段重排，cbin 字库按 9.3 布局生成，
+      #   cbin_font_create 盲拷 sizeof(lv_font_t) ⇒ dsc 空指针 / line_height=36
+      #   ⇒ 字形零命中 ⇒ 白屏。
+      # override_path 指向本地目录时管理器走 LocalSource，根本不去注册表。
+      - name: 准备 LVGL 9.3.0 本地副本（override_path 的源）
+        run: |
+          set -e
+          python3 tools/fetch_lvgl.py
+          echo "--- 校验 override 源 ---"
+          grep -m1 '^version:' third_party/lvgl/idf_component.yml
+          grep -E 'LVGL_VERSION_(MAJOR|MINOR|PATCH)' third_party/lvgl/lv_version.h
+          test ! -e third_party/lvgl/include/lvgl/lvgl.h \
+            || { echo "::error::third_party/lvgl 是 9.6+ 的目录形态"; exit 1; }
+
       - name: set-target（生成 sdkconfig）
         shell: bash
         run: |
@@ -207,52 +229,57 @@ jobs:
           idf.py set-target "$IDF_TARGET"
           grep -E 'CONFIG_BOARD_TYPE|CONFIG_ELDER_SERVER_URL|CONFIG_USE_EMOTE|CONFIG_SPIRAM' sdkconfig | head -12 || true
 
-      # ⚠️ 组件树闸门（2026-10-23 白屏事故的机械防线）：
-      # 判据有三条，从硬到软：
-      #   ① 目录形态：LVGL 9.3.0 的组件根是 lvgl.h + src/lvgl.h，**没有** include/lvgl/
-      #      这一层；9.6+ 才有 include/lvgl/lvgl.h（根 lvgl.h 退化成一行转发头）。
-      #   ② 真实代码版本：读 lv_version.h 的 MAJOR/MINOR/PATCH —— 这是编译期真正
-      #      参与 #include 的那份代码的版本，比清单里的声明可信。
-      #   ③ 与清单的精确钉法比对：main/idf_component.yml 里 lvgl/lvgl 必须是
-      #      ==9.3.0（不是 ~9.3.0 —— 事故复盘见该行注释）。
-      # 任一条不符直接红掉，绝不产出"能刷进去但白屏"的固件。
-      - name: 组件树自检（lvgl 必须是 9.3.0，且不能是 9.6 的目录树）
+      # ⚠️ 组件树闸门（2026-10-23 白屏事故的机械防线）。
+      # 改用 override_path 后 lvgl 是 LocalSource（用原地目录，**不拷进**
+      # managed_components），所以判据变成：
+      #   ① managed_components/lvgl__lvgl **不该存在** —— 存在就说明 override_path
+      #      没生效、管理器又去注册表下载了（那就会是 9.6）。
+      #   ② override 源 third_party/lvgl 必须是 9.3.0：lv_version.h 三个宏 + 目录形态。
+      #   ③ 清单里 lvgl 必须带 override_path 且版本 ==9.3.0（防止有人改回去）。
+      - name: 组件树自检（lvgl 必须来自 override_path，且是 9.3.0）
         shell: bash
         run: |
           set -e
           cd "$PROJECT_DIR"
 
-          # ③ 清单里的精确钉法
-          RAW=$(grep -E '^  lvgl/lvgl:' main/idf_component.yml | head -1 | sed 's/#.*//' | awk -F: '{print $2}')
-          WANT=$(echo "$RAW" | tr -d "'\" " | sed 's/^==//')
-          echo "main/idf_component.yml 要求 lvgl = '${RAW# }'（归一化: ${WANT:-<空>}）"
-          test -n "$WANT" || { echo "::error::清单里读不到 lvgl 版本"; exit 1; }
+          # ③ 清单必须走 override_path
+          if ! grep -A3 -E '^  lvgl/lvgl:' main/idf_component.yml | grep -q 'override_path:'; then
+            echo "::error::main/idf_component.yml 的 lvgl 没有 override_path —— 会退回注册表解析，"
+            echo "::error::求解器会把版本抬到 9.6.0~1（见该行上方长注释）。"
+            exit 1
+          fi
+          echo "清单 lvgl 声明："
+          grep -A3 -E '^  lvgl/lvgl:' main/idf_component.yml | sed 's/^/    /'
 
-          # ② 树里真实代码版本
-          VH=managed_components/lvgl__lvgl/lv_version.h
-          test -f "$VH" || { echo "::error::找不到 $VH，组件树不完整"; exit 1; }
+          # ① override_path 生效的判据：managed_components 里不该有 lvgl
+          if [ -d managed_components/lvgl__lvgl ]; then
+            echo "::error::managed_components/lvgl__lvgl 存在 —— override_path 没生效，"
+            echo "::error::管理器又去注册表下载了（内容会是 9.6，白屏根因复现）。"
+            grep -m1 '^version:' managed_components/lvgl__lvgl/idf_component.yml || true
+            exit 1
+          fi
+          echo "managed_components 里没有 lvgl（正确：走 override_path）"
+
+          # ② override 源的真实版本
+          SRC=../third_party/lvgl
+          test -d "$SRC" || { echo "::error::找不到 override 源 $SRC（tools/fetch_lvgl.py 没跑？）"; exit 1; }
+          VH=$SRC/lv_version.h
+          test -f "$VH" || { echo "::error::找不到 $VH"; exit 1; }
           MAJ=$(awk '/LVGL_VERSION_MAJOR/{print $3}' "$VH")
           MIN=$(awk '/LVGL_VERSION_MINOR/{print $3}' "$VH")
           PAT=$(awk '/LVGL_VERSION_PATCH/{print $3}' "$VH")
           HAVE="$MAJ.$MIN.$PAT"
-          echo "lv_version.h 实际版本 = $HAVE"
-
-          # ① 目录形态（最硬的判据：不看版本号，看文件在不在）
-          if [ -e managed_components/lvgl__lvgl/include/lvgl/lvgl.h ]; then
-            echo "::error::managed_components/lvgl__lvgl 是 9.6+ 的目录树（存在 include/lvgl/lvgl.h）"
-            echo "::error::编译期会用 9.6 的 lv_font_t 布局（44 字节，dsc@0/line_height@24），"
-            echo "::error::而 cbin 字库按 9.3 布局（36 字节，dsc@24/line_height@12）生成，"
-            echo "::error::cbin_font_create 会读出 dsc=空指针、line_height=36 ⇒ 屏上必然白屏。"
-            exit 1
-          fi
-
+          echo "override 源 $SRC 的 lv_version.h = $HAVE"
           if [ "$HAVE" != "9.3.0" ]; then
-            echo "::error::组件树里的 LVGL 是 $HAVE，不是 9.3.0 —— 白屏根因会复现。"
-            echo "::error::请检查 CI 日志里 'Processing N dependencies' 段落中 lvgl/lvgl 的条目。"
+            echo "::error::override 源里的 LVGL 是 $HAVE，不是 9.3.0 —— 白屏根因会复现。"
+            exit 1
+          fi
+          if [ -e "$SRC/include/lvgl/lvgl.h" ]; then
+            echo "::error::$SRC 是 9.6+ 的目录形态（存在 include/lvgl/lvgl.h）"
             exit 1
           fi
 
-          echo "OK: lvgl 目录形态是 9.3 的树，lv_version.h = $HAVE，与清单钉的 $WANT 一致"
+          echo "OK: lvgl 来自 override_path，lv_version.h = $HAVE，无 include/lvgl/ 层"
 
 
       # ⚠️ 第二次自检，位置在 set-target **之后**。

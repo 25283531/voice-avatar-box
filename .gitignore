@@ -48,6 +48,12 @@ firmware/xiaozhi/components/elder/
 # 规避方式是先 Move-Item 移到这里暂存（可逆、不改阈值），构建后可直接删
 firmware/xiaozhi/.mc_stash/
 
+# LVGL 9.3.0 的本地副本（约 159MB，不进 git）。
+# 由 tools/fetch_lvgl.py 下载并按内容校验后生成；main/idf_component.yml 里
+# lvgl 通过 override_path 指向它，这样组件管理器走 LocalSource、不去注册表，
+# 避免被求解器抬到 9.6（9.6 的 lv_font_t 布局与 cbin 字库不兼容 → 白屏）。
+third_party/lvgl/
+
 # CI 冒烟脚本的落盘日志（tools/run_smoke.py 写，红灯时随 artifact 上传）
 logs/
 

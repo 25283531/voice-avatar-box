@@ -467,13 +467,6 @@ dependencies:
     source:
       type: idf
     version: 5.5.1
-  lvgl/lvgl:
-    component_hash: b702d642e03e95928046d5c6726558e6444e112420c77efa5fdb6650b0a13c5d
-    dependencies: []
-    source:
-      registry_url: https://components.espressif.com/
-      type: service
-    version: 9.3.0
   tny-robotics/sh1106-esp-idf:
     component_hash: 036f5aad73224c563c3edb5db6f9833f3eb47c41b3d479740edddf49488ced69
     dependencies: []
@@ -553,7 +546,6 @@ direct_dependencies:
 - espressif/knob
 - espressif/led_strip
 - idf
-- lvgl/lvgl
 - tny-robotics/sh1106-esp-idf
 - waveshare/esp_lcd_sh8601
 - waveshare/esp_lcd_touch_cst9217
