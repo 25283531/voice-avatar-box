@@ -109,14 +109,41 @@ PROVIDER_PRESETS: Final[tuple[ProviderPreset, ...]] = (
         "endpoint": "https://open.bigmodel.cn/api/paas/v4",
         "needs_key": True,
         "key_hint": "填智谱开放平台生成的 API Key（单段）。",
+        # 2026-10-23 横向实测（12 个候选模型）后改的两个默认值，都不是口味问题：
+        #
+        # ① llm_light 用**带日期版本** glm-4-flash-250414，不用别名 glm-4-flash。
+        #    同一段含药名/摔跤/家属/喜好的老人对话，用真实 _EXTRACT_SYSTEM 跑：
+        #    glm-4-flash-250414 抽取 4/4 全对、TTFT 611~622ms，两次结果一致；
+        #    DeepSeek（现用）也 4/4 但总耗时 3.2~8.4s 抖动。抽取是后台任务，
+        #    这种抖动纯属浪费钱。另外别名会随平台升级漂移，带日期版本才可复现。
+        #
+        # ② llm_main **绝不能**再填 glm-4-flash。免费档（glm-4-flash /
+        #    glm-4-flash-250414 / glm-4.5-air）实测 5 次里 0 次真的调
+        #    create_reminder，只会回「好的，记下了」—— 这正是本项目
+        #    2026-10-23 07:12 那次「假成功」的形状：老人以为提醒设好了，
+        #    库里什么都没有。药品提醒出这种事故是不可接受的，所以宁可慢。
+        #    能稳定调工具的只有 glm-4.7（5/5，TTFT 3.2~8.9s）与
+        #    glm-5.3（5/5，TTFT 2.0~5.3s）。这里取 glm-4.7：
+        #    glm-5.x 是「始终思考」模型，连 thinking 都关不掉（传 disabled
+        #    直接 400 code 1210），留作管理员手填的可选项。
         "models": {
-            KIND_LLM_MAIN: "glm-4-flash",
-            KIND_LLM_LIGHT: "glm-4-flash",
+            KIND_LLM_MAIN: "glm-4.7",
+            KIND_LLM_LIGHT: "glm-4-flash-250414",
             KIND_EMBEDDING: "embedding-3",
         },
-        "free_tier": "GLM-4-Flash 有免费调用额度；向量模型按量计费。",
-        "notes": "⚠️ endpoint 要填到 `/api/paas/v4` 这一级，"
-                 "填 `bigmodel.cn` 首页必然失败。",
+        "free_tier": "`glm-4-flash` / `glm-4-flash-250414` 有免费调用额度；"
+                     "`glm-4.7` / `glm-5.3` 按量计费；向量 `embedding-3` 按量计费。"
+                     "**免费的是「便宜」，不是「够用」** —— 免费档不能调工具。",
+        "notes": "⚠️ ① endpoint 要填到 `/api/paas/v4` 这一级，"
+                 "填 `bigmodel.cn` 首页必然失败"
+                 " ② **免费档不能调工具**（glm-4-flash / glm-4-flash-250414 / "
+                 "glm-4.5-air 实测 0/5）：它只会嘴上答应「记下了」，"
+                 "不会真的建提醒。这类模型只能放在「小模型」档做记忆抽取，"
+                 "**放主对话档等于让药品提醒静默失效**"
+                 " ③ 能调工具的是 `glm-4.7` / `glm-5.3`，但首字 2~9 秒，"
+                 "老人端体感明显比 DeepSeek 慢"
+                 " ④ 模型名可手填，平台会不断出新版本（如 "
+                 "`glm-4-flash-250414` 这种带日期后缀的才是可复现的固定版）",
     },
     {
         "value": "aliyun",

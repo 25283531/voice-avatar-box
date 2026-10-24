@@ -37,7 +37,7 @@ log = logging.getLogger("elder.memory.client")
 # 本模块用到的用途名。与 app/model_catalog.py 的 USAGE_* 保持一致，
 # 单独在这里再写一遍是为了让记忆模块**不依赖**模型网关的内部常量，
 # 网关改名时这里只动一行映射表。
-USAGE_LIGHT = "light"    # 轻量任务：事实抽取、意图识别
+USAGE_LIGHT = "light"    # 轻量任务：本模块只用于记忆事实抽取（不带 tools）
 USAGE_CHAT = "chat"      # 正式对话
 USAGE_EMBED = "embed"    # 文本向量化
 

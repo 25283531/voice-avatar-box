@@ -16,8 +16,8 @@ kind 怎么分的
 「识别一句话是不是在设提醒」两种活。前者值得用贵的大模型，后者用便宜的小模型
 就够了（延迟也更低），混在一起只能按最贵的一档付费。现在拆成：
 
-  * ``llm_main``  大参数模型 —— 正式对话，质量优先；
-  * ``llm_light`` 小参数模型 —— 意图识别、结构化抽取、提醒语义解析、任务执行；
+  * ``llm_main``  大参数模型 —— 正式对话，质量优先；**工具调用也只走这里**；
+  * ``llm_light`` 小参数模型 —— 目前**只用于记忆事实抽取**（见下）;
   * ``embedding`` 向量模型   —— 只做文本嵌入（记忆检索用）；
   * ``rerank``    重排模型   —— 检索结果的二次打分（可选）；
   * ``vision``    视觉理解   —— 预留，看图说话 / 拍药盒识别。
@@ -35,6 +35,20 @@ kind 怎么分的
 上层只用 usage 说话（"我要 chat"），旧部署自动走到唯一的 llm 上继续工作；
 新部署可以逐步把精细档配齐。``_LEGACY_LLM`` 这个常量就是为了让这段历史包袱
 在代码里显式可见，而不是隐藏在调用层深处。
+
+⚠️ ``llm_light`` 的真实职责（2026-10-23 全仓核查后订正）
+--------------------------------------------------------
+上面那句「意图识别 / 结构化抽取 / 提醒语义解析 / 任务执行」是**设计意图**，
+代码里**只实现了「结构化抽取」一项**：全仓 ``USAGE_LIGHT`` 的唯一调用点是
+``memory/extract.py:294``（记忆事实抽取，不带 tools）。
+
+也就是说 —— **提醒语义解析、任务执行、工具调用全部走 ``llm_main``**
+（``voice/session.py`` 的 ``_chat_round`` 用 ``usage="chat"`` 且带 TOOL_DEFS）。
+按注释想当然会踩两个坑：
+  1. 以为给 ``llm_light`` 换个便宜模型就能省下任务执行的钱 —— 省不到；
+  2. 以为 ``llm_light`` 里的模型「能调工具」—— 抽取场景根本不发 tools，
+     所以「工具调用 0/5」的模型放在这一档完全没问题（glm-4-flash-250414
+     就是典型：当小模型 4/4 全对，当主模型 0/5 全假成功）。
 """
 from __future__ import annotations
 
@@ -90,7 +104,7 @@ EXPORT_KINDS: Final[tuple[str, ...]] = DEVICE_KINDS
 # 上层（记忆提取、意图识别、正式对话）只说 usage，不知道背后配的是哪一家。
 # 元组顺序即优先级：前面的 kind 一条都没启用，才轮到后面。
 USAGE_CHAT: Final = "chat"        # 正式对话
-USAGE_LIGHT: Final = "light"      # 轻量任务：意图识别 / 结构化抽取 / 提醒解析
+USAGE_LIGHT: Final = "light"      # 轻量任务：目前只有记忆事实抽取（不带 tools）
 USAGE_EMBED: Final = "embed"      # 文本向量化
 USAGE_RERANK: Final = "rerank"    # 检索结果重排
 USAGE_VISION: Final = "vision"    # 看图说话（预留）
@@ -115,7 +129,7 @@ USAGE_LIST: Final[tuple[str, ...]] = tuple(USAGE_ROUTES.keys())
 
 USAGE_LABELS: Final[dict[str, str]] = {
     USAGE_CHAT: "正式对话",
-    USAGE_LIGHT: "轻量任务（意图识别 / 抽取 / 提醒解析）",
+    USAGE_LIGHT: "轻量任务（记忆抽取等，不带工具）",
     USAGE_EMBED: "文本向量化",
     USAGE_RERANK: "检索结果重排",
     USAGE_VISION: "视觉理解",

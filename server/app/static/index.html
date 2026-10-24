@@ -1003,8 +1003,12 @@
               <input v-model="pForm.model" style="width:100%"
                      :disabled="modelLocked"
                      :class="{'presetLock':modelLocked}" />
+              <!-- 非 TTS 的模型栏不再锁（见 modelLocked 的注释），这里只提示
+                   「值是预置填的」，并把该厂商哪个模型能调工具指向 notes。 -->
               <div v-if="modelFromPreset" class="presetHint">
-                已按厂商预设填好{{ modelLocked ? '' : '（已解锁，可改）' }}。
+                {{ modelLocked
+                   ? '已按厂商预设填好。'
+                   : '已按厂商预设填好，可直接改成该厂商的其它模型名。' }}
                 <a v-if="modelLocked" href="#" @click.prevent="unlockPreset('model')">改成自定义</a>
               </div>
             </div>
@@ -2038,8 +2042,26 @@ createApp({
     modelFromPreset(){
       return !this.modelHidden && !!this.presetModelDefault;
     },
+    // 模型栏**只对 TTS 上锁**，非 TTS 一律可编辑。
+    //
+    // 2026-10-24 用户反馈「服务端智谱的配置项不能填写模型名称，无法指定
+    // 使用 glm-4-flash-250414」—— 就是这一行造成的：智谱预置把
+    // llm_light 填成 glm-4-flash 并禁用输入框，只留一个 12px 的
+    // 「改成自定义」链接，正常人找不到，于是「想填模型名」变成了死路。
+    //
+    // 为什么两族的待遇必须不同：
+    //   * TTS：腾讯云 ModelType 恒为 1、Edge 根本没有模型参数，这一栏填错
+    //     的表现是「没声音」，且从报错里看不出是模型名的锅 ⇒ 继续锁。
+    //   * LLM/Embedding/Rerank：模型名迭代极快（glm-4-flash →
+    //     glm-4-flash-250414 只隔几个月），锁死等于让管理员永远用不上
+    //     新模型。预置的职责是「把默认值填好 + 在 notes 里说清哪个能调
+    //     工具」，不是「禁止修改」—— 填错的代价由预置说明承担，
+    //     不该由一个禁用输入框承担。
     modelLocked(){
-      return this.modelFromPreset && !this.presetOverride.model;
+      if (!this.pForm || this.pForm.kind === 'tts') {
+        return this.modelFromPreset && !this.presetOverride.model;
+      }
+      return false;
     },
     apiStyleFromPreset(){
       return this.apiStyleStorable;

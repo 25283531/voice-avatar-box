@@ -745,6 +745,34 @@ def main() -> int:
               "providerPresets" in html and "Array.isArray(r.provider_presets)" in html,
               "index.html 里找不到 providerPresets 的装载处")
 
+        # P10/P11：智谱那一行踩过的两个坑（2026-10-24 用户反馈驱动）
+        # ----------------------------------------------------------
+        # 反馈原话：「服务端智谱的配置项不能填写模型名称，无法指定使用
+        # glm-4-flash-250414」。真因不是后端校验（后端只在 model 为空时
+        # 才填预置值，见 _normalize），而是前端把预置模型锁成只读，
+        # 只留一个 12px 的「改成自定义」链接 —— 等于没给出口。
+        # 顺带查出更危险的：预置把 llm_main 也填成 glm-4-flash，而免费档
+        # 实测 5 次 0 次真的调 create_reminder（只会口头答应）。药品提醒
+        # 出这种「假成功」是不可接受的，所以默认值必须换成能调工具的。
+        zp = pmap.get("zhipu") or {}
+        zp_models = zp.get("models") or {}
+        check("P10 智谱默认值：小模型=glm-4-flash-250414（实测抽取 4/4、"
+              "TTFT 611ms），主对话不得填免费档（实测 0/5 不能调工具）",
+              zp_models.get("llm_light") == "glm-4-flash-250414"
+              and not str(zp_models.get("llm_main") or "").startswith("glm-4-flash"),
+              json.dumps(zp_models, ensure_ascii=False))
+
+        # 钉「非 TTS 的模型栏可编辑」：直接读 modelLocked 的函数体，
+        # 确认里面有 tts 分支且非 tts 走 return false。
+        # 不钉的话，将来谁把锁加回来，用户又会回到「填不了模型名」。
+        import re as _re  # noqa: PLC0415
+        _m = _re.search(r"modelLocked\(\)\s*\{(.*?)\n    \},", html, _re.S)
+        _body = (_m.group(1) if _m else "")
+        check("P11 模型栏只对 TTS 上锁，非 TTS 可自由填模型名"
+              "（2026-10-24「智谱填不了模型名」的直接对策）",
+              "kind === 'tts'" in _body and "return false" in _body,
+              _body.strip()[:160] or "index.html 里找不到 modelLocked()")
+
     finally:
         try:
             proc.terminate()
