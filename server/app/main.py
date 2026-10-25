@@ -706,6 +706,18 @@ def support_contact(db=Depends(get_db)):
 
 
 # ---------------------------------------------------------------- 双入口页面
+# 两个入口页都必须**每次回源校验**（2026-10-25）。
+#
+# 起因：换版后用户报「功能没修好」，排查半天才发现浏览器拿的是旧页面。
+# 原先这两个 FileResponse 只带 etag / last-modified，**没有 Cache-Control**，
+# 浏览器于是按启发式规则自己决定缓存多久（Chrome 取 last-modified 的 10%
+# 左右）—— 部署完当天可能一直看到旧页面，而服务端日志显示一切正常。
+#
+# 用 no-cache 而不是 no-store：no-cache 允许缓存但**必须**回源校验，
+# 页面没变时仍是 304（不重传 160KB），变了立刻拿到新的。no-store 会让
+# 每次刷新都全量重传，反而更慢。
+_PAGE_CACHE_HEADERS = {"Cache-Control": "no-cache, must-revalidate"}
+
 if STATIC_DIR.is_dir():
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
@@ -724,11 +736,13 @@ if STATIC_DIR.is_dir():
     # 五张表也由 schema_patch 在启动时清掉（见 DROPPED_TABLES）。
     @app.get("/")
     def user_console():
-        return FileResponse(str(STATIC_DIR / "user.html"))
+        return FileResponse(str(STATIC_DIR / "user.html"),
+                            headers=_PAGE_CACHE_HEADERS)
 
     @app.get("/admin")
     def console():
-        return FileResponse(str(STATIC_DIR / "index.html"))
+        return FileResponse(str(STATIC_DIR / "index.html"),
+                            headers=_PAGE_CACHE_HEADERS)
 else:  # pragma: no cover
     @app.get("/")
     def console_placeholder():

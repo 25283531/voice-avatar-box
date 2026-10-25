@@ -1601,6 +1601,153 @@ createApp({
       }
       return '填该平台颁发的一段 API Key（OpenAI 兼容服务均为单段）。本地服务（如 Ollama）不需要密钥，可留空。';
     },
+    // ============ 派生量：必须留在 computed，禁止挪进 methods ============
+    // 2026-10-25 线上事故（用户报「所有接入类型都填不了模型名」）
+    //
+    // 这一组（vendorInfo / providerPreset / activePreset / presetModelDefault /
+    // modelHidden / modelFromPreset / modelLocked / endpointFromPreset /
+    // endpointLocked / apiStyle* / localService / showEndpoint / showApiKey /
+    // vendorVoices）曾被整段写在 methods 里，而模板是**当值**用的：
+    //
+    //     v-if="!modelHidden"        :disabled="modelLocked"
+    //     v-if="showApiKey"          v-if="!apiStyleHidden"
+    //
+    // Vue 3 里方法不带括号就是函数对象，恒为真。于是：
+    //   v-if="!modelHidden"  ->  !函数 -> 永远 false -> 模型栏永不渲染，
+    //                            永远走「该厂商没有模型名」那个分支，
+    //                            **任何厂商、任何能力都填不了模型名**；
+    //   v-if="!apiStyleHidden" -> 永远 false -> 「厂商 API 风格」栏永远隐藏；
+    //   apiKeyHint 里 `if (this.localService)` -> 函数恒真 -> 永远显示
+    //                            「本地服务没有密钥这一说」。
+    //
+    // 为什么现有的门禁没抓到：tools/smoke_frontend_hygiene.py 的 L1 只扫
+    // {{ }} 插值，L2 只查标识符有没有定义（它们确实有，只是定义在 methods）。
+    // 现在 L1 已扩展到 v-if / v-else-if / v-show / v-model / :prop 的值位，
+    // 再犯会直接红。
+    //
+    // 判断标准：**模板里当值用 -> computed；只有事件处理器才进 methods**。
+    // ====================================================================
+    // ---- TTS 厂商联动 ----
+    // 三个派生量都来自 pForm，所以用 computed 而不是 data —— data 里的副本
+    // 会在「改了厂商没同步」时静默出错，而这类错误表现为「音色是上一家的」。
+    vendorInfo(){
+      if (!this.pForm || this.pForm.kind!=='tts') return null;
+      return this.ttsVendors.find(v=>v.value===this.pForm.provider) || null;
+    },
+    // 非 TTS 的对应物。与 vendorInfo 严格互斥（一个认 tts，一个认 !tts），
+    // 这样 onProviderChange 可以靠「先看哪个非空」来分派，不用再判 kind。
+    providerPreset(){
+      if (!this.pForm || this.pForm.kind==='tts') return null;
+      return this.providerPresets.find(p=>p.value===this.pForm.provider) || null;
+    },
+    vendorVoices(){
+      if (!this.pForm) return [];
+      const map = this.voicesByVendor || {};
+      return map[this.pForm.provider] || [];
+    },
+    // ---- 预置字段锁定（2026-10-21 用户反馈：明明只要填密钥，却要填一堆）----
+    // 统一取「当前厂商的预置」：TTS 走 vendorInfo，其余走 providerPreset。
+    // 两者严格互斥，锁定判据只认这一个入口 —— 否则会出现「地址灰了、风格没灰」
+    // 这种半锁状态，比全不锁更让人困惑。
+    activePreset(){
+      return this.vendorInfo || this.providerPreset;
+    },
+    // 预置给这条配置指定的模型名（非 TTS 是 models[kind]，没有该 kind 就是空）
+    presetModelDefault(){
+      const p = this.activePreset;
+      if (!p) return '';
+      if (this.pForm.kind === 'tts') return p.model || '';
+      return (p.models || {})[this.pForm.kind] || '';
+    },
+    // TTS 预置里 model 为空 = 该厂商**没有「模型名」这个概念**
+    // （腾讯云 TTS 的 ModelType 恒为 1、Edge 根本没有模型参数）⇒ 整栏隐藏。
+    // 留一个空输入框只会让人以为漏填了什么。
+    modelHidden(){
+      const v = this.vendorInfo;
+      return !!(v && !v.model);
+    },
+    // 地址来自官方预置（自建服务与「其他/自建」不算：它们的地址本来就要改）
+    endpointFromPreset(){
+      const p = this.activePreset;
+      if (!p || !p.endpoint) return false;
+      if (this.pForm.provider === '__other__') return false;
+      if (this.localService) return false;
+      return true;
+    },
+    endpointLocked(){
+      return this.endpointFromPreset && !this.presetOverride.endpoint;
+    },
+    modelFromPreset(){
+      return !this.modelHidden && !!this.presetModelDefault;
+    },
+    // 模型栏**只对 TTS 上锁**，非 TTS 一律可编辑。
+    //
+    // 2026-10-24 用户反馈「服务端智谱的配置项不能填写模型名称，无法指定
+    // 使用 glm-4-flash-250414」—— 就是这一行造成的：智谱预置把
+    // llm_light 填成 glm-4-flash 并禁用输入框，只留一个 12px 的
+    // 「改成自定义」链接，正常人找不到，于是「想填模型名」变成了死路。
+    //
+    // 为什么两族的待遇必须不同：
+    //   * TTS：腾讯云 ModelType 恒为 1、Edge 根本没有模型参数，这一栏填错
+    //     的表现是「没声音」，且从报错里看不出是模型名的锅 ⇒ 继续锁。
+    //   * LLM/Embedding/Rerank：模型名迭代极快（glm-4-flash →
+    //     glm-4-flash-250414 只隔几个月），锁死等于让管理员永远用不上
+    //     新模型。预置的职责是「把默认值填好 + 在 notes 里说清哪个能调
+    //     工具」，不是「禁止修改」—— 填错的代价由预置说明承担，
+    //     不该由一个禁用输入框承担。
+    modelLocked(){
+      if (!this.pForm || this.pForm.kind === 'tts') {
+        return this.modelFromPreset && !this.presetOverride.model;
+      }
+      return false;
+    },
+    apiStyleFromPreset(){
+      return this.apiStyleStorable;
+    },
+    // 预置里的 api_style 是否**能存进库**。
+    // 腾讯云 / Edge 的 api_style 是「供应商级」的（tencent / edge），只用于
+    // ``asr_tts._tts_dispatch_style`` 分派，不在 API_STYLES 白名单里 ——
+    // 写进那一栏保存会被 ProviderIn 的校验器直接 500。取值集合从服务端下发。
+    apiStyleStorable(){
+      const p = this.activePreset;
+      if (!p || !p.api_style) return false;
+      return (this.apiStyleValues || []).includes(p.api_style);
+    },
+    // 供应商级协议（腾讯云 TC3 签名 / Edge 内置桥）：这一栏没有可选项，
+    // 与其留一个写着「OpenAI 兼容」却实际走 TC3 的下拉（那是**谎报**，
+    // 排查时最费时间），不如整行换成一句说明。
+    apiStyleHidden(){
+      const p = this.activePreset;
+      return !!(p && p.api_style && !this.apiStyleStorable);
+    },
+    // 风格是**派生量**，不是选择题：腾讯云配 openai_compatible 只会得到
+    // 「填对了 endpoint 却报格式不对」。所以预置给了就锁死。
+    apiStyleLocked(){
+      return this.apiStyleFromPreset && !this.presetOverride.api_style;
+    },
+    // 本地自建服务（本地 ASR / 本地向量化）：按当前 api_style 取服务端下发的
+    // 默认值。**非空即代表"这条配置是本地服务"**——API Key 隐藏、接口地址提示
+    // 切换、平台下拉联动都靠它判，判据统一在这一处。
+    localService(){
+      const s = (this.pForm && this.pForm.api_style) || '';
+      return (this.localServices || {})[s] || null;
+    },
+    // Edge 没有 endpoint、没有 key —— 显示这两个输入框只会让人瞎填
+    showEndpoint(){
+      if (!this.pForm || this.pForm.kind!=='tts') return true;
+      if (this.pForm.provider==='edge') return false;
+      if (this.pForm.provider==='__other__') return true;
+      return !!(this.vendorInfo && this.vendorInfo.endpoint);
+    },
+    showApiKey(){
+      // 本地服务（FunASR / FastEmbed）没有密钥：显示输入框只会让人瞎填，
+      // 而填了还会被后端清掉（providers 路由的归一化），不如干脆隐藏。
+      if (this.localService) return false;
+      if (!this.pForm || this.pForm.kind!=='tts') return true;
+      if (this.pForm.provider==='edge') return false;
+      if (this.pForm.provider==='__other__') return true;
+      return !!(this.vendorInfo && this.vendorInfo.needs_key);
+    },
   },
   methods:{
     async api(path, opt){
@@ -1988,127 +2135,6 @@ createApp({
         model:'', api_style:'', supports_stream:false, timeout_sec:30, max_retries:1,
         context_window:0, params:{}, priority:10, enabled:true,
         params_text_voice:'', tts_voice_custom:'' };
-    },
-    // ---- TTS 厂商联动 ----
-    // 三个派生量都来自 pForm，所以用 computed 而不是 data —— data 里的副本
-    // 会在「改了厂商没同步」时静默出错，而这类错误表现为「音色是上一家的」。
-    vendorInfo(){
-      if (!this.pForm || this.pForm.kind!=='tts') return null;
-      return this.ttsVendors.find(v=>v.value===this.pForm.provider) || null;
-    },
-    // 非 TTS 的对应物。与 vendorInfo 严格互斥（一个认 tts，一个认 !tts），
-    // 这样 onProviderChange 可以靠「先看哪个非空」来分派，不用再判 kind。
-    providerPreset(){
-      if (!this.pForm || this.pForm.kind==='tts') return null;
-      return this.providerPresets.find(p=>p.value===this.pForm.provider) || null;
-    },
-    vendorVoices(){
-      if (!this.pForm) return [];
-      const map = this.voicesByVendor || {};
-      return map[this.pForm.provider] || [];
-    },
-    // ---- 预置字段锁定（2026-10-21 用户反馈：明明只要填密钥，却要填一堆）----
-    // 统一取「当前厂商的预置」：TTS 走 vendorInfo，其余走 providerPreset。
-    // 两者严格互斥，锁定判据只认这一个入口 —— 否则会出现「地址灰了、风格没灰」
-    // 这种半锁状态，比全不锁更让人困惑。
-    activePreset(){
-      return this.vendorInfo || this.providerPreset;
-    },
-    // 预置给这条配置指定的模型名（非 TTS 是 models[kind]，没有该 kind 就是空）
-    presetModelDefault(){
-      const p = this.activePreset;
-      if (!p) return '';
-      if (this.pForm.kind === 'tts') return p.model || '';
-      return (p.models || {})[this.pForm.kind] || '';
-    },
-    // TTS 预置里 model 为空 = 该厂商**没有「模型名」这个概念**
-    // （腾讯云 TTS 的 ModelType 恒为 1、Edge 根本没有模型参数）⇒ 整栏隐藏。
-    // 留一个空输入框只会让人以为漏填了什么。
-    modelHidden(){
-      const v = this.vendorInfo;
-      return !!(v && !v.model);
-    },
-    // 地址来自官方预置（自建服务与「其他/自建」不算：它们的地址本来就要改）
-    endpointFromPreset(){
-      const p = this.activePreset;
-      if (!p || !p.endpoint) return false;
-      if (this.pForm.provider === '__other__') return false;
-      if (this.localService) return false;
-      return true;
-    },
-    endpointLocked(){
-      return this.endpointFromPreset && !this.presetOverride.endpoint;
-    },
-    modelFromPreset(){
-      return !this.modelHidden && !!this.presetModelDefault;
-    },
-    // 模型栏**只对 TTS 上锁**，非 TTS 一律可编辑。
-    //
-    // 2026-10-24 用户反馈「服务端智谱的配置项不能填写模型名称，无法指定
-    // 使用 glm-4-flash-250414」—— 就是这一行造成的：智谱预置把
-    // llm_light 填成 glm-4-flash 并禁用输入框，只留一个 12px 的
-    // 「改成自定义」链接，正常人找不到，于是「想填模型名」变成了死路。
-    //
-    // 为什么两族的待遇必须不同：
-    //   * TTS：腾讯云 ModelType 恒为 1、Edge 根本没有模型参数，这一栏填错
-    //     的表现是「没声音」，且从报错里看不出是模型名的锅 ⇒ 继续锁。
-    //   * LLM/Embedding/Rerank：模型名迭代极快（glm-4-flash →
-    //     glm-4-flash-250414 只隔几个月），锁死等于让管理员永远用不上
-    //     新模型。预置的职责是「把默认值填好 + 在 notes 里说清哪个能调
-    //     工具」，不是「禁止修改」—— 填错的代价由预置说明承担，
-    //     不该由一个禁用输入框承担。
-    modelLocked(){
-      if (!this.pForm || this.pForm.kind === 'tts') {
-        return this.modelFromPreset && !this.presetOverride.model;
-      }
-      return false;
-    },
-    apiStyleFromPreset(){
-      return this.apiStyleStorable;
-    },
-    // 预置里的 api_style 是否**能存进库**。
-    // 腾讯云 / Edge 的 api_style 是「供应商级」的（tencent / edge），只用于
-    // ``asr_tts._tts_dispatch_style`` 分派，不在 API_STYLES 白名单里 ——
-    // 写进那一栏保存会被 ProviderIn 的校验器直接 500。取值集合从服务端下发。
-    apiStyleStorable(){
-      const p = this.activePreset;
-      if (!p || !p.api_style) return false;
-      return (this.apiStyleValues || []).includes(p.api_style);
-    },
-    // 供应商级协议（腾讯云 TC3 签名 / Edge 内置桥）：这一栏没有可选项，
-    // 与其留一个写着「OpenAI 兼容」却实际走 TC3 的下拉（那是**谎报**，
-    // 排查时最费时间），不如整行换成一句说明。
-    apiStyleHidden(){
-      const p = this.activePreset;
-      return !!(p && p.api_style && !this.apiStyleStorable);
-    },
-    // 风格是**派生量**，不是选择题：腾讯云配 openai_compatible 只会得到
-    // 「填对了 endpoint 却报格式不对」。所以预置给了就锁死。
-    apiStyleLocked(){
-      return this.apiStyleFromPreset && !this.presetOverride.api_style;
-    },
-    // 本地自建服务（本地 ASR / 本地向量化）：按当前 api_style 取服务端下发的
-    // 默认值。**非空即代表"这条配置是本地服务"**——API Key 隐藏、接口地址提示
-    // 切换、平台下拉联动都靠它判，判据统一在这一处。
-    localService(){
-      const s = (this.pForm && this.pForm.api_style) || '';
-      return (this.localServices || {})[s] || null;
-    },
-    // Edge 没有 endpoint、没有 key —— 显示这两个输入框只会让人瞎填
-    showEndpoint(){
-      if (!this.pForm || this.pForm.kind!=='tts') return true;
-      if (this.pForm.provider==='edge') return false;
-      if (this.pForm.provider==='__other__') return true;
-      return !!(this.vendorInfo && this.vendorInfo.endpoint);
-    },
-    showApiKey(){
-      // 本地服务（FunASR / FastEmbed）没有密钥：显示输入框只会让人瞎填，
-      // 而填了还会被后端清掉（providers 路由的归一化），不如干脆隐藏。
-      if (this.localService) return false;
-      if (!this.pForm || this.pForm.kind!=='tts') return true;
-      if (this.pForm.provider==='edge') return false;
-      if (this.pForm.provider==='__other__') return true;
-      return !!(this.vendorInfo && this.vendorInfo.needs_key);
     },
     // 换厂商 / 换能力 / 打开弹窗时，把预置字段同步进表单。
     // ⚠️ 与旧实现的关键差别：旧版只在「值为空」时才填，于是任何一个不走

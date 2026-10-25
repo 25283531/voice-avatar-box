@@ -172,6 +172,18 @@ def vfor_aliases(tpl: str) -> set[str]:
     return aliases
 
 
+def strip_literals(expr: str) -> str:
+    """把表达式里的字符串字面量替换成空串，位置（长度以外）保持不变。
+
+    给 L1b 用：``:class="{'presetLock':modelLocked}"`` 里的 ``'presetLock'``
+    是字符串，不是标识符；不剥的话只要某个方法名恰好与某个 CSS 类名同名，
+    就会造出一条假失败。同理 ``v-if="kind==='showApiKey'"`` 这种也不该误报。
+    """
+    for q in ("'", '"', "`"):
+        expr = re.sub(rf"{q}(?:[^\\{q}]|\\.)*{q}", "''", expr)
+    return expr
+
+
 def root_identifiers(expr: str) -> list[str]:
     """取一段 Vue/JS 表达式里的**根标识符**。
 
@@ -350,6 +362,57 @@ def scan_file(path: Path) -> None:
           not bad,
           f"这些名字定义在 methods: 里却被当成值插值: {bad}。"
           f"搬进 computed:，或在模板里写成 名字() 显式调用")
+
+    # ------------------------------------------------- L1b 值位上的方法引用
+    # 2026-10-25 线上事故（用户报「所有接入类型都填不了模型名，点自定义接入点
+    # 没反应」）：一整组派生量（modelHidden / modelLocked / showApiKey /
+    # endpointFromPreset / apiStyleHidden / localService / providerPreset …）
+    # 被写在 methods 里，而模板是**当值**用的：
+    #
+    #     v-if="!modelHidden"   :disabled="modelLocked"   v-if="showApiKey"
+    #
+    # Vue 3 里方法不带括号就是函数对象，**恒为真**。后果：
+    #   v-if="!modelHidden"  -> !函数 -> 永远 false -> 那一栏永不渲染
+    #   :disabled="modelLocked" -> 函数 -> 永远禁用
+    #   apiKeyHint 里 if (this.localService) -> 恒真 -> 永远走本地服务分支
+    # 而且**点「改成自定义」也不会变**（绑的是函数对象，状态变了它还是那个函数）。
+    #
+    # L1 抓不到它：L1 只看 {{ }} 插值。L2 也抓不到：这些名字确实有定义，
+    # 只是定义在 methods 里。所以要单独扫「值位」。
+    #
+    # 为什么**不含** @event / v-on:：那里写方法名正是正确用法（事件处理器）。
+    value_exprs = []
+    for expr in re.findall(
+            r'(?:v-if|v-else-if|v-show|v-model(?::[\w.]+)?|v-for'
+            r'|:[\w-]+|v-bind:[\w-]+)="([^"]+)"', tpl):
+        value_exprs.append(expr)
+    for expr in re.findall(r"\{\{(.*?)\}\}", tpl):
+        value_exprs.append(expr)
+
+    bad_value: list[str] = []
+    for expr in value_exprs:
+        clean = strip_literals(expr)
+        for m in re.finditer(r"[a-zA-Z_$][\w$]*", clean):
+            name = m.group(0)
+            if name not in methods_keys:
+                continue
+            tail = clean[m.end():]
+            if tail.startswith("("):
+                continue                      # 显式调用，安全
+            head = clean[:m.start()].rstrip()
+            if head.endswith("."):
+                continue                      # 成员名（a.foo 里的 foo）
+            # 作为回调**传给**别的方法：``list.map(labelOfUsage)``、
+            # ``(a, labelOfUsage)`` —— 函数引用在这里是正确的用法，
+            # 只有「求值」位置才是 bug。判据取两头同时成立，避免误放。
+            if head.endswith(("(", ",")) and tail.lstrip().startswith((")", ",")):
+                continue
+            bad_value.append(f"{name} in «{expr.strip()[:70]}»")
+    check("L1b 值位上没有方法引用（v-if / :prop / {{ }} 里写方法名 = 函数恒为真）",
+          not bad_value,
+          f"这些名字在 methods: 里，却在值位被引用: {sorted(set(bad_value))}。"
+          f"函数对象恒为真 ⇒ v-if 永不成立、:disabled 永远禁用，且状态变化不会"
+          f"触发重算。搬进 computed:，或在模板里显式调用 名字()")
 
     # ---------------------------------------------------------- L2 孤儿引用
     used: set[str] = set()

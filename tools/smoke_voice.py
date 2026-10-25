@@ -3141,8 +3141,16 @@ def t_dismiss_and_watchdog() -> None:
     names = [d["function"]["name"] for d in TOOL_DEFS]
     check("12i ★ enter_standby 必须注册进 TOOL_DEFS", "enter_standby" in names,
           f"names={names}")
-    check("12i · enter_standby 必须追加在工具表末尾（保住 prompt 前缀缓存）",
-          names and names[-1] == "enter_standby", f"last={names[-1] if names else None}")
+    # 2026-10-25 起末尾是设备能力三件套（音量 / 亮度 / 设备状态）。
+    # 判据从「enter_standby 必须是最后一个」改成「新工具只能往后追加」：
+    # 真正要守的是**相对顺序**（老工具不许被挤到新工具后面，否则每次请求
+    # 的 tools 字段整体位移，prompt 前缀缓存全失效），不是某个具体名字。
+    check("12i · 设备能力三件套必须追加在工具表末尾（保住 prompt 前缀缓存）",
+          names[-3:] == ["set_volume", "set_brightness", "get_device_status"],
+          f"tail={names[-3:]}")
+    check("12i · 老工具不许排到新工具后面（防止有人往中间插）",
+          names.index("enter_standby") < names.index("set_volume"),
+          f"names={names}")
 
     # ---- ② 看门狗：一句都没说时不得起一轮 ----
     async def _run() -> None:

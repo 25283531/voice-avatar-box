@@ -279,6 +279,174 @@ def t_execute_tool_wiring() -> None:
           r.get("ok") is False and "按键" in str(r.get("message", "")), f"{r!r}")
 
 
+#: 固件 ``WifiBoard::GetDeviceStatusJson()`` 的真实形状（原文见 wifi_board.cc:193）。
+_STATUS_JSON = (
+    '{"audio_speaker":{"volume":70},'
+    '"screen":{"brightness":100,"theme":"light"},'
+    '"battery":{"level":55,"charging":true},'
+    '"network":{"type":"wifi","ssid":"XiaoZhi-XXXX","rssi":-60},'
+    '"chip":{"temperature":25}}'
+)
+
+
+class FakeDevice:
+    """按工具名回包的假设备，同时记录**调用顺序**。
+
+    顺序是这组用例的核心：相对量（delta）必须先读状态再写，写反了就是
+    「用上一次的旧值算」，老人连说两句「大一点」只会调上去一次。
+    """
+
+    def __init__(self, status: str | None = _STATUS_JSON,
+                 set_result: str = "true", error: str | None = None,
+                 set_timeout: bool = False):
+        self.status = status
+        self.set_result = set_result
+        self.error = error
+        self.set_timeout = set_timeout
+        self.calls: list[tuple] = []
+
+    def __call__(self, name, args=None, timeout=3.0):
+        self.calls.append((name, dict(args or {}), timeout))
+        if name == "self.get_device_status":
+            if self.status is None:
+                raise TimeoutError()
+            return _text_reply(self.status)
+        if self.set_timeout:
+            raise TimeoutError()
+        if self.error:
+            return {"error": {"message": self.error}}
+        return _text_reply(self.set_result)
+
+
+def _text_reply(text: str, is_error: bool = False) -> dict:
+    return {"jsonrpc": "2.0", "id": 1,
+            "result": {"content": [{"type": "text", "text": text}],
+                       "isError": is_error}}
+
+
+def t_device_controls() -> None:
+    print("\n[7] 音量 / 亮度 / 设备状态：服务端工具 → 设备 MCP 工具")
+    from app.voice.tools import TOOL_DEFS, execute_tool
+
+    names = [d["function"]["name"] for d in TOOL_DEFS]
+    check("三个设备能力工具都注册给 LLM 了",
+          {"set_volume", "set_brightness", "get_device_status"} <= set(names),
+          f"names={names}")
+    check("★ 必须追加在工具表末尾（插中间会让 prompt 前缀缓存全失效）",
+          names[-3:] == ["set_volume", "set_brightness", "get_device_status"],
+          f"tail={names[-3:]}")
+
+    # ---- 绝对量：一次往返，参数名必须与固件 Property 名逐字一致 ----
+    dev = FakeDevice()
+    r = execute_tool(None, 1, "set_volume", '{"level": 40}', device_call=dev)
+    check("set_volume(level=40) 下发到固件工具 self.audio_speaker.set_volume",
+          dev.calls and dev.calls[0][0] == "self.audio_speaker.set_volume",
+          f"calls={dev.calls}")
+    check("参数名是 volume（固件 Property('volume', ...) 拼错就 Unknown tool）",
+          dev.calls and dev.calls[0][1] == {"volume": 40}, f"calls={dev.calls}")
+    check("超时用 2.0 秒（小于 confirm_reminder 的 3.0，回调是毫秒级的）",
+          dev.calls and dev.calls[0][2] == 2.0, f"calls={dev.calls}")
+    check("绝对量只走一次往返，不先读状态",
+          len(dev.calls) == 1, f"calls={dev.calls}")
+    check("返回 ok 且带上调到的值", r.get("ok") is True and r.get("level") == 40,
+          f"{r!r}")
+
+    # ---- 相对量：先读状态再写，且算的是「当前 + delta」 ----
+    dev = FakeDevice()
+    r = execute_tool(None, 1, "set_volume", '{"delta": 20}', device_call=dev)
+    check("相对量先调 self.get_device_status",
+          dev.calls and dev.calls[0][0] == "self.get_device_status",
+          f"calls={dev.calls}")
+    check("相对量再调 set_volume，且是 70+20=90",
+          len(dev.calls) == 2
+          and dev.calls[1] == ("self.audio_speaker.set_volume",
+                               {"volume": 90}, 2.0), f"calls={dev.calls}")
+    check("相对量结果 ok", r.get("ok") is True and r.get("level") == 90, f"{r!r}")
+
+    dev = FakeDevice()
+    execute_tool(None, 1, "set_volume", '{"delta": -30}', device_call=dev)
+    check("负数 delta 是调小（70-30=40）",
+          dev.calls[-1][1] == {"volume": 40}, f"calls={dev.calls}")
+
+    # ---- 读不到当前值：不许瞎猜，也不许乱写 ----
+    dev = FakeDevice(status=None)
+    r = execute_tool(None, 1, "set_volume", '{"delta": 20}', device_call=dev)
+    check("读不到当前值时不发 set 请求（猜错方向会让老人越喊越小声）",
+          all(c[0] != "self.audio_speaker.set_volume" for c in dev.calls),
+          f"calls={dev.calls}")
+    check("读不到当前值时让老人说个具体数值",
+          r.get("ok") is False and "具体数值" in str(r.get("message", "")), f"{r!r}")
+
+    # ---- 上下限必须服务端自己夹住 ----
+    # 固件 Property("volume", Integer, 0, 100) 带 min/max，超范围会 throw
+    # std::invalid_argument → 回 error。等固件兜底就等于「调不动还没提示」。
+    dev = FakeDevice()
+    execute_tool(None, 1, "set_volume", '{"level": 120}', device_call=dev)
+    check("level 超过 100 被夹到 100", dev.calls[-1][1] == {"volume": 100},
+          f"calls={dev.calls}")
+
+    dev = FakeDevice()
+    execute_tool(None, 1, "set_volume", '{"level": -5}', device_call=dev)
+    check("level 小于 0 被夹到 0", dev.calls[-1][1] == {"volume": 0},
+          f"calls={dev.calls}")
+
+    dev = FakeDevice()
+    execute_tool(None, 1, "set_volume", '{"level": "50%"}', device_call=dev)
+    check("模型给 \"50%\" 也要认成 50", dev.calls[-1][1] == {"volume": 50},
+          f"calls={dev.calls}")
+
+    # bool 是 int 的子类：True 被当成 1 的话，老人说「调大点」音量会变 1
+    dev = FakeDevice()
+    r = execute_tool(None, 1, "set_volume", '{"level": true}', device_call=dev)
+    check("level=true 不得被当成 1（bool 是 int 子类，必须挡住）",
+          dev.calls == [] and r.get("ok") is False, f"calls={dev.calls} {r!r}")
+
+    # ---- 亮度：工具名 / 参数名换一套 ----
+    dev = FakeDevice()
+    r = execute_tool(None, 1, "set_brightness", '{"level": 0}', device_call=dev)
+    check("set_brightness 下发到 self.screen.set_brightness",
+          dev.calls and dev.calls[0][0] == "self.screen.set_brightness",
+          f"calls={dev.calls}")
+    check("参数名是 brightness", dev.calls and dev.calls[0][1] == {"brightness": 0},
+          f"calls={dev.calls}")
+    check("亮度结果 ok", r.get("ok") is True and r.get("level") == 0, f"{r!r}")
+
+    # 没背光的板子固件压根没注册这个工具 → 回 "Unknown tool"。
+    # 这不是故障，不能让 LLM 反复重试。
+    dev = FakeDevice(error="Unknown tool: self.screen.set_brightness")
+    r = execute_tool(None, 1, "set_brightness", '{"delta": 20}', device_call=dev)
+    check("设备没有该工具时判成「不支持」而不是「失败」",
+          r.get("ok") is False and r.get("unsupported") is True, f"{r!r}")
+    check("不支持时明确让模型别再试",
+          "再试" in str(r.get("message", "")), f"{r!r}")
+
+    # ---- 超时 / 没有通道 ----
+    dev = FakeDevice(set_timeout=True)
+    r = execute_tool(None, 1, "set_volume", '{"level": 30}', device_call=dev)
+    check("设备超时 → ok=False 且不崩", r.get("ok") is False, f"{r!r}")
+    check("超时时提示设备没回应",
+          "没有回应" in str(r.get("message", "")), f"{r!r}")
+
+    r = execute_tool(None, 1, "set_volume", '{"level": 30}')
+    check("没有 device_call 时降级不抛异常", r.get("ok") is False, f"{r!r}")
+
+    # ---- 设备状态：固件把 JSON 塞在 text 里，要再 loads 一次 ----
+    dev = FakeDevice()
+    r = execute_tool(None, 1, "get_device_status", "{}", device_call=dev)
+    st = r.get("status") or {}
+    check("get_device_status 能解出固件塞在 text 里的 JSON",
+          r.get("ok") is True and st.get("volume") == 70, f"{r!r}")
+    check("亮度也解出来了", st.get("brightness") == 100, f"{r!r}")
+    check("电量与充电状态也解出来了",
+          st.get("battery_level") == 55 and st.get("charging") is True, f"{r!r}")
+    check("★ 不把 ssid / 芯片温度这类字段喂给模型（会被念成「rssi -60」）",
+          not ({"ssid", "rssi", "temperature"} & set(st)), f"status={st}")
+
+    dev = FakeDevice(status="这不是 JSON")
+    r = execute_tool(None, 1, "get_device_status", "{}", device_call=dev)
+    check("状态不是 JSON 时 ok=False 而不是崩", r.get("ok") is False, f"{r!r}")
+
+
 async def main() -> int:
     print("=== 服务端 → 设备 MCP 工具通道 / 服药确认 单测 ===")
     await t_roundtrip_true()
@@ -287,6 +455,7 @@ async def main() -> int:
     await t_out_of_order()
     t_tool_mapping()
     t_execute_tool_wiring()
+    t_device_controls()
 
     print(f"\n=== {_g_pass} 通过 / {_g_fail} 失败 ===")
     if _failures:

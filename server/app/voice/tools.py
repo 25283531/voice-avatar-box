@@ -19,6 +19,20 @@ LLM 侧当 client"，暴露的是**设备能力**（音量、电量、摄像头�
 用户原话说的是 "mcp 工具调用"，但真实意图是"尤其是提醒功能"——上面这条
 路线用 LLM 标准的 function calling 满足了这个意图，且不依赖设备侧任何新能力。
 
+例外：**设备自己的能力**必须代理到设备（2026-10-25）
+----------------------------------------------------
+提醒数据在服务端，但音量 / 屏幕亮度 / 电量这些状态在**设备**上，服务端没有
+任何办法替它改。所以这一类工具走 ``device_call``（服务端 → 设备 ``tools/call``，
+实现见 ``session.VoiceSession.call_device_tool``）：
+
+* ``set_volume``        → 固件 ``self.audio_speaker.set_volume``
+* ``set_brightness``    → 固件 ``self.screen.set_brightness``
+* ``get_device_status`` → 固件 ``self.get_device_status``
+
+这三个工具固件**早就注册好了**（``main/mcp_server.cc`` 的 ``AddCommonTools``），
+缺的只是服务端这一侧的 ``TOOL_DEFS``。上线前的真实现象就是老人说「声音大一点」
+模型只能道歉 —— LLM 根本不知道设备有这两个能力。
+
 时间解析为什么自己写一层而不是只用 schedule.parse_hhmm
 -----------------------------------------------------
 ``schedule.parse_hhmm`` 只认 "08:30" 这种机器格式。老人说的是
@@ -199,6 +213,84 @@ TOOL_DEFS: list[dict[str, Any]] = [
                 "「没事了」）。这些情况照常回答他，**不要**调用本工具。\n"
                 "调用后本轮只说一句很短的道别（10 个字以内），不要再提问、"
                 "不要再展开任何内容。"
+            ),
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "set_volume",
+            # 追加在末尾（同上一条纪律：插在中间会让 prompt 前缀缓存全失效）。
+            "description": (
+                "调节设备扬声器的音量（0-100）。老人说「声音大一点」「太小了"
+                "听不清」「小点声」「太吵了」「声音调到 50」「最大声」「静音」"
+                "时**必须**调用，不能只口头答应。\n"
+                "两种用法二选一：\n"
+                "  · 老人给了具体数字 → 填 level（0-100）；\n"
+                "  · 老人只说了大小 → 填 delta（一档 20，如 20 表示调大、-20 表示调小）。\n"
+                "「最大 / 最响」填 level=100；「静音 / 别出声 / 关掉声音」填 level=0。\n"
+                "**一次只调一档**（20），调完用一句话问老人现在合不合适，"
+                "不要连着调好几次 —— 老人听不清时会一直说「再大点」，"
+                "你一次调到底反而会吓到他。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "level": {
+                        "type": "integer",
+                        "description": "目标音量，0-100（老人说了具体数值时填）",
+                    },
+                    "delta": {
+                        "type": "integer",
+                        "description": "相对变化量，20=调大一档，-20=调小一档",
+                    },
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "set_brightness",
+            # 追加在末尾（同上）。
+            "description": (
+                "调节设备屏幕亮度（0-100）。老人说「屏幕太亮了」「刺眼」「调暗点」"
+                "「看不清屏幕」「亮一点」「把屏幕关掉」时**必须**调用。\n"
+                "两种用法二选一：\n"
+                "  · 老人给了具体数字 → 填 level（0-100）；\n"
+                "  · 老人只说了亮/暗 → 填 delta（一档 20，如 20 表示调亮、-20 表示调暗）。\n"
+                "「太刺眼 / 关掉屏幕」填 level=0；「最亮」填 level=100。\n"
+                "**只调屏幕背光，不要动音量** —— 老人说屏幕刺眼时把声音调小是错的。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "level": {
+                        "type": "integer",
+                        "description": "目标亮度，0-100（老人说了具体数值时填）",
+                    },
+                    "delta": {
+                        "type": "integer",
+                        "description": "相对变化量，20=调亮一档，-20=调暗一档",
+                    },
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_device_status",
+            # 追加在末尾（同上）。
+            "description": (
+                "查询设备当前的真实状态：音量、屏幕亮度、电池电量与是否在充电。\n"
+                "老人问「现在声音多大」「还有多少电」「充上电了吗」「屏幕怎么这么暗」"
+                "时调用，**不要凭印象编数字**。\n"
+                "返回的是设备上报的字段（volume / brightness / battery_level / "
+                "charging），要把它翻译成一句老人听得懂的话（如「电量还有八成，"
+                "正插着电」），**不要念字段名，不要说英文**。\n"
+                "没屏幕或没电池的设备可能缺字段，缺了就说「这台看不到」，不要猜。"
             ),
             "parameters": {"type": "object", "properties": {}},
         },
@@ -607,7 +699,8 @@ def execute_tool(db: Any, device_pk: int, name: str,
     ``device_call(name, arguments, timeout)`` 是可选的「服务端 → 设备」同步
     回调，由 session 层注入（它内部用 run_coroutine_threadsafe 桥回事件
     循环，因为本函数跑在线程池里）。只有需要设备配合的工具才用得上：
-    目前是 ``confirm_reminder``。传 None 时该类工具返回"通道不可用"，
+    ``confirm_reminder`` / ``set_volume`` / ``set_brightness`` /
+    ``get_device_status``。传 None 时该类工具返回"通道不可用"，
     而不是抛异常 —— 这样单测可以不带设备直接跑。
     """
     try:
@@ -631,6 +724,12 @@ def execute_tool(db: Any, device_pk: int, name: str,
             return _confirm_reminder(db, device_pk, device_call)
         if name == "get_weather":
             return _get_weather(db, device_pk, args)
+        if name == "set_volume":
+            return _set_device_level("volume", args, device_call)
+        if name == "set_brightness":
+            return _set_device_level("brightness", args, device_call)
+        if name == "get_device_status":
+            return _get_device_status(device_call)
         return {"ok": False, "message": f"没有叫「{name}」的工具"}
     except Exception as exc:  # noqa: BLE001  兜底：工具失败不崩会话
         log.warning("工具 %s 执行失败：%s: %s", name, type(exc).__name__, exc)
@@ -696,6 +795,226 @@ def _confirm_reminder(db: Any, device_pk: int, device_call: Any) -> dict[str, An
     log.info("confirm_reminder：设备已确认（device_pk=%s）", device_pk)
     return {"ok": True, "confirmed": True,
             "message": "已确认，用一句话告诉老人「记下了」，不要多说"}
+
+
+# ================================================================ 设备能力
+# 音量 / 亮度 / 设备状态：状态在**设备**上，服务端只能经 device_call 代理。
+#
+# 超时为什么是 2.0 而不是 confirm_reminder 的 3.0
+# ----------------------------------------------
+# confirm_reminder 要等固件改状态 + 落 NVS，给宽一点有道理。而这两个 set
+# 工具的回调在固件里只是一句 ``codec->SetOutputVolume()`` /
+# ``backlight->SetBrightness()``，毫秒级；真机上局域网一个来回通常 50~150ms。
+# 等超过 2 秒就是链路真出问题了，早点失败让 LLM 换话术，别让老人对着
+# 一个"嗯……"干等 3 秒 —— 老人的耐心比链路预算更贵。
+_DEVICE_OP_TIMEOUT = 2.0
+
+#: kind -> 固件工具名 / 参数名 / 状态 JSON 里的取值路径。
+#: 工具名**必须与 ``main/mcp_server.cc`` 的 AddCommonTools 逐字一致**，
+#: 拼错的现象是「设备回 Unknown tool」，而日志里看起来像设备不支持。
+_LEVEL_SPECS: dict[str, dict[str, Any]] = {
+    "volume": {
+        "label": "音量",
+        "tool": "self.audio_speaker.set_volume",
+        "arg": "volume",
+        "path": ("audio_speaker", "volume"),
+    },
+    "brightness": {
+        "label": "屏幕亮度",
+        "tool": "self.screen.set_brightness",
+        "arg": "brightness",
+        "path": ("screen", "brightness"),
+    },
+}
+
+
+def _coerce_int(value: Any) -> int | None:
+    """把模型给的东西转成 int。
+
+    LLM 经常不守规矩：``"50"`` / ``"50%"`` / ``50.0`` / ``"+20"`` 都出现过。
+    ``bool`` 要单独挡掉（Python 里 True 是 int 的子类，会被转成 1 —— 那样
+    老人说「调大点」结果音量变成 1，是最刺耳的那种 bug）。
+    """
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(round(value))
+    if isinstance(value, str):
+        m = re.search(r"-?\d+", value)
+        if m:
+            return int(m.group())
+    return None
+
+
+def _dig(data: Any, path: tuple[str, ...]) -> Any:
+    """按路径取嵌套字典里的值，中途不是字典就返回 None（不抛异常）。"""
+    cur = data
+    for key in path:
+        if not isinstance(cur, dict):
+            return None
+        cur = cur.get(key)
+    return cur
+
+
+def _device_reply_text(payload: Any) -> tuple[bool, str]:
+    """把固件 ``tools/call`` 的回包拆成 ``(是否成功, 文本)``。
+
+    固件 ``McpTool::Call`` 的形状（``main/mcp_server.h``）：
+      成功 → ``{"result":{"content":[{"type":"text","text":"..."}],"isError":false}}``
+      失败 → ``{"error":{"message":"..."}}``
+
+    bool 结果被序列化成 ``"true"`` / ``"false"``，**cJSON 对象 / std::string
+    结果被序列化成一段 JSON 字符串**（所以 get_device_status 拿到的 text
+    还要再 json.loads 一次 —— 这是最容易写错的一步）。
+    """
+    if not isinstance(payload, dict):
+        return False, ""
+    err = payload.get("error")
+    if err:
+        msg = err.get("message") if isinstance(err, dict) else str(err)
+        return False, str(msg or "")
+    result = payload.get("result")
+    if not isinstance(result, dict) or result.get("isError"):
+        return False, ""
+    for item in (result.get("content") or []):
+        if isinstance(item, dict) and item.get("type") == "text":
+            return True, str(item.get("text") or "")
+    return True, ""
+
+
+def _device_status(device_call: Any) -> dict[str, Any] | None:
+    """读设备状态，失败一律返回 None（不抛）。
+
+    ``self.get_device_status`` 的 text 是 ``WifiBoard::GetDeviceStatusJson()``
+    的返回值，即一段 JSON **字符串**：
+    ``{"audio_speaker":{"volume":70},"screen":{"brightness":100,...},"battery":
+    {"level":50,"charging":true},...}``
+    """
+    try:
+        payload = device_call("self.get_device_status", {}, _DEVICE_OP_TIMEOUT)
+    except Exception as exc:  # noqa: BLE001  超时/断链都归到"读不到"
+        log.info("get_device_status 失败：%s: %s", type(exc).__name__, exc)
+        return None
+    ok, text = _device_reply_text(payload)
+    if not ok or not text:
+        log.info("get_device_status 回包不可用（ok=%s）", ok)
+        return None
+    try:
+        data = json.loads(text)
+    except Exception:  # noqa: BLE001  固件版本差异：解析不了就当读不到
+        log.info("get_device_status 的 text 不是 JSON：%r", text[:120])
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _set_device_level(kind: str, args: dict[str, Any],
+                      device_call: Any) -> dict[str, Any]:
+    """调音量 / 亮度。``kind`` 取 ``_LEVEL_SPECS`` 的键。
+
+    支持两种说法（老人不会说"音量 50"这种话，但子女在 App 里会）：
+      * ``level``  绝对值 0-100 —— 一次往返；
+      * ``delta``  相对量 —— **必须先读当前值**再算，两次往返。
+
+    为什么相对量不能"猜一个当前值"：猜错方向的后果是老人喊「大点声」声音
+    反而变小，他会以为设备坏了。读不到当前值就如实让老人说个数字。
+    """
+    spec = _LEVEL_SPECS[kind]
+    label = str(spec["label"])
+
+    if device_call is None:
+        log.warning("%s：没有设备通道（device_call=None）", kind)
+        return {"ok": False, "message": f"现在连不上设备，{label}没法调"}
+
+    level = _coerce_int(args.get("level"))
+    delta = _coerce_int(args.get("delta"))
+    if level is None and delta is None:
+        return {"ok": False, "need_clarify": True,
+                "message": f"没听出要调大还是调小{label}，请反问老人"}
+
+    if level is None:
+        current = _coerce_int(_dig(_device_status(device_call) or {},
+                                   tuple(spec["path"])))
+        if current is None:
+            log.info("%s：读不到当前值，无法按相对量调整", kind)
+            return {"ok": False,
+                    "message": f"没读到设备现在的{label}，请让老人说个具体数值"
+                               f"（比如 30、50）"}
+        level = current + int(delta or 0)
+
+    level = max(0, min(100, int(level)))
+
+    try:
+        payload = device_call(str(spec["tool"]), {str(spec["arg"]): level},
+                              _DEVICE_OP_TIMEOUT)
+    except TimeoutError:
+        log.warning("%s：设备 %.1f 秒内没回包", kind, _DEVICE_OP_TIMEOUT)
+        return {"ok": False,
+                "message": f"设备没有回应，{label}可能没调成，请老人再说一次"}
+    except Exception as exc:  # noqa: BLE001  设备离线 / WS 已断
+        log.warning("%s：下发失败 %s: %s", kind, type(exc).__name__, exc)
+        return {"ok": False, "message": f"现在连不上设备，{label}没法调"}
+
+    ok, text = _device_reply_text(payload)
+    if not ok:
+        log.warning("%s：设备回 error / isError（%s）", kind, text[:160])
+        # "Unknown tool" 不是故障：这台设备没屏幕背光（或固件没编 LVGL），
+        # 固件里压根没注册 self.screen.set_brightness。
+        if "unknown tool" in text.lower():
+            return {"ok": False, "unsupported": True,
+                    "message": f"这台设备不支持调{label}，一句话说明白就好，"
+                               f"不要让老人再试"}
+        return {"ok": False,
+                "message": f"设备说没调成，请老人再试一次"}
+
+    log.info("%s：已设为 %s（device_pk 无关，设备侧自管）", kind, level)
+    if kind == "volume" and level == 0:
+        # 静音之后我们自己的 TTS 也听不见了 —— 还让模型"自然回应老人"
+        # 就等于对着一台哑掉的设备说话，老人会以为设备坏了。
+        return {"ok": True, "level": 0,
+                "message": "已经静音（音量 0）。老人现在**听不到任何声音**，"
+                           "所以本轮只说一句极短的话留给屏幕字幕（如「已静音」），"
+                           "不要提问，也不要解释"}
+    return {"ok": True, "level": level,
+            "message": f"{label}已经调到 {level}（0-100）。用一句话自然回应老人"
+                       f"（可以说「调好了，您听听合不合适」），不要解释数值范围"}
+
+
+def _get_device_status(device_call: Any) -> dict[str, Any]:
+    """把设备状态挑成老人关心的几个字段。
+
+    刻意**不把原始 JSON 整段喂给模型**：里面还有 ssid / 芯片温度 / rssi，
+    模型很可能把「rssi -60」直接念出来。只给需要的四个数。
+    """
+    if device_call is None:
+        return {"ok": False, "message": "现在连不上设备，查不到状态"}
+
+    status = _device_status(device_call)
+    if status is None:
+        return {"ok": False, "message": "设备没有回应，查不到当前状态"}
+
+    out: dict[str, Any] = {}
+    volume = _coerce_int(_dig(status, ("audio_speaker", "volume")))
+    if volume is not None:
+        out["volume"] = volume
+    brightness = _coerce_int(_dig(status, ("screen", "brightness")))
+    if brightness is not None:
+        out["brightness"] = brightness
+    battery = _coerce_int(_dig(status, ("battery", "level")))
+    if battery is not None:
+        out["battery_level"] = battery
+    charging = _dig(status, ("battery", "charging"))
+    if isinstance(charging, bool):
+        out["charging"] = charging
+
+    if not out:
+        return {"ok": False, "message": "设备没有上报可用的状态"}
+
+    return {"ok": True, "status": out,
+            "message": "用一句话把上面的数字翻译成老人听得懂的话"
+                       "（如「电量还有八成，正插着电」），"
+                       "不要念字段名，不要说英文"}
 
 
 def _create_reminder(db: Any, device_pk: int, args: dict[str, Any]) -> dict[str, Any]:
