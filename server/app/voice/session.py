@@ -47,6 +47,7 @@ from ..llm_gateway import ConfigMissingError, chat_stream
 from ..macs import norm_mac
 from ..chat_quota import local_date_str, quota_snapshot, record_chat_usage
 from ..memory import bridge as memory_bridge
+from ..memory.persona import tone_profile
 from ..models import InteractionKind
 from ..security import decode_token
 from .. import models as _m
@@ -508,6 +509,12 @@ class VoiceSession:
         # 当前这一轮对话的 task。**必须与收包主循环解耦**，否则播报期间
         # 读不到上行消息、abort 失效（见 run() 里的注释）。
         self._turn_task: asyncio.Task | None = None
+
+        # ---- 唤醒应答（2026-10-25）----
+        # 唤醒词到达后起一个延时任务，补一句「你好，<称呼>，要聊点什么？」。
+        # 为什么是 task 而不是在 _on_listen 里直接 await：await 会卡住收包
+        # 主循环，那几百毫秒里 abort / listen stop 全都读不到。
+        self._greet_task: asyncio.Task | None = None
 
         # ---- 全双工打断（F2）状态 ----
         # 播报期的人声累计/静音累计。**独立于 _speech_ms/_silence_ms**：
@@ -1212,6 +1219,115 @@ class VoiceSession:
             self._reset_speech_window()
             self._barge_speech_ms = 0
             self._barge_silence_ms = 0
+            # 需求（2026-10-25）：唤醒后要有一句语音应答，否则老人以为没
+            # 唤醒、反复喊唤醒词（本板固件那句「叮」在 #else 分支里，不会播）。
+            # 起 task 而不是 await：见 _wake_greet 的注释。
+            self._schedule_wake_greet()
+
+    # ---------------------------------------------------------------- 唤醒应答
+    #: 这些"称呼"是代词，套进「你好，<称呼>，要聊点什么？」会变成病句
+    #: （「你好，您，要聊点什么？」）。识别到就走无称呼版。
+    _ADDRESS_PRONOUNS: Final[frozenset[str]] = frozenset(
+        {"您", "你", "您们", "你们"})
+
+    def _schedule_wake_greet(self) -> None:
+        """唤醒词到达后，排一次延时应答（可被下一次唤醒取消）。"""
+        if not config.VOICE_WAKE_GREET:
+            return
+        old = self._greet_task
+        if old is not None and not old.done():
+            old.cancel()
+        self._greet_task = asyncio.create_task(self._wake_greet())
+
+    async def _wake_greet(self) -> None:
+        """喊完唤醒词后补一句「你好，<称呼>，要聊点什么？」。
+
+        为什么需要它（2026-10-25 用户反馈）
+        ----------------------------------
+        老人喊完唤醒词，**设备一点声音都没有**：本板 ``CONFIG_SEND_WAKE_WORD_DATA=y``
+        让固件走了 ``SendWakeWordDetected`` 分支，而那句「叮」（OGG_POPUP）在
+        ``#else`` 里，压根不会播。于是老人的判断是「没唤醒」→ 反复喊唤醒词。
+
+        三个刻意保守的取舍（都是"宁可少说一句"）
+        --------------------------------------
+        1. **延时** ``VOICE_WAKE_GREET_DELAY_MS`` 再开口：老人常常一口气说
+           「你好小智，今天天气怎么样」，唤醒词只是这句话的开头。立刻应答
+           会把后半句吃掉，逼他重说 —— 那比不回应更烦人。
+        2. **开口前再确认一次没人说话**（``_ms_since_loud``，口径是"距最后
+           一个高能量帧多久"）。他正在说就整个跳过。用累计语音量判不行：
+           唤醒词自己的尾巴也算累计，那样永远跳过。
+        3. **任何异常都吞掉**：一句寒暄失败绝不能影响这一轮对话。
+        """
+        try:
+            await asyncio.sleep(config.VOICE_WAKE_GREET_DELAY_MS / 1000.0)
+            reason = self._wake_greet_skip_reason()
+            if reason:
+                log.info("[%s] 跳过唤醒应答：%s", self.session_id, reason)
+                return
+            text = await self._wake_greet_text()
+            # ⚠️ 必须**再判一次**：上面读称呼是一次真实的让出点，期间可能有
+            # listen stop 进来把 state 推成 thinking。这时候再开口就会和这一
+            # 轮的 TTS 抢同一条下行音频通道 —— 两路帧交错，老人听到的是破音。
+            # 这里到 _speak_reply 之间**不许再出现 await**（_speak_reply 内部
+            # 会在第一个 await 之前就把 state 置成 speaking，因此是原子的）。
+            reason = self._wake_greet_skip_reason()
+            if reason:
+                log.info("[%s] 跳过唤醒应答：%s", self.session_id, reason)
+                return
+            log.info("[%s] 唤醒应答：%s", self.session_id, text)
+            await self._speak_reply(text, time.monotonic())
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001  寒暄失败不影响对话
+            log.warning("[%s] 唤醒应答失败（不影响对话）：%s: %s",
+                        self.session_id, type(exc).__name__, exc)
+
+    def _wake_greet_skip_reason(self) -> str:
+        """返回跳过唤醒应答的原因；空串表示可以开口。"""
+        if self.state != "listening":
+            return f"会话状态是 {self.state}（不是 listening）"
+        if self._turn_task is not None and not self._turn_task.done():
+            return "本轮对话已经在跑"
+        if self._abort:
+            return "本轮已被打断"
+        if self._dismissed_until and time.monotonic() < self._dismissed_until:
+            return "退下吧冷却中"
+        if self._ms_since_loud < config.VOICE_WAKE_GREET_QUIET_MS:
+            return (f"老人已经在说话（距最后一个高能量帧 "
+                    f"{self._ms_since_loud}ms < "
+                    f"{config.VOICE_WAKE_GREET_QUIET_MS}ms）")
+        return ""
+
+    async def _wake_greet_text(self) -> str:
+        """组装要念的那句话。称呼取不到就退化成无称呼版，**绝不编一个**。"""
+        # 长度在这里**再夹一次**（_wake_address 里已有 [:16]）：这句是要送
+        # TTS 的，而 address 的来源是 LLM 抽取出来的文本，理论上可被污染。
+        # 两处都夹不是冗余 —— 一处管"数据进来时"，一处管"话出去时"。
+        addr = (await run_in_threadpool(self._wake_address)).strip()[:16]
+        if addr and addr not in self._ADDRESS_PRONOUNS:
+            return f"你好，{addr}，要聊点什么？"
+        return "你好，要聊点什么？"
+
+    def _wake_address(self) -> str:
+        """老人习惯的称呼（家属手动填的优先，其次是自动学出来的）。
+
+        唯一来源是 ``memory.persona.tone_profile`` 的 ``effective.address``
+        —— 它内部已经处理了「人工覆盖 > 统计值」的优先级，这里不许再算一遍
+        （同一事实两处实现必然分叉）。读不到就返回空串。
+        """
+        owner_id = getattr(self.dev, "owner_id", None)
+        if owner_id is None:
+            return ""
+        try:
+            with SessionLocal() as db:
+                eff = (tone_profile(
+                    db, owner_id, getattr(self.dev, "agent_id", None)
+                ).get("effective") or {})
+            return str(eff.get("address") or "").strip()[:16]
+        except Exception as exc:  # noqa: BLE001  读不到称呼不算错误
+            log.info("[%s] 读称呼失败，用无称呼版：%s: %s",
+                     self.session_id, type(exc).__name__, exc)
+            return ""
 
     def _on_abort(self, obj: dict[str, Any]) -> None:
         reason = obj.get("reason", "")

@@ -986,6 +986,30 @@ VOICE_TOOL_MAX_ROUNDS = int(os.getenv("ELDER_VOICE_TOOL_MAX_ROUNDS", "3"))
 # 纯文本更紧，且老人话题跳跃少、短会话即可；超过就丢最早的。
 VOICE_HISTORY_TURNS = int(os.getenv("ELDER_VOICE_HISTORY_TURNS", "4"))
 
+# ---------------------------------------------------------------- 唤醒应答
+# 老人喊完唤醒词之后，**设备一点声音都没有**：本板 sdkconfig 里
+# ``CONFIG_SEND_WAKE_WORD_DATA=y``，固件那句「叮」（OGG_POPUP）在
+# application.cc 的 ``#else`` 分支里，压根不会播。于是老人的判断是
+# 「没唤醒」→ 反复喊唤醒词。这里在唤醒后补一句
+# 「你好，<称呼>，要聊点什么？」。
+#
+# 三个参数的分工（全部刻意保守：宁可少说一句，也不能打断老人）：
+#   ENABLED   总开关。现场嫌吵可以直接关掉，关掉即完全回到旧行为，
+#             不需要回滚镜像。
+#   DELAY_MS  唤醒后等多久再开口。等这一下的目的不是"礼貌"，是**让老人
+#             把话说完**：他常常一口气说「你好小智，今天天气怎么样」，
+#             唤醒词只是这句话的开头 —— 立刻应答会把后半句吃掉。
+#   QUIET_MS  开口前再确认一次"现在有没有人在说话"（口径是**距最后一个
+#             高能量帧多少毫秒**）。小于它就整个跳过。这里刻意不用
+#             ``_speech_ms``（累计语音量）：唤醒词自己的尾巴也会算进累计值，
+#             用它判会永远跳过，等于这条功能从不上线。
+VOICE_WAKE_GREET = os.getenv(
+    "ELDER_VOICE_WAKE_GREET", "1").strip().lower() not in ("0", "false", "no", "off", "")
+VOICE_WAKE_GREET_DELAY_MS = int(
+    os.getenv("ELDER_VOICE_WAKE_GREET_DELAY_MS", "900"))
+VOICE_WAKE_GREET_QUIET_MS = int(
+    os.getenv("ELDER_VOICE_WAKE_GREET_QUIET_MS", "500"))
+
 # ---------------------------------------------------------------- 提醒调度
 # 服务端预生成提醒实例的提前量（小时）。设备离线时靠本地 RTC 兜底触发，
 # 联网时以服务端生成的实例为准做对账。

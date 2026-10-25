@@ -392,6 +392,16 @@ jobs:
       # 或把 finish() 里的排空等待删掉，它们必须变红，否则就是假绿。
       - name: 音频下行节流器（虚拟播放时钟）
         run: python tools/run_smoke.py logs/smoke_audio_pacing.log python tools/test_audio_pacing.py
+      # 唤醒应答（「你好，<称呼>，要聊点什么？」）。
+      # 为什么必须进 CI：这条功能的三类失效**没有一类会让协议层报错** ——
+      # ① 没接上（代码写了但 detect 分支没调），现象是「线上没反应」；
+      # ② 该闭嘴时开口，把老人一口气说的后半句吃掉（比不回应更烦）；
+      # ③ 读称呼期间本轮开始，两路 TTS 抢同一条下行音频通道 ⇒ 破音。
+      # 本脚本纯内存 + 临时库，不占端口、不联网、不需要 libopus。
+      # ⚠️ 第 1 组与第 4 组做过变异验证：删掉 detect 里的接线、或删掉第二次
+      #    跳过检查，它们必须变红，否则就是假绿。
+      - name: 唤醒应答（称呼 / 跳过判据 / 抢通道防护）
+        run: python tools/run_smoke.py logs/smoke_wake_greet.log python tools/test_wake_greet.py
       # 会员制遗留五张表必须**真的**被删掉。
       # 这条门禁是补 875b38c 留下的洞：当时删表函数整个被掏空，全仓 CI 依然全绿
       # （qa3_migration 的老库 DDL 根本不建这五张表，删表分支恒为空操作）。
