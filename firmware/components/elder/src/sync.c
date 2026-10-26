@@ -259,7 +259,7 @@ esp_err_t elder_time_restore_boot(void)
         struct timeval tv = { .tv_sec = t, .tv_usec = 0 };
         settimeofday(&tv, NULL);
         g.time_synced = true;
-        ESP_LOGI(TAG, "开机时钟来源: DS3231（%d）", (int)t);
+        ESP_LOGI(TAG, "开机时钟来源: 外部 RTC（%d）", (int)t);
         return ESP_OK;
     }
     if (err == ESP_OK) {

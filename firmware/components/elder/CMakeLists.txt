@@ -8,6 +8,10 @@ idf_component_register(
         "src/net.c"
         "src/sync.c"
         "src/rtc.c"
+        # DS1302 三线 bit-bang 后端（2026-10-23）。文件内部用 Kconfig 条件
+        # 编译：只有 ELDER_RTC_ENABLE=y 且选了 DS1302 才产出代码，否则是空
+        # 编译单元 —— 无条件加入 SRCS 是为了让"换芯片"只改 Kconfig。
+        "src/rtc_ds1302.c"
         "src/config_report.c"
     INCLUDE_DIRS "include"
     REQUIRES
@@ -19,6 +23,8 @@ idf_component_register(
         esp_driver_gpio
         # i2c_master_get_bus_handle / i2c_master_transmit（新 I2C 主机驱动，rtc.c）
         esp_driver_i2c
+        # esp_rom_delay_us（DS1302 三线时序的 µs 级忙等，rtc_ds1302.c）
+        esp_rom
         esp_http_client
         # esp_crt_bundle.h（证书包）在 mbedtls 组件里，必须显式声明：
         # 漏了它 net.c 直接 fatal error: esp_crt_bundle.h: No such file。

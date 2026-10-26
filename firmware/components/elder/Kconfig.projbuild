@@ -41,7 +41,16 @@ menu "老人陪伴 & 提醒助手 (Elder Companion)"
         default y
         help
             立创实战派板载没有 WS2812，需在扩展口外接灯珠。
-            硬件上 ESP32-S3 的 3.3V 电平需经 74HCT 转换（DIN 要求 >=0.7*VDD）。
+
+            ⚠️ 电平风险（2026-10-23 补充实测说明）：
+            WS2812B 供 5V 时 DIN 的 Vih 典型值是 0.7 x VDD = 3.5V，而
+            ESP32-S3 的 GPIO 只有 3.3V —— 处在**临界值以下**。表现是偶发
+            乱色、闪一下就灭、整条不亮，且时好时坏（受温度/线长/批次影响），
+            最难排查的一类故障。三种可靠做法，任选其一：
+              ① 加 74HCT245 / 74AHCT1G125 电平转换（推荐，产品级）；
+              ② 灯带 VDD 串一只肖特基二极管降到 ~4.4V（Vih 降到 ~3.1V）；
+              ③ 灯带直接供 3.3V（亮度和色准下降，但逻辑电平最稳）。
+            飞线短距离直连 5V 灯带**不保证稳定**，量产不要这么干。
 
     config ELDER_RGB_GPIO
         int "WS2812 数据脚 GPIO（-1 = 未接）"
@@ -62,33 +71,110 @@ menu "老人陪伴 & 提醒助手 (Elder Companion)"
             填 -1 表示原型期未接按键，按键模块静默不启动（不报错）。
 
     config ELDER_RTC_ENABLE
-        bool "启用 DS3231 外部时钟"
+        bool "启用外部时钟芯片"
         default n
         help
-            原型期没有时钟芯片，默认关闭。接上 DS3231 模块后打开，
-            开机从 RTC 恢复时间，联网校时后回写 RTC。
+            开机从外部时钟恢复时间，联网校时后回写。没有外部时钟时，完全断电
+            重启 + 无网 = 时钟停在 1970，reminder.c 的可信时间守卫会暂停所有
+            提醒（表现是"当天一条都不响，而屏幕一切正常"）。
 
-            接线：插板上 **I2C 外拓 5P 接口**（不是 GPIO10/11 那个 5P 口）。
-            该口引出的是板载音频 I2C 总线，DS3231 地址 0x68 与
-            PCA9557(0x19)/FT5x06(0x38)/ES8311(0x18) 不冲突。
+            具体接哪种芯片由下面的 ELDER_RTC_DRIVER 选择，两者接线完全不同：
+              · DS3231：I2C 器件，插板上 **I2C 外拓 5P 接口**（不是 GPIO10/11
+                那个 5P 口）。该口引出的是板载音频 I2C 总线，地址 0x68 与
+                PCA9557(0x19)/FT5x06(0x38)/ES8311(0x18) 不冲突。
+                温补晶振，年漂移约 ±2 分钟，有 OSF 位（0x0F bit7）标记掉电停振。
+              · DS1302：三线同步串行（CE/SCLK/DAT），**不是 I2C**，占三根普通
+                GPIO 由软件 bit-bang。**绝不能接 GPIO1/GPIO2**（音频 codec 的
+                I2C 总线，详见 ELDER_RTC_CLK_GPIO 的 help）。精度差
+                （±1~2 分钟/月），无闹钟输出，靠联网校时 + 每 30 分钟对时兜住。
+                停振标志是秒寄存器 bit7 的 CH 位，语义与 OSF 相同。
 
-            OSF 位（0x0F bit7）置位表示掉电停振过，此时读出的时间不可信，
-            固件会自动降级到 NVS 兜底而不是采信垃圾时间。
+            无论哪种芯片，时间不可信时都会自动降级到 NVS 兜底，绝不采信垃圾读数。
 
     config ELDER_RTC_I2C_PORT
-        int "DS3231 所在 I2C 端口号"
+        int "DS3231 所在 I2C 端口号（仅 DS3231 模式生效）"
         default 1
         depends on ELDER_RTC_ENABLE
         help
+            仅当 ELDER_RTC_DRIVER 选 DS3231 时使用；DS1302 模式下本项被忽略。
+
             立创板的音频 I2C 总线建在 **端口 1**（见 lichuang_dev_board.cc
             的 i2c_new_master_bus）。DS3231 挂同一条总线即可，地址 0x68
             与 PCA9557(0x19) / FT5x06(0x38) / ES8311(0x18) 不冲突。
             填错时固件会在 1 和 0 之间自动回退探测。
 
     config ELDER_RTC_I2C_ADDR
-        hex "DS3231 I2C 地址"
+        hex "DS3231 I2C 地址（仅 DS3231 模式生效）"
         default 0x68
         depends on ELDER_RTC_ENABLE
+
+    # ---- 外部时钟芯片型号（2026-10-23 新增 DS1302 三线后端）----
+    choice ELDER_RTC_DRIVER
+        prompt "外部时钟芯片型号"
+        default ELDER_RTC_DRIVER_DS3231
+        depends on ELDER_RTC_ENABLE
+        help
+            两种芯片的走线完全不同，选错只会初始化失败（打 WARN，提醒仍可用），
+            不会损坏硬件。DS3231 走 I2C，DS1302 走三线 bit-bang。
+
+        config ELDER_RTC_DRIVER_DS3231
+            bool "DS3231（I2C，现有实现）"
+
+        config ELDER_RTC_DRIVER_DS1302
+            bool "DS1302（三线 bit-bang，本次新增）"
+    endchoice
+
+    config ELDER_RTC_CLK_GPIO
+        int "DS1302 SCLK 脚 GPIO"
+        default 4
+        depends on ELDER_RTC_DRIVER_DS1302
+        help
+            DS1302 的 SCLK（模块丝印 CLK）。默认 GPIO4。
+
+            ⚠️ **绝对不能接 GPIO1 / GPIO2**：那是板载音频 codec（ES8311 /
+            ES7210）与触摸屏（FT5x06）**共用的 I2C 总线**（SDA=GPIO1、
+            SCL=GPIO2）。DS1302 不是 I2C 器件，bit-bang 会与触摸轮询的 I2C
+            事务持续抢总线，后果是 codec 寄存器被写坏、触摸失灵 —— 用户听到
+            的就是破音、卡顿、断续。
+
+            固件在初始化时硬性拒绝把 CLK/DAT/RST 配到这两个脚（直接返回
+            ESP_ERR_INVALID_STATE，一个脚都不驱动），除非显式打开
+            ELDER_RTC_ALLOW_SHARED_I2C_BUS。这是刻意设计的：宁可时钟功能
+            不可用，也不能毁掉音频。
+
+    config ELDER_RTC_DAT_GPIO
+        int "DS1302 I/O 脚 GPIO"
+        default 5
+        depends on ELDER_RTC_DRIVER_DS1302
+        help
+            DS1302 的 DAT（双向数据，模块丝印 DAT 或 I/O）。默认 GPIO5。
+            同样不能接 GPIO1/GPIO2，原因见 ELDER_RTC_CLK_GPIO。
+
+    config ELDER_RTC_RST_GPIO
+        int "DS1302 CE(RST) 脚 GPIO"
+        default 6
+        depends on ELDER_RTC_DRIVER_DS1302
+        help
+            DS1302 的 CE（模块丝印常写 RST / CE）。默认 GPIO6。
+
+            ⚠️ 不能等于 ELDER_KEY_GPIO（默认 11，老人服药确认键）：同一个脚
+            不能既做按键输入又做 CE 输出 —— 按键会把 CE 拉低导致三线时序全乱，
+            CE 输出又会让按键误触发。固件会拒绝启动 RTC 并打 ERROR 说明。
+
+    config ELDER_RTC_ALLOW_SHARED_I2C_BUS
+        bool "允许 DS1302 使用 GPIO1/GPIO2（音频 I2C 总线）—— 危险"
+        default n
+        depends on ELDER_RTC_DRIVER_DS1302
+        help
+            逃生舱，**默认关闭，正常使用不要打开**。
+
+            打开后固件才允许 DS1302 的 CLK/DAT/RST 落在 GPIO1/GPIO2 上。
+            代价：这两个脚是音频 codec 与触摸屏的 I2C 总线，bit-bang 期间
+            触摸轮询事务会被打断，ES8311 可能被写入错误寄存器 —— 用户听到的
+            就是破音、卡顿、断续，触摸也可能失灵。
+
+            只在"临时飞线验证 DS1302 本身能不能通"时值得打开，验证完立刻
+            改回 n 并改线到 GPIO4/5/6。
 
     config ELDER_TIME_NVS_FALLBACK
         bool "无 RTC 时用 NVS 里的上次校时时间兜底"

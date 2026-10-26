@@ -9,7 +9,18 @@
 
 static const char *TAG = "elder.rtc";
 
-#if CONFIG_ELDER_RTC_ENABLE
+/* 本文件是 **DS3231（I2C）** 后端。
+ *
+ * 2026-10-23 起支持 DS1302（三线同步串行，不是 I2C），实现在 rtc_ds1302.c，
+ * 由 Kconfig 的 ELDER_RTC_DRIVER choice 二选一。两者没有可复用代码，所以
+ * 各自独立成文件，对外接口仍是 elder_rtc.h 的四个函数。
+ *
+ * 三种编译形态：
+ *   · RTC 未启用            → 本文件提供"一律 NOT_SUPPORTED"的桩
+ *   · 启用 + DS3231（默认） → 本文件提供 I2C 实现
+ *   · 启用 + DS1302         → 本文件不定义任何函数（rtc_ds1302.c 负责） */
+
+#if CONFIG_ELDER_RTC_ENABLE && !defined(CONFIG_ELDER_RTC_DRIVER_DS1302)
 
 #define DS3231_REG_TIME     0x00    /* 秒/分/时/周/日/月/年，共 7 字节 */
 #define DS3231_REG_STATUS   0x0F
@@ -167,7 +178,7 @@ esp_err_t elder_rtc_write(time_t t)
     return ESP_OK;
 }
 
-#else  /* !CONFIG_ELDER_RTC_ENABLE —— 原型期未接时钟芯片 */
+#elif !CONFIG_ELDER_RTC_ENABLE  /* 原型期未接时钟芯片：一律返回 NOT_SUPPORTED */
 
 esp_err_t elder_rtc_init(void)
 {
@@ -192,4 +203,9 @@ esp_err_t elder_rtc_write(time_t t)
     return ESP_ERR_NOT_SUPPORTED;
 }
 
-#endif /* CONFIG_ELDER_RTC_ENABLE */
+#else  /* 启用 + DS1302：实现全在 rtc_ds1302.c，本文件不定义任何函数 */
+
+/* 避免空编译单元（ISO C 要求 translation unit 至少有一个外部声明）。 */
+typedef int elder_rtc_ds3231_not_compiled;
+
+#endif /* CONFIG_ELDER_RTC_ENABLE && !CONFIG_ELDER_RTC_DRIVER_DS1302 */
