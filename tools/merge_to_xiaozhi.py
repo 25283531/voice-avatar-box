@@ -199,17 +199,34 @@ CONFIG_ELDER_SERVER_URL="https://152.136.230.132"
 CONFIG_ELDER_SERVER_TOKEN=""
 CONFIG_ELDER_SYNC_INTERVAL_SEC=300
 CONFIG_ELDER_HTTP_TIMEOUT_MS=8000
-# 立创板无板载 WS2812；外接灯珠时才打开
-CONFIG_ELDER_ENABLE_RGB=n
+# 立创板无板载 WS2812；用户已外接 WS2812B 灯珠（DIN→GPIO10），打开。
+# ⚠️ 5V 供电时 DIN 的 Vih 典型 0.7×VDD≈3.5V，高于 ESP32-S3 的 3.3V ——
+#    处在临界值以下，表现是偶发乱色/闪一下就灭/整条不亮且时好时坏。
+#    三种可靠做法（74HCT245 电平转换 / VDD 串肖特基降到 4.4V / 灯带供 3.3V）
+#    见 Kconfig 里 ELDER_ENABLE_RGB 的 help。
+CONFIG_ELDER_ENABLE_RGB=y
 # --- 引脚：产品级换板只改这里，不改代码（2026-10-20）---
 # GH1.25 5P 扩展口只引出 GPIO10/11 两根信号线：彩灯 10、按键 11。
-# 时钟走板载 I2C（立创板建在端口 1，地址 0x68 与音频器件不冲突）。
 # ⚠️ 不要把 ELDER_KEY_GPIO 填回 0：GPIO0 是 BOOT 键，被自动下载电路接管，
 #    与上游 xiaozhi 的按键语义双触发，USB 无主机时还会被持续拉低。
 CONFIG_ELDER_KEY_GPIO=11
 CONFIG_ELDER_RGB_GPIO=10
-# 原型期无时钟芯片：先关。接上 DS3231 模块后改 y，开机即从 RTC 恢复时间。
-CONFIG_ELDER_RTC_ENABLE=n
+# 外部时钟：2026-10-23 起用户接的是 **DS1302**（三线同步串行，不是 I2C）。
+# ⚠️ DS1302 的 CLK/DAT 绝不能接 GPIO1/GPIO2 —— 那是板载音频 codec
+#    (ES8311/ES7210) 与触摸屏(FT5x06) 共用的 I2C 总线（SDA=1/SCL=2）。
+#    DS1302 必须软件 bit-bang，在这两个脚上跑会与触摸轮询的 I2C 事务持续
+#    抢总线，后果是 codec 寄存器被写坏、触摸失灵，听感上就是破音/卡顿/断续。
+#    用户当前把 CLK/DAT 插在了 I2C 外拓口 ⇒ 必须改线到 GPIO4/GPIO5；
+#    RST 从 GPIO11（老人服药确认键）改到 GPIO6。
+CONFIG_ELDER_RTC_ENABLE=y
+CONFIG_ELDER_RTC_DRIVER_DS1302=y
+# CONFIG_ELDER_RTC_DRIVER_DS3231 is not set
+CONFIG_ELDER_RTC_CLK_GPIO=4
+CONFIG_ELDER_RTC_DAT_GPIO=5
+CONFIG_ELDER_RTC_RST_GPIO=6
+# 逃生舱：默认关闭。打开等于允许在音频 I2C 总线上 bit-bang（毁音频风险）。
+CONFIG_ELDER_RTC_ALLOW_SHARED_I2C_BUS=n
+# 以下两项仅在切回 DS3231 模式时生效（DS1302 模式下被忽略）
 CONFIG_ELDER_RTC_I2C_PORT=1
 # 无 RTC 时用 NVS 里的上次校时 epoch 兜底，避免掉电重启后当天提醒一条不响。
 # 注意这是近似时间（关机时长未知），联网后立刻校正。

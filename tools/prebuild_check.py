@@ -578,6 +578,92 @@ def main() -> int:
             fatal=True,
         )
 
+    # --------------------------------- C10 elder 段是否被"手改生成文件"骗过
+    # 2026-10-23 真事故（DS1302 接入时暴露，代价是一次假绿 CI）：
+    # `firmware/xiaozhi/sdkconfig.defaults` 是**生成文件** —— 它的 elder 段
+    # 每次都由 merge_to_xiaozhi.py 用 SDKCONFIG_OVERLAY 常量整块**覆盖重写**
+    # （append_overlay() 先 strip_overlay() 再拼模板）。
+    # 手改那个文件在本机看着生效（sdkconfig 早就生成过、C1 也不比），
+    # 一到 CI 就被覆盖回模板里的旧值 ⇒ 固件里 CONFIG_ELDER_RTC_ENABLE=n，
+    # `#if CONFIG_ELDER_RTC_ENABLE && defined(...DS1302)` 整块被预处理跳过，
+    # 而**构建一路绿灯**（剩下的空 TU 也能链过，四个符号由 rtc.c 的桩提供）。
+    # 判据：模板拼出来的整段必须与 defaults 里的 BEGIN..END 段逐字节相同。
+    try:
+        if str(ROOT / "tools") not in sys.path:
+            sys.path.insert(0, str(ROOT / "tools"))
+        import merge_to_xiaozhi as _m2x  # noqa: E402  （只在 __main__ 里跑 main）
+
+        _text = SDK_DEFAULTS.read_text(encoding="utf-8", errors="replace")
+        _i = _text.find(_m2x.BEGIN)
+        _j = _text.find(_m2x.END)
+        _cur = _text[_i:_j + len(_m2x.END)] if (_i >= 0 and _j > _i) else ""
+        _same = _cur.strip("\n") == _m2x.SDKCONFIG_OVERLAY.strip("\n")
+        check(
+            "C10 sdkconfig.defaults 的 elder 段与 merge 模板一致",
+            _same,
+            "一致：生成文件没被手改，模板也没漂移"
+            if _same else
+            "**不一致**！`firmware/xiaozhi/sdkconfig.defaults` 的 elder 段由 "
+            "tools/merge_to_xiaozhi.py 的 SDKCONFIG_OVERLAY **整块重写**，"
+            "手改那个文件等于没改：CI 上会被覆盖回模板值，对应功能静默编空"
+            "（构建还照样绿）。\n"
+            "         处置：改 tools/merge_to_xiaozhi.py 的 SDKCONFIG_OVERLAY，"
+            "再跑 python tools/merge_to_xiaozhi.py 重新生成",
+            fatal=True,
+        )
+    except Exception as exc:  # noqa: BLE001
+        check("C10 sdkconfig.defaults 的 elder 段与 merge 模板一致", False,
+              f"无法比对（导入 merge_to_xiaozhi 失败：{exc}）", fatal=True)
+
+    # --------------------------------- C11 时钟/彩灯引脚不得碰音频 I2C 总线
+    # 用户的硬约束是「声音现在正常，千万不要再修的破音、卡顿」。
+    # DS1302 是三线 bit-bang，若 CLK/DAT 落在 GPIO1/GPIO2（板载音频 codec
+    # ES8311/ES7210 与触摸 FT5x06 共用的 I2C 总线，SDA=1/SCL=2）就会与触摸
+    # 轮询持续抢总线 ⇒ codec 寄存器被写坏，听感就是破音/卡顿/断续。
+    # rtc_ds1302.c 的 pins_guard() 运行时也会拒，但那时固件已经烧进设备了；
+    # 这里在**编译前**就拦，本机与 CI 都跑。
+    if src.get("CONFIG_ELDER_RTC_ENABLE", "n") != "y":
+        check("C11 时钟/彩灯引脚不与音频 I2C 总线冲突", SKIP,
+              "CONFIG_ELDER_RTC_ENABLE=n，未接外部时钟，本项无判据可查")
+    else:
+        _drv = ("DS1302" if src.get("CONFIG_ELDER_RTC_DRIVER_DS1302", "") == "y"
+                else "DS3231" if src.get("CONFIG_ELDER_RTC_DRIVER_DS3231", "") == "y"
+                else "(未选)")
+        _allow = src.get("CONFIG_ELDER_RTC_ALLOW_SHARED_I2C_BUS", "n") == "y"
+        _bad: list[str] = []
+        if _drv == "DS1302":
+            _pins = {k: src.get(f"CONFIG_ELDER_RTC_{k}", "(未设置)")
+                     for k in ("CLK_GPIO", "DAT_GPIO", "RST_GPIO")}
+            if not _allow:
+                for _k, _v in _pins.items():
+                    if _v in ("1", "2"):
+                        _bad.append(f"{_k}={_v} 落在音频/触摸 I2C 总线"
+                                    f"（SDA=GPIO1, SCL=GPIO2）")
+            _key = src.get("CONFIG_ELDER_KEY_GPIO", "")
+            if _key and _pins.get("RST_GPIO") == _key:
+                _bad.append(f"RST_GPIO 与 ELDER_KEY_GPIO 同为 GPIO{_key}"
+                            f"（CE 输出会把服药确认键一直拉高）")
+            _detail = (f"芯片 {_drv}，CLK={_pins['CLK_GPIO']} "
+                       f"DAT={_pins['DAT_GPIO']} RST={_pins['RST_GPIO']}"
+                       + ("（已显式允许共用 I2C 总线）" if _allow else ""))
+        else:
+            _detail = f"芯片 {_drv}（走 I2C，不占用额外 bit-bang 引脚）"
+        _rgb = src.get("CONFIG_ELDER_ENABLE_RGB", "n") == "y"
+        _rgbp = src.get("CONFIG_ELDER_RGB_GPIO", "(未设置)")
+        if _rgb and _rgbp in ("1", "2"):
+            _bad.append(f"RGB_GPIO={_rgbp} 落在音频/触摸 I2C 总线")
+        if _rgb:
+            _detail += f"；WS2812 已启用，DIN=GPIO{_rgbp}"
+        check(
+            "C11 时钟/彩灯引脚不与音频 I2C 总线冲突",
+            not _bad,
+            ("⚠️ " + "；".join(_bad) + "。GPIO1/GPIO2 是板载音频 codec"
+             "(ES8311/ES7210) 与触摸屏(FT5x06) 共用的 I2C 总线，软件 bit-bang "
+             "会与触摸轮询抢总线，听感就是破音/卡顿。请改线到 GPIO4/5/6。")
+            if _bad else _detail,
+            fatal=True,
+        )
+
     # ------------------------------------------------------ 汇总
     failed = [r for r in results if not r[1] and r[3]]
     warned = [r for r in results if not r[1] and not r[3]]

@@ -313,6 +313,18 @@ jobs:
           echo "=== 产物 ==="
           ls -lh build/*.bin build/bootloader/*.bin build/partition_table/*.bin 2>/dev/null || true
 
+      # ⚠️ 2026-10-23 假绿事故：DS1302 时钟 + WS2812 彩灯的配置写进了
+      # `firmware/xiaozhi/sdkconfig.defaults`，但那个文件的 elder 段每次都被
+      # tools/merge_to_xiaozhi.py 用 SDKCONFIG_OVERLAY **整块重写** ⇒ CI 上
+      # 变回 RTC=n / RGB=n，rtc_ds1302.c 的 380 行被 #if 整块跳过（剩下的空桩
+      # 由 rtc.c 提供同名符号，链接期毫无异常），构建一路绿灯、产物里连
+      # "DS1302" 这个字符串都没有。**编译成功不等于功能编进去了。**
+      # 这道断言只读编译真正读到的 build/config/sdkconfig.h，不看配置源头。
+      - name: 断言 elder 开关真的编进了固件配置
+        run: |
+          set -e
+          python3 tools/check_built_config.py
+
       # 体积排名（只读报告，不参与判定）。
       # 为什么必须有：删「用不到的代码」如果只按组件名或印象猜，十次有八次删错
       # 对象 —— 体积几乎不动、功能却回归了。这份排名直接给出谁在占地方，
@@ -390,6 +402,40 @@ jobs:
           if b'wn9_nihaoxiaoan' in adata:
               sys.exit('assets 里仍有 wn9_nihaoxiaoan（你好小安）⇒ 与回归上游方向相反，请检查 sdkconfig')
           print(f'唤醒模型自检通过：{assets[0].name} 含 wn9_nihaoxiaozhi（{len(adata)} bytes）')
+
+          # ---- 外部时钟 / 彩灯必须**真编进产物**（2026-10-23 假绿事故）----
+          # check_built_config.py 只断言 sdkconfig.h 里开关是 1；这里再往下扎
+          # 一层：开关为 1 时，对应源文件的**独有字符串**必须在 .bin 里。
+          # 为什么两层都要 —— 开关对、但 #if 条件写错时，只有搜二进制能发现。
+          # 判据必须用「只有启用分支才有」的字符串：
+          #   · RGB 启用分支有 "WS2812 ready on GPIO"，关闭分支有 "未启用 WS2812"；
+          #   · TAG "elder.rgb" 在 #if **外面**，两种形态都有，不能当判据。
+          hdr = pathlib.Path('build/config/sdkconfig.h').read_text(errors='replace')
+          def _on(sym):
+              return f'#define {sym} 1' in hdr
+
+          if _on('CONFIG_ELDER_RTC_ENABLE'):
+              if _on('CONFIG_ELDER_RTC_DRIVER_DS1302'):
+                  if b'elder.rtc.ds1302' not in data:
+                      sys.exit('CONFIG_ELDER_RTC_DRIVER_DS1302=1，但 xiaozhi.bin 里'
+                               '没有 DS1302 后端的 TAG ⇒ rtc_ds1302.c 被 #if 整块'
+                               '跳过，时钟芯片等于没驱动（构建却是绿的）')
+              elif b'DS3231' not in data:
+                  sys.exit('CONFIG_ELDER_RTC_ENABLE=1 但产物里既没有 DS1302 也没有'
+                           ' DS3231 后端的字符串 ⇒ 编进去的是空桩')
+              print('RTC 后端自检通过：产物与编译配置一致')
+          else:
+              print('RTC 未启用（跳过后端自检）')
+
+          if _on('CONFIG_ELDER_ENABLE_RGB'):
+              if b'WS2812 ready on GPIO' not in data:
+                  sys.exit('CONFIG_ELDER_ENABLE_RGB=1，但 xiaozhi.bin 里没有 '
+                           '"WS2812 ready on GPIO" ⇒ rgb.c 走了未启用分支，彩灯不会亮')
+              print('WS2812 自检通过：启用分支已编入')
+          else:
+              if b'\xe6\x9c\xaa\xe5\x90\xaf\xe7\x94\xa8 WS2812' not in data:
+                  print('提示：RGB 关闭但产物里也找不到关闭分支的日志串（可能是被优化掉了）')
+              print('WS2812 未启用（跳过启用分支自检）')
           PY
 
       - name: 校验 OTA 地址指向本项目服务端
