@@ -50,9 +50,22 @@ static int64_t now_us(void) { return esp_timer_get_time(); }
  * 原型期 CONFIG_ELDER_KEY_GPIO=-1 ⇒ 整段不参与构建，避免
  * -Wunused-function 把编译打断（本项目开了 -Werror 级别的告警）。 */
 
+/* 编译期钉死极性：本模块**固定开内部上拉**（见下方 gpio_config 的
+ * pull_up_en = GPIO_PULLUP_ENABLE），按键另一端接 GND。上拉 + 接 GND 的
+ * 组合只有一种物理事实 —— 空闲为 1、按下为 0，也就是必须低电平有效。
+ * 填成 0（高电平有效）不会编译失败，但运行时会认为"一直按着"：
+ * released_seen 永远为假 ⇒ 按键一次都不响应，20s 后还误报"按键卡住"。
+ * 2026-10-26 就是这么错的，靠这条断言让它再也回不去。 */
+#if !ELDER_KEY_ACTIVE_LEVEL
+#error "按键开了内部上拉且另一端接 GND ⇒ 必须 ELDER_KEY_ACTIVE_LEVEL=1（低电平有效）"
+#endif
+
 static bool key_down(void)
 {
     int lvl = gpio_get_level(ELDER_KEY_GPIO);
+    /* ELDER_KEY_ACTIVE_LEVEL 是**布尔开关**（1=低电平有效），不是"按下时的电平值"。
+     * 写成 `lvl == ELDER_KEY_ACTIVE_LEVEL` 是错的：那样 0 会变成"电平 0 才按下"，
+     * 与这里的语义正好相反。改这个宏前先看 elder_board.h 的注释。 */
     return ELDER_KEY_ACTIVE_LEVEL ? (lvl == 0) : (lvl != 0);
 }
 

@@ -57,7 +57,16 @@
 #define ELDER_KEY_GPIO          GPIO_NUM_NC
 #define ELDER_KEY_ENABLED       0
 #endif
-#define ELDER_KEY_ACTIVE_LEVEL  0   /* 按键另一端接 GND，低电平有效 */
+/* 按键极性：**1 = 低电平有效**（按键另一端接 GND，内部上拉，按下读到 0）。
+ *
+ * ⚠️ 这个宏不是"按下时的电平值"，而是一个**布尔开关**：
+ *     input.c 里写的是 `ACTIVE_LEVEL ? (lvl == 0) : (lvl != 0)`。
+ *     填 1 → 低电平算按下；填 0 → 高电平算按下。
+ *   2026-10-26 用户确认接线是「GPIO11 直接接 GND」+ 内部上拉 ⇒ 必须填 1。
+ *   曾经这里填的是 0（注释却写着"低电平有效"），实际含义是**高电平有效**：
+ *   空闲被上拉到 1 会被当成"一直按着"，`released_seen` 永远为假 ⇒
+ *   按键一次都不响应，20s 后还会误报"按键卡住"。 */
+#define ELDER_KEY_ACTIVE_LEVEL  1
 
 /* ---------- 外部扩展：WS2812 RGB 指示灯 ---------- */
 /* 扩展口只剩两根信号线：GPIO10 给彩灯、GPIO11 给按键，时钟走 I2C。
