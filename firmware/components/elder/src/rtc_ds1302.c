@@ -19,8 +19,15 @@
  *   · 命令字节：bit7=1 起始位；bit6=0 时钟寄存器；bit5..1 地址；bit0 读写。
  *   · 时钟寄存器：秒 0x80/81、分 0x82/83、时 0x84/85、日 0x86/87、
  *     月 0x88/89、星期 0x8A/8B、年 0x8C/8D、写保护 0x8E/8F。
- *   · 突发模式：写 0xBE、读 0xBF，一次搬 8 字节（7 时间 + 控制）。
- *     突发比逐字节稳：逐字节时两次事务之间芯片仍在走时，秒可能进位。
+ *   · 突发模式：写 0xBE、读 0xBF，一次搬 8 字节，**顺序就是地址序**：
+ *       秒(0x80) / 分(0x82) / 时(0x84) / 日-几号(0x86) /
+ *       月(0x88) / 星期(0x8A) / 年(0x8C) / 控制-写保护(0x8E)
+ *     ⚠️ 「日-几号」在「月」**之前**，「星期」在「年」之前 —— 按中文习惯
+ *     说成"秒分时日 月 星期 年"很容易把 日/月/星期 三者写成
+ *     [3]=星期 [4]=日 [5]=月，那就整体错位了。这个错误**读回自检发现不了**：
+ *     写和读用同一套错索引，彼此自洽、BCD 合法、范围也合法，只有芯片自己的
+ *     日历进位会坏（午夜递增的是"星期"寄存器，几号永远不动）。
+ *     参考实现（esp-idf-lib ds1302.c 的 ds1302_set_time/get_time）就是这个顺序。
  *   · 数据是 BCD；年份 00~99 映射 2000~2099。
  *   · 秒寄存器 bit7 = CH（Clock Halt）：1 表示停振过/从未起振（新模块出厂
  *     就是 CH=1），读数是垃圾 —— 语义等价于 DS3231 的 OSF 位。
@@ -127,16 +134,23 @@ static void write_byte(uint8_t v)
     }
 }
 
-/* 读一个字节：LSB first，DS1302 在 SCLK 下降沿输出，主机在下降沿之后采样。 */
+/* 读一个字节：LSB first。
+ *
+ * ⚠️ 采样必须在时钟脉冲**之前**。DS1302 在 SCLK 下降沿把这一位摆上 DAT，
+ * 主机要在**下一个上升沿之前**把它读走（手册的"下降沿输出、上升沿有效"）。
+ * 先拉高时钟再采样 = 采样点被推后了一整个边沿，读到的永远是**下一位**
+ * —— 整体错一位。现象不是报错，而是所有读数都通不过 BCD 合法性检查，
+ * 于是时钟静默降级到 NVS（用户看到的就是"装了芯片还是不准"）。
+ * 参考实现（esp-idf-lib ds1302.c::read_byte）同样是"先采样后打时钟"。 */
 static uint8_t read_byte(void)
 {
     uint8_t v = 0;
     for (int i = 0; i < 8; i++) {
+        if (gpio_get_level(PIN_DAT)) v |= (uint8_t)(1u << i);
         gpio_set_level(PIN_CLK, 1);
         bit_delay();
-        gpio_set_level(PIN_CLK, 0);   /* 下降沿：芯片把这一位摆上 DAT */
+        gpio_set_level(PIN_CLK, 0);   /* 下降沿：芯片把下一位摆上 DAT */
         bit_delay();
-        if (gpio_get_level(PIN_DAT)) v |= (uint8_t)(1u << i);
     }
     return v;
 }
@@ -320,10 +334,12 @@ esp_err_t elder_rtc_read(time_t *out)
         return ESP_ERR_INVALID_STATE;
     }
 
-    /* 非法 BCD（例如 0x1A）先拦掉：bcd2bin 对它会算出 26，蒙混过范围检查。 */
+    /* 非法 BCD（例如 0x1A）先拦掉：bcd2bin 对它会算出 26，蒙混过范围检查。
+     * 索引必须是地址序：b[3]=日(几号)、b[4]=月、b[6]=年；b[5] 是星期，
+     * 不参与换算，也就不校验（见下面 mktime 段的说明）。 */
     if (!bcd_valid(b[0] & 0x7F) || !bcd_valid(b[1] & 0x7F) ||
-        !bcd_valid(b[2] & 0x3F) || !bcd_valid(b[4] & 0x3F) ||
-        !bcd_valid(b[5] & 0x1F) || !bcd_valid(b[6])) {
+        !bcd_valid(b[2] & 0x3F) || !bcd_valid(b[3] & 0x3F) ||
+        !bcd_valid(b[4] & 0x1F) || !bcd_valid(b[6])) {
         ESP_LOGW(TAG, "DS1302 寄存器不是合法 BCD，判为无效");
         return ESP_ERR_INVALID_ARG;
     }
@@ -340,9 +356,9 @@ esp_err_t elder_rtc_read(time_t *out)
     } else {
         hour = bcd2bin(b[2] & 0x3F);
     }
-    int mday = bcd2bin(b[4] & 0x3F);
-    int mon  = bcd2bin(b[5] & 0x1F);
-    int year = 2000 + bcd2bin(b[6]);
+    int mday = bcd2bin(b[3] & 0x3F);   /* 0x86 日-几号 */
+    int mon  = bcd2bin(b[4] & 0x1F);   /* 0x88 月 */
+    int year = 2000 + bcd2bin(b[6]);   /* 0x8C 年（b[5]=0x8A 是星期，不用） */
 
     /* 合理性校验：越界一律判无效，**不做任何"修正"**。
      * 修正会把"芯片里是垃圾"伪装成"时间是好的"，提醒照样在错的时间响。 */
@@ -384,11 +400,15 @@ esp_err_t elder_rtc_write(time_t t)
     b[0] = (uint8_t)(bin2bcd((uint8_t)tmv.tm_sec) & 0x7F);  /* 清 CH：写时间即视为振荡器可用 */
     b[1] = bin2bcd((uint8_t)tmv.tm_min);
     b[2] = bin2bcd((uint8_t)tmv.tm_hour);                   /* bit7=0 → 24 小时制 */
-    b[3] = (uint8_t)(tmv.tm_wday + 1);                      /* 1~7，周日=1 */
-    b[4] = bin2bcd((uint8_t)tmv.tm_mday);
-    b[5] = bin2bcd((uint8_t)(tmv.tm_mon + 1));
-    b[6] = bin2bcd((uint8_t)(tmv.tm_year - 100));           /* 2000 起算 */
-    b[7] = 0x00;                                            /* 控制寄存器（突发第 8 字节） */
+    /* ⚠️ 索引必须是**地址序**：0x86 日-几号 → 0x88 月 → 0x8A 星期。
+     * 别按中文语序"日 月 星期"想当然地写成 [3]=星期 —— 那会让芯片的
+     * 日历进位彻底错位（午夜递增的是星期寄存器，几号永远不动），
+     * 而**回读自检发现不了**：读写用同一套错索引，彼此自洽。 */
+    b[3] = bin2bcd((uint8_t)tmv.tm_mday);                   /* 0x86 日-几号 */
+    b[4] = bin2bcd((uint8_t)(tmv.tm_mon + 1));              /* 0x88 月 */
+    b[5] = (uint8_t)(tmv.tm_wday + 1);                      /* 0x8A 星期，1~7，周日=1 */
+    b[6] = bin2bcd((uint8_t)(tmv.tm_year - 100));           /* 0x8C 年，2000 起算 */
+    b[7] = 0x00;                                            /* 0x8E 控制（写保护），突发第 8 字节 */
 
     /* DS1302 上电默认写保护位 WP=1（0x80），不解锁什么都写不进去。
      * 顺序：解锁 → 突发写 8 字节 → 加锁。加锁放最后，中途掉电最多是
@@ -398,11 +418,14 @@ esp_err_t elder_rtc_write(time_t t)
     reg_write(CMD_WP_WRITE, WP_LOCK);
 
     /* 回读校验：三线 bit-bang 没有 ACK，写没写进去只能读回来看。
-     * 只比时/日/月/年 —— 分和秒在"写"与"读回"之间可能已经进位，
-     * 严格比对会误报失败。多花约 1ms，换来"写失败能报出来"而不是静默。 */
+     * 只比 时/日/月/年 —— 分和秒在"写"与"读回"之间可能已经进位，
+     * 严格比对会误报失败。多花约 1ms，换来"写失败能报出来"而不是静默。
+     * ⚠️ 这条自检**只能**发现"没写进去"，发现不了"索引错位"：
+     *    索引写错时读写用的是同一套错索引，比出来照样相等。索引正确性
+     *    由 prebuild_check 的 C12 在编译前静态校验。 */
     uint8_t rb[8] = {0};
     burst_read(rb, sizeof(rb));
-    if (rb[2] != b[2] || rb[4] != b[4] || rb[5] != b[5] || rb[6] != b[6]) {
+    if (rb[2] != b[2] || rb[3] != b[3] || rb[4] != b[4] || rb[6] != b[6]) {
         ESP_LOGW(TAG, "DS1302 回读校验失败（时/日/月/年不符），写入可能未生效");
         return ESP_FAIL;
     }

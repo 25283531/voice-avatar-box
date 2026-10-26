@@ -664,6 +664,45 @@ def main() -> int:
             fatal=True,
         )
 
+    # ------------------- C12 DS1302 突发字节顺序（地址序，不是中文语序）
+    # 2026-10-26 复核 rtc_ds1302.c 时发现真错位：写侧写成
+    #   b[3]=星期 / b[4]=日 / b[5]=月
+    # 而 DS1302 的突发顺序是**地址序** 0x86 日(几号) → 0x88 月 → 0x8A 星期。
+    # 这个错**回读自检发现不了**：读写用同一套错索引，彼此自洽、BCD 合法、
+    # 范围也合法；只有芯片自己的日历进位会坏（午夜递增的是星期寄存器，
+    # 几号永远不动 ⇒ 掉电几天后开机，日期差好几天）。
+    # 参考实现：esp-idf-lib components/ds1302/ds1302.c 的
+    # ds1302_set_time / ds1302_get_time。
+    # 为什么放在这里：固件没有 C 单元测试框架，prebuild_check 是**本机与 CI
+    # 共有的唯一编译前钩子**，静态扫源码是成本最低的回归护栏。
+    _ds = ROOT / "firmware" / "components" / "elder" / "src" / "rtc_ds1302.c"
+    if not _ds.is_file():
+        check("C12 DS1302 突发字节顺序符合数据手册", SKIP,
+              "rtc_ds1302.c 不存在，本项无判据可查")
+    else:
+        _src = _ds.read_text(encoding="utf-8", errors="replace")
+        _bad: list[str] = []
+        for _i, _field in ((3, "tm_mday"), (4, "tm_mon"),
+                           (5, "tm_wday"), (6, "tm_year")):
+            if not re.search(rf"^\s*b\[{_i}\]\s*=\s*[^;]*{_field}", _src, re.M):
+                _bad.append(f"写侧 b[{_i}] 没有赋 {_field}")
+        if not re.search(r"mday\s*=\s*bcd2bin\(b\[3\]", _src):
+            _bad.append("读侧没有从 b[3] 取 mday")
+        if not re.search(r"mon\s*=\s*bcd2bin\(b\[4\]", _src):
+            _bad.append("读侧没有从 b[4] 取 mon")
+        check(
+            "C12 DS1302 突发字节顺序符合数据手册",
+            not _bad,
+            ("⚠️ " + "；".join(_bad) + "。突发顺序是地址序："
+             "秒(0x80)/分(0x82)/时(0x84)/日-几号(0x86)/月(0x88)/星期(0x8A)/"
+             "年(0x8C)/控制(0x8E)，日-几号在月**之前**、星期在年之前。"
+             "写成「秒分时日 月 星期 年」会把日/月/星期整体错位，"
+             "且回读自检查不出来。参考 esp-idf-lib ds1302.c。")
+            if _bad else
+            "写侧 b[3..6] = 日/月/星期/年，读侧从 b[3]/b[4] 取日/月 —— 与地址序一致",
+            fatal=True,
+        )
+
     # ------------------------------------------------------ 汇总
     failed = [r for r in results if not r[1] and r[3]]
     warned = [r for r in results if not r[1] and not r[3]]

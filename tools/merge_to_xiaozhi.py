@@ -211,22 +211,17 @@ CONFIG_ELDER_ENABLE_RGB=y
 #    与上游 xiaozhi 的按键语义双触发，USB 无主机时还会被持续拉低。
 CONFIG_ELDER_KEY_GPIO=11
 CONFIG_ELDER_RGB_GPIO=10
-# 外部时钟：2026-10-23 起用户接的是 **DS1302**（三线同步串行，不是 I2C）。
-# ⚠️ DS1302 的 CLK/DAT 绝不能接 GPIO1/GPIO2 —— 那是板载音频 codec
-#    (ES8311/ES7210) 与触摸屏(FT5x06) 共用的 I2C 总线（SDA=1/SCL=2）。
-#    DS1302 必须软件 bit-bang，在这两个脚上跑会与触摸轮询的 I2C 事务持续
-#    抢总线，后果是 codec 寄存器被写坏、触摸失灵，听感上就是破音/卡顿/断续。
-#    用户当前把 CLK/DAT 插在了 I2C 外拓口 ⇒ 必须改线到 GPIO4/GPIO5；
-#    RST 从 GPIO11（老人服药确认键）改到 GPIO6。
-CONFIG_ELDER_RTC_ENABLE=y
-CONFIG_ELDER_RTC_DRIVER_DS1302=y
-# CONFIG_ELDER_RTC_DRIVER_DS3231 is not set
-CONFIG_ELDER_RTC_CLK_GPIO=4
-CONFIG_ELDER_RTC_DAT_GPIO=5
-CONFIG_ELDER_RTC_RST_GPIO=6
-# 逃生舱：默认关闭。打开等于允许在音频 I2C 总线上 bit-bang（毁音频风险）。
-CONFIG_ELDER_RTC_ALLOW_SHARED_I2C_BUS=n
-# 以下两项仅在切回 DS3231 模式时生效（DS1302 模式下被忽略）
+# 外部时钟：**当前不接**（2026-10-26 用户决定舍弃 DS1302 硬件）。
+# 曾经接过 DS1302（三线同步串行 CE/SCLK/DAT，软件 bit-bang），驱动留在
+# components/elder/src/rtc_ds1302.c，由 ELDER_RTC_DRIVER 选择，随时可开。
+# ⚠️ 若哪天重新接，**绝不能把 CLK/DAT 接到 GPIO1/GPIO2** —— 那是板载音频
+#    codec(ES8311/ES7210) 与触摸屏(FT5x06) 共用的 I2C 总线（SDA=1/SCL=2）。
+#    DS1302 不是 I2C 器件，bit-bang 会与触摸轮询持续抢总线，后果是 codec
+#    寄存器被写坏、触摸失灵，听感上就是破音/卡顿/断续（用户的硬约束是
+#    「声音现在正常，千万不要再修的破音、卡顿」）。
+#    推荐走线：CLK→GPIO4、DAT→GPIO5、RST→GPIO6（RST 不能占 GPIO11，
+#    那是老人服药确认键 ELDER_KEY_GPIO）。prebuild_check 的 C11 会拦这条红线。
+CONFIG_ELDER_RTC_ENABLE=n
 CONFIG_ELDER_RTC_I2C_PORT=1
 # 无 RTC 时用 NVS 里的上次校时 epoch 兜底，避免掉电重启后当天提醒一条不响。
 # 注意这是近似时间（关机时长未知），联网后立刻校正。
