@@ -11,8 +11,10 @@
 
 #include "nvs.h"        /* nvs_handle_t —— 与 reminder.c 用的是同一份替身 */
 #include "elder_ui.h"   /* elder_tone_t —— elder_ui_* 桩的形参类型 */
+#include "esp_heap_caps.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 /* ---------------- NVS（内存实现，跨"重启"保留） ---------------- */
@@ -196,3 +198,31 @@ const char *esp_err_to_name(esp_err_t code)
     default: return "ESP_ERR(?)";
     }
 }
+/* ---------------- 堆（esp_heap_caps 桩） ----------------
+ *
+ * reminder.c 的 replace_all 把 2.8KB 的旧表快照区放在堆上（真机 6KB
+ * 同步栈装不下，见该函数注释）。这里转发到 libc malloc/free 并记账，
+ * 让「忘记 free」在宿主测试里就是一条失败断言，而不是只在真机上
+ * 跑几小时才显形的泄漏。 */
+static int s_heap_alloc;
+static int s_heap_live;
+
+void *heap_caps_malloc(size_t size, unsigned caps)
+{
+    (void)caps;
+    if (size == 0) size = 1;
+    void *p = malloc(size);
+    if (p) { s_heap_alloc++; s_heap_live++; }
+    return p;
+}
+
+void heap_caps_free(void *ptr)
+{
+    if (!ptr) return;
+    free(ptr);
+    if (s_heap_live > 0) s_heap_live--;
+}
+
+int  stub_heap_alloc_count(void) { return s_heap_alloc; }
+int  stub_heap_live_count(void)  { return s_heap_live; }
+void stub_heap_reset(void)       { s_heap_alloc = 0; s_heap_live = 0; }

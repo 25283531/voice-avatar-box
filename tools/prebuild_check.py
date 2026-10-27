@@ -85,7 +85,13 @@ def check(name: str, ok: bool | object, detail: str = "", fatal: bool = True) ->
     #    「[PASS] … -> ⚠️ 这些配置的改动不会生效」这种自相矛盾的输出
     #    —— 那种输出会让人怀疑整个脚本是不是坏了。
     if detail:
-        lines = [ln for ln in detail.splitlines() if not ln.strip().startswith("⚠️")]
+        # ⚠️ 只在 **PASS** 时滤掉以 ⚠️ 开头的行：那类文案在通过时是噪音，
+        #    但失败时它**正是唯一的解释**。原先无条件过滤，导致 C11/C12 这类
+        #    「[FAIL] 但一个字原因都不打」的输出 —— 一个不解释原因的失败门禁，
+        #    比没有门禁更折磨人（2026-10-27 踩到）。
+        lines = detail.splitlines()
+        if ok:
+            lines = [ln for ln in lines if not ln.strip().startswith("⚠️")]
         if lines:
             print("         -> " + "\n         ".join(lines))
 
@@ -700,6 +706,62 @@ def main() -> int:
              "且回读自检查不出来。参考 esp-idf-lib ds1302.c。")
             if _bad else
             "写侧 b[3..6] = 日/月/星期/年，读侧从 b[3]/b[4] 取日/月 —— 与地址序一致",
+            fatal=True,
+        )
+
+    # --------- C13 提醒表定长数组只许待在 typedef struct 里，不许压任务栈
+    # 2026-10-27 真机事故：elder_reminder_replace_all() 与 do_sync() 里有
+    # 7 份 ELDER_REMINDER_MAX 大小的局部数组，合计约 4.2KB，而 elder_sync
+    # 任务栈只有 6KB。后端下发 6 条提醒时正好压穿：
+    #     I elder.reminder: 提醒表已合并：后端 6 条 + 本地 0 条 = 6 条
+    #     ***ERROR*** A stack overflow in task elder_sync has been detected.
+    # 后果是**每轮同步（5 分钟）都重启**，设备永远停在开机阶段、提醒全失效。
+    # 之所以要在编译前拦：这种溢出与"表里几条数据"强相关 —— 3 条时完全正常，
+    # 6 条时崩，编译、链接、单测、甚至短时间试机都发现不了。
+    # 修法是把快照区搬到堆（rmd_merge_scratch_t / sync_rmd_buf_t），
+    # 本项保证没人再把它们改回栈上数组。
+    # 局限：只认单行声明；写成多行会漏 —— 但漏了也不比现在更差。
+    _c13_files = [
+        ROOT / "firmware" / "components" / "elder" / "src" / "reminder.c",
+        ROOT / "firmware" / "components" / "elder" / "src" / "sync.c",
+    ]
+    _c13_arr = re.compile(
+        r"^\s*[A-Za-z_][A-Za-z0-9_ \t\*]*\b[A-Za-z_][A-Za-z0-9_]*"
+        r"\s*\[\s*ELDER_REMINDER_MAX\s*\]\s*;")
+    _c13_bad: list[str] = []
+    _c13_scanned = 0
+    for _f in _c13_files:
+        if not _f.is_file():
+            continue
+        _c13_scanned += 1
+        _in_typedef = False
+        for _ln, _line in enumerate(
+                _f.read_text(encoding="utf-8", errors="replace").splitlines(), 1):
+            # 只要进了**任何** struct 体就算"不是栈上"：文件级 `static struct {...} g;`
+            # 与 `typedef struct {...} x_t;` 都是静态存储，都安全。
+            # （第一版只认 `typedef struct`，把 reminder.c 里 `static struct {...} g;`
+            #  的 4 个成员数组误判成栈上 —— 门禁的第一版先要自己不误报。）
+            if re.search(r"\bstruct\b", _line) and "{" in _line:
+                _in_typedef = True
+            if _in_typedef and re.match(r"^\}\s*[A-Za-z_]", _line):
+                _in_typedef = False
+                continue
+            if _c13_arr.match(_line) and not _in_typedef:
+                _c13_bad.append(f"{_f.name}:{_ln} {_line.strip()}")
+    if _c13_scanned == 0:
+        check("C13 提醒表定长数组不压任务栈", SKIP,
+              "reminder.c / sync.c 都不存在，本项无判据可查")
+    else:
+        check(
+            "C13 提醒表定长数组只在 typedef struct 里（不许压任务栈）",
+            not _c13_bad,
+            ("⚠️ 这些定长数组出现在了函数栈上：" + "；".join(_c13_bad[:6]) +
+             "。ELDER_REMINDER_MAX 条 × 每条几十字节，叠起来会把 8KB 的 "
+             "elder_sync 任务栈压穿（真机表现是每轮同步重启一次、提醒全失效）。"
+             "请放进 typedef struct 再用 heap_caps_malloc 分配，"
+             "参考 reminder.c 的 rmd_merge_scratch_t 与 sync.c 的 sync_rmd_buf_t。")
+            if _c13_bad else
+            f"{_c13_scanned} 个文件里的提醒表数组都在 typedef struct 内（堆上）",
             fatal=True,
         )
 

@@ -1026,6 +1026,17 @@ static const char *chip_model_name(void)
     }
 }
 
+/* 一轮同步里「解析后端提醒表」用的暂存区。
+ *
+ * 放堆上的理由见 do_sync() 里 step 3 的注释：这两块合计 1344 字节，
+ * 而同步路径跑在 elder_sync 任务上（栈 8KB，2026-10-27 之前是 6KB）——
+ * 真机上后端下发 6 条提醒时正是它把栈压爆的
+ * （栈溢出 → 每轮同步都重启 → 提醒全部失效）。 */
+typedef struct {
+    elder_rmd_item_t items[ELDER_REMINDER_MAX];
+    elder_rmd_when_t when[ELDER_REMINDER_MAX];
+} sync_rmd_buf_t;
+
 static esp_err_t do_sync(void)
 {
     static char *resp = NULL;
@@ -1081,16 +1092,27 @@ static esp_err_t do_sync(void)
      *    这些条目 server_id 还是 0，不先拿到 id 就无法与后端规则对上） */
     upload_local_reminders();
 
-    /* 3) 提醒规则 */
-    elder_rmd_item_t items[ELDER_REMINDER_MAX];
-    elder_rmd_when_t when[ELDER_REMINDER_MAX];
+    /* 3) 提醒规则
+     *
+     * items/when 放堆上，不压栈：16×(56+28) = 1344 字节，压在同步任务栈上
+     * （当时只有 6KB）。2026-10-27 真机上「后端下发 6 条提醒」就是这样把
+     * elder_sync 压爆的（栈溢出 → 每 5 分钟重启一次 → 老人收不到任何提醒）。
+     * 这两块与 reminder.c 里 rmd_merge_scratch_t 是同一类问题，一起搬到堆。 */
+    sync_rmd_buf_t *rb = heap_caps_malloc(sizeof(*rb), MALLOC_CAP_8BIT);
     uint8_t count = 0;
-    memset(when, 0, sizeof(when));
-    parse_reminders(cJSON_GetObjectItem(root, "reminders"), items, when, &count);
-    if (count > 0) {
-        elder_reminder_replace_all(items, when, count);
+    if (!rb) {
+        /* 拿不到就**不动本地表**：本地提醒照常响，5 分钟后再试。 */
+        ESP_LOGW(TAG, "解析提醒表时内存不足（需 %u 字节），本轮跳过提醒同步",
+                 (unsigned)sizeof(*rb));
     } else {
-        ESP_LOGI(TAG, "后端没有启用中的提醒规则，保留本地表兜底");
+        memset(rb->when, 0, sizeof(rb->when));
+        parse_reminders(cJSON_GetObjectItem(root, "reminders"), rb->items, rb->when, &count);
+        if (count > 0) {
+            elder_reminder_replace_all(rb->items, rb->when, count);
+        } else {
+            ESP_LOGI(TAG, "后端没有启用中的提醒规则，保留本地表兜底");
+        }
+        heap_caps_free(rb);
     }
 
     /* 4) 心跳周期以服务端下发为准 */
@@ -1098,6 +1120,13 @@ static esp_err_t do_sync(void)
     if (cJSON_IsNumber(iv) && iv->valueint >= 60 && iv->valueint <= 3600) {
         g.interval_sec = (uint32_t)iv->valueint;
     }
+
+    /* 栈水位：这一轮最深用到哪。
+     * 加这条是因为 2026-10-27 的栈溢出**只在后端下发 6 条以上提醒时才炸**，
+     * 平时看不出来；有了余量数字，谁再往同步路径里加大局部数组，串口上
+     * 会先看到余量掉到几百字节，而不是等到某天设备开始无限重启才发现。 */
+    ESP_LOGI(TAG, "本轮同步结束，elder_sync 栈余量 %u 字节（<1024 说明快压穿了）",
+             (unsigned)(uxTaskGetStackHighWaterMark(NULL) * sizeof(StackType_t)));
 
     /* 5) 形象 / 语音地址（记录到日志，接入层在 bridge 中处理） */
     cJSON *avatar = cJSON_GetObjectItem(root, "avatar");
@@ -1301,8 +1330,11 @@ esp_err_t elder_sync_start(void)
         return ESP_ERR_NO_MEM;
     }
 
-    /* 栈 6KB：cJSON 解析 + 24KB 响应缓冲（分配在堆） */
-    if (xTaskCreatePinnedToCore(sync_task, "elder_sync", 6144, NULL, 4, &g.task, 1) != pdPASS) {
+    /* 栈 8KB：cJSON 解析 + 24KB 响应缓冲（分配在堆）。
+     * 2026-10-27 原为 6144，后端下发 6 条提醒时溢出重启 —— 提醒表相关的
+     * 大数组已全部搬到堆（见 sync_rmd_buf_t / rmd_merge_scratch_t），
+     * 这里再留 2KB 余量给 cJSON 递归与 TLS 回调栈。 */
+    if (xTaskCreatePinnedToCore(sync_task, "elder_sync", 8192, NULL, 4, &g.task, 1) != pdPASS) {
         return ESP_ERR_NO_MEM;
     }
     g.started = true;

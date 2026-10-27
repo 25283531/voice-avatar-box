@@ -20,6 +20,7 @@
  * 全程**没有任何网络调用**：这正是要验证的场景。
  */
 #include "stubs.h"
+#include "esp_heap_caps.h"   /* T16：replace_all 的堆快照区对账 */
 
 #include "elder_reminder.h"
 #include "elder_ui.h"
@@ -1770,6 +1771,20 @@ int main(void)
     test_voice_confirm_no_false_missed();
     test_late_boot_no_instant_escalate();
     test_first_ringing_picks_ringing();
+
+    printf("\n=== 堆对账（T16）===\n");
+    /* replace_all 的旧表快照区现在走 heap_caps_malloc：真机上 7 份定长数组
+     * 合计 2.8KB，压在 6KB 的 elder_sync 栈上会在后端下发 6 条提醒时溢出
+     * 重启（2026-10-27 真机）。搬到堆之后新增的风险是「忘记 free」——
+     * 老人设备几个月不重启，泄漏会累积成同步越来越慢、最后 OOM。
+     * 下面两条把它变成可断言的失败，而不是只靠肉眼 review。 */
+    check("T16 ★ replace_all 的堆快照区全部归还（无泄漏）",
+          stub_heap_live_count() == 0,
+          det("未释放块数 %d（累计分配 %d 次）",
+              stub_heap_live_count(), stub_heap_alloc_count()));
+    check("T16 · replace_all 真的走了堆分配（没被改回栈上数组）",
+          stub_heap_alloc_count() > 0,
+          det("累计分配 %d 次", stub_heap_alloc_count()));
 
     printf("\n=== %d 通过 / %d 失败 ===\n", g_pass, g_fail);
     return g_fail ? 1 : 0;

@@ -5,6 +5,7 @@
 #include "nvs.h"
 #include "nvs_flash.h"
 #include "esp_log.h"
+#include "esp_heap_caps.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -681,33 +682,71 @@ static elder_rmd_when_t resolve_when(const elder_rmd_when_t *src, uint32_t serve
     return w;
 }
 
+/* 合并提醒表时的「旧表快照区」—— **必须放堆上，不许压栈**。
+ *
+ * 为什么（2026-10-27 真机实证，代价是设备无限重启）：
+ *   elder_sync 任务的栈当时只有 6144 字节（sync.c 的 xTaskCreatePinnedToCore，
+ *   事后已提到 8192 —— 但**别因此把快照区改回栈上**：栈余量是给 cJSON 递归和
+ *   TLS 回调留的，不该被定长数组吃掉），而下面这 7 份定长数组要同时存在：
+ *       old / keep            16 × 56 = 896 × 2
+ *       old_when / keep_when  16 × 28 = 448 × 2
+ *       三个运行态快照        16 × (1+1+8) = 160
+ *   ≈ 2.8KB。再叠上 do_sync 自己的 items[16] + when[16]（1344 字节），
+ *   后端下发 6 条提醒时刚好压穿，串口原文：
+ *       I (12787) elder.reminder: 提醒表已合并：后端 6 条 + 本地 0 条 = 6 条
+ *       ***ERROR*** A stack overflow in task elder_sync has been detected.
+ *   后果不是"少响一次"，而是**每轮同步（5 分钟）都重启**：设备永远停在
+ *   开机阶段，老人收不到任何提醒。V3 新增 when[] 正是压穿它的最后一根稻草。
+ *
+ * 搬到堆上是结构性修法：以后 ELDER_REMINDER_MAX 或结构体字段再怎么长，
+ * 都只涨堆、不再吃任务的栈 —— 不会再以"崩在别人任务里"的形态复发。 */
+typedef struct {
+    elder_rmd_item_t old[ELDER_REMINDER_MAX];
+    elder_rmd_when_t old_when[ELDER_REMINDER_MAX];
+    elder_rmd_item_t keep[ELDER_REMINDER_MAX];
+    elder_rmd_when_t keep_when[ELDER_REMINDER_MAX];
+    uint8_t          old_state[ELDER_REMINDER_MAX];
+    bool             old_fired[ELDER_REMINDER_MAX];
+    int64_t          old_deadline[ELDER_REMINDER_MAX];
+} rmd_merge_scratch_t;
+
 esp_err_t elder_reminder_replace_all(const elder_rmd_item_t *items,
                                      const elder_rmd_when_t *when,
                                      uint8_t count)
 {
     if (count > ELDER_REMINDER_MAX) return ESP_ERR_INVALID_SIZE;
 
+    /* 拿不到快照区就**什么都不动**：宁可这轮不同步（5 分钟后重试），
+     * 也绝不能在没有旧表快照的情况下覆盖 g.table —— 那会连带丢掉
+     * 老人断网时亲手建的本地提醒（服务端没有副本，丢了就永久没了）。 */
+    rmd_merge_scratch_t *sc = heap_caps_malloc(sizeof(*sc), MALLOC_CAP_8BIT);
+    if (!sc) {
+        ESP_LOGE(TAG, "合并提醒表时内存不足（需 %u 字节），本轮跳过同步",
+                 (unsigned)sizeof(*sc));
+        return ESP_ERR_NO_MEM;
+    }
+    elder_rmd_item_t *old = sc->old;
+    elder_rmd_when_t *old_when = sc->old_when;
+    elder_rmd_item_t *keep = sc->keep;
+    elder_rmd_when_t *keep_when = sc->keep_when;
+    uint8_t *old_state = sc->old_state;
+    bool    *old_fired = sc->old_fired;
+    int64_t *old_deadline = sc->old_deadline;
+
     /* ---- 1. 快照旧表与运行态 ---- */
-    elder_rmd_item_t old[ELDER_REMINDER_MAX];
-    elder_rmd_when_t old_when[ELDER_REMINDER_MAX];
     uint8_t old_n = g.table.count > ELDER_REMINDER_MAX ? ELDER_REMINDER_MAX : g.table.count;
     memcpy(old, g.table.items, sizeof(elder_rmd_item_t) * old_n);
     /* 先清零再拷：old_n 之后的元素不会被读，但保持确定性总没坏处 */
-    memset(old_when, 0, sizeof(old_when));
+    memset(old_when, 0, sizeof(sc->old_when));
     memcpy(old_when, g.table.when, sizeof(elder_rmd_when_t) * old_n);
-    uint8_t old_state[ELDER_REMINDER_MAX];
-    bool    old_fired[ELDER_REMINDER_MAX];
-    int64_t old_deadline[ELDER_REMINDER_MAX];
-    memcpy(old_state, g.state, sizeof(old_state));
-    memcpy(old_fired, g.fired_today, sizeof(old_fired));
-    memcpy(old_deadline, g.confirm_deadline_us, sizeof(old_deadline));
+    memcpy(old_state, g.state, sizeof(sc->old_state));
+    memcpy(old_fired, g.fired_today, sizeof(sc->old_fired));
+    memcpy(old_deadline, g.confirm_deadline_us, sizeof(sc->old_deadline));
 
     /* ---- 2. 挑出「设备本地自建」（server_id==0）条目 —— 后端同步绝不能抹掉它们 ----
      * 这是本函数存在的理由：断网时老人亲手建的服药提醒只存在于设备 NVS，
      * 服务端毫不知情；一次 replace_all 全量覆盖就会让它们永久消失，
      * 属于医疗事故级数据丢失。 */
-    elder_rmd_item_t keep[ELDER_REMINDER_MAX];
-    elder_rmd_when_t keep_when[ELDER_REMINDER_MAX];
     uint8_t keep_n = 0;
     for (uint8_t i = 0; i < old_n; i++) {
         if (old[i].server_id != 0) continue;
@@ -831,7 +870,9 @@ esp_err_t elder_reminder_replace_all(const elder_rmd_item_t *items,
 
     g.dirty = true;
     ESP_LOGI(TAG, "提醒表已合并：后端 %u 条 + 本地 %u 条 = %u 条", srv_n, keep_n, n);
-    return elder_reminder_flush();
+    esp_err_t rc = elder_reminder_flush();
+    heap_caps_free(sc);
+    return rc;
 }
 
 int elder_reminder_find_by_server_id(uint32_t server_id)
