@@ -521,7 +521,58 @@ static uint8_t weekdays_to_mask(cJSON *arr)
     return mask;
 }
 
-static void parse_reminders(cJSON *root, elder_rmd_item_t *out, uint8_t *out_count)
+/* ---------------------------------------------------------------- 排期字段 */
+
+/* "YYYY-MM-DD" → YYYYMMDD；空串/格式不对/越界 → 0（= 未指定）。
+ *
+ * 用 sscanf 而不是手写解析：服务端下发的是 Pydantic 序列化出来的标准
+ * ISO 日期串，格式固定；手写解析反而容易在"月/日只有一位"这类边角上出错。
+ * 返回 0 的语义是"没有这个约束"，调用方按不限处理 —— 绝不能因为一个新
+ * 字段格式怪就把整条提醒丢掉（老人吃药提醒不能因为解析失败而消失）。 */
+static int ymd_from_str(const char *s)
+{
+    if (s == NULL || *s == '\0') return 0;
+    int y = 0, m = 0, d = 0;
+    if (sscanf(s, "%d-%d-%d", &y, &m, &d) != 3) return 0;
+    return elder_rmd_ymd_of(y, m, d);
+}
+
+/* MONTHLY 的 month_days（[1..31] 数组）→ 位图，bit(d-1) 表示每月 d 号。 */
+static uint32_t month_days_to_mask(cJSON *arr)
+{
+    uint32_t mask = 0;
+    if (!cJSON_IsArray(arr)) return 0;
+    cJSON *it = NULL;
+    cJSON_ArrayForEach(it, arr) {
+        if (!cJSON_IsNumber(it)) continue;
+        int d = it->valueint;
+        if (d < 1 || d > 31) continue;   /* 越界值丢弃，不"修正"成 1 号 */
+        mask |= (1u << (d - 1));
+    }
+    return mask;
+}
+
+/* ISO 时间串的日期部分 → 真实日序号。
+ *
+ * 为什么需要它：INTERVAL_DAYS（隔 N 天）必须有一个**相位基准**，
+ * 否则"每隔 3 天"从哪天算起就没定义。服务端给了 start_date 就用它；
+ * 没给就用 created_at（规则创建日）—— 这样"创建当天算第 0 天"，
+ * 与用户在 APP 上看到的语义一致。两者都没有时返回 0，由
+ * elder_reminder_replace_all() 补"首次同步当天"并尽量继承旧值。 */
+static int32_t ordinal_from_iso_date(const char *s)
+{
+    if (s == NULL || strlen(s) < 10) return 0;
+    char buf[11];
+    memcpy(buf, s, 10);
+    buf[10] = '\0';
+    int y = 0, m = 0, d = 0;
+    if (sscanf(buf, "%d-%d-%d", &y, &m, &d) != 3) return 0;
+    if (y < 1970 || y > 2999 || m < 1 || m > 12 || d < 1 || d > 31) return 0;
+    return (int32_t)elder_rmd_ordinal_of(y, m, d);
+}
+
+static void parse_reminders(cJSON *root, elder_rmd_item_t *out,
+                            elder_rmd_when_t *when_out, uint8_t *out_count)
 {
     uint8_t n = 0;
     if (!cJSON_IsArray(root)) return;
@@ -535,6 +586,14 @@ static void parse_reminders(cJSON *root, elder_rmd_item_t *out, uint8_t *out_cou
         cJSON *jkind = cJSON_GetObjectItem(r, "schedule_kind");
         cJSON *jtimes = cJSON_GetObjectItem(r, "times_of_day");
         cJSON *jweek = cJSON_GetObjectItem(r, "weekdays");
+        /* ---- 2026-10-23 新增：原先整段被忽略，导致 ONCE/MONTHLY/
+         * INTERVAL_DAYS 三种规则全部静默退化成"每天" ---- */
+        cJSON *jonce = cJSON_GetObjectItem(r, "once_date");
+        cJSON *jmonth = cJSON_GetObjectItem(r, "month_days");
+        cJSON *jinterval = cJSON_GetObjectItem(r, "interval_days");
+        cJSON *jstart = cJSON_GetObjectItem(r, "start_date");
+        cJSON *jend = cJSON_GetObjectItem(r, "end_date");
+        cJSON *jcreated = cJSON_GetObjectItem(r, "created_at");
 
         if (!cJSON_IsNumber(jid)) continue;
         if (cJSON_IsBool(jenabled) && !cJSON_IsTrue(jenabled)) continue;
@@ -544,9 +603,48 @@ static void parse_reminders(cJSON *root, elder_rmd_item_t *out, uint8_t *out_cou
         uint8_t kind = cJSON_IsNumber(jkind) ? (uint8_t)jkind->valueint : 1;
         uint8_t mask = weekdays_to_mask(jweek);
 
-        /* 无 weekdays（每天 / 一次性）→ 全周掩码，tick 里靠 repeat_mask==0 判一次性，
-           这里统一用 0x7F 表示「每天」 */
-        if (mask == 0) mask = 0x7F;
+        /* ⚠️ 这里**不再**把 mask==0 强行改成 0x7F。
+         *
+         * 旧代码注释写「无 weekdays（每天 / 一次性）→ 全周掩码」，
+         * 结果一次性规则的 mask 也变成"每天"，加上 tick 只看 mask，
+         * 用户设一次性的喝水提醒就天天响（本次修复的 bug）。
+         * 现在 mask 保持服务端给的真实值（可能为 0），由 kind 决定
+         * 怎么解释：DAILY 根本不看 mask，WEEKLY 才用它，ONCE/MONTHLY/
+         * INTERVAL 各自有自己的字段。 */
+
+        /* ---- 排期（与 items[] 同下标，展开成多条时共用同一份）---- */
+        elder_rmd_when_t w;
+        memset(&w, 0, sizeof(w));
+        w.kind        = kind;
+        w.repeat_mask = mask;
+        w.once_ymd    = (uint32_t)ymd_from_str(cJSON_IsString(jonce) ? jonce->valuestring : NULL);
+        w.month_mask  = month_days_to_mask(jmonth);
+        w.start_ymd   = ymd_from_str(cJSON_IsString(jstart) ? jstart->valuestring : NULL);
+        w.end_ymd     = ymd_from_str(cJSON_IsString(jend) ? jend->valuestring : NULL);
+
+        int interval = cJSON_IsNumber(jinterval) ? jinterval->valueint : 0;
+        /* <=0 或超出 uint16 的值按 1（每天）处理：宁可天天响，
+         * 也不要因为一个异常整数把提醒变成"永不响"。 */
+        w.interval_days = (interval >= 1 && interval <= 65535) ? (uint16_t)interval : 1;
+
+        /* INTERVAL 的相位基准：start_date 优先，其次 created_at。
+         * 都为 0 时留给 replace_all 补"首次同步当天"（并继承旧值，
+         * 否则每次同步都重算，相位天天跳）。 */
+        if (w.start_ymd != 0) {
+            w.anchor_ordinal = (int32_t)elder_rmd_ordinal_of(
+                (int)(w.start_ymd / 10000), (int)((w.start_ymd / 100) % 100),
+                (int)(w.start_ymd % 100));
+        } else if (cJSON_IsString(jcreated)) {
+            w.anchor_ordinal = ordinal_from_iso_date(jcreated->valuestring);
+        }
+
+        /* 一次性却没给日期：这是服务端数据问题，不能猜。保留 kind 原样，
+         * elder_rmd_due_on() 会判"不到期"并告警一次 —— 猜成"今天"
+         * 会让它今天响一次然后永远不响，更难排查。 */
+        if (kind == ELDER_RMD_KIND_ONCE && w.once_ymd == 0) {
+            ESP_LOGW(TAG, "提醒 #%u 是一次性规则但缺 once_date，将不会触发",
+                     (unsigned)sid);
+        }
 
         const char *title = cJSON_IsString(jtitle) ? jtitle->valuestring : "提醒";
 
@@ -572,6 +670,8 @@ static void parse_reminders(cJSON *root, elder_rmd_item_t *out, uint8_t *out_cou
                 it->enabled = true;
                 it->server_id = sid;
                 snprintf(it->label, sizeof(it->label), "%s", title);
+                /* 同一规则展开出的多条 item 共用同一份排期 */
+                when_out[n] = w;
                 n++;
             }
         } else {
@@ -982,10 +1082,12 @@ static esp_err_t do_sync(void)
 
     /* 3) 提醒规则 */
     elder_rmd_item_t items[ELDER_REMINDER_MAX];
+    elder_rmd_when_t when[ELDER_REMINDER_MAX];
     uint8_t count = 0;
-    parse_reminders(cJSON_GetObjectItem(root, "reminders"), items, &count);
+    memset(when, 0, sizeof(when));
+    parse_reminders(cJSON_GetObjectItem(root, "reminders"), items, when, &count);
     if (count > 0) {
-        elder_reminder_replace_all(items, count);
+        elder_reminder_replace_all(items, when, count);
     } else {
         ESP_LOGI(TAG, "后端没有启用中的提醒规则，保留本地表兜底");
     }

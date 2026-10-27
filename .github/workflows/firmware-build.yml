@@ -26,6 +26,9 @@ on:
     paths:
       - 'firmware/**'
       - 'tools/merge_to_xiaozhi.py'
+      # 主机单测（host-test job）的用例文件：改它必须也跑一遍，
+      # 否则"改了测试却没人跑"是比没有测试更糟的状态。
+      - 'tools/test_rmd_sched.c'
       - '.github/workflows/firmware-build.yml'
   workflow_dispatch:
     inputs:
@@ -47,6 +50,46 @@ env:
   PROJECT_DIR: firmware/xiaozhi
 
 jobs:
+  # 提醒排期判定的主机单测（2026-10-23）。
+  #
+  # 为什么要单独一个 job、且**不用** IDF 容器：
+  #   elder_rmd_sched.c 是刻意做成零依赖的纯函数（只 include stdint/stdbool），
+  #   为的就是能在原生 gcc 上秒级跑完。它要防的 bug 是「服务端设成一次性的
+  #   提醒，设备每天都响」—— 这类缺陷不崩、不报错，只是行为错，真机上得等到
+  #   第二天才看得出来；放进 CI 才能在合并前拦住。
+  #   不用 IDF 镜像的另一个原因：镜像里只有 xtensa 交叉工具链、没有宿主 gcc，
+  #   而这里要编的是 x86_64 程序。
+  host-test:
+    name: 主机单测（提醒排期判定）
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 编译并运行 elder_rmd_sched 单测
+        run: |
+          set -euo pipefail
+          gcc -std=c11 -Wall -Wextra -Werror \
+              -Ifirmware/components/elder/include \
+              -o /tmp/test_rmd_sched \
+              tools/test_rmd_sched.c \
+              firmware/components/elder/src/elder_rmd_sched.c
+          /tmp/test_rmd_sched
+
+      - name: 断言该模块没有引入 ESP-IDF 依赖
+        run: |
+          set -euo pipefail
+          # 这个模块的全部价值在于"能在主机上编译"。一旦有人 include 了
+          # esp_log.h / freertos/ / sdkconfig.h，host-test 会以"找不到头文件"
+          # 的形式失败，看起来像环境问题。这条断言把真正的原因说清楚。
+          if grep -nE '#include *[<"](esp_|freertos/|driver/|sdkconfig\.h)' \
+               firmware/components/elder/src/elder_rmd_sched.c \
+               firmware/components/elder/include/elder_rmd_sched.h; then
+            echo "::error::elder_rmd_sched 必须保持零依赖（只许 stdint/stdbool），否则主机单测失去意义"
+            exit 1
+          fi
+          echo "OK：无 ESP-IDF 依赖"
+
   build:
     name: 编译 ESP32-S3 固件
     runs-on: ubuntu-latest

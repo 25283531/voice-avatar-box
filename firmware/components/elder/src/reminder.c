@@ -88,17 +88,22 @@ static int day_ordinal(const struct tm *tm)
     return tm->tm_year * 366 + tm->tm_yday;
 }
 
-static int weekday_mask_from_tm(const struct tm *tm)
+/* 今天该不该响。判定**全部委托**给 elder_rmd_sched.c 的纯函数。
+ *
+ * 原先这里只有两行：
+ *     if (it->repeat_mask == 0) return true;   // 注释写"一次性"
+ *     return (it->repeat_mask & weekday_mask_from_tm(tm)) != 0;
+ * 两个问题叠在一起就成了用户实报的 bug「设成一次性的喝水提醒每天响」：
+ *   1) `mask==0` 返回的是 **true（永远到期）**，注释"一次性"是错的；
+ *   2) sync.c 在"没有 weekdays"时把 mask 强制写成 0x7F（每天），
+ *      一次性规则连 0 都拿不到。
+ * 现在 kind 决定语义、mask 只做 WEEKLY 的位图，两条都不再靠猜。 */
+static bool item_due_today(int idx, const struct tm *tm, int today_ymd, int today_ordinal)
 {
-    /* tm_wday: 0=周日 .. 6=周六 */
-    return 1 << tm->tm_wday;
-}
-
-static bool item_due_today(const elder_rmd_item_t *it, const struct tm *tm)
-{
+    if (idx < 0 || idx >= ELDER_REMINDER_MAX) return false;
+    const elder_rmd_item_t *it = &g.table.items[idx];
     if (!it->enabled) return false;
-    if (it->repeat_mask == 0) return true;              /* 一次性 */
-    return (it->repeat_mask & weekday_mask_from_tm(tm)) != 0;
+    return elder_rmd_due_on(&g.table.when[idx], today_ymd, today_ordinal, tm->tm_wday);
 }
 
 /* ---------------- 持久化 ---------------- */
@@ -121,31 +126,71 @@ static bool table_v1_crc_ok(const uint8_t *raw, size_t len)
     return ok;
 }
 
-/* 把按 V1 解读出来的内容装进运行态，并就地升级成 V2。
- * 老表的 items / count / done_today / pending_today / last_day_ordinal
- * **逐字段原样保留** —— 这些正是老人已有的提醒与已确认记录，
- * 迁移过程中任何一处丢失都等于提醒或服药记录消失。
+/* V2 布局的 CRC 校验。与 V1 同理：老固件是按 sizeof(V2) 算的，
+ * 拿 sizeof(V3) 去重算必然不匹配。 */
+static bool table_v2_crc_ok(const uint8_t *raw, size_t len)
+{
+    if (len != sizeof(elder_rmd_table_v2_t)) return false;
+    elder_rmd_table_v2_t v2;
+    memcpy(&v2, raw, sizeof(v2));
+    uint32_t saved = v2.crc32;
+    v2.crc32 = 0;
+    bool ok = (crc32_simple(&v2, sizeof(v2)) == saved);
+    v2.crc32 = saved;
+    return ok;
+}
+
+/* 老表（V1 / V2）装进运行态的公共部分。
+ *
+ * items / count / done_today / pending_today / last_day_ordinal **逐字段
+ * 原样保留** —— 这些正是老人已有的提醒与已确认记录，迁移过程中任何一处
+ * 丢失都等于提醒或服药记录消失。
+ *
+ * ⚠️ when[] 必须**显式置成 DAILY**，不能只 memset 成 0：
+ *    零值是 kind=0(ONCE) + once_ymd=0，而 ONCE 缺日期在 elder_rmd_due_on()
+ *    里判为"不到期"（还要告警）。老用户升级后**所有**提醒会变成永不响，
+ *    比原来的"天天响"更危险 —— 该响的时候不响。
+ *    老固件的实际行为是"只看 repeat_mask，有 mask 按星期、没 mask 每天"，
+ *    统一按 DAILY 迁移是唯一不会让已有提醒消失的选择。 */
+static void adopt_legacy(const elder_rmd_item_t *items, uint8_t count,
+                         uint16_t done_today, uint16_t pending_today,
+                         uint16_t fired_today, int32_t last_day_ordinal)
+{
+    memcpy(g.table.items, items, sizeof(g.table.items));
+    g.table.count            = count;
+    g.table.done_today       = done_today;
+    g.table.pending_today    = pending_today;
+    g.table.fired_today      = fired_today;
+    g.table.last_day_ordinal = last_day_ordinal;
+    g.table.fmt_ver          = ELDER_RMD_FMT_V3;
+
+    for (int i = 0; i < ELDER_REMINDER_MAX; i++) {
+        g.table.when[i].kind = ELDER_RMD_KIND_DAILY;
+    }
+}
+
+/* V1 → V3。
  * fired_today 从 done_today|pending_today 反推：这俩位图非零即证明
  * 「今天响过」，用它们把重启后二次响铃堵住，同时不制造「响都没响
  * 却说响过」的假抑制。 */
-static void migrate_v1_to_v2(const elder_rmd_table_v1_t *v1)
+static void migrate_v1_to_v3(const elder_rmd_table_v1_t *v1)
 {
-    memcpy(g.table.items, v1->items, sizeof(g.table.items));
-    g.table.count            = v1->count;
-    g.table.done_today       = v1->done_today;
-    g.table.pending_today    = v1->pending_today;
-    g.table.last_day_ordinal = v1->last_day_ordinal;
-    g.table.crc32            = v1->crc32;
-
-    /* 「今天响过」在 V1 里没有独立记录，只能从两个当日位图反推。
-     * done_today 的位=老人已确认吃过药；pending_today 的位=响过还没确认。
-     * 两者合起来正好覆盖「今天响过」的全体，且不会误判没到点的提醒。 */
-    g.table.fired_today = (uint16_t)(v1->done_today | v1->pending_today);
-    g.table.fmt_ver     = ELDER_RMD_FMT_V2;
-
-    ESP_LOGW(TAG, "迁移旧格式提醒表(V1) -> V2：%u 条，已完成 0x%04x / 待办 0x%04x / "
+    adopt_legacy(v1->items, v1->count, v1->done_today, v1->pending_today,
+                 (uint16_t)(v1->done_today | v1->pending_today),
+                 v1->last_day_ordinal);
+    ESP_LOGW(TAG, "迁移旧格式提醒表(V1) -> V3：%u 条，已完成 0x%04x / 待办 0x%04x / "
                   "响过 0x%04x 全部保留", g.table.count,
              g.table.done_today, g.table.pending_today, g.table.fired_today);
+}
+
+/* V2 → V3。V2 有独立的 fired_today，直接沿用；只多一步"排期按每天"，
+ * 否则 V2 里那批本来按 repeat_mask 走的提醒会全部停摆。 */
+static void migrate_v2_to_v3(const elder_rmd_table_v2_t *v2)
+{
+    adopt_legacy(v2->items, v2->count, v2->done_today, v2->pending_today,
+                 v2->fired_today, v2->last_day_ordinal);
+    ESP_LOGW(TAG, "迁移提醒表(V2) -> V3：%u 条，排期字段缺失按每天处理（与升级前行为一致）",
+             g.table.count);
 }
 
 static esp_err_t load(void)
@@ -153,8 +198,8 @@ static esp_err_t load(void)
     nvs_handle_t h;
     if (nvs_open(NVS_NS, NVS_READONLY, &h) != ESP_OK) return ESP_ERR_NOT_FOUND;
 
-    /* 按 V2 尺寸读。V1 是 V2 的逐字节前缀（有编译期断言），所以
-     * 老 blob 一定读得下，且读进来的前 sizeof(V1) 字节就是合法的 V1。 */
+    /* 按 V3 尺寸读。V1 / V2 都是 V3 的逐字节前缀（各有编译期断言），
+     * 所以老 blob 一定读得下，读进来的前 sizeof(Vn) 字节就是合法的 Vn。 */
     size_t len = sizeof(g.table);
     esp_err_t err = nvs_get_blob(h, NVS_KEY, &g.table, &len);
     nvs_close(h);
@@ -162,11 +207,11 @@ static esp_err_t load(void)
 
     /* ---- 版本判定 ----
      * 先按长度分流，再校验各自那一段字节的 CRC。
-     * 为什么不能只看 fmt_ver：新 blob 写进来之前，V1/V2 的前 sizeof(V1)
-     * 字节完全相同，fmt_ver 在结构体末尾、读的时候根本还不知道它的值
-     * （nvs_get_blob 只告诉我们读到了多少字节）。长度是唯一可靠的信号。 */
+     * 为什么不能只看 fmt_ver：V1/V2 的 fmt_ver 位置与 V3 不同（V1 压根没有），
+     * 而且新 blob 写进来之前前 sizeof(V1) 字节完全相同 —— 长度是唯一可靠信号。 */
     if (len == sizeof(elder_rmd_table_t)) {
-        if (g.table.fmt_ver != ELDER_RMD_FMT_V2) {
+        /* ---- 当前格式（V3）---- */
+        if (g.table.fmt_ver != ELDER_RMD_FMT_V3) {
             ESP_LOGE(TAG, "未知提醒表版本 %u，按无数据处理", g.table.fmt_ver);
             memset(&g.table, 0, sizeof(g.table));
             return ESP_ERR_NOT_FOUND;
@@ -179,25 +224,38 @@ static esp_err_t load(void)
             return ESP_ERR_INVALID_CRC;
         }
         g.table.crc32 = saved;
+    } else if (len == sizeof(elder_rmd_table_v2_t)) {
+        /* ---- V2 升级路径 ---- */
+        if (!table_v2_crc_ok((const uint8_t *)&g.table, len)) {
+            ESP_LOGE(TAG, "旧格式提醒表(V2) CRC 校验失败，reset table");
+            memset(&g.table, 0, sizeof(g.table));
+            return ESP_ERR_INVALID_CRC;
+        }
+        elder_rmd_table_v2_t v2;
+        memcpy(&v2, &g.table, sizeof(v2));
+        memset(&g.table, 0, sizeof(g.table));
+        migrate_v2_to_v3(&v2);
+        /* 迁移必须立刻落盘，否则下次重启又读到 V2 来一遍。 */
+        g.dirty = true;
+        elder_reminder_flush();
     } else if (len == sizeof(elder_rmd_table_v1_t)) {
         /* ---- 老设备升级路径 ----
          * 这里**绝不能**返回 NOT_FOUND：那会让 init() memset 掉整张表，
          * 老用户升级固件后老人的服药提醒全部消失（医疗事故级）。
          * CRC 必须按 V1 的尺寸重算 —— 老固件就是按 sizeof(V1) 算的。 */
         if (!table_v1_crc_ok((const uint8_t *)&g.table, len)) {
-            ESP_LOGE(TAG, "旧格式提醒表 CRC 校验失败，reset table");
+            ESP_LOGE(TAG, "旧格式提醒表(V1) CRC 校验失败，reset table");
             memset(&g.table, 0, sizeof(g.table));
             return ESP_ERR_INVALID_CRC;
         }
         elder_rmd_table_v1_t v1;
         memcpy(&v1, &g.table, sizeof(v1));
         memset(&g.table, 0, sizeof(g.table));
-        migrate_v1_to_v2(&v1);
-        /* 迁移必须立刻落盘，否则下次重启又读到 V1 来一遍。 */
+        migrate_v1_to_v3(&v1);
         g.dirty = true;
         elder_reminder_flush();
     } else {
-        ESP_LOGE(TAG, "提醒表长度异常（%u 字节，既非 V1 也非 V2），按无数据处理",
+        ESP_LOGE(TAG, "提醒表长度异常（%u 字节，既非 V1/V2 也非 V3），按无数据处理",
                  (unsigned)len);
         memset(&g.table, 0, sizeof(g.table));
         return ESP_ERR_NOT_FOUND;
@@ -211,6 +269,9 @@ esp_err_t elder_reminder_flush(void)
 {
     nvs_handle_t h;
     ESP_ERROR_CHECK_WITHOUT_ABORT(nvs_open(NVS_NS, NVS_READWRITE, &h));
+    /* 版本号在落盘时统一写：任何一次写盘之后，NVS 里就一定是 V3 布局，
+     * load() 才能按 sizeof(V3) 做 CRC 校验。 */
+    g.table.fmt_ver = ELDER_RMD_FMT_V3;
     g.table.crc32 = 0;
     g.table.crc32 = crc32_simple(&g.table, sizeof(g.table));
     esp_err_t err = nvs_set_blob(h, NVS_KEY, &g.table, sizeof(g.table));
@@ -325,9 +386,17 @@ static void tick(void)
 
     int now_min = tm_now.tm_hour * 60 + tm_now.tm_min;
 
+    /* 排期判定需要的两个"今天"：YYYYMMDD（给 ONCE/MONTHLY 比大小）与
+     * 真实日序号（给 INTERVAL_DAYS 做 % N）。**不能用上面跨天检测的
+     * day_ordinal()** —— 那个是 tm_year*366 + tm_yday，把每年都当 366 天，
+     * 拿它取模会跨年漂移（"隔三天"的提醒在元旦后整体错位）。
+     * 跨天检测本身继续用它：那里只需要"变了没有"，不需要真实日历日号。 */
+    int today_ymd = elder_rmd_ymd_of(tm_now.tm_year + 1900, tm_now.tm_mon + 1, tm_now.tm_mday);
+    int today_ord = elder_rmd_ordinal_of(tm_now.tm_year + 1900, tm_now.tm_mon + 1, tm_now.tm_mday);
+
     for (int i = 0; i < g.table.count && i < ELDER_REMINDER_MAX; i++) {
         elder_rmd_item_t *it = &g.table.items[i];
-        if (!item_due_today(it, &tm_now)) continue;
+        if (!item_due_today(i, &tm_now, today_ymd, today_ord)) continue;
 
         int due = it->hour * 60 + it->minute;
 
@@ -406,6 +475,13 @@ void elder_reminder_tick_once(void)
 
 static int64_t now_us(void) { return esp_timer_get_time(); }
 
+/* elder_rmd_sched 的告警出口。那个文件是纯函数、不依赖 esp_log，
+ * 由 init() 用 elder_rmd_set_warn_hook() 把日志能力注入进去。 */
+static void RmdSchedWarn(const char *msg)
+{
+    ESP_LOGW(TAG, "排期: %s", msg);
+}
+
 /* ---------------- 对外接口 ---------------- */
 
 /* 从落盘的「今日位图」把运行态恢复出来。
@@ -465,15 +541,21 @@ esp_err_t elder_reminder_init(elder_rmd_cb_t cb, void *ctx)
     g.ctx = ctx;
     g.last_flush_us = now_us();
 
+    /* 把排期模块的告警接到本组件的日志上。elder_rmd_sched.c 是纯函数、
+     * 不许 include esp_log.h（否则主机单测编不过），所以只能反向注入。
+     * 不注入也能工作，只是"未知 kind / 一次性缺日期"这两类配置问题
+     * 不会出现在日志里。 */
+    elder_rmd_set_warn_hook(RmdSchedWarn);
+
     if (load() != ESP_OK) {
         memset(&g.table, 0, sizeof(g.table));
         ESP_LOGW(TAG, "no saved table, starting empty");
     }
-    /* 盖上版本号。任何**本固件写出**的表都必须是 V2：新建表与迁移表
-     * 走的是同一条路，load() 里靠 fmt_ver 判定读取布局，所以漏盖的后果
-     * 是「下一次重启把这张表当成未知版本丢弃」—— 即刚加的提醒白加。
+    /* 盖上版本号。任何**本固件写出**的表都必须是 V3：新建表与迁移表
+     * 走的是同一条路，load() 里靠长度 + fmt_ver 判定读取布局，所以漏盖的
+     * 后果是「下一次重启把这张表当成未知版本丢弃」—— 即刚加的提醒白加。
      * 放在 load() 之后统一盖，覆盖「无数据新建」与「迁移成功」两种情况。 */
-    g.table.fmt_ver = ELDER_RMD_FMT_V2;
+    g.table.fmt_ver = ELDER_RMD_FMT_V3;
     /* 恢复当天运行态（旧表无数据时这里是全 IDLE，行为与修复前一致） */
     restore_daily_state();
 
@@ -506,6 +588,11 @@ esp_err_t elder_reminder_add(const elder_rmd_item_t *item)
     memcpy(&g.table.items[idx], item, sizeof(elder_rmd_item_t));
     g.table.items[idx].id = (uint8_t)idx;
     g.table.items[idx].label[ELDER_REMINDER_LABEL] = '\0';
+    /* 设备本地自建提醒没有排期来源（后端下发的走 replace_all，会带上
+     * when[]），按 DAILY 处理 —— 与 2026-10-23 之前"只看 repeat_mask"
+     * 的行为一致，不会因为新增字段而让本地提醒停摆。 */
+    memset(&g.table.when[idx], 0, sizeof(elder_rmd_when_t));
+    g.table.when[idx].kind = ELDER_RMD_KIND_DAILY;
     g.table.count++;
     g.dirty = true;
     elder_reminder_flush();
@@ -517,9 +604,14 @@ esp_err_t elder_reminder_del(uint8_t id)
     if (id >= g.table.count) return ESP_ERR_NOT_FOUND;
     for (int i = id; i < (int)g.table.count - 1; i++) {
         memcpy(&g.table.items[i], &g.table.items[i + 1], sizeof(elder_rmd_item_t));
+        /* when[] 与 items[] 同下标，必须一起左移 —— 漏掉这一步会让
+         * 删掉一条之后，后面每条都继承前一条的排期（删了"每周一"，
+         * 下一条"每天"就变成每周一）。 */
+        memcpy(&g.table.when[i], &g.table.when[i + 1], sizeof(elder_rmd_when_t));
         g.table.items[i].id = (uint8_t)i;
     }
     g.table.count--;
+    memset(&g.table.when[g.table.count], 0, sizeof(elder_rmd_when_t));
     g.dirty = true;
     elder_reminder_flush();
     return ESP_OK;
@@ -542,14 +634,67 @@ static bool same_content(const elder_rmd_item_t *a, const elder_rmd_item_t *b)
            strncmp(a->label, b->label, ELDER_REMINDER_LABEL) == 0;
 }
 
-esp_err_t elder_reminder_replace_all(const elder_rmd_item_t *items, uint8_t count)
+/* 今天的真实日序号（本地时区），给 INTERVAL_DAYS 的相位基准兜底用。 */
+static int32_t today_ordinal_now(void)
+{
+    time_t now = time(NULL);
+    struct tm tm_now;
+    localtime_r(&now, &tm_now);
+    return (int32_t)elder_rmd_ordinal_of(tm_now.tm_year + 1900,
+                                         tm_now.tm_mon + 1, tm_now.tm_mday);
+}
+
+/* 把一条下发的排期整理成可用的 when。
+ *
+ * 三件事：
+ *  1) src == NULL（老调用方 / 测试）→ 按 DAILY，语义与 2026-10-23 之前一致；
+ *  2) INTERVAL_DAYS 且 anchor_ordinal == 0 → 相位基准要补：服务端既没给
+ *     start_date 也没给 created_at 时用"今天"。
+ *     ⚠️ 必须**尽量继承旧值**：每次同步都重新取"今天"的话，相位每天跟着
+ *     跳，N=3 会退化成天天响（或永远不响）—— 这是"补一个基准"这件事
+ *     唯一的正确做法，不能省。
+ *  3) 其余字段原样带过。 */
+static elder_rmd_when_t resolve_when(const elder_rmd_when_t *src, uint32_t server_id,
+                                     const elder_rmd_item_t *old,
+                                     const elder_rmd_when_t *old_when, uint8_t old_n)
+{
+    elder_rmd_when_t w;
+    if (src) {
+        w = *src;
+    } else {
+        memset(&w, 0, sizeof(w));
+        w.kind = ELDER_RMD_KIND_DAILY;
+    }
+
+    if (w.kind == ELDER_RMD_KIND_INTERVAL_DAYS && w.anchor_ordinal == 0) {
+        int32_t inherited = 0;
+        for (uint8_t j = 0; j < old_n; j++) {
+            if (old[j].server_id != 0 && old[j].server_id == server_id &&
+                old_when[j].kind == ELDER_RMD_KIND_INTERVAL_DAYS &&
+                old_when[j].anchor_ordinal != 0) {
+                inherited = old_when[j].anchor_ordinal;
+                break;
+            }
+        }
+        w.anchor_ordinal = inherited ? inherited : today_ordinal_now();
+    }
+    return w;
+}
+
+esp_err_t elder_reminder_replace_all(const elder_rmd_item_t *items,
+                                     const elder_rmd_when_t *when,
+                                     uint8_t count)
 {
     if (count > ELDER_REMINDER_MAX) return ESP_ERR_INVALID_SIZE;
 
     /* ---- 1. 快照旧表与运行态 ---- */
     elder_rmd_item_t old[ELDER_REMINDER_MAX];
+    elder_rmd_when_t old_when[ELDER_REMINDER_MAX];
     uint8_t old_n = g.table.count > ELDER_REMINDER_MAX ? ELDER_REMINDER_MAX : g.table.count;
     memcpy(old, g.table.items, sizeof(elder_rmd_item_t) * old_n);
+    /* 先清零再拷：old_n 之后的元素不会被读，但保持确定性总没坏处 */
+    memset(old_when, 0, sizeof(old_when));
+    memcpy(old_when, g.table.when, sizeof(elder_rmd_when_t) * old_n);
     uint8_t old_state[ELDER_REMINDER_MAX];
     bool    old_fired[ELDER_REMINDER_MAX];
     int64_t old_deadline[ELDER_REMINDER_MAX];
@@ -562,6 +707,7 @@ esp_err_t elder_reminder_replace_all(const elder_rmd_item_t *items, uint8_t coun
      * 服务端毫不知情；一次 replace_all 全量覆盖就会让它们永久消失，
      * 属于医疗事故级数据丢失。 */
     elder_rmd_item_t keep[ELDER_REMINDER_MAX];
+    elder_rmd_when_t keep_when[ELDER_REMINDER_MAX];
     uint8_t keep_n = 0;
     for (uint8_t i = 0; i < old_n; i++) {
         if (old[i].server_id != 0) continue;
@@ -576,7 +722,13 @@ esp_err_t elder_reminder_replace_all(const elder_rmd_item_t *items, uint8_t coun
                      old[i].label, old[i].hour, old[i].minute);
             continue;
         }
-        if (keep_n < ELDER_REMINDER_MAX) keep[keep_n++] = old[i];
+        if (keep_n < ELDER_REMINDER_MAX) {
+            keep[keep_n] = old[i];
+            /* 本地条目的排期必须跟着一起保留，否则保留下来的那条
+             * 会退回 DAILY（等于把用户的"每周一次"改成"每天"）。 */
+            keep_when[keep_n] = old_when[i];
+            keep_n++;
+        }
     }
 
     /* ---- 3. 组装新表：后端下发在前，本地保留在后 ----
@@ -592,17 +744,21 @@ esp_err_t elder_reminder_replace_all(const elder_rmd_item_t *items, uint8_t coun
 
     /* ---- 4. 安装 + 运行态继承（按 server_id / 内容匹配旧表）---- */
     memset(g.table.items, 0, sizeof(g.table.items));
+    memset(g.table.when, 0, sizeof(g.table.when));
     uint8_t n = 0;
     for (uint8_t i = 0; i < srv_n; i++) {
         g.table.items[n] = items[i];
         g.table.items[n].id = n;
         g.table.items[n].label[ELDER_REMINDER_LABEL] = '\0';
+        g.table.when[n] = resolve_when(when ? &when[i] : NULL, items[i].server_id,
+                                       old, old_when, old_n);
         n++;
     }
     for (uint8_t i = 0; i < keep_n; i++) {
         g.table.items[n] = keep[i];
         g.table.items[n].id = n;
         g.table.items[n].label[ELDER_REMINDER_LABEL] = '\0';
+        g.table.when[n] = keep_when[i];
         n++;
     }
 
@@ -786,11 +942,13 @@ int32_t elder_reminder_next_in_sec(void)
     struct tm tm_now;
     localtime_r(&now, &tm_now);
     int now_min = tm_now.tm_hour * 60 + tm_now.tm_min;
+    int today_ymd = elder_rmd_ymd_of(tm_now.tm_year + 1900, tm_now.tm_mon + 1, tm_now.tm_mday);
+    int today_ord = elder_rmd_ordinal_of(tm_now.tm_year + 1900, tm_now.tm_mon + 1, tm_now.tm_mday);
     int best = -1;
 
     for (int i = 0; i < g.table.count && i < ELDER_REMINDER_MAX; i++) {
         elder_rmd_item_t *it = &g.table.items[i];
-        if (!item_due_today(it, &tm_now)) continue;
+        if (!item_due_today(i, &tm_now, today_ymd, today_ord)) continue;
         if (g.state[i] != ELDER_RMD_IDLE) continue;
         int due = it->hour * 60 + it->minute;
         int delta = due - now_min;

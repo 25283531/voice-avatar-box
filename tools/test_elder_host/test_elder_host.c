@@ -244,7 +244,7 @@ static void test_replace_all_keeps_local(void)
     srv[0] = mk_med(9, 30, "降压药", 101);
     srv[1] = mk_med(21, 0, "钙片", 102);
 
-    check("replace_all 返回成功", elder_reminder_replace_all(srv, 2) == ESP_OK, NULL);
+    check("replace_all 返回成功", elder_reminder_replace_all(srv, NULL, 2) == ESP_OK, NULL);
 
     const elder_rmd_table_t *t = tbl();
     check("后端 2 条 + 本地 2 条 = 4 条", t && t->count == 4,
@@ -259,7 +259,7 @@ static void test_replace_all_keeps_local(void)
     /* 最狠的一遍：服务端下发空表（孩子把 App 里的提醒全删了）。
      * 老人在断网时建的提醒此时只剩这一份拷贝，绝不能跟着消失。 */
     check("后端下发 0 条时也不丢本地",
-          elder_reminder_replace_all(srv, 0) == ESP_OK, NULL);
+          elder_reminder_replace_all(srv, NULL, 0) == ESP_OK, NULL);
     t = tbl();
     check("空表下发后本地 2 条仍在", t && t->count == 2,
           det("实际 count=%u，%s", t ? t->count : 0, dump_tbl(t)));
@@ -274,7 +274,7 @@ static void test_replace_all_keeps_local(void)
     for (int i = 0; i < 16; i++) {
         many[i] = mk_med((uint8_t)(i % 24), 0, "服务端提醒", (uint32_t)(200 + i));
     }
-    elder_reminder_replace_all(many, 16);
+    elder_reminder_replace_all(many, NULL, 16);
     t = tbl();
     check("溢出时本地两条仍活", t && find_idx(t, 8, 0, "早上的药") >= 0
                              && find_idx(t, 20, 0, "晚上的药") >= 0,
@@ -1282,7 +1282,7 @@ static void test_replace_all_recomputes_fired(void)
     /* 两条后端提醒：早上的药（idx 0）、晚上的药（idx 1） */
     elder_rmd_item_t morning = mk_med(8, 0, "早上的药", 101);
     elder_rmd_item_t evening = mk_med(20, 0, "晚上的药", 102);
-    elder_reminder_replace_all((const elder_rmd_item_t[]){morning, evening}, 2);
+    elder_reminder_replace_all((const elder_rmd_item_t[]){morning, evening}, NULL, 2);
 
     /* 08:00 触发 + 确认服药 */
     stub_time_advance(2 * 3600);
@@ -1305,7 +1305,7 @@ static void test_replace_all_recomputes_fired(void)
      *   b) 晚上的药（新 idx0）被误标成响过 -> 今天再也不会响。 */
     elder_rmd_item_t swapped[2] = { evening, morning };
     check("后端下发调换顺序的两条提醒",
-          elder_reminder_replace_all(swapped, 2) == ESP_OK, NULL);
+          elder_reminder_replace_all(swapped, NULL, 2) == ESP_OK, NULL);
     const elder_rmd_table_t *t = tbl();
     check("★同步后顺序确实调换了（新 idx0 应是晚上的药）",
           t && t->count == 2 && t->items[0].server_id == 102 &&

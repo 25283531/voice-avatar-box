@@ -3,6 +3,9 @@ idf_component_register(
         "src/rgb.c"
         "src/input.c"
         "src/reminder.c"
+        # 提醒排期判定（2026-10-23）：纯函数、零依赖，单独成文件是为了能在
+        # 主机上用 gcc 直接跑单测（tools/test_rmd_sched.c + CI host-test job）。
+        "src/elder_rmd_sched.c"
         "src/activation.c"
         "src/ui.c"
         "src/net.c"

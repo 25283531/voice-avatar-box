@@ -76,7 +76,8 @@ CFLAGS  ?= -std=c99 -D_POSIX_C_SOURCE=200809L \
            -I$(STUBS)/include -I$(ELDER)/include
 
 SRCS     = test_elder_host.c stubs.c \
-           $(ELDER)/src/reminder.c
+           $(ELDER)/src/reminder.c \
+           $(ELDER)/src/elder_rmd_sched.c
 BUILD    = build
 
 .PHONY: all run clean

@@ -6,6 +6,8 @@
 #include <stddef.h>
 #include <time.h>
 #include "esp_err.h"
+/* elder_rmd_when_t（V3 的排期扩展）。纯函数模块，只依赖 stdint/stdbool。 */
+#include "elder_rmd_sched.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -64,6 +66,7 @@ typedef struct {
  *   V1：没有 fired_today / fmt_ver（历史布局，见下方 elder_rmd_table_v1_t，
  *       升级时按老尺寸读出并迁移）
  *   V2：新增 fired_today 位图 + 本版本号
+ *   V3：新增 when[] 排期扩展数组（2026-10-23，见下方说明）
  *
  * ⚠️ 加字段必须**只追加在结构体末尾**。V1 之所以能零成本迁移，
  *    正是因为 V1 是 V2 的逐字节前缀（下方有编译期断言钉死它）——
@@ -71,6 +74,7 @@ typedef struct {
  *    load() 会判为「无数据」并清空整张表，老用户升级后服药提醒全部消失。 */
 #define ELDER_RMD_FMT_V1  1u
 #define ELDER_RMD_FMT_V2  2u
+#define ELDER_RMD_FMT_V3  3u
 
 typedef struct {
     elder_rmd_item_t items[ELDER_REMINDER_MAX];
@@ -95,6 +99,34 @@ typedef struct {
 
     /* 结构版本号，见 ELDER_RMD_FMT_* */
     uint8_t          fmt_ver;
+
+    /* ---- V3 新增字段（2026-10-23）：排期扩展，与 items[] 同下标 ----
+     *
+     * 为什么单独一个数组，而不是往 elder_rmd_item_t 里加字段：
+     *   items[] 的 stride 一旦变化，V1/V2 blob 里每个元素的偏移全变，
+     *   迁移就只能靠逐字段重排（错一个字段 = 服药时刻变乱码）。
+     *   追加到表尾则 items[] 保持逐字节不变，V1/V2 前缀断言继续成立，
+     *   迁移只需要"把 when[] 清零"这一件事。
+     *
+     * 为什么需要它：设备端原先只看 repeat_mask，schedule_kind 解析了却
+     * 没人读，而 sync.c 在"没有 weekdays"时把 mask 强制成 0x7F（每天）——
+     * 于是后端 ONCE / MONTHLY / INTERVAL_DAYS 三种规则**全部静默退化成
+     * 每天**（用户设一次性的喝水提醒，设备天天响）。判定逻辑拆到了
+     * elder_rmd_sched.h 的纯函数里，数据就放这里。 */
+    /* V3：显式补齐到 8 字节边界。
+     *
+     * 为什么需要这 4 个字节（不是可有可无的凑数）：
+     *   V2 的 sizeof 会被编译器补到 8 的倍数（920），而 when[] 里的成员
+     *   最大只要求 4 字节对齐（916）—— 正好差 4。不补的话
+     *   `sizeof(elder_rmd_table_v2_t) != offsetof(elder_rmd_table_t, when)`，
+     *   下方的 v2_prefix_assert 编译失败；更重要的是，"V2 是 V3 的逐字节
+     *   前缀"这句话就不成立，V2 → V3 的迁移只能靠猜偏移。
+     *   显式补 4 字节让这件事由代码保证，而不是碰巧成立。
+     *
+     * 这 4 字节不存任何数据，任何写盘路径上都是 0（init / 迁移都 memset 过
+     * 整张表），所以它不影响 CRC 的稳定性。 */
+    uint8_t pad_v3[4];
+    elder_rmd_when_t when[ELDER_REMINDER_MAX];
 } elder_rmd_table_t;
 
 /**
@@ -118,6 +150,29 @@ typedef struct {
     uint32_t         crc32;
 } elder_rmd_table_v1_t;
 
+/**
+ * @brief V2 布局 —— **只为升级迁移而存在**，不是活跃数据结构。
+ *
+ * 与 V1 同理：老设备 NVS 里可能存着 V2 的 blob，crc32 按
+ * `sizeof(elder_rmd_table_v2_t)` 算。原样保留一份与当年逐字节一致的
+ * 定义，读旧 blob 才有依据，而不是猜"大概是前 N 个字节"。
+ *
+ * ⚠️ 本结构必须与 2026-10-23 之前的 elder_rmd_table_t 完全一致
+ *    （items / count / done_today / pending_today / last_day_ordinal /
+ *    crc32 / fired_today / fmt_ver，字段顺序与类型都不许动）。
+ *    下方 elder_rmd_v2_prefix_assert 钉死它等于 V3 的 when 偏移。
+ */
+typedef struct {
+    elder_rmd_item_t items[ELDER_REMINDER_MAX];
+    uint8_t          count;
+    uint16_t         done_today;
+    uint16_t         pending_today;
+    int32_t          last_day_ordinal;
+    uint32_t         crc32;
+    uint16_t         fired_today;
+    uint8_t          fmt_ver;
+} elder_rmd_table_v2_t;
+
 /* 编译期钉死：V1 必须是 V2 的**逐字节前缀**。
  *
  * 这条断言是「加字段安全」的全部依据：
@@ -129,6 +184,18 @@ typedef struct {
  */
 typedef char elder_rmd_v1_prefix_assert[
     (sizeof(elder_rmd_table_v1_t) == offsetof(elder_rmd_table_t, fired_today)) ? 1 : -1];
+
+/* 同理钉死：V2 必须是 V3 的**逐字节前缀**（V3 只在末尾追加了 when[]）。
+ *
+ * 这条断言是「V2 设备升级到 V3 后提醒不丢」的全部依据：
+ *   - 尺寸：V2 blob 读进 V3 缓冲区不会越界；
+ *   - CRC：老 crc32 按 sizeof(V2) 算出，按同一段字节重算必然吻合；
+ *   - 偏移：items[] / 三个位图 / last_day_ordinal 的位置一个都没动，
+ *     所以 V2 里存着的提醒与「今日已完成」记录可以直接沿用。
+ * 有人把 when[] 插到 fmt_ver 之前、或改动了 items[] 的 stride，
+ * 这条断言立刻编译失败。 */
+typedef char elder_rmd_v2_prefix_assert[
+    (sizeof(elder_rmd_table_v2_t) == offsetof(elder_rmd_table_t, when)) ? 1 : -1];
 
 /* 同理钉死：今日三个位图（done_today / pending_today / fired_today）都是
  * uint16_t，一个 bit 对应一个 items[] 下标。把 ELDER_REMINDER_MAX 调大到
@@ -155,8 +222,19 @@ esp_err_t elder_reminder_list(const elder_rmd_table_t **out);
 /**
  * @brief 用后端下发的规则**整体替换**本地表（幂等，按 server_id 复用条目）。
  *        替换后 dirty 但不立即落盘，由 tick 去抖写 NVS。
+ *
+ * @param items  后端下发的条目（至少 count 个）
+ * @param when   与 items 同下标的排期；**传 NULL 表示全部按 DAILY 处理**
+ *               （老调用方/测试的兼容路径，语义与 2026-10-23 之前一致）
+ * @param count  条目数
+ *
+ * 为什么 when 单独传而不是塞进 elder_rmd_item_t：见 elder_rmd_table_t 里
+ * when[] 的注释 —— 往 items[] 的元素里加字段会改变 NVS 里每个元素的偏移，
+ * 让 V1/V2 老 blob 无法逐字节前缀迁移（错一个字段 = 服药时刻变乱码）。
  */
-esp_err_t elder_reminder_replace_all(const elder_rmd_item_t *items, uint8_t count);
+esp_err_t elder_reminder_replace_all(const elder_rmd_item_t *items,
+                                     const elder_rmd_when_t *when,
+                                     uint8_t count);
 
 /** 按后端 reminder_id 查本地索引；找不到返回 -1 */
 int elder_reminder_find_by_server_id(uint32_t server_id);
