@@ -14,7 +14,17 @@ const devicePk = ref(0)
 const editId = ref(0)
 
 const typeOptions = ['服药', '日程', '喝水', '运动', '自定义']
-const kindOptions = ['每天', '每周指定几天', '每月指定几号', '每隔 N 天', '指定日期一次']
+// ⚠️ 这个数组的**下标就是服务端 ScheduleKind 的值**（0=ONCE 1=DAILY 2=WEEKLY
+// 3=MONTHLY 4=INTERVAL_DAYS，见 server/app/models.py 的 ScheduleKind）。
+// pickKind() 直接把 picker 的下标写进 form.schedule_kind，所以**改这里的顺序
+// 等于静默改掉所有规则的含义**，而不是改显示顺序。
+//
+// 2026-10-27 就是这么错的：原来写成 ['每天', '每周…', '每月…', '每隔 N 天',
+// '指定日期一次']，整体与枚举错位一格 —— 用户在 APP 上选"每天"实际存成
+// ONCE（0）、选"指定日期一次"实际存成 INTERVAL（4）。症状是"服务端显示
+// 一次性、设备每天响"，而且存成 ONCE 的那些规则连日期都没机会填。
+// 模板里的 v-if 分支（=== 0/2/3/4）本来就是按枚举写的、是对的，不要动。
+const kindOptions = ['指定日期一次', '每天', '每周指定几天', '每月指定几号', '每隔 N 天']
 const weekCn = ['一', '二', '三', '四', '五', '六', '日']
 
 const form = ref<Partial<Reminder>>({
