@@ -133,6 +133,8 @@ static const char *state_name(uint8_t st)
     case ELDER_RMD_CONFIRM_WIN: return "CONFIRM_WIN";
     case ELDER_RMD_DONE:        return "DONE";
     case ELDER_RMD_ESCALATED:   return "ESCALATED";
+    case ELDER_RMD_SKIPPED:     return "SKIPPED";
+    case ELDER_RMD_HALF_CONFIRMED: return "HALF";
     default:                    return "?";
     }
 }
@@ -1524,14 +1526,19 @@ static void test_stale_skip_no_false_missed(void)
  * 随上游回归删除 ⇒ 提醒响完没有任何确认手段 ⇒ 15 分钟后升级 ESCALATED ⇒
  * 回执 ELDER_EV_MISSED ⇒ 子女端每条提醒都收到「老人漏服」的假告警。
  *
- * 宿主测试能覆盖的是**状态机这一半**：确认必须落 DONE、此后不得再升级、
- * 确认方式必须是 VOICE 而不是 BUTTON（否则子女端分不清「老人自己按的」
- * 还是「跟小智说的」）。MCP 传输那半边（tools/call → mcp_server 的 lambda）
- * 在 xiaozhi 的 C++ 里，宿主环境编不了，由真机验收清单覆盖。
+ * 宿主测试能覆盖的是**状态机这一半**：2026-10-27 之后语音确认只算
+ * **半置信**（ELDER_RMD_HALF_CONFIRMED），所以这里钉的是两件事：
+ *   ① 语音确认必须进 HALF 而不是 DONE —— 仍然算待确认（pending_today 保持、
+ *      done_today 不置位、first_ringing 仍然选得中），否则老人被提示
+ *      "长按按钮复核"、按下去却回"没有待确认的提醒"；
+ *   ② 按键复核之后才落 DONE、才置 done_today、确认方式变成 BUTTON。
+ * 两条都要有，缺一条这个流程就是断的。
+ * MCP 传输那半边（tools/call → mcp_server 的 lambda）在 xiaozhi 的 C++ 里，
+ * 宿主环境编不了，由真机验收清单覆盖。
  */
 static void test_voice_confirm_no_false_missed(void)
 {
-    printf("\n[T13] 语音确认：落 DONE、记 VOICE 来源、此后不得再报漏服\n");
+    printf("\n[T13] 语音确认=半置信（HALF），按键复核才落 DONE\n");
     stub_nvs_init();
     stub_time_set(1772661600L);      /* 06:00，可信时钟 */
     rec_reset();
@@ -1553,20 +1560,44 @@ static void test_voice_confirm_no_false_missed(void)
           elder_reminder_last_confirm_method() == ELDER_CFM_VOICE,
           det("记成 %u —— 子女端会误判成「老人自己按的」",
               (unsigned)elder_reminder_last_confirm_method()));
-    check("确认后必须落 DONE 且清掉红灯待确认",
-          saw(0, ELDER_RMD_DONE) >= 1 && (tbl()->pending_today & 1u) == 0,
+    check("★语音确认进 HALF（半置信），不得直接落 DONE",
+          saw(0, ELDER_RMD_HALF_CONFIRMED) >= 1 && saw(0, ELDER_RMD_DONE) == 0,
+          det("HALF %d 次 / DONE %d 次",
+              saw(0, ELDER_RMD_HALF_CONFIRMED), saw(0, ELDER_RMD_DONE)));
+    check("★HALF 仍是待确认：pending_today 保持、done_today 不置位",
+          (tbl()->pending_today & 1u) != 0 && (tbl()->done_today & 1u) == 0,
           det("%s", dump_tbl(tbl())));
-    check("确认后必须记成今天已服用",
-          (tbl()->done_today & 1u) != 0, det("%s", dump_tbl(tbl())));
+    /* 这一条是整个改造的命门：老人被提示"长按按钮复核"，按键那条路
+     * 走的就是 first_ringing()。它要是选不中，按下去就是彻底没反应。 */
+    check("★HALF 状态下按键复核必须选得中（first_ringing == 0）",
+          elder_reminder_first_ringing() == 0,
+          det("first_ringing=%d —— 选不中 = 老人按了按钮没反应",
+              elder_reminder_first_ringing()));
 
-    /* 最关键的一条：确认过之后，15 分钟的升级扫描不得再判漏服 */
+    /* 最关键的一条：语音确认过之后，15 分钟的升级扫描不得再判漏服。
+     * HALF 不在 PENDING 集合里，升级扫描应当跳过它。 */
     stub_time_advance(20 * 60);
     rec_reset();
     elder_reminder_tick_once();
-    check("★确认后再过 20 分钟不得升级 ESCALATED",
+    check("★语音确认后再过 20 分钟不得升级 ESCALATED",
           saw(0, ELDER_RMD_ESCALATED) == 0,
-          det("ESCALATED %d 次 —— 老人明明确认过，家属仍收到「漏服」",
+          det("ESCALATED %d 次 —— 老人明明说过吃过了，家属仍收到「漏服」",
               saw(0, ELDER_RMD_ESCALATED)));
+
+    /* 老人长按按钮 3 秒复核 → 这一步才是全置信 */
+    check("按键复核返回 OK",
+          elder_reminder_confirm_ex(0, ELDER_CFM_BUTTON) == ESP_OK, NULL);
+    check("★复核后落 DONE 并清掉红灯待确认",
+          saw(0, ELDER_RMD_DONE) >= 1 && (tbl()->pending_today & 1u) == 0,
+          det("%s", dump_tbl(tbl())));
+    check("复核后必须记成今天已服用",
+          (tbl()->done_today & 1u) != 0, det("%s", dump_tbl(tbl())));
+    check("复核后确认方式变成 BUTTON",
+          elder_reminder_last_confirm_method() == ELDER_CFM_BUTTON,
+          det("记成 %u", (unsigned)elder_reminder_last_confirm_method()));
+    check("复核后不再被选中（first_ringing == -1）",
+          elder_reminder_first_ringing() == -1,
+          det("first_ringing=%d", elder_reminder_first_ringing()));
 
     /* 固件侧 elder_confirm_pending_medicine() 用 FirstUndoneMedicine() 守卫，
      * 正常不会传越界 id；这里钉住底层契约：越界 id 必须被拒，且不得把
@@ -1702,9 +1733,18 @@ static void test_first_ringing_picks_ringing(void)
               (long long)t->items[water_idx].fired_due_at,
               (long long)t->items[med_idx].fired_due_at));
 
-    /* 老人对喝水说「弄好了」→ 确认必须落在喝水上 */
-    check("语音确认喝水成功",
+    /* 老人对喝水说「弄好了」→ 确认必须落在喝水上。
+     * 语音只算半置信（HALF），所以它**仍然**是选中目标 —— 这一条正是
+     * "提示按按钮、按下去没反应"的守门断言。按键复核之后才移出集合。 */
+    check("语音确认喝水成功（半置信）",
           elder_reminder_confirm_ex((uint8_t)water_idx, ELDER_CFM_VOICE) == ESP_OK,
+          NULL);
+    check("★半置信之后仍然选得中它（否则老人按按钮没反应）",
+          elder_reminder_first_ringing() == water_idx,
+          det("first_ringing=%d（应为喝水 idx=%d）",
+              elder_reminder_first_ringing(), water_idx));
+    check("按键复核喝水成功",
+          elder_reminder_confirm_ex((uint8_t)water_idx, ELDER_CFM_BUTTON) == ESP_OK,
           NULL);
     check("喝水已确认（DONE）后不再被选中，改选中服药",
           elder_reminder_first_ringing() == med_idx,
@@ -1713,7 +1753,7 @@ static void test_first_ringing_picks_ringing(void)
 
     /* 服药也确认掉 → 没有任何响铃（DONE 不算响铃） */
     check("两条都确认后，没有正在响铃的提醒",
-          elder_reminder_confirm_ex((uint8_t)med_idx, ELDER_CFM_VOICE) == ESP_OK
+          elder_reminder_confirm_ex((uint8_t)med_idx, ELDER_CFM_BUTTON) == ESP_OK
               && elder_reminder_first_ringing() == -1,
           det("first_ringing=%d（应为 -1）", elder_reminder_first_ringing()));
 
@@ -1737,7 +1777,7 @@ static void test_first_ringing_picks_ringing(void)
           elder_reminder_first_ringing() == med_idx,
           det("first_ringing=%d（应为服药 idx=%d）",
               elder_reminder_first_ringing(), med_idx));
-    elder_reminder_confirm_ex((uint8_t)med_idx, ELDER_CFM_VOICE);
+    elder_reminder_confirm_ex((uint8_t)med_idx, ELDER_CFM_BUTTON);
     check("窗口内确认后同样回到 -1",
           elder_reminder_first_ringing() == -1,
           det("first_ringing=%d（应为 -1）", elder_reminder_first_ringing()));
