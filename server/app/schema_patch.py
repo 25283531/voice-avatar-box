@@ -160,6 +160,9 @@ PATCH_REGISTRY: Final[dict[str, str]] = {
         "把存量 MAC 统一成 norm_mac 口径（无分隔符小写），"
         "让 _find_device 能用上索引、不再全表扫无鉴权的 OTA 热路径；"
         "同时归一化 activation_codes.device_id",
+    "reminder_once_without_date_v1":
+        "把「schedule_kind=0(ONCE) 但 once_date 为空」的提醒改为每天"
+        "（这类规则服务端算不出触发时刻、永远不响；成因是 APP 选项下标错位）",
 }
 
 # 登记表名。与 models.PatchMeta.__tablename__ 一致；不 import models 是为了
@@ -670,6 +673,98 @@ def backfill_token_epoch() -> int:
     return changed
 
 
+def backfill_once_without_date() -> int:
+    """把「标成一次性(ONCE)却没填 ``once_date``」的提醒改成每天(DAILY)，返回行数。
+
+    要修的是什么
+    ------------
+    ``schedule_kind = 0``（ONCE）配一个空的 ``once_date``，是一个**自相矛盾
+    且没有任何一方能正确解释**的状态：
+
+    * 服务端排期（:func:`app.schedule.occurrences_on`）拿不到日期 -> 算不出
+      任何触发时刻 -> 这条规则**永远不排期**；
+    * 固件侧（``elder_rmd_sched.c``）拿到 ``once_ymd = 0`` 也只能兜底。
+
+    用户的观感是「APP 里明明写着『指定日期一次』，但设备从来不会响」——
+    比"响错时间"更糟，因为**没有任何声音提示它坏了**。
+
+    这个状态是怎么产生的（根因，写下来免得下次又只看表象）
+    ------------------------------------------------------
+    APP 的 ``reminder-edit.vue`` 里 ``kindOptions`` 曾整体错位一格：显示
+    "每天"的那一项，其下标是 ``0``（= ONCE）。用户选"每天"，服务端存下来的
+    却是 ``schedule_kind = 0`` + 空的 ``once_date``。所以库里的坏行是
+    **用户的真实意图恰好是"每天"**，这决定了本迁移的方向（见下）。
+
+    为什么改成 DAILY，而不是删掉或留着不动
+    ------------------------------------
+    1. **删行**是错的：那是老人正在吃的药、正在喝的水。删掉 = 静默丢功能。
+    2. **留成 ONCE** 是错的：永远不响，且用户看不见这个错误（APP 上只显示
+       "指定日期一次"，看起来完全正常）。
+    3. **改成 DAILY** 与用户的真实意图一致（错位一格前的选项就是"每天"），
+       也与固件的兜底口径**逐字一致** —— ``elder_rmd_due_on()`` 遇到
+       ``once_ymd == 0`` 就是按每天处理 + 告警（见 ``elder_rmd_sched.c``）。
+       两层各写一套不同的兜底，才是真正的坑：设备响、服务端排期不响，
+       或者反过来。
+
+    ⚠️ **两层兜底不是冗余，是两种不同的失败面**：固件那层挡的是「设备已经
+    拿到坏数据」（比如升级前就同步下去的老规则、或者服务端校验被绕过）；
+    这一层挡的是「库里的坏数据继续被下发给所有设备」。只留一层，另一个面就
+    裸奔。反过来，**正因为两层口径相同**，任何一层单独生效都不会让行为跳变。
+
+    判据为什么是 ``schedule_kind = 0 AND once_date 为空``
+    ----------------------------------------------------
+    两个条件都**由写入端无条件保证**，且各自回答一个独立问题：
+
+    * ``schedule_kind = 0`` —— 这条规则自称"只响一次"，因此 ``once_date``
+      对它而言**不是可选项**（一次性不填日期根本无从计算触发时刻）。
+      这是 ONCE 的**定义**，不是"通常这么填"。
+    * ``once_date IS NULL OR once_date = ''`` —— 日期确实缺失。两种写法都要判：
+      ``once_date`` 可空且默认 NULL，但前端提交空字符串时会落成 ``''``，
+      只判 NULL 会漏掉一半。
+
+    只有 ONCE 行会被碰，DAILY/WEEKLY/MONTHLY/INTERVAL 行的 ``once_date``
+    本来就该为空，**不能**被这个判据捞进来 —— 这是本条迁移最容易写错的地方
+    （漏掉 ``schedule_kind = 0`` 就会把所有每周/每月提醒改成每天）。
+
+    幂等：改完之后 ``schedule_kind`` 不再是 0，第二次执行匹配 0 行。
+    但仍登记进 :data:`PATCH_REGISTRY` —— 它**改业务数据**，符合模块顶部的登记
+    判据；「只执行一次」那层保护不能靠幂等性替代（见顶部铁律）。
+    """
+    patch_id = "reminder_once_without_date_v1"
+    insp = inspect(engine)
+    existing_tables = set(insp.get_table_names())
+    if "reminders" not in existing_tables:
+        # 表都还不存在：全新库，没有任何历史坏行，无需回填。
+        return 0
+
+    cols = {c["name"] for c in insp.get_columns("reminders")}
+    if "schedule_kind" not in cols or "once_date" not in cols:
+        # 列还没补上（理论上 run_all 保证先补列）。本轮跳过、**不登记**，
+        # 下次启动会重试 —— 宁可重跑，不可漏跑。
+        log.warning("reminders 缺少 schedule_kind/once_date 列，跳过一次性回填（下次启动重试）")
+        return 0
+
+    meta_ready = _patch_meta_ready(insp)
+    with engine.begin() as conn:
+        if meta_ready and _is_applied(conn, patch_id):
+            return 0
+        res = conn.execute(text(
+            "UPDATE reminders SET schedule_kind = 1 "
+            "WHERE schedule_kind = 0 "
+            "AND (once_date IS NULL OR once_date = '')"))
+        changed = int(res.rowcount or 0)
+        if meta_ready:
+            # 登记放在**同一个事务里、UPDATE 之后**：中途抛异常则两者一起回滚，
+            # 不会留下「标记写了但数据没改」的静默漏跑。
+            _mark_applied(conn, patch_id)
+
+    if changed:
+        log.warning(
+            "一次性回填：%d 条「标成一次性但缺 once_date」的提醒已改为每天"
+            "（这些规则原本永远不会触发；用户可在 APP 里改回指定日期）", changed)
+    return changed
+
+
 def normalize_device_macs() -> int:
     """把存量 MAC 统一成 :func:`app.macs.norm_mac` 口径，返回改动的行数。
 
@@ -1151,6 +1246,9 @@ def run_all() -> dict[str, int]:
          同理没有 token_epoch 列就没法做代次回填；
       2. 回填 record_type —— 必须在建索引前完成，否则索引建在错误的分类上；
       3. 代次回填 —— 必须在补列之后（依赖 token_epoch 存在），且只跑一次；
+      3b. 一次性提醒缺日期回填 —— 同样必须在补列之后（依赖 once_date 列），
+         且只跑一次；与第 4/5/6 步互不依赖，放这里是为了让「所有回填聚在一起」，
+         读代码时不必在补索引之间找它；
       4. MAC 归一化 —— 与代次回填互不依赖，但**必须在建索引之前**：
          索引本身不挑数据，可 `_find_device` 能否用上索引取决于存量是否已归一；
       5. 去重 + 回填 agent_key —— 必须在建唯一索引前完成，否则索引直接失败；
@@ -1166,6 +1264,9 @@ def run_all() -> dict[str, int]:
     added = ensure_missing_columns()
     backfilled = backfill_record_types()
     epochs = backfill_token_epoch()
+    # 一次性提醒缺日期的回填：与上面几条互不依赖，但必须**在补列之后**
+    # （依赖 once_date/schedule_kind 两列存在），且只跑一次。
+    once_fixed = backfill_once_without_date()
     # ⚠️ 这条**必须真的被调用**，否则 `_find_device` 的 `IN (mac_variants(...))`
     # 在带冒号的老数据上会退化成「查不到设备」—— 而 OTA 端点会因此把一台
     # **已绑定**设备判成未绑定并下发激活码（违反用户规则 4）。
@@ -1178,6 +1279,7 @@ def run_all() -> dict[str, int]:
         "columns_added": added,
         "record_types_backfilled": backfilled,
         "token_epochs_backfilled": epochs,
+        "reminder_once_fixed": once_fixed,
         "device_macs_normalized": macs,
         "persona_globals_deduped": deduped,
         "indexes_created": indexed,

@@ -56,11 +56,49 @@ def _reminder_tz(request, dev: models.Device, explicit: str = "") -> str:
     return ""
 
 
+def _reject_once_without_date(payload: ReminderIn) -> None:
+    """一次性提醒必须带日期，否则 422。
+
+    为什么这条校验在 **router 层**，而不是 ``ReminderIn`` 的
+    ``model_validator``
+    ---------------------------------------------------------------
+    这是一个**只该拦入参、不该拦出参**的约束。而 ``ReminderOut(ReminderIn)``
+    继承了 ``ReminderIn`` 的全部校验器，``_with_next()`` 里的
+    ``ReminderOut.model_validate(r)`` 会把库里的行**再校验一遍**。
+    于是同一个校验器会在两条完全不同的路径上生效：
+
+    * 入参（POST/PATCH）：拦的是「用户刚提交的、还没落库的数据」—— 正确；
+    * 出参（任何读接口 + 设备下发同步）：拦的是「**已经躺在库里**的行」——
+      一条历史坏行会让 ``GET /api/reminders`` 和 ``/api/device/sync`` 直接
+      抛异常 → 500 → **设备一条提醒都同步不到**，故障面从"一条规则不响"
+      扩大到"整台设备静音"。
+
+    换句话说：把校验挂在 model 上，等于让「修复坏数据」的手段（读取、编辑）
+    本身也被坏数据卡死 —— 这是典型的"校验器选错层"。
+
+    ⚠️ 所以**不要**把这段逻辑搬进 ``schemas.ReminderIn``。库里的坏行由
+    :func:`app.schema_patch.backfill_once_without_date` 一次性修掉，固件侧另有
+    ``elder_rmd_sched.c`` 的兜底 —— 三方各管一个面，见那两处注释。
+
+    判据与回填、固件保持一致：``schedule_kind == ONCE`` 且 ``once_date``
+    去空白后为空。``once_date`` 允许 ``None`` / ``''`` 两种写法，都要拦。
+    """
+    if int(payload.schedule_kind) != int(models.ScheduleKind.ONCE):
+        return
+    if (payload.once_date or "").strip():
+        return
+    raise HTTPException(
+        status.HTTP_422_UNPROCESSABLE_ENTITY,
+        "一次性提醒必须填写日期（once_date）",
+    )
+
+
 @router.post("", response_model=ReminderOut, status_code=status.HTTP_201_CREATED)
 def create_reminder(device_pk: int, payload: ReminderIn, request: Request,
                     db: Session = Depends(get_db),
                     user: models.User = Depends(get_current_user)):
     require_device_owner(device_pk, user, db)
+    _reject_once_without_date(payload)
     dev = db.get(models.Device, device_pk)
     data = payload.model_dump()
     data["tz"] = _reminder_tz(request, dev, data.get("tz", ""))
@@ -133,6 +171,9 @@ def update_reminder(reminder_pk: int, payload: ReminderIn, request: Request,
     if not r:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "提醒不存在")
     require_device_owner(r.device_id, user, db)
+    # 与 create 同一条约束：把一条规则改成「一次性」却不给日期，等于让它
+    # 永远不触发（见 _reject_once_without_date 的说明）。
+    _reject_once_without_date(payload)
 
     data = payload.model_dump()
     # 未显式给 tz 时**保留原值**，不重新判定：一条规则建好之后的时区不该

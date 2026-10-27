@@ -110,6 +110,16 @@ jobs:
       - name: 提醒音乐资源门禁（OGG 结构 / 时长 / 固件接入顺序）
         run: python tools/run_smoke.py logs/smoke_smoke_reminder_chime.log python tools/smoke_reminder_chime.py
 
+      # 「一次性提醒缺日期」的三面校验（回填 / 入参 422 / 出参不被拦）。
+      # 为什么必须门禁住：``schedule_kind=0`` + 空 ``once_date`` 在服务端算不出
+      # 任何触发时刻 ⇒ 那条提醒**永远不响**，而 APP 上显示完全正常 ——
+      # 对老人来说这是"该响的时候不响且毫无提示"的最坏形态。
+      # 反向断言（C11/C12）尤其重要：把校验挂到 ``ReminderIn`` 的 model 上会让
+      # ``ReminderOut.model_validate`` 在**读路径**上抛异常 ⇒ 设备下发同步 500。
+      # 这条门禁跑不红，就等于那个坑随时能被重新挖开。
+      - name: 一次性提醒缺日期（回填 / 422 / 读路径不被拦）
+        run: python tools/run_smoke.py logs/smoke_check_reminder_once.log python tools/check_reminder_once.py
+
       # P0：`devices.id` 无 AUTOINCREMENT ⇒ 删掉最大行后 pk 被复用，而已删设备的
       # 旧 device_token（ep 与代次都是 0）会**通过鉴权读到另一家人**的提醒与回执；
       # 同一根因还有一条不需要 token 的通道（Interaction / ChatUsage 无 cascade ⇒

@@ -390,13 +390,29 @@ def report_local_reminders(
     acks: list[dict[str, Any]] = []
 
     for item in payload:
+        # ⚠️ 本端点**没有** once_date 字段（协议里就没有，设备侧也只上报
+        # schedule_kind/times_of_day/weekdays）。所以设备报一条
+        # ``schedule_kind = 0``（ONCE）过来，落库必然是「一次性 + 无日期」
+        # —— 那个组合服务端算不出任何触发时刻，这条规则**永远不会响**，
+        # 而子女端看到的是一条正常的"指定日期一次"。
+        #
+        # 这里**改成每天**而不是拒绝：拒绝等于把老人断网时自建的提醒**丢掉**，
+        # 正是本端点存在的意义（见 docstring「医疗事故级」）。口径与
+        # routers/reminders._reject_once_without_date（入参 422）和固件
+        # elder_rmd_sched.c（once_ymd==0 按每天）一致：能救的救，不静默丢。
+        kind = int(item.schedule_kind)
+        if kind == int(models.ScheduleKind.ONCE):
+            log.warning("设备上报的本地提醒 %s 标成一次性但没有日期（协议无此字段），"
+                        "按每天落库", item.client_key)
+            kind = int(models.ScheduleKind.DAILY)
+
         existing = db.scalar(
             select(models.Reminder).where(
                 models.Reminder.device_id == dev.id,
                 models.Reminder.title == item.title,
                 models.Reminder.times_of_day == item.times_of_day,
                 models.Reminder.rtype == item.rtype,
-                models.Reminder.schedule_kind == item.schedule_kind,
+                models.Reminder.schedule_kind == kind,
             )
         )
         if existing is not None:
@@ -409,7 +425,7 @@ def report_local_reminders(
             title=item.title,
             speak_text=item.speak_text or item.title,
             rtype=item.rtype,
-            schedule_kind=item.schedule_kind,
+            schedule_kind=kind,
             times_of_day=list(item.times_of_day),
             weekdays=list(item.weekdays),
             require_confirm=True,
