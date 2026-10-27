@@ -103,8 +103,14 @@ int main(void)
     CHECK(!due_on(&w, 20261024), "ONCE 晚一天 -> false");
     CHECK(!due_on(&w, 20271023), "ONCE 次年同一天 -> false（不能变成每年）");
 
-    w.once_ymd = 0;   /* 缺日期：判不到期，绝不猜"今天" */
-    CHECK(!due_on(&w, 20261023), "ONCE 缺 once_date -> false");
+    /* 缺日期：**按每天处理**，不是"不到期"。
+     * 历史上 APP 编辑页的 kindOptions 与 ScheduleKind 枚举错位一格，
+     * 用户选"每天"会存成 kind=0(ONCE) 且 once_date 为空 —— 存量里有一批
+     * 这样的规则。判成"不到期"等于让它们从此永不触发：老人收不到提醒，
+     * 而屏幕一切正常、没人会发现。宁可多响。 */
+    w.once_ymd = 0;
+    CHECK(due_on(&w, 20261023), "ONCE 缺 once_date -> true（按每天兜底，绝不静默不响）");
+    CHECK(due_on(&w, 20280229), "ONCE 缺 once_date 换一天仍 true");
 
     /* ================= 2. DAILY ================= */
     printf("[2] DAILY 每天\n");

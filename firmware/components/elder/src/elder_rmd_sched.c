@@ -67,12 +67,21 @@ bool elder_rmd_due_on(const elder_rmd_when_t *w, int today_ymd,
     switch (w->kind) {
     case ELDER_RMD_KIND_ONCE:
         if (w->once_ymd == 0) {
-            /* 一次性规则却没给日期：这是服务端/解析出了问题。
-             * 不猜"那就今天吧"——猜错会让它今天响一次然后永远不响，
-             * 比一直不响更难排查。判为不到期并告警一次。 */
+            /* 一次性却没给日期 = 数据有问题。
+             *
+             * 这个组合不是理论上的：2026-10-27 查明 APP 编辑页的
+             * kindOptions 数组顺序与服务端 ScheduleKind 枚举整体错位一格，
+             * 用户选"每天"实际存成了 kind=0(ONCE)，而 once_date 根本没机会填。
+             * 存量里就有一批这样的规则（用户实报的"喝水提醒"就是）。
+             *
+             * 这里**按每天处理**，与本模块"宁可多响、绝不静默不响"的原则
+             * 一致：漏掉一条服药提醒的后果远大于多响一次。
+             * 判成"不到期"会让这类规则从此永不触发 —— 老人收不到提醒，
+             * 而屏幕上一切正常、没人会发现。服务端已有 backfill 把这类行
+             * 改成 DAILY，设备端这层是"数据没修好也不能哑"的兜底。 */
             warn_once(&s_warned_once_no_date,
-                      "一次性提醒缺 once_date，判为不到期（请检查服务端下发）");
-            return false;
+                      "一次性提醒缺 once_date，按每天处理（请检查服务端下发）");
+            return true;
         }
         return (uint32_t)today_ymd == w->once_ymd;
 

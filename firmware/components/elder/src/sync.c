@@ -638,11 +638,12 @@ static void parse_reminders(cJSON *root, elder_rmd_item_t *out,
             w.anchor_ordinal = ordinal_from_iso_date(jcreated->valuestring);
         }
 
-        /* 一次性却没给日期：这是服务端数据问题，不能猜。保留 kind 原样，
-         * elder_rmd_due_on() 会判"不到期"并告警一次 —— 猜成"今天"
-         * 会让它今天响一次然后永远不响，更难排查。 */
+        /* 一次性却没给日期：这是服务端数据问题（历史上 APP 编辑页的
+         * kindOptions 与 ScheduleKind 枚举错位，"每天"被存成了 kind=0）。
+         * 不猜具体日期，但**按每天处理** —— 设备端宁可多响，绝不静默不响。
+         * 服务端已有 backfill 把这类行改成 DAILY，这里只是兜底。 */
         if (kind == ELDER_RMD_KIND_ONCE && w.once_ymd == 0) {
-            ESP_LOGW(TAG, "提醒 #%u 是一次性规则但缺 once_date，将不会触发",
+            ESP_LOGW(TAG, "提醒 #%u 是一次性规则但缺 once_date，按每天处理",
                      (unsigned)sid);
         }
 
