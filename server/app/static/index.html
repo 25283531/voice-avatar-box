@@ -2753,7 +2753,10 @@ createApp({
     },
     stateName(s){ return ['待触发','已响铃','已确认','超时未确认','已跳过'][s] || '—'; },
     stateClass(s){ return s===2?'ok':(s===3?'bad':(s===1?'warn':'')); },
-    methodName(m){ return ['—','语音','按键','手机端','自动'][m] || '—'; }
+    /* 2026-10-27 两档置信度：语音确认=半置信（还要按键复核），
+       语音+按键=全置信。5 是 ConfirmMethod.VOICE_AND_BUTTON，
+       由服务端把同一条的 VOICE 与 BUTTON 两次回执合并得到。 */
+    methodName(m){ return ['—','语音确认','按键','手机端','自动','语音+按键确认'][m] || '—'; }
   },
   watch:{
     curDeviceId(){ this.loadReminders(); },

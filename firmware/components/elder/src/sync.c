@@ -786,6 +786,17 @@ void elder_sync_on_reminder_state(const elder_rmd_item_t *item, elder_rmd_state_
                                  "confirmed");
         elder_sync_report_interaction(ELDER_IT_REMINDER_CONFIRM, 0);
         break;
+    case ELDER_RMD_HALF_CONFIRMED:
+        /* 语音确认（半置信）：照样上报 CONFIRMED + method=VOICE，服务端据此
+         * 显示「语音确认」；老人随后按按钮复核时再报一条 method=BUTTON，
+         * 服务端把同一条 (reminder_id, due_at) 升级成「语音+按键确认」。
+         *
+         * **不报 ELDER_IT_REMINDER_CONFIRM 埋点**：这一条最终会由按键确认
+         * 再走一遍上面那个 case，两处都报会让 stats 的今日确认数翻倍
+         * （虚高 = 子女端看到的依从率是假的）。 */
+        elder_sync_enqueue_event(sid, due, ELDER_EV_CONFIRMED, ELDER_CFM_VOICE,
+                                 "voice-confirmed(half)");
+        break;
     case ELDER_RMD_ESCALATED:
         elder_sync_enqueue_event(sid, due, ELDER_EV_MISSED, ELDER_CFM_NONE, "timeout");
         elder_sync_report_interaction(ELDER_IT_REMINDER_MISS, 0);

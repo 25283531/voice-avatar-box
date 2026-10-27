@@ -35,7 +35,23 @@ typedef enum {
     /* 过期作废：到点时设备已离线/断电太久（> ELDER_RMD_STALE_MIN 分钟），
      * 不再补响。语义对齐服务端 EventState.SKIPPED(4)——「不算待服药，
      * 也不算漏服」。加这个状态是为了堵住「校时后第一个 tick 就谎报漏服」。 */
-    ELDER_RMD_SKIPPED
+    ELDER_RMD_SKIPPED,
+    /* 半置信：老人用**语音**说了「我吃过了」，但还没按按钮复核。
+     *
+     * 2026-10-27 用户定义：语音确认 = 半置信（APP/网页显示「语音确认」），
+     * 语音 + 按钮 = 全置信（「语音+按键确认」）。语音识别会错，所以语音这一声
+     * 只能记下来，不能当完成。
+     *
+     * ⚠️ 语义上它**仍然是"待确认"**：done_today 不置位、闪灯节奏不停、
+     *    #1 继续橙色呼吸催人去按按钮。所以 has_pending_confirm() /
+     *    has_pending_medicine() / elder_reminder_first_ringing() 三个判据
+     *    都必须包含它 —— 漏掉任何一个，老人被提示"请按按钮"、按下去却
+     *    提示"没有待确认的提醒"，这是最难解释的一类 bug。
+     *
+     * 为什么追加在末尾而不是插在 PENDING 后面：这个值会经
+     * elder_sync_on_reminder_state() 映射上报，也参与日志与界面判断，
+     * 中间插入等于给所有既有取值重新编号。 */
+    ELDER_RMD_HALF_CONFIRMED
 } elder_rmd_state_t;
 
 typedef enum {

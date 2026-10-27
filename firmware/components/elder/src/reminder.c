@@ -1,6 +1,13 @@
 #include "elder_reminder.h"
 #include "elder_rgb.h"
 #include "elder_ui.h"
+/* 确认方式（ELDER_CFM_VOICE / ELDER_CFM_BUTTON …）的**唯一真源**在
+ * elder_sync.h 的 elder_confirm_method_t。这里原来有一份本地
+ * `#define ELDER_CFM_BUTTON_NUM 2` 兜着，理由是"不想让提醒引擎依赖同步层"，
+ * 代价是同一个枚举两处定义 —— 2026-10-27 加「语音确认=半置信」时，
+ * 本地那份没有 VOICE，编译才发现。直接 include 更省事：elder_sync.h 本身
+ * 已经 include elder_reminder.h，头文件保护能挡住循环。 */
+#include "elder_sync.h"
 
 #include "nvs.h"
 #include "nvs_flash.h"
@@ -31,9 +38,6 @@ static const char *TAG = "elder.reminder";
  * 取 60 分钟：比 15 分钟升级阈值宽，能容纳「重启/短暂断网后几分钟内补响」；
  * 又短到不会把半天前的提醒翻出来。 */
 #define ELDER_RMD_STALE_MIN     60
-
-/* 确认方式默认值（数值与 elder_sync.h 的 elder_confirm_method_t 一致） */
-#define ELDER_CFM_BUTTON_NUM 2
 
 static struct {
     elder_rmd_table_t table;
@@ -302,8 +306,10 @@ static bool has_pending_confirm(void)
     for (int i = 0; i < g.table.count && i < ELDER_REMINDER_MAX; i++) {
         if (!g.table.items[i].enabled) continue;
         uint8_t st = g.state[i];
+        /* HALF_CONFIRMED（语音说过、没按按钮）也算"还要人管"：
+         * #1 得继续橙色呼吸催他去按按钮。见 elder_reminder.h 的枚举注释。 */
         if (st == ELDER_RMD_PENDING || st == ELDER_RMD_CONFIRM_WIN ||
-            st == ELDER_RMD_ESCALATED) {
+            st == ELDER_RMD_ESCALATED || st == ELDER_RMD_HALF_CONFIRMED) {
             return true;
         }
     }
@@ -321,7 +327,8 @@ static void set_state(int idx, elder_rmd_state_t st)
              st == ELDER_RMD_CONFIRM_WIN ? "CONFIRM_WIN" :
              st == ELDER_RMD_DONE ? "DONE" :
              st == ELDER_RMD_ESCALATED ? "ESCALATED" :
-             st == ELDER_RMD_SKIPPED ? "SKIPPED" : "IDLE");
+             st == ELDER_RMD_SKIPPED ? "SKIPPED" :
+             st == ELDER_RMD_HALF_CONFIRMED ? "HALF(语音已记，待按键复核)" : "IDLE");
 
     /* 需求 8（2026-10-22 用户拍板，**覆盖**原「需求 11 红灯长亮」）：
      *
@@ -348,7 +355,10 @@ static void set_state(int idx, elder_rmd_state_t st)
     if (st == ELDER_RMD_DONE) {
         g.table.done_today |= (1u << idx);
         g.table.pending_today &= ~(1u << idx);
-    } else if (st == ELDER_RMD_PENDING || st == ELDER_RMD_ESCALATED) {
+    } else if (st == ELDER_RMD_PENDING || st == ELDER_RMD_ESCALATED ||
+               st == ELDER_RMD_HALF_CONFIRMED) {
+        /* HALF 仍然是待办：服务端/子女端看到的应该是「还没完成」，
+         * 只是多了一条"老人说办完了"的记录。 */
         g.table.pending_today |= (1u << idx);
         g.table.done_today &= ~(1u << idx);
     } else if (st == ELDER_RMD_SKIPPED) {
@@ -932,7 +942,7 @@ esp_err_t elder_reminder_list(const elder_rmd_table_t **out)
 
 esp_err_t elder_reminder_confirm(uint8_t id)
 {
-    return elder_reminder_confirm_ex(id, ELDER_CFM_BUTTON_NUM);
+    return elder_reminder_confirm_ex(id, ELDER_CFM_BUTTON);
 }
 
 esp_err_t elder_reminder_confirm_ex(uint8_t id, uint8_t confirm_method)
@@ -942,7 +952,20 @@ esp_err_t elder_reminder_confirm_ex(uint8_t id, uint8_t confirm_method)
      * 那时 sync 层要能读到正确的确认方式。 */
     g.last_confirm_method = confirm_method;
     g.confirm_deadline_us[id] = 0;
-    set_state(id, ELDER_RMD_DONE);
+
+    /* 语音确认 = **半置信**，进 HALF 而不是 DONE（2026-10-27 用户定义）。
+     *
+     * 为什么不能直接置 DONE：
+     *   ① 按键复核再也找不到目标 —— first_ringing() 只认待确认集合，
+     *      于是"语音确认后提示按按钮、按下去却提示没有待确认的提醒"；
+     *   ② 服务端只会收到一条 method=VOICE 的回执，永远升不到
+     *      「语音+按键确认」（全置信）。
+     * 按键/APP 确认本身就是"人在场"的证据，直接 DONE。 */
+    if (confirm_method == ELDER_CFM_VOICE) {
+        set_state(id, ELDER_RMD_HALF_CONFIRMED);
+    } else {
+        set_state(id, ELDER_RMD_DONE);
+    }
     elder_reminder_flush();
     return ESP_OK;
 }
@@ -967,7 +990,8 @@ bool elder_reminder_has_pending_medicine(void)
         if (!g.table.items[i].enabled) continue;
         if (g.state[i] == ELDER_RMD_PENDING ||
             g.state[i] == ELDER_RMD_CONFIRM_WIN ||
-            g.state[i] == ELDER_RMD_ESCALATED) {
+            g.state[i] == ELDER_RMD_ESCALATED ||
+            g.state[i] == ELDER_RMD_HALF_CONFIRMED) {
             return true;
         }
     }
@@ -998,7 +1022,8 @@ int elder_reminder_first_ringing(void)
         if (!g.table.items[i].enabled) continue;
         if (g.state[i] != ELDER_RMD_PENDING &&
             g.state[i] != ELDER_RMD_CONFIRM_WIN &&
-            g.state[i] != ELDER_RMD_ESCALATED) {
+            g.state[i] != ELDER_RMD_ESCALATED &&
+            g.state[i] != ELDER_RMD_HALF_CONFIRMED) {
             continue;
         }
         /* 严格大于：fired_due_at 相等（同一分钟触发的两条）时保留下标

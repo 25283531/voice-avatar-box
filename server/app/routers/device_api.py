@@ -29,7 +29,7 @@ from ..deps import get_current_device
 from ..llm_gateway import resolve_row
 from ..chat_quota import quota_snapshot
 from ..model_catalog import DEVICE_KINDS, KIND_LLM
-from ..models import EventState, Interaction, ReminderEvent, utcnow
+from ..models import ConfirmMethod, EventState, Interaction, ReminderEvent, utcnow
 from ..schedule import (TZ_MARGIN, event_due_utc, local_now, materialize_events,
                         next_occurrence)
 from ..schemas import (
@@ -355,7 +355,23 @@ def report_event(payload: EventReportIn, db: Session = Depends(get_db),
         ev.device_id = dev.id
 
     ev.state = payload.state
-    ev.confirm_method = payload.confirm_method
+    # 语音确认 = 半置信，按键确认 = 全置信（2026-10-27 用户定义）。
+    # 同一条提醒实例设备会报两次：先 method=VOICE（老人说「我吃过了」），
+    # 再 method=BUTTON（长按 3 秒复核）。这里把"先语音、后按键"合并成
+    # VOICE_AND_BUTTON(5)，而不是让后到的直接覆盖：
+    #   * 覆盖 ⇒ 子女端只看到「按键确认」，丢掉"语音也确认过"这个事实，
+    #     也看不出老人是"自己说的"还是"被催着按的"；
+    #   * 反过来（先按键、后语音）保持 BUTTON：按键已是全置信，不该被降级。
+    _method = payload.confirm_method
+    if (
+        payload.state == int(EventState.CONFIRMED)
+        and _method == int(ConfirmMethod.BUTTON)
+        and ev.confirm_method == int(ConfirmMethod.VOICE)
+    ):
+        _method = int(ConfirmMethod.VOICE_AND_BUTTON)
+        if not ev.note:
+            ev.note = "语音确认后半置信，按键复核"
+    ev.confirm_method = _method
     if payload.fired_at:
         ev.fired_at = payload.fired_at
         ev.fired_count = (ev.fired_count or 0) + 1

@@ -511,13 +511,21 @@ class ReminderType(IntEnum):
 
 
 class ConfirmMethod(IntEnum):
-    """确认方式。"""
+    """确认方式。
+
+    2026-10-27 新增 ``VOICE_AND_BUTTON``：用户把确认分成两档置信度 ——
+    语音确认 = **半置信**（识别可能出错，只记下），语音 + 按键 = **全置信**。
+    设备会分两次上报同一条 ``(reminder_id, due_at)``：先 VOICE，后 BUTTON，
+    由 ``device_api.report_event`` 合并成 5。**必须是追加值**：0~4 已经在
+    存量数据库里，重新编号会让历史数据的含义整体漂移。
+    """
 
     NONE = 0
-    VOICE = 1      # 语音关键词（离线命令词）
+    VOICE = 1      # 语音关键词（离线命令词）—— 半置信
     BUTTON = 2     # 物理按键长按 3s + 30s 内短按
     APP = 3        # 手机端代确认
     AUTO = 4       # 超时自动确认（不建议用于服药）
+    VOICE_AND_BUTTON = 5   # 语音 + 按键复核 —— 全置信
 
 
 class Reminder(Base):
