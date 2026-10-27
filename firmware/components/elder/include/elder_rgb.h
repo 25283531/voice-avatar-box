@@ -12,7 +12,8 @@ extern "C" {
 /*
  * RGB 灯效优先级仲裁器
  *
- * 灯带共 9 颗（见 elder_board.h 的 ELDER_RGB_LEDS）：
+ * 灯带共 9 颗**受控**（见 elder_board.h 的 ELDER_RGB_LEDS；物理上是 20 颗，
+ * #10~#20 每帧显式写 0 保持熄灭，见 ELDER_RGB_CHAIN）：
  *   #1       按键指示灯（独立状态机，见本文件下半部分）
  *   #2 ~ #9  对话/提醒灯效（本文件上半部分）
  *
@@ -58,7 +59,8 @@ typedef enum {
  */
 typedef enum {
     ELDER_RGB_UI_IDLE = 0,   /* 待机：天蓝 #87CEFA，30% 亮度，呼吸 */
-    ELDER_RGB_UI_LISTENING,  /* 唤醒后收听：蓝 #0000FF，100%，常亮 */
+    ELDER_RGB_UI_LISTENING,  /* 唤醒后收听：深天蓝 #00BFFF，55%，常亮 */
+                             /* （原 #0000FF/100%，2026-10-27 用户实报刺眼） */
     ELDER_RGB_UI_CONNECTING, /* 数据上传/等回复：五彩流水，80% */
     ELDER_RGB_UI_SPEAKING    /* TTS 输出：深橙 #FF8C00，100%，常亮 */
 } elder_rgb_ui_t;

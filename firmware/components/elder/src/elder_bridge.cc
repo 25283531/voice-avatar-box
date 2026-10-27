@@ -367,41 +367,32 @@ void OnReminder(const elder_rmd_item_t *item, elder_rmd_state_t st, void *ctx)
 
 /* ---------------------------------------------------------------- 按键 */
 
-/* 找第一条「今天还没确认」的提醒。**正在响铃的优先**，其次服药优先。
- * 返回下标，没有则 -1。抽成函数的原因：短按直接确认、长按挂窗口、
- * 语音确认三条路必须用**同一套判据**，否则会出现「长按能确认、短按确认到
- * 别的条」这种对不上的行为。
+/* 找「此刻正在等确认」的那条提醒。返回下标，没有则 -1。
+ * 抽成函数的原因：短按直接确认、长按确认、语音确认三条路必须用**同一套判据**，
+ * 否则会出现「长按能确认、短按确认到别的条」这种对不上的行为。
  *
  * 2026-10-22 需求 8 把它从"只看服药"扩展到"任意提醒"：
  * 现在日程提醒也会全屏显示并要求"语音/按键确认完成"，判据若仍只认服药，
  * 老人对日程说「做完了」会被回一句"没有待确认的提醒"。
  *
  * 2026-10-22 用户实报 bug（喝水提醒响铃时说「弄好了」，确认记到了吃药
- * 提醒上）：根因是下面的循环"见到第一条服药就返回"，正在响铃的日程
- * 提醒永远选不中。所以现在的优先级是：
- *   ① 先问 elder_reminder_first_ringing()：此刻有提醒在响就确认它
- *      （fired_due_at 最大 = 最近触发的那条，正是老人刚回应的那条）；
- *   ② 都没有在响时，才退回服药优先启发式 —— 两条都待确认时确认药那一条
- *      （药漏了是真事故，日程漏了不是），不动老行为。 */
+ * 提醒上）：根因是"见到第一条服药就返回"，正在响铃的日程提醒永远选不中。
+ * 所以目标只能是 elder_reminder_first_ringing()：状态在
+ * PENDING / CONFIRM_WIN / ESCALATED 且 enabled 的那条，多条时取
+ * fired_due_at 最大（最近触发）的一条 —— 老人回应的就是刚响的那条。
+ *
+ * 2026-10-27 删掉了原来的「兜底」分支（原逻辑：没有在响的，就退回
+ * "任意 enabled 且今天没确认过的"，服药优先）。两个真机后果：
+ *   ① 老人长按 3 秒，灯闪了"成功"，可 #1 从来没亮过橙色呼吸 ——
+ *      因为确认走的是兜底分支，而 #1 的"待确认"判据只认 PENDING 集合。
+ *      用户原话：「现在没有了长按颜色渐变的过程，只有长按 3 秒之后
+ *      显示一次深蓝绿色」。灯和行为各说各话，比不亮更糟。
+ *   ② 兜底会确认**还没到点**的提醒：上午 10 点按一下，就能把晚上的药
+ *      标成"已完成"。对一个吃药的老人，这是真事故，不是小瑕疵。
+ *   ⇒ 只认"正在等确认"，没有就明确地什么都不做。 */
 int FirstUndoneReminder()
 {
-    int ringing = elder_reminder_first_ringing();
-    if (ringing >= 0) return ringing;
-
-    const elder_rmd_table_t *tbl = nullptr;
-    if (elder_reminder_list(&tbl) != ESP_OK || tbl == nullptr) {
-        return -1;
-    }
-    int fallback = -1;
-    for (uint8_t i = 0; i < tbl->count && i < ELDER_REMINDER_MAX; i++) {
-        if (!tbl->items[i].enabled) continue;
-        if (tbl->done_today & (1u << i)) continue;   /* 已完成的不必再确认 */
-        if (tbl->items[i].type == ELDER_RMD_TYPE_MEDICINE) {
-            return (int)i;                            /* 服药优先，见到就返回 */
-        }
-        if (fallback < 0) fallback = (int)i;
-    }
-    return fallback;
+    return elder_reminder_first_ringing();
 }
 
 /* method 区分「按键确认」与「语音确认」（ELDER_CFM_BUTTON / ELDER_CFM_VOICE）。

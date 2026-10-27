@@ -88,6 +88,21 @@ static void BootDiagInit() {
     ESP_LOGW("BootDiag", "复位原因=%s 累计启动=%u 次 最小空闲堆=%u 字节",
              s_reset_reason, (unsigned)s_boot_count,
              (unsigned)esp_get_minimum_free_heap_size());
+
+    /* NVS 余量：2026-10-27 语音调音量重启的现场是
+     *   nvs_open("audio", RW) 失败 → 句柄 0 → nvs_set_i32 返回 0x1107 → abort。
+     * 本工程 nvs 分区只有 0x4000（16KB，3 个可用页），而 elder 的提醒表
+     * （~1KB 一条 blob）每次状态变化都整块重写，最容易把页吃干净。
+     * 这行日志是判断"NVS 是否已满"的唯一直接证据，别删。 */
+    nvs_stats_t st;
+    if (nvs_get_stats(NULL, &st) == ESP_OK) {
+        ESP_LOGW("BootDiag", "NVS: 已用 %u / 共 %u 条，可用 %u 条，命名空间 %u 个"
+                             "（可用条数长期 <20 就该扩容 nvs 分区）",
+                 (unsigned)st.used_entries, (unsigned)st.total_entries,
+                 (unsigned)st.available_entries, (unsigned)st.namespace_count);
+    } else {
+        ESP_LOGE("BootDiag", "nvs_get_stats 失败：NVS 分区可能未初始化");
+    }
 }
 
 
@@ -717,7 +732,20 @@ void Application::MainEventLoop() {
             clock_ticks_++;
             auto display = Board::GetInstance().GetDisplay();
             display->UpdateStatusBar();
-        
+
+            /* 待机 25 秒后清掉屏幕下方的最后一句答复文字（2026-10-27 用户要求：
+             * 「待机状态下不要显示图标下部最后一次的答复文字」）。
+             *
+             * 为什么不是"一进 idle 就清"：2026-10-20 真机事故就是这么修的
+             * —— 音频通道一关立刻清空，老人说完话抬头看屏幕时字幕已经没了，
+             * 现象是"两侧代码都通、屏幕上却没有字幕"。所以保留 25 秒：
+             * 刚说完的这段时间老人能看，进入真正的待机态就干净。
+             * clock_ticks_ 在 SetDeviceState() 里清零 ⇒ 每次进入 idle 只会
+             * 命中一次 25，不需要额外状态位。 */
+            if (device_state_ == kDeviceStateIdle && clock_ticks_ == 25) {
+                display->SetChatMessage("system", "");
+            }
+
             // Print the debug info every 10 seconds
             if (clock_ticks_ % 10 == 0) {
                 // SystemInfo::PrintTaskCpuUsage(pdMS_TO_TICKS(1000));

@@ -46,7 +46,17 @@ typedef struct {
 /* ---- 对话四态的取值（2026-10-27 用户指定，改数字 = 改产品观感） ---- */
 #define ELDER_UI_COLOR_IDLE      0x87CEFAu  /* 天蓝 */
 #define ELDER_UI_LEVEL_IDLE      77         /* 30% of 255 */
-#define ELDER_UI_COLOR_LISTENING 0x0000FFu  /* 纯蓝 */
+/* 收听态：**不是**纯蓝 #0000FF 100%（2026-10-27 用户实报"过于刺眼"）。
+ *
+ * 为什么纯蓝最刺眼：蓝光波长短、在暗环境里散射强，老人晶状体黄化后
+ * 对短波更敏感；而 #0000FF 只有蓝通道满驱，另外两个通道为 0，
+ * 观感是"发紫的高亮针尖"，眩光强但显色极差。
+ * 换成深天蓝 #00BFFF（青味蓝）+ 55% 亮度：加进来的绿通道把峰值能量摊开，
+ * 视觉上仍是"蓝色 = 正在听"，刺眼感约降到三分之一，且和待机的
+ * 浅天蓝 #87CEFA 靠"更饱和、更亮"区分开（不会看混）。
+ * 要再暗一档就调 ELDER_UI_LEVEL_LISTENING，别改色相 —— 色相是语义。 */
+#define ELDER_UI_COLOR_LISTENING 0x00BFFFu  /* 深天蓝 */
+#define ELDER_UI_LEVEL_LISTENING 140        /* 55% of 255 */
 #define ELDER_UI_COLOR_SPEAKING  0xFF8C00u  /* 深橙 */
 #define ELDER_UI_LEVEL_FLOW      204        /* 80% of 255 */
 #define ELDER_UI_FULL_LEVEL      255        /* 100% */
@@ -65,10 +75,22 @@ typedef struct {
 #define ELDER_RGB_BTN_OK_COLOR      0x00CED1u  /* 深蓝绿：确认完成 */
 #define ELDER_RGB_BTN_FAIL_COLOR    0xFF1493u  /* 深粉红：中途松开没确认 */
 #define ELDER_RGB_BTN_BREATH_MS     3000u      /* 吸引注意的呼吸周期 */
-#define ELDER_RGB_BTN_FLASH_ON_MS   200u       /* 亮 200ms / 灭 200ms： */
-#define ELDER_RGB_BTN_FLASH_OFF_MS  200u       /* 慢到老人看得清次数 */
+/* 亮 250ms / 灭 250ms：慢到老人看得清次数，一次结果共 1.25s（3 次）/
+ * 2.5s（5 次）。再快就数不清，再慢就以为灯坏了。 */
+#define ELDER_RGB_BTN_FLASH_ON_MS   250u
+#define ELDER_RGB_BTN_FLASH_OFF_MS  250u
 #define ELDER_RGB_BTN_OK_TIMES      3
 #define ELDER_RGB_BTN_FAIL_TIMES    5
+/* 单次"动画步进"的时间上限（ms）。
+ *
+ * 闪烁用的是**渲染时钟**而不是墙上时钟，这是 2026-10-27 真机事故的直接产物：
+ *   老人长按 3 秒确认 → elder_bridge 立刻把回执入队 → elder_sync 开始
+ *   HTTPS 上传，TLS 握手实测占用 1.6 秒；rgb_task 优先级只有 5，在这 1.6 秒里
+ *   **一帧都没跑**。而闪烁窗口按墙上时钟算只有 1.2 秒 —— 等 CPU 回来，
+ *   窗口早就过期了，老人只看到"闪了一下深蓝绿"（用户原话）。
+ *   ⇒ 把每步最多算 50ms：被饿死时动画就地**暂停**，CPU 回来接着放完，
+ *     3 次就是 3 次，不会因为系统忙而少闪。 */
+#define ELDER_RGB_ANIM_MAX_STEP_MS  50u
 
 /* #1 的四个状态（互斥） */
 typedef enum {
@@ -81,8 +103,11 @@ typedef enum {
 static struct {
     rmt_channel_handle_t  chan;
     rmt_encoder_handle_t  enc;
-    uint8_t               pixels[ELDER_RGB_LEDS * 3];
-    uint8_t               last[ELDER_RGB_LEDS * 3];   /* 上一帧，用于"没变就不发" */
+    /* 缓冲区按**灯带真实颗数**开（20 颗 = 60 字节），不是受控颗数。
+     * #10~#20 每帧显式写 0，否则它们的锁存器会停在开机随机态常亮，
+     * 见 elder_board.h 的 ELDER_RGB_CHAIN。 */
+    uint8_t               pixels[ELDER_RGB_CHAIN * 3];
+    uint8_t               last[ELDER_RGB_CHAIN * 3];  /* 上一帧，用于"没变就不发" */
     bool                  last_valid;
     SemaphoreHandle_t     lock;
     TaskHandle_t          task;
@@ -97,10 +122,12 @@ static struct {
     btn_mode_t            btn_mode;
     bool                  btn_pending;    /* 存在待确认提醒（吸引注意态的真源） */
     bool                  btn_resolved;   /* 本轮按下已经出过结果，别再重复反馈 */
-    uint32_t              btn_phase_ms;   /* 呼吸/渐变的相位起点 */
-    uint32_t              btn_flash_start_ms;
+    uint32_t              btn_phase_ms;   /* 呼吸/渐变的相位起点（墙上时钟） */
+    uint32_t              btn_flash_start_ms;  /* 闪烁起点（**渲染时钟**） */
     uint32_t              btn_flash_color;
     uint8_t               btn_flash_times;
+    uint32_t              btn_anim_ms;    /* 渲染时钟：只在真的渲染时前进 */
+    uint32_t              btn_last_step_ms; /* 上次步进时的墙上时钟，用于算 dt */
 } g;
 
 static uint32_t now_ms(void)
@@ -213,21 +240,45 @@ static uint32_t fx_pixel(const slot_t *s, uint32_t t_ms, int led_idx)
  *
  * 全部在 g.lock 保护下调用（btn_step 会改 g.btn_mode）。 */
 
-static void btn_enter_flash(uint32_t t_ms, uint32_t color, uint8_t times)
+static void btn_enter_flash(uint32_t color, uint8_t times)
 {
     g.btn_mode = BTN_FLASH;
-    g.btn_flash_start_ms = t_ms;
+    /* 起点用**渲染时钟**（g.btn_anim_ms），不是 now_ms()：
+     * 这样"系统忙、rgb_task 被饿死"只会让闪烁暂停，不会让它过期。
+     * 详见 ELDER_RGB_ANIM_MAX_STEP_MS 的注释。 */
+    g.btn_flash_start_ms = g.btn_anim_ms;
     g.btn_flash_color = color;
     g.btn_flash_times = times;
     g.btn_resolved = true;   /* 这一轮已经有结果了，松开时不能再补一次粉色闪 */
+    ESP_LOGI(TAG, "按键结果灯：%s，闪 %u 次（每次 %ums 亮 / %ums 灭）",
+             (color == ELDER_RGB_BTN_OK_COLOR) ? "成功（深蓝绿）" : "未完成（深粉红）",
+             (unsigned)times,
+             (unsigned)ELDER_RGB_BTN_FLASH_ON_MS,
+             (unsigned)ELDER_RGB_BTN_FLASH_OFF_MS);
+}
+
+/* 推进渲染时钟：dt 取两次步进之间的真实间隔，单步封顶 ELDER_RGB_ANIM_MAX_STEP_MS。
+ * 必须**在每帧调用一次**（btn_step 的第一句），且只在 g.lock 内跑。 */
+static void btn_anim_advance(uint32_t t_ms)
+{
+    if (g.btn_last_step_ms == 0u) {   /* 第一次：只记基准，不加时间 */
+        g.btn_last_step_ms = t_ms;
+        return;
+    }
+    uint32_t dt = t_ms - g.btn_last_step_ms;
+    g.btn_last_step_ms = t_ms;
+    if (dt > ELDER_RGB_ANIM_MAX_STEP_MS) dt = ELDER_RGB_ANIM_MAX_STEP_MS;
+    g.btn_anim_ms += dt;
 }
 
 static uint32_t btn_step(uint32_t t_ms)
 {
+    btn_anim_advance(t_ms);
+
     /* 闪烁放完 → 有待确认就继续吸引注意，否则熄灭 */
     if (g.btn_mode == BTN_FLASH) {
         uint32_t period = ELDER_RGB_BTN_FLASH_ON_MS + ELDER_RGB_BTN_FLASH_OFF_MS;
-        if ((t_ms - g.btn_flash_start_ms) >= (uint32_t)g.btn_flash_times * period) {
+        if ((g.btn_anim_ms - g.btn_flash_start_ms) >= (uint32_t)g.btn_flash_times * period) {
             g.btn_mode = g.btn_pending ? BTN_ATTRACT : BTN_OFF;
             g.btn_phase_ms = t_ms;
             g.btn_resolved = false;
@@ -243,13 +294,16 @@ static uint32_t btn_step(uint32_t t_ms)
         return scale_color(ELDER_RGB_BTN_ATTRACT_COLOR, lvl);
     }
     case BTN_GRADIENT:
-        /* 进度条语义：3 秒走完，走完就是最深绿 */
+        /* 进度条语义：3 秒走完，走完就是最深绿。
+         * 这里**必须**用墙上时钟：它要和 input.c 判"按住够 3 秒"的时长
+         * 严格对齐，动画时钟一旦落后，灯还在浅绿、按键却已经算确认了
+         * —— 灯在骗人。 */
         return lerp_color(ELDER_RGB_BTN_GRAD_FROM, ELDER_RGB_BTN_GRAD_TO,
                           t_ms - g.btn_phase_ms,
                           (uint32_t)ELDER_BTN_CONFIRM_HOLD_MS);
     case BTN_FLASH: {
         uint32_t period = ELDER_RGB_BTN_FLASH_ON_MS + ELDER_RGB_BTN_FLASH_OFF_MS;
-        uint32_t el = t_ms - g.btn_flash_start_ms;
+        uint32_t el = g.btn_anim_ms - g.btn_flash_start_ms;
         return ((el % period) < ELDER_RGB_BTN_FLASH_ON_MS) ? g.btn_flash_color : 0u;
     }
     case BTN_OFF:
@@ -261,7 +315,12 @@ static uint32_t btn_step(uint32_t t_ms)
 /* ---------------- 帧渲染 ---------------- */
 
 /* #1 = 按键指示灯，其余 = 灯效。两路分开写，互不覆盖。
- * WS2812 为 GRB 顺序，别按 RGB 顺序写（写错的表现是红蓝互换）。 */
+ * WS2812 为 GRB 顺序，别按 RGB 顺序写（写错的表现是红蓝互换）。
+ *
+ * 循环写满**整条灯带**（ELDER_RGB_CHAIN = 20 颗），其中 #10~#20 一律写 0：
+ * 只发前 9 颗的数据时，后面 11 颗收不到任何比特，锁存器停在开机随机态，
+ * 真机表现是低亮度白色常亮（2026-10-27 用户实报）。显式写 0 是唯一的办法
+ * —— 没被寻址过的灯珠不会自己熄灭。 */
 static void render_frame(const slot_t *fx, bool has_nag, uint32_t nag_color,
                          uint32_t t_ms, uint32_t btn)
 {
@@ -269,13 +328,15 @@ static void render_frame(const slot_t *fx, bool has_nag, uint32_t nag_color,
     g.pixels[1] = (uint8_t)((btn >> 16) & 0xFFu);
     g.pixels[2] = (uint8_t)(btn & 0xFFu);
 
-    for (int i = 1; i < ELDER_RGB_LEDS; i++) {
+    for (int i = 1; i < ELDER_RGB_CHAIN; i++) {
         uint32_t c = 0u;
-        if (has_nag) {
-            c = nag_color;            /* 提醒闪灯整条一起闪 */
-        } else if (fx) {
-            c = fx_pixel(fx, t_ms, i);
-        }
+        if (i < ELDER_RGB_LEDS) {          /* 受控段：#2~#9 */
+            if (has_nag) {
+                c = nag_color;             /* 提醒闪灯整条一起闪 */
+            } else if (fx) {
+                c = fx_pixel(fx, t_ms, i);
+            }
+        }                                      /* #10~#20 保持 0 */
         g.pixels[i * 3 + 0] = (uint8_t)((c >> 8) & 0xFFu);
         g.pixels[i * 3 + 1] = (uint8_t)((c >> 16) & 0xFFu);
         g.pixels[i * 3 + 2] = (uint8_t)(c & 0xFFu);
@@ -356,13 +417,30 @@ esp_err_t elder_rgb_init(void)
     rmt_tx_channel_config_t ch = {
         .clk_src = RMT_CLK_SRC_DEFAULT,
         .gpio_num = ELDER_RGB_GPIO,
-        .mem_block_symbols = 64,
+        /* 一次申请**整组** RMT 内存（8 通道 × 48 字 = 384 符号）。
+         *
+         * 为什么要这么多：一帧要发 20 颗 = 60 字节 = 480 个符号，
+         * 而单块只有 48 符号。原来 mem_block_symbols=64 时驱动按 48 符号
+         * 一块流式发送，480 符号要补块 9 次，每次都必须在 4.8µs 内补上
+         * （10MHz 下 48 符号就是 4.8µs）；补块由 RMT 中断完成，只要有一次
+         * 被更高优先级中断拖住超过 50µs，灯珠就把断流当成复位，后半段颜色
+         * 不再更新。申请 384 之后只剩 1 次补块，风险降到最低。
+         * 本工程没有别的东西用 RMT（无红外、无第二路灯带），整组拿走安全。 */
+        .mem_block_symbols = 384,
         .resolution_hz = 10 * 1000 * 1000,   /* 10MHz → 100ns/符号 */
         .trans_queue_depth = 4,
         .flags.invert_out = false,
         .flags.with_dma = false,
     };
-    ESP_ERROR_CHECK(rmt_new_tx_channel(&ch, &g.chan));
+    esp_err_t ch_err = rmt_new_tx_channel(&ch, &g.chan);
+    if (ch_err != ESP_OK) {
+        /* 整组申请失败（例如将来有人加了第二路 RMT 设备）不能直接死：
+         * 退回 48 符号分块流式发送，功能照旧，只是补块次数多。 */
+        ESP_LOGW(TAG, "整组 RMT 内存申请失败(%s)，退回 64 符号分块流式发送",
+                 esp_err_to_name(ch_err));
+        ch.mem_block_symbols = 64;
+        ESP_ERROR_CHECK(rmt_new_tx_channel(&ch, &g.chan));
+    }
 
     rmt_bytes_encoder_config_t enc = {
         .bit0 = {.level0 = 1, .duration0 = WS2812_T0H_NS / 100,
@@ -381,8 +459,10 @@ esp_err_t elder_rgb_init(void)
     g.ready = true;
 
     xTaskCreatePinnedToCore(rgb_task, "elder_rgb", 3072, NULL, 5, &g.task, 1);
-    ESP_LOGI(TAG, "WS2812 ready on GPIO%d, %d LED(s)：#1 按键指示灯，#2~#%d 灯效",
-             ELDER_RGB_GPIO, ELDER_RGB_LEDS, ELDER_RGB_LEDS);
+    ESP_LOGI(TAG, "WS2812 ready on GPIO%d，灯带 %d 颗（受控 %d 颗）："
+                  "#1 按键指示灯，#2~#%d 灯效，#%d~#%d 恒灭",
+             ELDER_RGB_GPIO, ELDER_RGB_CHAIN, ELDER_RGB_LEDS,
+             ELDER_RGB_LEDS, ELDER_RGB_LEDS + 1, ELDER_RGB_CHAIN);
     return ESP_OK;
 }
 
@@ -440,7 +520,7 @@ void elder_rgb_set_ui_state(elder_rgb_ui_t st)
     switch (st) {
     case ELDER_RGB_UI_LISTENING:
         elder_rgb_request_ex(ELDER_RGB_PRIO_EMOTION, ELDER_FX_SOLID,
-                             ELDER_UI_COLOR_LISTENING, ELDER_UI_FULL_LEVEL, 0);
+                             ELDER_UI_COLOR_LISTENING, ELDER_UI_LEVEL_LISTENING, 0);
         break;
     case ELDER_RGB_UI_CONNECTING:
         /* 五彩流水：颜色由 fx 自己按色相算，这里的 color 参数不用 */
@@ -549,7 +629,7 @@ void elder_rgb_button_release(void)
     if (g.btn_mode == BTN_GRADIENT) {
         if (!g.btn_resolved) {
             /* 渐变还没走完就松手 ⇒ 没完成确认 */
-            btn_enter_flash(t_ms, ELDER_RGB_BTN_FAIL_COLOR, ELDER_RGB_BTN_FAIL_TIMES);
+            btn_enter_flash(ELDER_RGB_BTN_FAIL_COLOR, ELDER_RGB_BTN_FAIL_TIMES);
         } else {
             g.btn_mode = g.btn_pending ? BTN_ATTRACT : BTN_OFF;
             g.btn_phase_ms = t_ms;
@@ -561,10 +641,9 @@ void elder_rgb_button_release(void)
 void elder_rgb_button_confirmed(void)
 {
     if (!g.ready) return;
-    uint32_t t_ms = now_ms();
 
     xSemaphoreTake(g.lock, portMAX_DELAY);
-    btn_enter_flash(t_ms, ELDER_RGB_BTN_OK_COLOR, ELDER_RGB_BTN_OK_TIMES);
+    btn_enter_flash(ELDER_RGB_BTN_OK_COLOR, ELDER_RGB_BTN_OK_TIMES);
     xSemaphoreGive(g.lock);
 }
 
