@@ -66,7 +66,22 @@ void McpServer::AddCommonTools() {
         }), 
         [&board](const PropertyList& properties) -> ReturnValue {
             auto codec = board.GetAudioCodec();
-            codec->SetOutputVolume(properties["volume"].value<int>());
+            if (!codec) {
+                /* 没有 codec 的板子：如实报错，别让 LLM 以为调成了 */
+                throw std::runtime_error("no audio codec on this board");
+            }
+            /* 夹紧范围：模型给的数不总是 0~100（见过 150、"50%"）。
+             * Property 的 set_value 会挡掉越界，但这里是二次兜底 ——
+             * 真调到头/尾也只是音量到顶，不该变成一次异常。 */
+            int volume = properties["volume"].value<int>();
+            if (volume < 0) volume = 0;
+            if (volume > 100) volume = 100;
+            /* 这条日志是"语音调音量到底有没有走到固件"的唯一证据。
+             * 待机/收听时输出是关着的，音量会在下次 EnableOutput(true)
+             * 时由 BoxAudioCodec 补写（见那里的注释）。 */
+            ESP_LOGI(TAG, "set_volume -> %d（输出%s）", volume,
+                     codec->output_enabled() ? "已打开，立即生效" : "未打开，下次播放生效");
+            codec->SetOutputVolume(volume);
             return true;
         });
     
@@ -78,8 +93,14 @@ void McpServer::AddCommonTools() {
                 Property("brightness", kPropertyTypeInteger, 0, 100)
             }),
             [backlight](const PropertyList& properties) -> ReturnValue {
-                uint8_t brightness = static_cast<uint8_t>(properties["brightness"].value<int>());
-                backlight->SetBrightness(brightness, true);
+                int brightness = properties["brightness"].value<int>();
+                if (brightness < 0) brightness = 0;
+                if (brightness > 100) brightness = 100;
+                /* 同样留一行证据：语音调亮度到底有没有走到固件。
+                 * SetBrightness 内部用 LEDC 渐变（每 5ms 一步），
+                 * permanent=true 会落 NVS，重启后仍然记得。 */
+                ESP_LOGI(TAG, "set_brightness -> %d", brightness);
+                backlight->SetBrightness(static_cast<uint8_t>(brightness), true);
                 return true;
             });
     }

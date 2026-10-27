@@ -285,6 +285,31 @@ esp_err_t elder_reminder_flush(void)
 
 /* ---------------- 状态机 ---------------- */
 
+/* 「还有没有等着老人确认的提醒」—— #1 按键指示灯"吸引注意"态的唯一真源。
+ *
+ * 为什么服药和日程都算（用户 2026-10-27 原话是「有待确认的日程提醒（服药）」）：
+ *   本按键的功能就是"确认日程完成"，日程和服药走的是同一个确认入口
+ *   （elder_bridge.cc 的 FirstUndoneReminder）。只判 medicine 的话，
+ *   「喝水」提醒响着的时候 #1 不亮，老人根本不知道该按哪颗键 ——
+ *   而那正是他最需要提示的时刻。
+ *
+ * 状态集合与 elder_reminder_has_pending_medicine() / first_ringing() 保持一致：
+ * PENDING / CONFIRM_WIN / ESCALATED 三者都算"这一轮还没完结"，
+ * 且必须 enabled（停用的提醒不发声，也就不该亮灯催人）。
+ */
+static bool has_pending_confirm(void)
+{
+    for (int i = 0; i < g.table.count && i < ELDER_REMINDER_MAX; i++) {
+        if (!g.table.items[i].enabled) continue;
+        uint8_t st = g.state[i];
+        if (st == ELDER_RMD_PENDING || st == ELDER_RMD_CONFIRM_WIN ||
+            st == ELDER_RMD_ESCALATED) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static void set_state(int idx, elder_rmd_state_t st)
 {
     if (idx < 0 || idx >= ELDER_REMINDER_MAX) return;
@@ -332,6 +357,10 @@ static void set_state(int idx, elder_rmd_state_t st)
         g.table.done_today &= ~(1u << idx);
     }
     g.dirty = true;
+    /* #1 指示灯的"待确认"态跟着状态集合走。放在 g.cb 之前：
+     * 回调里会播提示音、切全屏提醒，那一刻灯应该已经是新的状态，
+     * 否则老人会看到"屏上写着该吃药了，灯却不亮"。 */
+    elder_rgb_button_pending(has_pending_confirm());
     if (g.cb) g.cb(&g.table.items[idx], st, g.ctx);
 }
 
@@ -382,6 +411,7 @@ static void tick(void)
             g.table.items[i].fired_due_at = 0;
         }
         g.dirty = true;
+        elder_rgb_button_pending(has_pending_confirm());   /* 跨天清空 ⇒ 灯也该灭 */
     }
     g.table.last_day_ordinal = ord;
 
@@ -869,6 +899,10 @@ esp_err_t elder_reminder_replace_all(const elder_rmd_item_t *items,
     }
 
     g.dirty = true;
+    /* 合并后条数/下标都变了，待确认集合必须重算 —— 否则 #1 指示灯会停在
+     * 合并前的状态：提醒被后端删了灯还亮着（催老人确认一条不存在的任务），
+     * 或者后端新下发的提醒在等确认、灯却不亮。 */
+    elder_rgb_button_pending(has_pending_confirm());
     ESP_LOGI(TAG, "提醒表已合并：后端 %u 条 + 本地 %u 条 = %u 条", srv_n, keep_n, n);
     esp_err_t rc = elder_reminder_flush();
     heap_caps_free(sc);

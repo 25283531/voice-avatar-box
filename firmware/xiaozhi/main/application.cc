@@ -21,6 +21,13 @@
 
 #define TAG "Application"
 
+// >>> BEGIN elder-companion overlay >>>
+// VAD 边沿（老人开口 / 说完）转发给 elder 灯效模块。
+// 定义在 components/elder/src/elder_bridge.cc；elder 组件没有对外头文件，
+// 沿用本仓既有做法（见 mcp_server.cc 的裸 extern "C" 声明）。
+extern "C" void elder_on_vad_change(bool speaking);
+// <<< END elder-companion overlay <<<
+
 /* ---------------------------------------------------------------- 启动诊断
  * 缘由（2026-10-20）：设备会在运行 30 秒~2 分钟后**自发重启**，但串口抓不到
  * ROM 打印的 `rst:0x..(RESET_REASON)` 那一行。
@@ -460,6 +467,15 @@ void Application::Start() {
         xEventGroupSetBits(event_group_, MAIN_EVENT_WAKE_WORD_DETECTED);
     };
     callbacks.on_vad_change = [this](bool speaking) {
+        /* >>> BEGIN elder-companion overlay >>>
+         * 灯效要区分「在听老人说话」和「老人说完了、在等服务端回复」。
+         * 后者在设备状态机里**没有对应状态**（realtime 模式全程停在
+         * kDeviceStateListening，服务端 VAD 才决定何时开口），
+         * 唯一可用的信号就是这里。回调跑在音频处理任务里，只做一次
+         * 互斥锁保护的灯效请求，不碰音频数据。
+         * 声明沿用 mcp_server.cc 的裸 extern "C" 模式（elder 组件没有对外头文件）。 */
+        elder_on_vad_change(speaking);
+        // <<< END elder-companion overlay <<<
         xEventGroupSetBits(event_group_, MAIN_EVENT_VAD_CHANGE);
     };
     audio_service_.SetCallbacks(callbacks);

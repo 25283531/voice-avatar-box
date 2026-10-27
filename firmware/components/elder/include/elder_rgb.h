@@ -2,7 +2,7 @@
 #define ELDER_RGB_H
 
 #include <stdint.h>
-#include <stdbool.h>   /* elder_rgb_button_indicator(bool) 的形参类型 */
+#include <stdbool.h>   /* elder_rgb_button_pending(bool) 的形参类型 */
 #include "esp_err.h"
 
 #ifdef __cplusplus
@@ -11,13 +11,18 @@ extern "C" {
 
 /*
  * RGB 灯效优先级仲裁器
- * 需求 11（服药未确认长亮红灯 / 完成后绿灯）与需求 12（灯效随对话情绪）
- * 会争抢同一颗灯，必须定优先级，否则现场表现不可预测。
+ *
+ * 灯带共 9 颗（见 elder_board.h 的 ELDER_RGB_LEDS）：
+ *   #1       按键指示灯（独立状态机，见本文件下半部分）
+ *   #2 ~ #9  对话/提醒灯效（本文件上半部分）
+ *
+ * 两路**完全分开渲染**：提醒在 #2~#9 上闪，不会把按键反馈盖掉；
+ * 反过来按键呼吸也不会污染提醒的颜色语义。优先级只作用于 #2~#9。
  */
 
 typedef enum {
     ELDER_RGB_PRIO_IDLE      = 0,  /* 呼吸/待机 */
-    ELDER_RGB_PRIO_EMOTION   = 10, /* 对话情绪（可被提醒打断） */
+    ELDER_RGB_PRIO_EMOTION   = 10, /* 对话状态（可被提醒打断） */
     ELDER_RGB_PRIO_REMINDER  = 50, /* 日程提醒中 */
     ELDER_RGB_PRIO_MED_PEND  = 90, /* 服药未确认 —— 除升级外最高 */
     ELDER_RGB_PRIO_ALARM     = 100 /* 求助/告警 */
@@ -36,8 +41,27 @@ typedef enum {
     ELDER_FX_SOLID = 0,
     ELDER_FX_BREATH,
     ELDER_FX_BLINK_FAST,
-    ELDER_FX_RAINBOW
+    ELDER_FX_RAINBOW,   /* 整条灯带同步变色（旧的"五彩"） */
+    ELDER_FX_FLOW       /* **低速流水五彩**：彩虹沿灯带逐颗流动 */
 } elder_rgb_fx_t;
+
+/* ---------------------------------------------------------------- 对话四态
+ *
+ * 2026-10-27 用户重新定义的灯效（原话见 docs/决策记录.md D59）。
+ * 四个状态**互斥**，共用 ELDER_RGB_PRIO_EMOTION 一个槽位 —— 切换即替换，
+ * 不会留下过期槽位把新状态顶掉。
+ *
+ * 为什么亮度要单独传、而不是把颜色预先调暗：
+ *   呼吸和流水都是**动态**算出来的（呼吸会从 0 涨到峰值、流水的色相一直在
+ *   变），颜色值预先乘 0.3 之后再叠加动态亮度，峰值就变成 0.3×255×动态值，
+ *   实测峰值只有约 9% —— 看起来像灯坏了。所以亮度必须是"算完之后统一乘"。
+ */
+typedef enum {
+    ELDER_RGB_UI_IDLE = 0,   /* 待机：天蓝 #87CEFA，30% 亮度，呼吸 */
+    ELDER_RGB_UI_LISTENING,  /* 唤醒后收听：蓝 #0000FF，100%，常亮 */
+    ELDER_RGB_UI_CONNECTING, /* 数据上传/等回复：五彩流水，80% */
+    ELDER_RGB_UI_SPEAKING    /* TTS 输出：深橙 #FF8C00，100%，常亮 */
+} elder_rgb_ui_t;
 
 /**
  * @brief 初始化 RMT + WS2812 灯带，并启动灯效任务
@@ -55,12 +79,27 @@ esp_err_t elder_rgb_request(elder_rgb_prio_t prio, elder_rgb_fx_t fx,
                             uint32_t color, uint32_t ttl_ms);
 
 /**
+ * @brief 同上，但可以指定亮度等级。
+ * @param level 0~255（255 = 100%）。**不是** 0~100，别按百分数传。
+ */
+esp_err_t elder_rgb_request_ex(elder_rgb_prio_t prio, elder_rgb_fx_t fx,
+                               uint32_t color, uint8_t level, uint32_t ttl_ms);
+
+/**
  * @brief 释放之前申请的灯效，回落到次高优先级的请求
  */
 void elder_rgb_release(elder_rgb_prio_t prio);
 
 /**
+ * @brief 设置对话四态灯效（推荐入口，语义见 elder_rgb_ui_t）
+ */
+void elder_rgb_set_ui_state(elder_rgb_ui_t st);
+
+/**
  * @brief 设置对话情绪（内部映射到 ELDER_RGB_PRIO_EMOTION）
+ *
+ * NEUTRAL/LISTENING/SPEAKING 三个会转成对应的 UI 四态；
+ * HAPPY/SAD/ANGRY 保留原来的颜色，100% 常亮。
  */
 void elder_rgb_set_emotion(elder_emotion_t emo);
 
@@ -94,26 +133,45 @@ void elder_rgb_reminder_nag_stop(void);
 
 /* ---------------------------------------------- 第 1 颗灯：按键指示灯
  *
- * 灯带共 9 颗（见 elder_board.h 的 ELDER_RGB_LEDS）：#1 专做按键指示灯，
- * #2~#9 才是上面那些灯效。两路互不干扰 —— 提醒在 #2~#9 上闪，不会把
- * 按键反馈盖掉；反过来按键呼吸也不会污染提醒的颜色语义。
+ * 2026-10-27 用户原话（重新定义，覆盖 10-26 的"暖琥珀呼吸"版本）：
  *
- * 为什么按键要有独立的视觉反馈（适老化，2026-10-27 用户要求）：
- *   本机按键只做「确认日程完成」，**按下去不一定有结果**（当前没有待确认
- *   提醒时什么都不做）。老人无法从"没声音"区分「按到了但没事可确认」和
- *   「根本没按到」。给一颗常驻在按键旁边的灯做即时反馈，是把这两件事
- *   分开的唯一办法 —— 灯亮 = 设备收到了。
+ *   「第一颗LED一般情况下不亮，只有需要按键时才亮。当有待确认的日程提醒
+ *     （服药）时，为深橙色 #FF8C00 高亮（100%）呼吸灯效。当用户按下确认
+ *     按键时，从浅绿色 #90EE90 向深绿色 #006400 转变，转变时长为按钮定义
+ *     的需要按键时长。确认完成时以深蓝绿色 #00CED1 闪烁三次结束。如果按键
+ *     中途松开，没有完成确认，则以深粉红色 #FF1493 闪烁5次结束。」
  *
- * 适老化取值（改动前先读，这三个数字不是随手定的）：
- *   · 颜色用**暖琥珀**：老年人晶状体黄化、蓝光透射率下降，蓝/冷白在
- *     他们眼里又暗又糊；暖色的辨识度和舒适度都更好。
- *   · 呼吸周期 **3 秒**（常规呼吸灯多用 2~2.4 秒）：明暗变化越慢，
- *     眩光与焦虑感越低，也更像"在呼吸"而不是"在闪"。
- *   · 亮度封顶 **约 40%**：夜里起夜按键时不刺眼，也不会把同床的人晃醒。
- *   · 松开后**余辉 2 秒**：一次短按只有一百多毫秒，若严格跟着"按住"的
- *     时长走，老人几乎看不到任何变化，反馈等于没有。
+ * 四个状态（互斥）：
+ *   ① 熄灭      —— 没有待确认提醒，也没在按。**这是常态**，夜里不发光。
+ *   ② 橙色呼吸  —— 有待确认提醒。作用是"吸引注意"：老人听到提醒后要知道
+ *                  该按哪个键，灯亮着的那颗就是。
+ *   ③ 绿→深绿   —— 按住期间。渐变本身是**进度条**：老人能看出"还差多少"，
+ *                  比一个突然亮起的"完成"更不容易半途松手。
+ *   ④ 结果闪烁  —— 深蓝绿 3 次 = 确认成功；深粉红 5 次 = 中途松开没成。
+ *
+ * 为什么"没待确认提醒时按下什么都不亮"（而不是给个"按到了"的反馈）：
+ *   本按键只做确认。没有可确认的东西时给正反馈，等于告诉老人"办成了"，
+ *   而实际什么都没发生 —— 这是最坏的一类欺骗。安静地不亮才是诚实的。
+ *
+ * ⚠️ 渐变时长必须与 input.c 的长按判定**同源**：两边都用
+ *    elder_board.h 的 ELDER_BTN_CONFIRM_HOLD_MS。各写一份的话，只要有人
+ *    改了一处，就会出现"灯已经过渡到最深绿、按键却还没算确认"（或反过来）
+ *    —— 灯在骗人，比没有灯更糟。
  */
-void elder_rgb_button_indicator(bool down);
+
+/** 按下（不管当时有没有可确认的提醒；没有就保持熄灭） */
+void elder_rgb_button_press(void);
+
+/** 松开。仍在渐变中 ⇒ 判定为"中途松开没确认"，粉红闪 5 次。
+ *  已经出过结果（confirmed 或已闪烁）⇒ 忽略，不会重复反馈。 */
+void elder_rgb_button_release(void);
+
+/** 确认完成 ⇒ 深蓝绿闪 3 次 */
+void elder_rgb_button_confirmed(void);
+
+/** 是否存在待确认的提醒 ⇒ #1 橙色呼吸 / 熄灭。
+ *  由 reminder.c 在提醒状态集合变化时调用，是"吸引注意"态的唯一真源。 */
+void elder_rgb_button_pending(bool pending);
 
 #ifdef __cplusplus
 }

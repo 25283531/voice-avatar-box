@@ -16,6 +16,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdbool.h>   /* elder_rgb_button_pending(bool) 桩的形参类型 */
 
 /* ---------------- NVS（内存实现，跨"重启"保留） ---------------- */
 
@@ -176,6 +177,11 @@ void elder_rgb_med_escalate(void) { s_rgb_count++; s_rgb_escalate++; }
  * ⇒ server-ci 的「elder 断网链路宿主测试」自那时起一直是红的
  * （undefined reference to `elder_rgb_reminder_nag_start`）。 */
 void elder_rgb_reminder_nag_start(void) { s_rgb_count++; s_rgb_nag++; }
+/* 2026-10-27：#1 按键指示灯改成"有待确认提醒就橙色呼吸"，
+ * reminder.c 的 set_state()/跨天重置/replace_all 都会调它。
+ * 桩漏了这个符号 ⇒ 宿主测试链接期 undefined reference，
+ * 和上面 nag_start 当年踩的是同一个坑（CI 红但代码没错）。 */
+void elder_rgb_button_pending(bool pending) { (void)pending; }
 
 /* ---------------- FreeRTOS 任务（丢弃，不启动死循环） ---------------- */
 

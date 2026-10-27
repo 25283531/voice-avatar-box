@@ -180,7 +180,28 @@ void BoxAudioCodec::CreateDuplexChannels(gpio_num_t mclk, gpio_num_t bclk, gpio_
 }
 
 void BoxAudioCodec::SetOutputVolume(int volume) {
-    ESP_ERROR_CHECK(esp_codec_dev_set_out_vol(output_dev_, volume));
+    /* ⚠️ 这里**不能**用 ESP_ERROR_CHECK。
+     *
+     * esp_codec_dev_set_out_vol() 在 codec 没打开时返回
+     * ESP_CODEC_DEV_WRONG_STATE（见 esp_codec_dev.c 的
+     * _verify_codec_setting → _verify_codec_ready）。而「输出没打开」是
+     * **正常状态**：设备在待机 / 收听时 EnableOutput(false)，ES8311 是关着的。
+     *
+     * 真机事故（2026-10-27，每次必现）：老人说「把音量调小一点」→
+     * 服务端下发 self.audio_speaker.set_volume → 此刻设备正处于 listening
+     * （输出关闭）→ 旧代码 ESP_ERROR_CHECK 直接 abort → 设备重启。
+     * 语音调音量/亮度这条功能因此完全不可用。
+     *
+     * 值不会丢：AudioCodec::SetOutputVolume() 照样更新 output_volume_
+     * 并落 NVS，而 EnableOutput(true) 在打开 codec 之后会
+     * esp_codec_dev_set_out_vol(output_dev_, output_volume_) 补写一次
+     * （见本文件 EnableOutput）。所以下一次开口说话时就是新音量。
+     */
+    esp_err_t err = esp_codec_dev_set_out_vol(output_dev_, volume);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "设置输出音量 %d 时 codec 未打开（err=%d），"
+                      "已记下，下次打开输出时生效", volume, err);
+    }
     AudioCodec::SetOutputVolume(volume);
 }
 

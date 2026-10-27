@@ -10,7 +10,7 @@
 
 static const char *TAG = "elder.input";
 
-#define LONG_HOLD_MS        3000    /* 长按达标：3s（用户指定） */
+#define LONG_HOLD_MS        ELDER_BTN_CONFIRM_HOLD_MS  /* 3s，真源在 elder_board.h */
 #define CONFIRM_WINDOW_MS   30000   /* 松开后 30s 内短按有效（用户指定） */
 #define DEBOUNCE_MS         30
 #define POLL_MS             20
@@ -73,6 +73,13 @@ static bool key_down(void)
 static void emit(elder_key_event_t ev)
 {
     if (g.cb) g.cb(ev, g.ctx);
+    /* 栈水位日志：确认这条链会**同步**跑到 UI 切换 + 提示音 + 回执入队
+     * （见 elder_bridge.cc 的 OnKey / OnPlayTone）。2560 字节时被撑爆过一次，
+     * 4096 也不代表安全 —— 长按确认要走的 DONE 分支比短按更重。
+     * 出"按键重启"时第一眼就看这行：余量接近 0 就是栈，不是别的。 */
+    ESP_LOGI(TAG, "事件 %d 处理完，elder_input 栈余量 %u 字节",
+             (int)ev,
+             (unsigned)(uxTaskGetStackHighWaterMark(NULL) * sizeof(StackType_t)));
 }
 
 /* 电平跟踪：维护 released_seen / stuck 两个判据。
@@ -90,7 +97,7 @@ static bool track_level(bool stable_down)
             /* 卡住时必须把进行中的按压状态清掉，否则松开时会误发 RELEASE */
             g.pressed = false;
             g.long_fired = false;
-            elder_rgb_button_indicator(false);   /* 指示灯别跟着一直呼吸 */
+            elder_rgb_button_release();          /* 指示灯别跟着一直呼吸 */
         }
     } else {
         g.low_since_us = 0;
@@ -132,10 +139,10 @@ static void input_task(void *arg)
                 g.pressed = true;
                 g.press_start_us = now_us();
                 g.long_fired = false;
-                /* #1 灯开始呼吸：这是"设备收到了"的唯一即时反馈。
-                 * 本按键只做确认，没有待确认提醒时按下**什么都不会发生**，
-                 * 没有这颗灯老人分不清"按到了但没事"和"根本没按到"。 */
-                elder_rgb_button_indicator(true);
+                /* #1 灯开始"绿→深绿"渐变：渐变本身就是**进度条**，
+                 * 老人能看出还差多少，比突然亮一下"完成"更不容易半途松手。
+                 * 没有待确认提醒时 rgb.c 会让它保持熄灭（见 elder_rgb.h）。 */
+                elder_rgb_button_press();
                 ESP_LOGD(TAG, "press start");
             }
             /* acceptable=false（开机就是低 / 已判卡住）⇒ 连按压起点都不记 */
@@ -143,18 +150,19 @@ static void input_task(void *arg)
             int64_t held = now_us() - g.press_start_us;
             if (!g.long_fired && held >= (LONG_HOLD_MS * 1000LL)) {
                 g.long_fired = true;
-                ESP_LOGI(TAG, "long hold 3s reached");
+                ESP_LOGI(TAG, "长按 %d ms 达标（= 确认时长）", LONG_HOLD_MS);
                 emit(ELDER_KEY_EV_LONG_HOLD);
             }
         } else if (!stable_down && g.pressed) {
             int64_t held = now_us() - g.press_start_us;
             g.pressed = false;
-            elder_rgb_button_indicator(false);   /* 松开：留 2 秒余辉后自动熄 */
+            /* 松开：没走到结果就给粉色闪 5 次，出过结果则忽略（见 elder_rgb.h） */
+            elder_rgb_button_release();
             if (g.long_fired) {
-                ESP_LOGI(TAG, "release after long hold (%.1fs)", held / 1e6);
+                ESP_LOGI(TAG, "长按后松开（%d ms）", (int)(held / 1000));
                 emit(ELDER_KEY_EV_RELEASE);
             } else {
-                ESP_LOGI(TAG, "short press (%.0fms)", held / 1e3);
+                ESP_LOGI(TAG, "短按（%d ms）", (int)(held / 1000));
                 emit(ELDER_KEY_EV_SHORT);
             }
         }
@@ -199,10 +207,14 @@ esp_err_t elder_input_init(elder_key_cb_t cb, void *ctx)
     ESP_LOGI(TAG, "GPIO%d 初始电平=%d（1=松开，0=被拉低/按住）",
              ELDER_KEY_GPIO, gpio_get_level(ELDER_KEY_GPIO));
 
-    /* 栈 4096：emit() 是**同步**调用 elder.bridge::OnKey 的，那条 switch 里会跑
-     * UI 状态切换 + 提示音 + 日志格式化。2560 字节实测被撑爆过（2026-10-20）。
+    /* 栈 8192（原 4096）：emit() 是**同步**调用 elder.bridge::OnKey 的，那条
+     * switch 会跑 UI 状态切换 + 提示音 + 回执入队，其中
+     * OnReminder(DONE) → elder_ui_play_tone → Application::PlaySound
+     * 是**就地解析 OGG 并打开 codec** 的重活。2560 字节时撑爆过一次
+     * （2026-10-20），4096 在长按确认这条更重的分支上又出过偶发重启
+     * （2026-10-27）。别因为"还有余量"就调回去。
      * ⚠️ 但**不要**指望靠加栈来扛 HTTPS：联网上报必须留在独立任务里。 */
-    xTaskCreatePinnedToCore(input_task, "elder_input", 4096, NULL, 6, &g.task, 1);
+    xTaskCreatePinnedToCore(input_task, "elder_input", 8192, NULL, 6, &g.task, 1);
     ESP_LOGI(TAG, "key on GPIO%d ready", ELDER_KEY_GPIO);
     return ESP_OK;
 #endif

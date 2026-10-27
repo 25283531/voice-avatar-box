@@ -162,30 +162,36 @@ const char *ToneName(elder_tone_t tone)
 void OnPlayTone(elder_tone_t tone, void *ctx)
 {
     (void)ctx;
-    auto &app = Application::GetInstance();
+
+    std::string_view sound;
     switch (tone) {
-    case ELDER_TONE_POPUP:
-        app.PlaySound(Lang::Sounds::OGG_POPUP);
-        break;
-    case ELDER_TONE_EXCLAMATION:
-        app.PlaySound(Lang::Sounds::OGG_EXCLAMATION);
-        break;
-    case ELDER_TONE_SUCCESS:
-        app.PlaySound(Lang::Sounds::OGG_SUCCESS);
-        break;
-    case ELDER_TONE_VIBRATION:
-        app.PlaySound(Lang::Sounds::OGG_VIBRATION);
-        break;
-    case ELDER_TONE_LOW_BATTERY:
-        app.PlaySound(Lang::Sounds::OGG_LOW_BATTERY);
-        break;
+    case ELDER_TONE_POPUP:       sound = Lang::Sounds::OGG_POPUP;       break;
+    case ELDER_TONE_EXCLAMATION: sound = Lang::Sounds::OGG_EXCLAMATION; break;
+    case ELDER_TONE_SUCCESS:     sound = Lang::Sounds::OGG_SUCCESS;     break;
+    case ELDER_TONE_VIBRATION:   sound = Lang::Sounds::OGG_VIBRATION;   break;
+    case ELDER_TONE_LOW_BATTERY: sound = Lang::Sounds::OGG_LOW_BATTERY; break;
     case ELDER_TONE_REMINDER:
         // 提醒音乐：固件内置固定资源，离线可用
-        app.PlaySound(kReminderChime);
+        sound = kReminderChime;
         break;
     default:
-        break;
+        return;
     }
+
+    /* ⚠️ 必须 Schedule，不能就地 PlaySound。
+     *
+     * AudioService::PlaySound 是**同步**的：它当场遍历 OGG 页、调
+     * codec->EnableOutput(true) 打开 ES8311、再逐帧推 I2S。而本函数会被
+     * 两条**小栈**路径同步调到：
+     *   ① elder_input 任务（按键确认 → OnReminder(DONE) → 提示音），
+     *      2026-10-27 长按确认偶发重启就发生在这一条上；
+     *   ② esp_event 默认任务（状态变化回调里也可能间接触发）。
+     * 在主事件循环（main_event_loop，栈 8192）里执行，调用方立刻返回，
+     * 谁调都不会因为"顺便播个音"把自己的栈压穿。
+     * sound 指向的都是静态常量，lambda 里存 string_view 安全。 */
+    Application::GetInstance().Schedule([sound]() {
+        Application::GetInstance().PlaySound(sound);
+    });
 }
 
 // 联网 TTS：通过 MCP/协议让服务端合成并播报一段话。
@@ -420,7 +426,8 @@ void ConfirmMedicine(int idx, uint8_t method)
  * lichuang_dev_board.cc 的 OnClick。
  * SOS 分支已删除，原因见 elder_input.h 头注释（长按同步跑联网上报把栈撑爆，
  * 设备重启，求助根本发不出去）。**不要把 HTTPS 放回这个回调里** ——
- * 它是 elder_input 任务同步调用的，栈只有 4096。 */
+ * 它是 elder_input 任务同步调用的（栈 8192，但那是给 UI/提示音留的，
+ * 不是给 TLS 留的）。 */
 void OnKey(elder_key_event_t ev, void *ctx)
 {
     (void)ctx;
@@ -448,6 +455,7 @@ void OnKey(elder_key_event_t ev, void *ctx)
         }
 
         if (idx >= 0) {
+            elder_rgb_button_confirmed();   /* #1 闪深蓝绿 3 次 */
             ConfirmMedicine(idx, ELDER_CFM_BUTTON);
         } else {
             /* 没有待确认提醒时，这一下**什么都不做**（2026-10-27 用户拍板）。
@@ -463,29 +471,42 @@ void OnKey(elder_key_event_t ev, void *ctx)
              *
              * 不发声、不闪屏：没有提醒可确认时，「安静地没反应」比
              * 「莫名其妙开始说话/静音」安全得多。按下的即时反馈由
-             * #1 指示灯给（input.c 调 elder_rgb_button_indicator）。 */
+             * #1 指示灯给（input.c 调 elder_rgb_button_press/release）。 */
             ESP_LOGI(TAG, "短按：当前没有待确认的提醒 —— 本按键只做确认，不做对话开关");
         }
         break;
     }
 
-    case ELDER_KEY_EV_LONG_HOLD:
-        /* 长按只是**提示**，真正的挂起在松开时做（见 RELEASE） */
-        ESP_LOGI(TAG, "请松开按键，30 秒内再短按一次确认");
-        break;
-
-    case ELDER_KEY_EV_RELEASE: {
+    case ELDER_KEY_EV_LONG_HOLD: {
+        /* 2026-10-27 用户重新定义：**按住够 3 秒 = 确认完成**，
+         * 不再是"长按挂起 + 30 秒内再短按一次"的两步流程。
+         *
+         * 为什么必须改成一步：新灯效是「按住期间 #1 从浅绿渐变到深绿，
+         * 走满即完成」（见 elder_rgb.h 的 #1 状态机）。灯已经走到最深绿了，
+         * 却还要再按一下才算数 —— 老人在这一步犹豫一下就超时，
+         * 失败率反而比一步高。灯说什么，行为就得是什么。
+         *
+         * 反馈：确认成功 → #1 闪深蓝绿 3 次（rgb.c 负责）；
+         *       没确认成 → 松开时 #1 闪深粉红 5 次。
+         * 先给灯再改状态：老人按下 3 秒那一刻就要看到"成了"，
+         * 而不是等提醒引擎落完 NVS 才亮。 */
         int idx = FirstUndoneReminder();
         if (idx >= 0) {
-            s_arming_id = idx;
-            elder_input_open_confirm_window();
-            elder_reminder_arm_confirm((uint8_t)idx);
-            ESP_LOGI(TAG, "进入确认窗口：#%d", idx);
+            elder_rgb_button_confirmed();
+            ConfirmMedicine(idx, ELDER_CFM_BUTTON);
         } else {
-            ESP_LOGI(TAG, "长按松开，但没有待确认的服药提醒 → 不进入确认窗口");
+            ESP_LOGI(TAG, "长按 3 秒：当前没有待确认的提醒，不确认");
         }
         break;
     }
+
+    case ELDER_KEY_EV_RELEASE:
+        /* 确认已经在上面的 LONG_HOLD 里做完了，这里**只打日志**。
+         * 再叠一层"挂起 / 开确认窗口"会让同一轮按键产生两次确认机会，
+         * 而且 rgb.c 会把"确认之后才松开"误判成中途放弃（粉色闪 5 次），
+         * 老人看到的是"明明成了却报错"。 */
+        ESP_LOGI(TAG, "按键松开");
+        break;
 
     default:
         break;
@@ -493,6 +514,16 @@ void OnKey(elder_key_event_t ev, void *ctx)
 }
 
 /* ---------------------------------------------------------------- 状态机钩子 */
+
+/* 本轮对话里老人是否已经开过口。
+ * 只在"本轮"内有效：进入 listening / idle 就清，由 OnDeviceStateChanged 负责。
+ *
+ * 为什么要这个标志：VAD 的 speaking=false 既可能是"老人说完了"，
+ * 也可能是"还没开口、在等老人说话"。前者要亮流水灯（设备在干活），
+ * 后者必须亮蓝色（等你说话）—— 混起来的话，老人刚唤醒就看到五彩乱转，
+ * 会以为设备在自己玩。
+ * volatile：写的一方在音频处理任务，读的一方在事件任务。 */
+static volatile bool s_spoke_in_turn = false;
 
 void OnDeviceStateChanged(DeviceState prev, DeviceState cur)
 {
@@ -503,6 +534,13 @@ void OnDeviceStateChanged(DeviceState prev, DeviceState cur)
         return;
     }
     elder_ui_set_state(ui, 0);
+
+    /* 换轮次就清"已开口"标志。不清的话，上一轮说过话之后，下一轮刚进
+     * listening 就会因为残留的 true 而立刻显示流水灯。 */
+    if (cur == kDeviceStateListening || cur == kDeviceStateIdle ||
+        cur == kDeviceStateSpeaking) {
+        s_spoke_in_turn = false;
+    }
 
     if (cur == kDeviceStateIdle) {
         elder_rgb_set_emotion(ELDER_EMO_NEUTRAL);
@@ -526,12 +564,46 @@ void OnDeviceStateChanged(DeviceState prev, DeviceState cur)
         }
     } else if (cur == kDeviceStateListening) {
         elder_rgb_set_emotion(ELDER_EMO_LISTENING);
+    } else if (cur == kDeviceStateConnecting) {
+        /* 2026-10-27 用户定义的第四态：「网络传输处理中（数据传输开始传输到
+         * 服务端，语音发生之前）时是低速流水五彩灯效（80%亮度）」。
+         *
+         * 这一态原先被 MapDeviceState 折进 LISTENING（同一个形象），
+         * 但灯效必须分开：老人看不出设备"在听"还是"在想"，等两秒没声音
+         * 就会以为没听清、再喊一遍，把这次请求打断。流水灯 = 正在干活。 */
+        elder_rgb_set_ui_state(ELDER_RGB_UI_CONNECTING);
     } else if (cur == kDeviceStateSpeaking) {
         elder_rgb_set_emotion(ELDER_EMO_SPEAKING);
     }
 }
 
 }  // namespace
+
+/* ------------------------------------------------------- VAD 边沿（灯效） */
+
+/* 由 application.cc 的 on_vad_change 回调转发，跑在**音频处理任务**里。
+ *
+ * 这里只做一次灯效请求（内部只有一把互斥锁），不碰音频数据、不做任何
+ * 阻塞操作 —— 音频链路是本产品的红线（用户明确要求"不要再修的破音、卡顿"），
+ * 绝不能在采集回调里做重活。
+ *
+ * ⚠️ 必须定义在匿名命名空间**外面**：放在里面的话 `extern "C"` 仍然只有
+ * 内部链接，application.cc 那边会 undefined reference（链接期才发现，
+ * 症状是"构建到最后一步才炸"，很难定位）。 */
+extern "C" void elder_on_vad_change(bool speaking)
+{
+    if (speaking) {
+        s_spoke_in_turn = true;
+        elder_rgb_set_ui_state(ELDER_RGB_UI_LISTENING);   /* 纯蓝：正在听你说 */
+        return;
+    }
+    /* 老人刚说完、服务端还在 ASR/LLM/合成 —— 这一两秒里没有任何声音。
+     * 老人以为没听清就会再喊一遍，反而把这次请求打断。
+     * 五彩流水灯 = 设备在干活，是这段时间唯一的信号。 */
+    if (s_spoke_in_turn) {
+        elder_rgb_set_ui_state(ELDER_RGB_UI_CONNECTING);
+    }
+}
 
 /* ------------------------------------------------------- 语音确认（MCP 工具） */
 
