@@ -109,12 +109,21 @@ private:
     }
 
     void InitializeButtons() {
+        /* 板载用户按键（GPIO0 BOOT）= **一键唤醒**（2026-10-27 用户拍板）。
+         *
+         * 原先是 ToggleChatState()：待机→收听没问题，但"正在说话时按一下"
+         * 只会打断并回到待机，老人还得再按一次才能说话 —— 用户的原话是
+         * "如果硬件正在说话，可以按键中断硬件说话，直接开始收听用户说话"。
+         * 改用 WakeUp()：说话中 → 打断 + 直接进收听；其余状态行为不变。
+         *
+         * 注意：扩展口上的 GPIO11 按键**不是**这个键，它只做日程/服药确认，
+         * 见 firmware/components/elder/src/elder_bridge.cc 的 OnKey。 */
         boot_button_.OnClick([this]() {
             auto& app = Application::GetInstance();
             if (app.GetDeviceState() == kDeviceStateStarting && !WifiStation::GetInstance().IsConnected()) {
                 ResetWifiConfiguration();
             }
-            app.ToggleChatState();
+            app.WakeUp();
         });
 
 #if CONFIG_USE_DEVICE_AEC

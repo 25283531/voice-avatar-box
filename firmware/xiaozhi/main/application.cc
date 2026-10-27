@@ -353,6 +353,26 @@ void Application::ToggleChatState() {
     }
 }
 
+void Application::WakeUp() {
+    if (device_state_ == kDeviceStateSpeaking) {
+        /* 打断 + 立刻收听。
+         *
+         * 收听模式必须与 ToggleChatState 的待机分支用**同一个判据**：
+         * 若这里固定用 kListeningModeManualStop，就会出现"唤醒进来是自动
+         * 停止、打断进来却要再按一次才停"的不一致 —— 老人记不住，而且
+         * 走开后设备会一直开着麦收音。
+         * 用 AutoStop 的语义是：老人说完，静音一会儿就自己结束。 */
+        Schedule([this]() {
+            AbortSpeaking(kAbortReasonNone);
+            SetListeningMode(aec_mode_ == kAecOff ? kListeningModeAutoStop : kListeningModeRealtime);
+        });
+        return;
+    }
+    /* 其余状态（待机→收听、收听→停止、配网等）复用既有逻辑，
+     * 不在这里另写一份，避免两处行为随时间分叉。 */
+    ToggleChatState();
+}
+
 void Application::StartListening() {
     if (device_state_ == kDeviceStateActivating) {
         SetDeviceState(kDeviceStateIdle);

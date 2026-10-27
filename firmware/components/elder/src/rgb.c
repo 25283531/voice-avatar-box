@@ -42,6 +42,14 @@ typedef struct {
 #define ELDER_NAG_BLINK_MS  (10u * 1000u)
 #define ELDER_NAG_TOTAL_MS  (2u * 60u * 60u * 1000u)
 
+/* ---- 第 1 颗灯：按键指示灯 ----
+ * 取值理由见 elder_rgb.h 的 elder_rgb_button_indicator 注释（适老化三条：
+ * 暖色、慢呼吸、亮度封顶）。改这几个数字等于改产品观感，别顺手调。 */
+#define ELDER_RGB_BTN_COLOR      0xFFB300u  /* 暖琥珀：老人晶状体黄化，暖色辨识度高于冷白/蓝 */
+#define ELDER_RGB_BTN_BREATH_MS  3000u      /* 一次完整呼吸 3 秒（比常规 2.4s 更慢，不刺眼） */
+#define ELDER_RGB_BTN_MAX_LEVEL  100        /* 亮度上限 ≈39%，夜里不晃眼 */
+#define ELDER_RGB_BTN_TAIL_MS    2000u      /* 松开后余辉 2 秒：短按只有一百多毫秒，不留余辉等于没反馈 */
+
 static struct {
     rmt_channel_handle_t  chan;
     rmt_encoder_handle_t  enc;
@@ -54,6 +62,11 @@ static struct {
     /* 提醒闪灯：active 为真时由 rgb_task 自己算"这一帧该不该亮" */
     bool                  nag_active;
     uint32_t              nag_start_ms;
+
+    /* 按键指示灯（只驱动 #1，与上面那些灯效互不干扰） */
+    bool                  btn_down;
+    uint32_t              btn_start_ms;      /* 本次按下的起始时刻，呼吸相位从它算起 */
+    uint32_t              btn_tail_until_ms; /* 松开后的余辉截止；0 = 无 */
 } g;
 
 /* ---------------- 灯效计算 ---------------- */
@@ -117,13 +130,36 @@ static uint32_t fx_color(const slot_t *s, uint32_t now_ms)
     }
 }
 
-static void write_pixels(uint32_t color)
+/* 按键指示灯的颜色：从「本次按下时刻」起算的慢呼吸。
+ *
+ * 相位刻意从按下时刻算，而不是从系统 tick 算 —— 后者会让每次按下都
+ * 落在一个随机相位上，有时按下去正好是全暗的那一帧，老人看到的是"没反应"。
+ * 松开后余辉继续沿用同一相位，避免松手瞬间亮度跳变（跳变看起来像故障）。 */
+static uint32_t btn_color(uint32_t now_ms)
 {
-    for (int i = 0; i < ELDER_RGB_LEDS; i++) {
-        /* WS2812 为 GRB 顺序 */
-        g.pixels[i * 3 + 0] = (color >> 8) & 0xFF;
-        g.pixels[i * 3 + 1] = (color >> 16) & 0xFF;
-        g.pixels[i * 3 + 2] = color & 0xFF;
+    const uint32_t half = ELDER_RGB_BTN_BREATH_MS / 2;
+    uint32_t phase = (now_ms - g.btn_start_ms) % ELDER_RGB_BTN_BREATH_MS;
+    uint32_t lvl = (phase < half) ? (phase * 255u / half)
+                                  : ((ELDER_RGB_BTN_BREATH_MS - phase) * 255u / half);
+    lvl = lvl * ELDER_RGB_BTN_MAX_LEVEL / 255u;
+    uint8_t r = (ELDER_RGB_BTN_COLOR >> 16) & 0xFF;
+    uint8_t gg = (ELDER_RGB_BTN_COLOR >> 8) & 0xFF;
+    uint8_t b = ELDER_RGB_BTN_COLOR & 0xFF;
+    return ((uint32_t)(r * lvl / 255) << 16) | ((uint32_t)(gg * lvl / 255) << 8) |
+           (uint32_t)(b * lvl / 255);
+}
+
+/* #1 = 按键指示灯，其余 = 灯效。两路分开写，互不覆盖。
+ * WS2812 为 GRB 顺序，别按 RGB 顺序写（写错的表现是红蓝互换）。 */
+static void write_pixels(uint32_t fx_color, uint32_t btn)
+{
+    g.pixels[0] = (uint8_t)((btn >> 8) & 0xFF);
+    g.pixels[1] = (uint8_t)((btn >> 16) & 0xFF);
+    g.pixels[2] = (uint8_t)(btn & 0xFF);
+    for (int i = 1; i < ELDER_RGB_LEDS; i++) {
+        g.pixels[i * 3 + 0] = (uint8_t)((fx_color >> 8) & 0xFF);
+        g.pixels[i * 3 + 1] = (uint8_t)((fx_color >> 16) & 0xFF);
+        g.pixels[i * 3 + 2] = (uint8_t)(fx_color & 0xFF);
     }
     rmt_transmit_config_t tx = {.loop_count = 0};
     rmt_transmit(g.chan, g.enc, g.pixels, sizeof(g.pixels), &tx);
@@ -132,11 +168,12 @@ static void write_pixels(uint32_t color)
 
 static void rgb_task(void *arg)
 {
-    uint32_t last = 0xFFFFFFFF;
+    uint32_t last_fx = 0xFFFFFFFF, last_btn = 0xFFFFFFFF;
     while (1) {
         uint32_t now = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
         slot_t s;
         uint32_t color = 0;
+        uint32_t btn = 0;
 
         if (xSemaphoreTake(g.lock, pdMS_TO_TICKS(50)) == pdTRUE) {
             int prio = -1;
@@ -162,10 +199,25 @@ static void rgb_task(void *arg)
                     color = ((now % 500u) < 250u) ? 0xFF0000u : 0u;
                 }
             }
+
+            /* 按键指示灯：按住期间呼吸；松开后余辉 2 秒再熄。
+             * 两者用同一相位，松手不跳变。 */
+            if (g.btn_down) {
+                btn = btn_color(now);
+            } else if (g.btn_tail_until_ms &&
+                       (int32_t)(g.btn_tail_until_ms - now) > 0) {
+                btn = btn_color(now);
+            } else if (g.btn_tail_until_ms) {
+                g.btn_tail_until_ms = 0;   /* 余辉结束，回到全灭 */
+            }
             xSemaphoreGive(g.lock);
         }
 
-        if (color != last) { write_pixels(color); last = color; }
+        if (color != last_fx || btn != last_btn) {
+            write_pixels(color, btn);
+            last_fx = color;
+            last_btn = btn;
+        }
         vTaskDelay(pdMS_TO_TICKS(30));   /* 灯效刷新 ~33Hz */
     }
 }
@@ -210,7 +262,8 @@ esp_err_t elder_rgb_init(void)
     g.ready = true;
 
     xTaskCreatePinnedToCore(rgb_task, "elder_rgb", 3072, NULL, 5, &g.task, 1);
-    ESP_LOGI(TAG, "WS2812 ready on GPIO%d, %d LED(s)", ELDER_RGB_GPIO, ELDER_RGB_LEDS);
+    ESP_LOGI(TAG, "WS2812 ready on GPIO%d, %d LED(s)：#1 按键指示灯，#2~#%d 灯效",
+             ELDER_RGB_GPIO, ELDER_RGB_LEDS, ELDER_RGB_LEDS);
     return ESP_OK;
 }
 
@@ -305,5 +358,25 @@ void elder_rgb_reminder_nag_stop(void)
     xSemaphoreTake(g.lock, portMAX_DELAY);
     if (g.nag_active) ESP_LOGI(TAG, "提醒闪灯停止");
     g.nag_active = false;
+    xSemaphoreGive(g.lock);
+}
+
+/* ---- 第 1 颗灯：按键指示灯（语义与取值理由见 elder_rgb.h） ---- */
+void elder_rgb_button_indicator(bool down)
+{
+    if (!g.ready) return;
+    uint32_t now = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
+
+    xSemaphoreTake(g.lock, portMAX_DELAY);
+    if (down) {
+        /* 只在"从松到按"的边沿重置相位：按住不放时不能每帧重置，
+         * 否则亮度会一直停在最暗那一帧，看起来像没亮。 */
+        if (!g.btn_down) g.btn_start_ms = now;
+        g.btn_down = true;
+        g.btn_tail_until_ms = 0;
+    } else {
+        if (g.btn_down) g.btn_tail_until_ms = now + ELDER_RGB_BTN_TAIL_MS;
+        g.btn_down = false;
+    }
     xSemaphoreGive(g.lock);
 }

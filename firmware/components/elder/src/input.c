@@ -1,5 +1,6 @@
 #include "elder_input.h"
 #include "elder_board.h"
+#include "elder_rgb.h"
 
 #include "driver/gpio.h"
 #include "esp_log.h"
@@ -89,6 +90,7 @@ static bool track_level(bool stable_down)
             /* 卡住时必须把进行中的按压状态清掉，否则松开时会误发 RELEASE */
             g.pressed = false;
             g.long_fired = false;
+            elder_rgb_button_indicator(false);   /* 指示灯别跟着一直呼吸 */
         }
     } else {
         g.low_since_us = 0;
@@ -130,6 +132,10 @@ static void input_task(void *arg)
                 g.pressed = true;
                 g.press_start_us = now_us();
                 g.long_fired = false;
+                /* #1 灯开始呼吸：这是"设备收到了"的唯一即时反馈。
+                 * 本按键只做确认，没有待确认提醒时按下**什么都不会发生**，
+                 * 没有这颗灯老人分不清"按到了但没事"和"根本没按到"。 */
+                elder_rgb_button_indicator(true);
                 ESP_LOGD(TAG, "press start");
             }
             /* acceptable=false（开机就是低 / 已判卡住）⇒ 连按压起点都不记 */
@@ -143,6 +149,7 @@ static void input_task(void *arg)
         } else if (!stable_down && g.pressed) {
             int64_t held = now_us() - g.press_start_us;
             g.pressed = false;
+            elder_rgb_button_indicator(false);   /* 松开：留 2 秒余辉后自动熄 */
             if (g.long_fired) {
                 ESP_LOGI(TAG, "release after long hold (%.1fs)", held / 1e6);
                 emit(ELDER_KEY_EV_RELEASE);

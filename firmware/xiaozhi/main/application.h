@@ -52,6 +52,15 @@ public:
     void DismissAlert();
     void AbortSpeaking(AbortReason reason);
     void ToggleChatState();
+    /* 一键唤醒 / 打断（2026-10-27 用户需求：板载用户按键要"按了就说话"）。
+     *
+     * 与 ToggleChatState 的**唯一**区别在「正在说话」这一支：
+     *   ToggleChatState：说话中 → AbortSpeaking → 回待机
+     *   WakeUp         ：说话中 → AbortSpeaking → **直接进收听**
+     * 老人按键的意图是"我要说话"，不是"别说了"。其余状态（待机→收听、
+     * 收听→停止）与 ToggleChatState 完全一致，保证同一个按键不出现
+     * 两套语义 —— 老人记不住"什么时候按是停、什么时候按是说"。 */
+    void WakeUp();
     void StartListening();
     void StopListening();
     void Reboot();

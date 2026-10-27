@@ -411,17 +411,19 @@ void ConfirmMedicine(int idx, uint8_t method)
     s_arming_id = -1;
 }
 
-/* 这个按键**只做服药确认**（2026-10-20 用户拍板：SOS 取消）：
+/* 这个按键**只做日程/服药确认**（2026-10-20 用户拍板取消 SOS；
+ * 2026-10-27 用户进一步拍板：连"开始/结束对话"也去掉，单一功能）：
  *   提醒响铃期间（ELDER_UI_REMINDER）短按 → 直接确认，不需要任何前置手势；
  *   确认窗口内短按                   → 确认长按挂起的那一条；
- *   其余情况短按                     → 退化成「开始/结束对话」。
+ *   其余情况短按                     → **什么都不做**（只打日志）。
+ * 对话开关不在这里：板载用户按键（GPIO0 BOOT）才是一键唤醒/打断，见
+ * lichuang_dev_board.cc 的 OnClick。
  * SOS 分支已删除，原因见 elder_input.h 头注释（长按同步跑联网上报把栈撑爆，
  * 设备重启，求助根本发不出去）。**不要把 HTTPS 放回这个回调里** ——
  * 它是 elder_input 任务同步调用的，栈只有 4096。 */
 void OnKey(elder_key_event_t ev, void *ctx)
 {
     (void)ctx;
-    auto &app = Application::GetInstance();
 
     switch (ev) {
     case ELDER_KEY_EV_SHORT: {
@@ -434,9 +436,10 @@ void OnKey(elder_key_event_t ev, void *ctx)
              *
              * 判据要**同时**看"全屏提醒是否在显示"：全屏提醒会挂 4 小时，
              * 而 ELDER_UI_REMINDER 这个表情态 30 秒就自动回落 IDLE。
-             * 只看表情态的话，老人 30 秒后才去按按钮，这一下会被当成
-             * "开始对话"（ToggleChatState），全屏提醒照旧挂着 ——
-             * 用户的诉求「按键确认任务完成」直接失效。 */
+             * 只看表情态的话，老人 30 秒后才去按按钮，这一次就选不中目标，
+             * 全屏提醒照旧挂着 —— 用户的诉求「按键确认任务完成」直接失效。
+             * （这条判据在 2026-10-27 去掉"短按切换对话"之后**更加**重要：
+             *  现在没有兜底分支了，选不中目标就是彻底没反应。） */
             idx = FirstUndoneReminder();
             if (idx >= 0) {
                 elder_input_open_confirm_window();   /* 让界面立刻进确认态 */
@@ -447,8 +450,21 @@ void OnKey(elder_key_event_t ev, void *ctx)
         if (idx >= 0) {
             ConfirmMedicine(idx, ELDER_CFM_BUTTON);
         } else {
-            /* 没有待确认提醒时，短按复用为「开始/停止对话」 */
-            app.ToggleChatState();
+            /* 没有待确认提醒时，这一下**什么都不做**（2026-10-27 用户拍板）。
+             *
+             * 原先这里退化成 app.ToggleChatState()，效果是「没有提醒时按一下
+             * 就切换对话」：设备正在听/正在说，按一下就直接进待机；老人想
+             * 确认任务，结果设备静音了 —— 语义完全错位，且老人会以为设备坏了。
+             *
+             * 现在职责彻底分开：
+             *   本按键（GPIO11）  → 只有「确认日程完成」一个功能
+             *   板载用户按键（GPIO0 BOOT）→ 一键唤醒 / 打断说话，见
+             *                        lichuang_dev_board.cc 的 OnClick
+             *
+             * 不发声、不闪屏：没有提醒可确认时，「安静地没反应」比
+             * 「莫名其妙开始说话/静音」安全得多。按下的即时反馈由
+             * #1 指示灯给（input.c 调 elder_rgb_button_indicator）。 */
+            ESP_LOGI(TAG, "短按：当前没有待确认的提醒 —— 本按键只做确认，不做对话开关");
         }
         break;
     }
