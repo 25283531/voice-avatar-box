@@ -135,11 +135,28 @@ def main() -> int:
           "_binary_reminder_chime_ogg_start" in bridge
           and "_binary_reminder_chime_ogg_end" in bridge)
     check("B2 音效枚举里有 ELDER_TONE_REMINDER", "ELDER_TONE_REMINDER" in ui_hdr)
+    # B3 的判据跟着实现走（2026-10-27：OnPlayTone 改成"先选 sound、再在
+    # Application::Schedule 里 PlaySound"，因为就地 PlaySound 会同步解 OGG +
+    # codec->EnableOutput(true)，把 elder_input / esp_event 两条小栈路径压穿）。
+    # 保护意图一点没变：ELDER_TONE_REMINDER 这一支必须真的指向内置 chime，
+    # 且函数体里必须真的调 PlaySound —— 落到 default 就是"提醒到点但没声音"，
+    # 运行时零报错，是本项目最坏的一类静默失效。
     check("B3 OnPlayTone **函数体内**为该枚举接了 PlaySound（落到 default 就静默无声）",
           bool(on_play_tone)
           and "case ELDER_TONE_REMINDER:" in on_play_tone
-          and "PlaySound(kReminderChime)" in on_play_tone,
+          and "kReminderChime" in on_play_tone
+          and "PlaySound(" in on_play_tone,
           f"func_len={len(on_play_tone)}")
+
+    # B9（2026-10-27）：PlaySound 必须**延后**到主事件循环，不许就地同步播。
+    # AudioService::PlaySound() 是同步的（遍历 OGG 页 + 打开 codec + 推 I2S），
+    # 而 OnPlayTone 会被 elder_input（按键确认 → OnReminder(DONE) → 提示音）
+    # 和 esp_event 默认任务同步调到 —— 就地调就是"长按确认偶发重启"。
+    # 判据用位置关系：Schedule( 必须出现在 PlaySound( 之前。
+    _i_sched = on_play_tone.find("Schedule(")
+    _i_play = on_play_tone.find("PlaySound(")
+    check("B9 PlaySound 经 Schedule 延后，不就地同步播（避免压穿小栈任务）",
+          -1 < _i_sched < _i_play, f"Schedule@{_i_sched} PlaySound@{_i_play}")
 
     # 顺序：play_tone(REMINDER) 必须出现在 ScheduleAnnounce 之前
     i_tone = bridge.find("elder_ui_play_tone(ELDER_TONE_REMINDER)")
