@@ -556,13 +556,12 @@ void OnDeviceStateChanged(DeviceState prev, DeviceState cur)
     } else if (cur == kDeviceStateListening) {
         elder_rgb_set_emotion(ELDER_EMO_LISTENING);
     } else if (cur == kDeviceStateConnecting) {
-        /* 2026-10-28 用户定义：「网络传输处理中为从 2-9 轮流亮起的五彩灯效，
-         * 20% 亮度」。
+        /* 2026-10-28 用户定义：「流星替掉现在的 CHASE」，用于"网络传输处理中"。
          *
          * 这一态原先被 MapDeviceState 折进 LISTENING（同一个形象），
          * 但灯效必须分开：老人看不出设备"在听"还是"在想"，等两秒没声音
          * 就会以为没听清、再喊一遍，把这次请求打断。
-         * **亮点在跑** = 正在干活（只有一颗亮，位置一直在前进）。 */
+         * **流星跑过去** = 正在干活（亮头 + 拖尾，一秒钟穿过灯带）。 */
         elder_rgb_set_ui_state(ELDER_RGB_UI_CONNECTING);
     } else if (cur == kDeviceStateSpeaking) {
         elder_rgb_set_emotion(ELDER_EMO_SPEAKING);

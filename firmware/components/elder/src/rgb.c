@@ -72,7 +72,7 @@ typedef struct {
 #define ELDER_UI_LEVEL_LISTENING 140        /* 55% */
 #define ELDER_UI_COLOR_SPEAKING  0xFF8C00u  /* 深橙 */
 #define ELDER_UI_LEVEL_SPEAKING  178        /* 70%（原 100%，2026-10-28 用户下调） */
-#define ELDER_UI_LEVEL_CHASE     51         /* 20%：网络传输中（原 80%） */
+#define ELDER_UI_LEVEL_METEOR    51         /* 20%：网络传输中 */
 #define ELDER_UI_FULL_LEVEL      255        /* 100% */
 
 /* 待机"高亮 1 分钟"的窗口长度：进待机先亮 60%，1 分钟后自动降到 30%。
@@ -80,13 +80,37 @@ typedef struct {
  * 1 分钟后进入真正的待机，太亮会干扰睡眠（夜里尤其）。 */
 #define ELDER_IDLE_BOOST_MS       (60u * 1000u)
 
-/* 待机"五彩幻彩"：整条同步缓慢流转，一圈约 20 秒。
- * 为什么这么慢：待机是**长期**状态，颜色变化太快在余光里会一直"动"，
- * 夜里尤其让人睡不踏实。55ms 走 1° ≈ 每秒 18°，肉眼看是"颜色缓缓流动"。 */
+/* ---- 待机"闪烁星光"（ELDER_FX_TWINKLE，2026-10-28 用户指定替掉幻彩）----
+ *
+ * 每颗灯一个**独立的伪随机节拍**：亮 ELDER_TWINKLE_ON_MS 然后长时间熄灭，
+ * 周期在 1.2~3.0 秒之间按灯位散列。8 颗灯平均同时只亮 0.6~1 颗
+ * （ON/周期 ≈ 10%，× 8 颗）—— 观感是"偶尔有颗星闪一下"。
+ *
+ * 为什么比整条幻彩更适合待机：幻彩是**整条**一直在变色，余光里"一直在动"，
+ * 夜里躺着看会一直吸引注意力。星光绝大部分时间是黑的，只在某处亮一下，
+ * 是"安静但不死"的信号。 */
+#define ELDER_TWINKLE_ON_MS      220u
+#define ELDER_TWINKLE_MIN_MS     1200u
+#define ELDER_TWINKLE_SPAN_MS    1800u   /* 周期 = MIN + [0,SPAN) ⇒ 1.2~3.0s */
+
+/* ---- 网络传输中"流星"（ELDER_FX_METEOR，2026-10-28 用户指定替掉 CHASE）----
+ *
+ * 一个亮头 + 拖尾沿灯带跑过去。8 颗灯上拖尾取 4 格（含头部）正好半条，
+ * "头亮尾淡"才看得出是流星；再长就分不清头尾、只剩一团。
+ *
+ * 每 ELDER_METEOR_STEP_MS 前进一格，走完 8 格 + 4 格出尾 + 2 格空档
+ * = 14 格 ≈ 1.26 秒一颗。**那 2 格空档是必需的**：不留空档的话
+ * 尾巴还没走完头就从起点冒出来，变成"头尾相接的循环"，
+ * 看上去像一条虫在爬，不是流星。 */
+#define ELDER_METEOR_TAIL        4
+#define ELDER_METEOR_STEP_MS     90u
+
+/* 待机"五彩幻彩"（ELDER_FX_RAINBOW）：整条同步缓慢流转，一圈约 20 秒。
+ * 2026-10-28 已被 TWINKLE 替掉，保留常量是因为换回来只需改一行。 */
 #define ELDER_RAINBOW_MS_PER_DEG  55u
 
-/* 网络传输中"从 #2 到 #9 轮流亮起"：同一时刻只有一颗亮，每 150ms 前进一格
- * （8 颗一轮 1.2 秒）。慢到能看清"有一颗在跑"，又不至于像卡住。 */
+/* "轮流亮起"（ELDER_FX_CHASE）：同一时刻只有一颗亮，每 150ms 前进一格
+ * （8 颗一轮 1.2 秒）。2026-10-28 已被 METEOR 替掉，保留备用。 */
 #define ELDER_CHASE_STEP_MS       150u
 
 /* 流水灯速度（ELDER_FX_FLOW 专用；当前四态不再使用它，
@@ -174,13 +198,23 @@ static uint32_t now_ms(void)
 
 /* ---------------- 颜色工具 ---------------- */
 
+/* HSV → RGB。**h 是角度 0~359，不是 0~255**（见下面的血泪注释）。 */
 static uint32_t hsv2rgb(uint16_t h, uint8_t s, uint8_t v)
 {
-    uint8_t region = h / 43;
-    uint8_t rem    = (h % 43) * 6;
-    uint8_t p = (v * (255 - s)) >> 8;
-    uint8_t q = (v * (255 - ((s * rem) >> 8))) >> 8;
-    uint8_t t = (v * (255 - ((s * (255 - rem)) >> 8))) >> 8;
+    /* ⚠️ 2026-10-28 修正：原来写的是 `region = h / 43` + `rem = (h % 43) * 6`
+     * —— 那是 **hue 取 0~255** 的实现（255/6 ≈ 43）。而本文件所有调用方
+     * 传的都是 `% 360` 的**角度**，于是：
+     *     h=240（应是纯蓝）→ 实际 rgb(255,0,105) 粉红
+     *     h=180（应是青色）→ 实际 rgb(48,0,255) 蓝紫
+     *     h=300（应是洋红）→ 实际 rgb(255,0,3) 纯红
+     * 也就是说 258°~359° 全部落进 default 分支、拿 region 5 的公式配错的
+     * 相位，**整条灯带从来没有出过蓝色和青色**，"五彩"其实只有红橙黄绿。
+     * 修正：region = h/60（6 个 60° 扇区），rem 按 60 归一化到 0~255。 */
+    uint8_t region = (uint8_t)(h / 60u);
+    uint8_t rem    = (uint8_t)(((uint32_t)(h % 60u) * 255u) / 60u);
+    uint8_t p = (uint8_t)(((uint32_t)v * (255u - s)) >> 8);
+    uint8_t q = (uint8_t)(((uint32_t)v * (255u - (((uint32_t)s * rem) >> 8))) >> 8);
+    uint8_t t = (uint8_t)(((uint32_t)v * (255u - (((uint32_t)s * (255u - rem)) >> 8))) >> 8);
     switch (region) {
     case 0: return ((uint32_t)v << 16) | ((uint32_t)t << 8) | p;
     case 1: return ((uint32_t)q << 16) | ((uint32_t)v << 8) | p;
@@ -313,18 +347,66 @@ static uint32_t fx_pixel(const slot_t *s, uint32_t t_ms, int led_idx)
         mod = ((t_ms % 500u) < 250u) ? 255u : 0u;
         break;
     case ELDER_FX_CHASE: {
-        /* **从 #2 到 #9 轮流亮起**（2026-10-28 用户指定，用于"网络传输处理中"）：
-         * 同一时刻只有一颗亮，位置每 ELDER_CHASE_STEP_MS 前进一格，8 颗循环。
+        /* **从 #2 到 #9 轮流亮起**：同一时刻只有一颗亮，位置每
+         * ELDER_CHASE_STEP_MS 前进一格，8 颗循环。
          * 色相按灯位固定分配（#2 红 → #9 紫，每颗 45°），于是"轮流亮起"的
          * 同时颜色也在依次变化，形成五彩循环。
          *
-         * 和 ELDER_FX_FLOW 的区别：FLOW 是"8 颗都亮、彩虹沿灯带流动"，
-         * CHASE 是"只有一颗亮、亮点在跑"。用户要的是后者（"轮流亮起"）。 */
+         * 2026-10-28 用户已把"网络传输处理中"改成 ELDER_FX_METEOR（流星），
+         * 这里保留备用：CHASE 是"单点跑"、METEOR 是"头 + 拖尾跑"，
+         * 想换回单点只需改 set_ui_state 一行。
+         * 与 ELDER_FX_FLOW 的区别：FLOW 是"8 颗都亮、彩虹沿灯带流动"。 */
         const uint32_t span = (uint32_t)(ELDER_RGB_LEDS - 1);   /* 8 格 */
         uint32_t idx  = (uint32_t)(led_idx - 1);                /* 0..7 */
         uint32_t step = (t_ms / ELDER_CHASE_STEP_MS) % span;
         if (idx != step) return 0u;      /* 没轮到它：灭 */
         c = hsv2rgb((uint16_t)(idx * ELDER_FLOW_LED_STEP_DEG), 255, 255);
+        break;
+    }
+    case ELDER_FX_TWINKLE: {
+        /* **闪烁星光**（待机用，2026-10-28 用户指定）。
+         *
+         * 散列用 Knuth 乘法常数：同一 led_idx 每帧结果完全一致（纯函数），
+         * 8 颗灯之间又互相错开。**绝对不能用 rand()** —— rgb_task 每 30ms
+         * 调一次，rand() 会让同一颗灯的相位每帧跳变，出来的不是星光、
+         * 是雪花噪点。
+         *
+         * 颜色每闪一次换一个：用"第几个周期"（round）参与散列，
+         * 于是同一个周期内颜色恒定、下一轮才换色。如果每帧算一次随机色，
+         * 220ms 的闪亮会被切成 7 段不同颜色，看着像坏点。 */
+        uint32_t seed   = (uint32_t)led_idx * 2654435761u;
+        uint32_t period = ELDER_TWINKLE_MIN_MS + ((seed >> 8) % ELDER_TWINKLE_SPAN_MS);
+        uint32_t t      = t_ms + (seed >> 16);            /* 相位错开 */
+        uint32_t phase  = t % period;
+        if (phase >= ELDER_TWINKLE_ON_MS) return 0u;      /* 大部分时间灭 */
+        mod = 255u - phase * 255u / ELDER_TWINKLE_ON_MS;  /* 亮起瞬间最亮，快速衰减 */
+        {
+            uint32_t round = t / period;
+            /* 137 / 61 都是质数：色相在相邻两次闪烁之间跳得够远，
+             * 不会连着两次都是绿。饱和度 220（不是 255）——
+             * 纯饱和的彩点在暗环境里仍然刺眼，略降一点更像"星光"。 */
+            uint32_t hue = (round * 137u + (seed >> 24) * 61u) % 360u;
+            c = hsv2rgb((uint16_t)hue, 220, 255);
+        }
+        break;
+    }
+    case ELDER_FX_METEOR: {
+        /* **流星**（网络传输中用，2026-10-28 用户指定）。
+         *
+         * head 是头部所在格（0..7 对应 #2..#9），会继续往右走出灯带，
+         * 让尾巴自然流干净；最后 2 格是空档（见 ELDER_METEOR_TAIL 的注释）。 */
+        const int n    = ELDER_RGB_LEDS - 1;                        /* 8 格 */
+        const int span = n + ELDER_METEOR_TAIL + 2;                 /* 14 格 */
+        int head = (int)((t_ms / ELDER_METEOR_STEP_MS) % (uint32_t)span);
+        int d    = head - (led_idx - 1);        /* 0 = 头部，越大越靠尾 */
+        if (d < 0 || d >= ELDER_METEOR_TAIL) return 0u;
+        mod = 255u * (uint32_t)(ELDER_METEOR_TAIL - d) / (uint32_t)ELDER_METEOR_TAIL;
+        /* 单颗流星必须是**一个**颜色 —— 流星不是彩虹，整条同色才认得出是流星。
+         * 但连续几颗换色（按"第几颗流星"散列），整体仍是用户要的"五彩"。 */
+        {
+            uint32_t round = (t_ms / ELDER_METEOR_STEP_MS) / (uint32_t)span;
+            c = hsv2rgb((uint16_t)((round * 137u) % 360u), 230, 255);
+        }
         break;
     }
     case ELDER_FX_FLOW: {
@@ -335,7 +417,8 @@ static uint32_t fx_pixel(const slot_t *s, uint32_t t_ms, int led_idx)
         break;
     }
     case ELDER_FX_RAINBOW:
-        /* **五彩幻彩**（待机用）：整条同步、缓慢流转，约 20 秒一圈。 */
+        /* **五彩幻彩**：整条同步、缓慢流转，约 20 秒一圈。
+         * 2026-10-28 待机已改用 ELDER_FX_TWINKLE，这里保留备用。 */
         c = hsv2rgb((uint16_t)((t_ms / ELDER_RAINBOW_MS_PER_DEG) % 360u), 255, 255);
         break;
     case ELDER_FX_SOLID:
@@ -487,9 +570,9 @@ static void rgb_task(void *arg)
              *   待机期间**没有任何上层任务在跑**（会话已结束、唤醒词还没来），
              *   没人能来改。放在渲染循环里是唯一的做法，且不引入定时器/新任务。
              *
-             * 只认"待机幻彩"这一种：条件里带 s.fx == ELDER_FX_RAINBOW，
-             * 这样别人用 RAINBOW 做别的灯效时不会被误降亮。 */
-            if (g.idle_dim && has_fx && s.fx == ELDER_FX_RAINBOW
+             * 只认"待机星光"这一种：条件里带 s.fx == ELDER_FX_TWINKLE，
+             * 这样别人用 TWINKLE 做别的灯效时不会被误降亮。 */
+            if (g.idle_dim && has_fx && s.fx == ELDER_FX_TWINKLE
                 && (int32_t)(t_ms - g.idle_since_ms) >= (int32_t)ELDER_IDLE_BOOST_MS) {
                 s.level = ELDER_UI_LEVEL_IDLE;
             }
@@ -662,10 +745,10 @@ void elder_rgb_set_ui_state(elder_rgb_ui_t st)
                              ELDER_UI_COLOR_LISTENING, ELDER_UI_LEVEL_LISTENING, 0);
         break;
     case ELDER_RGB_UI_CONNECTING:
-        /* #2~#9 轮流亮起五彩，20%。颜色由 CHASE 自己按灯位算，
+        /* 流星：颜色由 METEOR 自己按"第几颗流星"算（单颗同色、颗与颗换色），
          * 这里的 color 参数不用（传 0 明确表示"灯效自定色"）。 */
-        elder_rgb_request_ex(ELDER_RGB_PRIO_EMOTION, ELDER_FX_CHASE,
-                             0u, ELDER_UI_LEVEL_CHASE, 0);
+        elder_rgb_request_ex(ELDER_RGB_PRIO_EMOTION, ELDER_FX_METEOR,
+                             0u, ELDER_UI_LEVEL_METEOR, 0);
         break;
     case ELDER_RGB_UI_SPEAKING:
         /* 深橙 #FF8C00，70%，常亮。 */
@@ -674,10 +757,11 @@ void elder_rgb_set_ui_state(elder_rgb_ui_t st)
         break;
     case ELDER_RGB_UI_IDLE:
     default:
-        /* 五彩幻彩，整条同步缓慢流转。
+        /* 闪烁星光（随机彩色）。颜色由 TWINKLE 自己每闪一次换一个，
+         * 所以这里 color 传 0。
          * level 先给 60%（刚进待机）；1 分钟后由 rgb_task 自动降到 30%
          * （见 g.idle_dim / ELDER_IDLE_BOOST_MS），上层不需要再调一次。 */
-        elder_rgb_request_ex(ELDER_RGB_PRIO_EMOTION, ELDER_FX_RAINBOW,
+        elder_rgb_request_ex(ELDER_RGB_PRIO_EMOTION, ELDER_FX_TWINKLE,
                              0u, ELDER_UI_LEVEL_IDLE_BOOST, 0);
         break;
     }
