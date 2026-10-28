@@ -43,27 +43,56 @@ typedef struct {
 #define ELDER_NAG_BLINK_MS  (10u * 1000u)
 #define ELDER_NAG_TOTAL_MS  (2u * 60u * 60u * 1000u)
 
-/* ---- 对话四态的取值（2026-10-27 用户指定，改数字 = 改产品观感） ---- */
-#define ELDER_UI_COLOR_IDLE      0x87CEFAu  /* 天蓝 */
-#define ELDER_UI_LEVEL_IDLE      77         /* 30% of 255 */
+/* ---- 对话四态的取值（2026-10-27 定色，2026-10-28 定亮度，改数字 = 改产品观感）
+ *
+ * ⚠️ 这里的 level 是**感知亮度**（"看起来几成亮"），不是写入灯珠的线性值。
+ *    中间隔着一张 gamma 2.2 查表（GAMMA_LUT / level_to_linear）。
+ *
+ *    为什么必须有这张表：加表之前 scale_color() 是纯线性乘法
+ *    （`通道 × level / 255`），而人眼亮度感知近似 gamma 2.2 ——
+ *    写 30% 出来人眼看着约 58%，写 55% 看着约 76%。用户 2026-10-28 问
+ *    「WS2812B 是不是控制不了亮度」，根因就是这个错位，不是驱动没生效。
+ *    加表之后 30% 真的是三成亮、70% 真的是七成亮。
+ *
+ *    副作用要记住：感知 30% ⇒ 线性只有 7%（18/255），感知 20% ⇒ 线性 2.7%
+ *    （7/255）。WS2812B 的低端本来就不可靠（值 1~11 在表里直接是 0，
+ *    就是为了避开恒流源最小导通时间造成的闪烁/偏色），所以**低于 20% 的
+ *    感知亮度基本等于"看不太清"**，别指望再往下调。 */
+#define ELDER_UI_LEVEL_IDLE_BOOST 153       /* 60%：刚进待机的那 1 分钟 */
+#define ELDER_UI_LEVEL_IDLE       77        /* 30%：待机超过 1 分钟 */
 /* 收听态：**不是**纯蓝 #0000FF 100%（2026-10-27 用户实报"过于刺眼"）。
  *
  * 为什么纯蓝最刺眼：蓝光波长短、在暗环境里散射强，老人晶状体黄化后
  * 对短波更敏感；而 #0000FF 只有蓝通道满驱，另外两个通道为 0，
  * 观感是"发紫的高亮针尖"，眩光强但显色极差。
- * 换成深天蓝 #00BFFF（青味蓝）+ 55% 亮度：加进来的绿通道把峰值能量摊开，
- * 视觉上仍是"蓝色 = 正在听"，刺眼感约降到三分之一，且和待机的
- * 浅天蓝 #87CEFA 靠"更饱和、更亮"区分开（不会看混）。
+ * 换成深天蓝 #00BFFF（青味蓝）：加进来的绿通道把峰值能量摊开，
+ * 视觉上仍是"蓝色 = 正在听"，且和待机的幻彩靠"单色常亮"区分开。
  * 要再暗一档就调 ELDER_UI_LEVEL_LISTENING，别改色相 —— 色相是语义。 */
 #define ELDER_UI_COLOR_LISTENING 0x00BFFFu  /* 深天蓝 */
-#define ELDER_UI_LEVEL_LISTENING 140        /* 55% of 255 */
+#define ELDER_UI_LEVEL_LISTENING 140        /* 55% */
 #define ELDER_UI_COLOR_SPEAKING  0xFF8C00u  /* 深橙 */
-#define ELDER_UI_LEVEL_FLOW      204        /* 80% of 255 */
+#define ELDER_UI_LEVEL_SPEAKING  178        /* 70%（原 100%，2026-10-28 用户下调） */
+#define ELDER_UI_LEVEL_CHASE     51         /* 20%：网络传输中（原 80%） */
 #define ELDER_UI_FULL_LEVEL      255        /* 100% */
 
-/* 流水灯速度：60°/秒（完整循环 6 秒），逐颗偏移 45°。
- * "低速"是用户明确要求的 —— 快速闪烁对老人有光敏性癫痫风险，
- * 而且夜里看会晕。要调快之前先想清楚这一点。 */
+/* 待机"高亮 1 分钟"的窗口长度：进待机先亮 60%，1 分钟后自动降到 30%。
+ * 为什么要有这个窗口：老人刚放下话、抬头看设备时，灯还亮着能确认"它听见了"；
+ * 1 分钟后进入真正的待机，太亮会干扰睡眠（夜里尤其）。 */
+#define ELDER_IDLE_BOOST_MS       (60u * 1000u)
+
+/* 待机"五彩幻彩"：整条同步缓慢流转，一圈约 20 秒。
+ * 为什么这么慢：待机是**长期**状态，颜色变化太快在余光里会一直"动"，
+ * 夜里尤其让人睡不踏实。55ms 走 1° ≈ 每秒 18°，肉眼看是"颜色缓缓流动"。 */
+#define ELDER_RAINBOW_MS_PER_DEG  55u
+
+/* 网络传输中"从 #2 到 #9 轮流亮起"：同一时刻只有一颗亮，每 150ms 前进一格
+ * （8 颗一轮 1.2 秒）。慢到能看清"有一颗在跑"，又不至于像卡住。 */
+#define ELDER_CHASE_STEP_MS       150u
+
+/* 流水灯速度（ELDER_FX_FLOW 专用；当前四态不再使用它，
+ * 保留是因为"整条每颗不同色相同时流动"和"轮流亮起"是两种观感，
+ * 将来想换回来改一行就行）。60°/秒，逐颗偏移 45°。
+ * "低速"是用户明确要求的 —— 快速闪烁对老人有光敏性癫痫风险。 */
 #define ELDER_FLOW_DEG_PER_TICK   3u        /* 每 50ms 走 3° ⇒ 60°/秒 */
 #define ELDER_FLOW_TICK_MS        50u
 #define ELDER_FLOW_LED_STEP_DEG   45u       /* 8 颗灯铺满一圈色相 */
@@ -118,6 +147,14 @@ static struct {
     bool                  nag_active;
     uint32_t              nag_start_ms;
 
+    /* 待机"高亮 1 分钟"窗口（见 ELDER_IDLE_BOOST_MS）。
+     * idle_dim 为真表示当前 #2~#9 正在放**待机幻彩**，rgb_task 每帧按
+     * idle_since_ms 算"该 60% 还是 30%"。放在这里而不是写死进槽位的 level，
+     * 是因为降亮必须**自己发生** —— 让上层 60 秒后再调一次 set_ui_state
+     * 就得依赖上层定时器，而待机期间没有任何上层任务在跑（唤醒词才起会话）。 */
+    bool                  idle_dim;
+    uint32_t              idle_since_ms;
+
     /* #1 按键指示灯状态机 */
     btn_mode_t            btn_mode;
     bool                  btn_pending;    /* 存在待确认提醒（吸引注意态的真源） */
@@ -154,14 +191,65 @@ static uint32_t hsv2rgb(uint16_t h, uint8_t s, uint8_t v)
     }
 }
 
-/* 统一亮度：**算完灯效之后**再乘，见 elder_rgb.h 里 ELDER_RGB_UI_* 的注释 */
+/* ---- gamma 2.2 查表：感知亮度 level(0..255) → 线性系数(0..255) ----
+ *
+ * 生成方式（Python，改表就重跑这一行）：
+ *     [round(255 * (i / 255.0) ** 2.2) for i in range(256)]
+ *
+ * 关键点：**表作用在"亮度系数"上，不作用在每个颜色通道上**。
+ *   若对通道值单独做 gamma，三个通道在暗部的非线性不一致，颜色会偏
+ *   （暗绿变墨绿、暗蓝发紫）。这里先算出"整体该暗多少"，再等比乘到
+ *   RGB 三个通道上 —— 色相不变，只有亮度变。
+ *
+ * 表里 0~14 全是 0/1：这是**故意的**。WS2812B 用内置恒流源，
+ *   值 1~8 时占空比太窄，实际表现是闪烁 + 三色比例失衡；
+ *   与其"似亮非亮地抖"，不如干脆黑掉。所以感知亮度低于约 8% 就看不见了，
+ *   这是硬件下限，不是 bug。
+ *
+ * 体积：256 字节常量，放 flash，不进 RAM。查表比 powf() 快得多，
+ *   而 rgb_task 每 30ms 要算 8 颗灯 × 3 通道。 */
+static const uint8_t GAMMA_LUT[256] = {
+      0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   1,
+      1,   1,   1,   1,   1,   1,   1,   1,   1,   2,   2,   2,   2,   2,   2,   2,
+      3,   3,   3,   3,   3,   4,   4,   4,   4,   5,   5,   5,   5,   6,   6,   6,
+      6,   7,   7,   7,   8,   8,   8,   9,   9,   9,  10,  10,  11,  11,  11,  12,
+     12,  13,  13,  13,  14,  14,  15,  15,  16,  16,  17,  17,  18,  18,  19,  19,
+     20,  20,  21,  22,  22,  23,  23,  24,  25,  25,  26,  26,  27,  28,  28,  29,
+     30,  30,  31,  32,  33,  33,  34,  35,  35,  36,  37,  38,  39,  39,  40,  41,
+     42,  43,  43,  44,  45,  46,  47,  48,  49,  49,  50,  51,  52,  53,  54,  55,
+     56,  57,  58,  59,  60,  61,  62,  63,  64,  65,  66,  67,  68,  69,  70,  71,
+     73,  74,  75,  76,  77,  78,  79,  81,  82,  83,  84,  85,  87,  88,  89,  90,
+     91,  93,  94,  95,  97,  98,  99, 100, 102, 103, 105, 106, 107, 109, 110, 111,
+    113, 114, 116, 117, 119, 120, 121, 123, 124, 126, 127, 129, 130, 132, 133, 135,
+    137, 138, 140, 141, 143, 145, 146, 148, 149, 151, 153, 154, 156, 158, 159, 161,
+    163, 165, 166, 168, 170, 172, 173, 175, 177, 179, 181, 182, 184, 186, 188, 190,
+    192, 194, 196, 197, 199, 201, 203, 205, 207, 209, 211, 213, 215, 217, 219, 221,
+    223, 225, 227, 229, 231, 234, 236, 238, 240, 242, 244, 246, 248, 251, 253, 255,
+};
+
+/* 感知亮度 → 线性系数 */
+static uint32_t level_to_linear(uint32_t lvl)
+{
+    return (lvl >= 255u) ? 255u : (uint32_t)GAMMA_LUT[lvl];
+}
+
+/* 线性衰减：k 是**线性**系数（0..255），不再过 gamma。
+ * 灯效自身的调制（呼吸相位、轮流亮起的通断）都走这里 ——
+ * 它们本来就是线性波形，再过一次 gamma 会让暗部占比过大、
+ * 呼吸看起来像"眨眼"而不是"呼吸"。 */
+static uint32_t dim_color(uint32_t c, uint32_t k)
+{
+    if (k >= 255u) return c;
+    uint32_t r  = ((c >> 16) & 0xFFu) * k / 255u;
+    uint32_t g2 = ((c >> 8) & 0xFFu) * k / 255u;
+    uint32_t b  = (c & 0xFFu) * k / 255u;
+    return (r << 16) | (g2 << 8) | b;
+}
+
+/* 对外唯一入口：按**感知亮度**衰减一个颜色（见 GAMMA_LUT 的注释） */
 static uint32_t scale_color(uint32_t c, uint32_t lvl)
 {
-    if (lvl >= 255u) return c;
-    uint32_t r = ((c >> 16) & 0xFFu) * lvl / 255u;
-    uint32_t g2 = ((c >> 8) & 0xFFu) * lvl / 255u;
-    uint32_t b = (c & 0xFFu) * lvl / 255u;
-    return (r << 16) | (g2 << 8) | b;
+    return dim_color(c, level_to_linear(lvl));
 }
 
 /* 线性插值：num/den 为进度。den==0 时直接给终点色，避免除零。 */
@@ -200,23 +288,45 @@ static bool active_slot(slot_t *out, uint32_t t_ms, int *best_prio)
 }
 
 /* 单颗灯的最终颜色。led_idx 是灯带索引（1..ELDER_RGB_LEDS-1），
- * 流水的相位偏移按 led_idx-1 算 —— #1 不参与灯效，不能让它占掉一格色相。 */
+ * 灯效的相位/位置偏移按 led_idx-1 算 —— #1 不参与灯效，不能让它占掉一格色相。
+ *
+ * 亮度分两层，别混：
+ *   ① 基准亮度 s->level 是**感知亮度**（60% / 30% / 20%…）→ 过 gamma 表；
+ *   ② 灯效自身的调制 mod（呼吸相位、轮流亮起的通断）是**线性波形** → 不过 gamma。
+ * 合成方式：dim_color(颜色, gamma(level) × mod / 255)。
+ * 历史上这里是 `scale_color(color, lvl)` 之后又 `scale_color(c, s->level)`
+ * 两层都乘 —— 加了 gamma 之后会变成"gamma 套 gamma"，暗部直接消失。 */
 static uint32_t fx_pixel(const slot_t *s, uint32_t t_ms, int led_idx)
 {
-    uint32_t c;
+    uint32_t c = s->color;
+    uint32_t mod = 255u;      /* 灯效自身的线性调制，255 = 不做调制 */
 
     switch (s->fx) {
     case ELDER_FX_BREATH: {
-        /* 2.4s 一个呼吸周期 */
+        /* 2.4s 一个呼吸周期（三角波） */
         uint32_t phase = t_ms % 2400u;
-        uint32_t lvl = (phase < 1200u) ? (phase * 255u / 1200u)
-                                       : ((2400u - phase) * 255u / 1200u);
-        c = scale_color(s->color, lvl);
+        mod = (phase < 1200u) ? (phase * 255u / 1200u)
+                              : ((2400u - phase) * 255u / 1200u);
         break;
     }
     case ELDER_FX_BLINK_FAST:
-        c = ((t_ms % 500u) < 250u) ? s->color : 0u;
+        mod = ((t_ms % 500u) < 250u) ? 255u : 0u;
         break;
+    case ELDER_FX_CHASE: {
+        /* **从 #2 到 #9 轮流亮起**（2026-10-28 用户指定，用于"网络传输处理中"）：
+         * 同一时刻只有一颗亮，位置每 ELDER_CHASE_STEP_MS 前进一格，8 颗循环。
+         * 色相按灯位固定分配（#2 红 → #9 紫，每颗 45°），于是"轮流亮起"的
+         * 同时颜色也在依次变化，形成五彩循环。
+         *
+         * 和 ELDER_FX_FLOW 的区别：FLOW 是"8 颗都亮、彩虹沿灯带流动"，
+         * CHASE 是"只有一颗亮、亮点在跑"。用户要的是后者（"轮流亮起"）。 */
+        const uint32_t span = (uint32_t)(ELDER_RGB_LEDS - 1);   /* 8 格 */
+        uint32_t idx  = (uint32_t)(led_idx - 1);                /* 0..7 */
+        uint32_t step = (t_ms / ELDER_CHASE_STEP_MS) % span;
+        if (idx != step) return 0u;      /* 没轮到它：灭 */
+        c = hsv2rgb((uint16_t)(idx * ELDER_FLOW_LED_STEP_DEG), 255, 255);
+        break;
+    }
     case ELDER_FX_FLOW: {
         uint32_t idx = (led_idx > 0) ? (uint32_t)(led_idx - 1) : 0u;
         uint32_t hue = ((t_ms / ELDER_FLOW_TICK_MS) * ELDER_FLOW_DEG_PER_TICK
@@ -225,15 +335,15 @@ static uint32_t fx_pixel(const slot_t *s, uint32_t t_ms, int led_idx)
         break;
     }
     case ELDER_FX_RAINBOW:
-        c = hsv2rgb((uint16_t)((t_ms / 8u) % 360u), 255, 255);
+        /* **五彩幻彩**（待机用）：整条同步、缓慢流转，约 20 秒一圈。 */
+        c = hsv2rgb((uint16_t)((t_ms / ELDER_RAINBOW_MS_PER_DEG) % 360u), 255, 255);
         break;
     case ELDER_FX_SOLID:
     default:
-        c = s->color;
         break;
     }
 
-    return scale_color(c, s->level);
+    return dim_color(c, level_to_linear(s->level) * mod / 255u);
 }
 
 /* ---------------- #1 按键指示灯状态机 ----------------
@@ -370,6 +480,19 @@ static void rgb_task(void *arg)
         if (xSemaphoreTake(g.lock, pdMS_TO_TICKS(50)) == pdTRUE) {
             int prio = -1;
             has_fx = active_slot(&s, t_ms, &prio);
+
+            /* 待机降亮：进待机的前 ELDER_IDLE_BOOST_MS 用 60%，之后 30%。
+             *
+             * 为什么在这里改 s.level 而不是让上层再调一次 set_ui_state：
+             *   待机期间**没有任何上层任务在跑**（会话已结束、唤醒词还没来），
+             *   没人能来改。放在渲染循环里是唯一的做法，且不引入定时器/新任务。
+             *
+             * 只认"待机幻彩"这一种：条件里带 s.fx == ELDER_FX_RAINBOW，
+             * 这样别人用 RAINBOW 做别的灯效时不会被误降亮。 */
+            if (g.idle_dim && has_fx && s.fx == ELDER_FX_RAINBOW
+                && (int32_t)(t_ms - g.idle_since_ms) >= (int32_t)ELDER_IDLE_BOOST_MS) {
+                s.level = ELDER_UI_LEVEL_IDLE;
+            }
 
             /* 需求 8：提醒闪灯（每 10 分钟的前 10 秒，共 2 小时）。
              *
@@ -508,7 +631,7 @@ void elder_rgb_release(elder_rgb_prio_t prio)
     xSemaphoreGive(g.lock);
 }
 
-/* ---- 对话四态（2026-10-27 用户定义） ---- */
+/* ---- 对话四态（2026-10-28 用户最终定义，见 elder_rgb.h） ---- */
 void elder_rgb_set_ui_state(elder_rgb_ui_t st)
 {
     /* 四个状态共用一个槽位（ELDER_RGB_PRIO_EMOTION）⇒ 切换就是替换。
@@ -517,24 +640,45 @@ void elder_rgb_set_ui_state(elder_rgb_ui_t st)
      *
      * ttl 一律 0（常驻）：原来给 8000 会让待机呼吸 8 秒后灯自己灭掉，
      * 而待机是**长期**状态，老人看到灯灭了只会以为设备坏了。 */
+    if (g.ready) {
+        xSemaphoreTake(g.lock, portMAX_DELAY);
+        /* 待机降亮的计时基准：**每次从别的状态回到待机都重新起算**。
+         * 这样"老人刚说完话、放下设备"时灯是亮的（60%），他能确认设备
+         * 已经回到待机；1 分钟后才悄悄降到 30%，夜里不刺眼。 */
+        if (st == ELDER_RGB_UI_IDLE) {
+            if (!g.idle_dim) g.idle_since_ms = now_ms();
+            g.idle_dim = true;
+        } else {
+            g.idle_dim = false;
+        }
+        xSemaphoreGive(g.lock);
+    }
+
     switch (st) {
     case ELDER_RGB_UI_LISTENING:
+        /* 深天蓝 #00BFFF，55%，常亮。色相是语义（蓝 = 正在听），
+         * 觉得亮就调 ELDER_UI_LEVEL_LISTENING，别改颜色。 */
         elder_rgb_request_ex(ELDER_RGB_PRIO_EMOTION, ELDER_FX_SOLID,
                              ELDER_UI_COLOR_LISTENING, ELDER_UI_LEVEL_LISTENING, 0);
         break;
     case ELDER_RGB_UI_CONNECTING:
-        /* 五彩流水：颜色由 fx 自己按色相算，这里的 color 参数不用 */
-        elder_rgb_request_ex(ELDER_RGB_PRIO_EMOTION, ELDER_FX_FLOW,
-                             0u, ELDER_UI_LEVEL_FLOW, 0);
+        /* #2~#9 轮流亮起五彩，20%。颜色由 CHASE 自己按灯位算，
+         * 这里的 color 参数不用（传 0 明确表示"灯效自定色"）。 */
+        elder_rgb_request_ex(ELDER_RGB_PRIO_EMOTION, ELDER_FX_CHASE,
+                             0u, ELDER_UI_LEVEL_CHASE, 0);
         break;
     case ELDER_RGB_UI_SPEAKING:
+        /* 深橙 #FF8C00，70%，常亮。 */
         elder_rgb_request_ex(ELDER_RGB_PRIO_EMOTION, ELDER_FX_SOLID,
-                             ELDER_UI_COLOR_SPEAKING, ELDER_UI_FULL_LEVEL, 0);
+                             ELDER_UI_COLOR_SPEAKING, ELDER_UI_LEVEL_SPEAKING, 0);
         break;
     case ELDER_RGB_UI_IDLE:
     default:
-        elder_rgb_request_ex(ELDER_RGB_PRIO_EMOTION, ELDER_FX_BREATH,
-                             ELDER_UI_COLOR_IDLE, ELDER_UI_LEVEL_IDLE, 0);
+        /* 五彩幻彩，整条同步缓慢流转。
+         * level 先给 60%（刚进待机）；1 分钟后由 rgb_task 自动降到 30%
+         * （见 g.idle_dim / ELDER_IDLE_BOOST_MS），上层不需要再调一次。 */
+        elder_rgb_request_ex(ELDER_RGB_PRIO_EMOTION, ELDER_FX_RAINBOW,
+                             0u, ELDER_UI_LEVEL_IDLE_BOOST, 0);
         break;
     }
 }

@@ -556,12 +556,13 @@ void OnDeviceStateChanged(DeviceState prev, DeviceState cur)
     } else if (cur == kDeviceStateListening) {
         elder_rgb_set_emotion(ELDER_EMO_LISTENING);
     } else if (cur == kDeviceStateConnecting) {
-        /* 2026-10-27 用户定义的第四态：「网络传输处理中（数据传输开始传输到
-         * 服务端，语音发生之前）时是低速流水五彩灯效（80%亮度）」。
+        /* 2026-10-28 用户定义：「网络传输处理中为从 2-9 轮流亮起的五彩灯效，
+         * 20% 亮度」。
          *
          * 这一态原先被 MapDeviceState 折进 LISTENING（同一个形象），
          * 但灯效必须分开：老人看不出设备"在听"还是"在想"，等两秒没声音
-         * 就会以为没听清、再喊一遍，把这次请求打断。流水灯 = 正在干活。 */
+         * 就会以为没听清、再喊一遍，把这次请求打断。
+         * **亮点在跑** = 正在干活（只有一颗亮，位置一直在前进）。 */
         elder_rgb_set_ui_state(ELDER_RGB_UI_CONNECTING);
     } else if (cur == kDeviceStateSpeaking) {
         elder_rgb_set_emotion(ELDER_EMO_SPEAKING);
@@ -585,12 +586,12 @@ extern "C" void elder_on_vad_change(bool speaking)
 {
     if (speaking) {
         s_spoke_in_turn = true;
-        elder_rgb_set_ui_state(ELDER_RGB_UI_LISTENING);   /* 纯蓝：正在听你说 */
+        elder_rgb_set_ui_state(ELDER_RGB_UI_LISTENING);   /* 深天蓝：正在听你说 */
         return;
     }
     /* 老人刚说完、服务端还在 ASR/LLM/合成 —— 这一两秒里没有任何声音。
      * 老人以为没听清就会再喊一遍，反而把这次请求打断。
-     * 五彩流水灯 = 设备在干活，是这段时间唯一的信号。 */
+     * "亮点在跑"的五彩灯 = 设备在干活，是这段时间唯一的信号。 */
     if (s_spoke_in_turn) {
         elder_rgb_set_ui_state(ELDER_RGB_UI_CONNECTING);
     }
