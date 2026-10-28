@@ -137,6 +137,11 @@ static int s_rgb_pending;
 static int s_rgb_escalate;
 /* 提醒闪烁（漏服后一直闪，与「升级成红灯」是两件事，分开计） */
 static int s_rgb_nag;
+/* 停闪的次数。2026-10-28 起 reminder.c 在「半置信超时 → 跳过」时也会调
+ * nag_stop，T13b 要靠它断言"跳过之后真的不再催了"。
+ * ⚠️ 这个桩是**跟着新调用一起加的**：只加调用不加桩 ⇒ 宿主测试链接期
+ *    undefined reference（nag_start / button_pending 都踩过同一个坑）。 */
+static int s_rgb_nag_stop;
 static int s_rgb_done;
 /* 「只屏显不发声」的通知（未校时提示走这条）。单独计数，不并进 tone：
  * 并进去的话「播了提示音」与「只是安静地在屏幕上说了句状态」无法区分，
@@ -148,6 +153,7 @@ int  stub_rgb_count(void) { return s_rgb_count; }
 int  stub_rgb_pending_count(void) { return s_rgb_pending; }
 int  stub_rgb_escalate_count(void) { return s_rgb_escalate; }
 int  stub_rgb_nag_count(void) { return s_rgb_nag; }
+int  stub_rgb_nag_stop_count(void) { return s_rgb_nag_stop; }
 int  stub_rgb_done_count(void) { return s_rgb_done; }
 int  stub_notice_count(void) { return s_notice_count; }
 void stub_fx_reset(void)
@@ -157,6 +163,7 @@ void stub_fx_reset(void)
     s_rgb_pending = 0;
     s_rgb_escalate = 0;
     s_rgb_nag = 0;
+    s_rgb_nag_stop = 0;
     s_rgb_done = 0;
     s_notice_count = 0;
 }
@@ -177,6 +184,8 @@ void elder_rgb_med_escalate(void) { s_rgb_count++; s_rgb_escalate++; }
  * ⇒ server-ci 的「elder 断网链路宿主测试」自那时起一直是红的
  * （undefined reference to `elder_rgb_reminder_nag_start`）。 */
 void elder_rgb_reminder_nag_start(void) { s_rgb_count++; s_rgb_nag++; }
+/* 2026-10-28：半置信复核窗口超时转 SKIPPED 时调用（"跳过之后不再催"） */
+void elder_rgb_reminder_nag_stop(void) { s_rgb_count++; s_rgb_nag_stop++; }
 /* 2026-10-27：#1 按键指示灯改成"有待确认提醒就橙色呼吸"，
  * reminder.c 的 set_state()/跨天重置/replace_all 都会调它。
  * 桩漏了这个符号 ⇒ 宿主测试链接期 undefined reference，

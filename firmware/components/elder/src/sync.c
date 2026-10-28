@@ -808,6 +808,22 @@ void elder_sync_on_reminder_state(const elder_rmd_item_t *item, elder_rmd_state_
          * 服务端 home.py 已把 EventState.SKIPPED 排除在「待服药」之外。 */
         elder_sync_enqueue_event(sid, due, ELDER_EV_SKIPPED, ELDER_CFM_NONE, "stale");
         break;
+    case ELDER_RMD_HALF_EXPIRED:
+        /* 半置信复核窗口过期 —— **故意什么都不发**（2026-10-28 用户定义）。
+         *
+         * 用户原话：「半置信后不按按钮就跳过该次事件，仅在用户网页端和用户
+         * 手机APP上做标记。」那个"标记"就是 HALF_CONFIRMED 那一刻已经上报
+         * 的 CONFIRMED + method=VOICE（网页/APP 显示「语音确认」）。
+         *
+         * 这里若报一条 SKIPPED/MISSED，服务端会把同一条 (reminder_id, due_at)
+         * 的状态**覆盖**成「跳过」或「漏服」，note 还会写成 "stale"（设备离线
+         * 错过）—— 两处都与事实不符，而且「老人说过吃过了」这个信息会永久丢失。
+         *
+         * 所以：本地把状态清干净（不催、不亮灯、不算待办），云端一个字不说。
+         * ⚠️ 新增这个 case 而不是让它落到 default：default 现在也是 break，
+         *    但写出来是为了让"这里**有意**不上报"成为代码里的显式决定，
+         *    而不是将来有人给 default 加日志/兜底上报时被静默带偏。 */
+        break;
     default:
         break;
     }

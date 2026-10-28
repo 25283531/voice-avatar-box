@@ -135,6 +135,7 @@ static const char *state_name(uint8_t st)
     case ELDER_RMD_ESCALATED:   return "ESCALATED";
     case ELDER_RMD_SKIPPED:     return "SKIPPED";
     case ELDER_RMD_HALF_CONFIRMED: return "HALF";
+    case ELDER_RMD_HALF_EXPIRED:   return "HALF_EXPIRED";
     default:                    return "?";
     }
 }
@@ -1574,15 +1575,20 @@ static void test_voice_confirm_no_false_missed(void)
           det("first_ringing=%d —— 选不中 = 老人按了按钮没反应",
               elder_reminder_first_ringing()));
 
-    /* 最关键的一条：语音确认过之后，15 分钟的升级扫描不得再判漏服。
-     * HALF 不在 PENDING 集合里，升级扫描应当跳过它。 */
-    stub_time_advance(20 * 60);
+    /* 复核窗口内（10 分钟）既不得升级漏服，也不得提前跳过。
+     * HALF 不在 PENDING 集合里，15 分钟的升级扫描应当跳过它。
+     * 这里取 5 分钟：在窗口内，又远小于 15 分钟的升级阈值。 */
+    stub_time_advance(5 * 60);
     rec_reset();
     elder_reminder_tick_once();
-    check("★语音确认后再过 20 分钟不得升级 ESCALATED",
+    check("★语音确认后 5 分钟（窗口内）不得升级 ESCALATED",
           saw(0, ELDER_RMD_ESCALATED) == 0,
           det("ESCALATED %d 次 —— 老人明明说过吃过了，家属仍收到「漏服」",
               saw(0, ELDER_RMD_ESCALATED)));
+    check("★窗口内不得提前跳过（仍选得中，能按键复核）",
+          saw(0, ELDER_RMD_HALF_EXPIRED) == 0 && elder_reminder_first_ringing() == 0,
+          det("HALF_EXPIRED %d 次 / first_ringing=%d",
+              saw(0, ELDER_RMD_HALF_EXPIRED), elder_reminder_first_ringing()));
 
     /* 老人长按按钮 3 秒复核 → 这一步才是全置信 */
     check("按键复核返回 OK",
@@ -1607,6 +1613,74 @@ static void test_voice_confirm_no_false_missed(void)
           NULL);
     check("越界确认不得污染已有提醒的完成位",
           (tbl()->done_today & 1u) != 0, det("%s", dump_tbl(tbl())));
+}
+
+/* ---- T13b：半置信后一直不按按钮 → 跳过该次，只在服务端留「语音确认」----
+ *
+ * 2026-10-28 用户定义：「半置信后不按按钮就跳过该次事件，仅在用户网页端和
+ * 用户手机APP上做标记。」
+ *
+ * 钉五件事，每一件单独错都是事故：
+ *   ① 10 分钟窗口过了必须落 SKIPPED，**不是** ESCALATED —— 否则子女端
+ *      收到「漏服」假告警，而老人其实说过吃过了；
+ *   ② done_today **绝不能**置位 —— 跳过 ≠ 完成。语音是半置信，万一误识别成
+ *      "吃过了"还置完成，等于替老人谎报服药；
+ *   ③ 必须调 nag_stop —— 否则灯还每 10 分钟闪一次，老人整夜被折腾；
+ *   ④ 不得再被 first_ringing 选中（#1 按键指示灯要熄灭）；
+ *   ⑤ 确认方式仍记 VOICE —— 服务端那条「语音确认」标记不能被本地跳过改写。
+ */
+static void test_half_confirm_skip_after_window(void)
+{
+    printf("\n[T13b] 半置信超时未复核 → 跳过本次（不算完成、不再催）\n");
+    stub_nvs_init();
+    stub_time_set(1772661600L);      /* 06:00，可信时钟 */
+    rec_reset();
+    elder_reminder_init(rec_cb, NULL);
+
+    elder_rmd_item_t m = mk_med(8, 0, "降压药", 0);
+    elder_reminder_add(&m);
+    stub_time_advance(2 * 3600);     /* 08:00 到点 */
+    rec_reset();
+    elder_reminder_tick_once();
+    check("前置：08:00 已响（PENDING）",
+          saw(0, ELDER_RMD_PENDING) >= 1,
+          det("PENDING %d 次", saw(0, ELDER_RMD_PENDING)));
+
+    check("语音确认返回 OK",
+          elder_reminder_confirm_ex(0, ELDER_CFM_VOICE) == ESP_OK, NULL);
+    check("前置：语音确认进 HALF",
+          saw(0, ELDER_RMD_HALF_CONFIRMED) >= 1, NULL);
+    int nag_stop_before = stub_rgb_nag_stop_count();
+
+    /* 窗口 10 分钟，推进 11 分钟 ⇒ 必然超时 */
+    stub_time_advance(11 * 60);
+    rec_reset();
+    elder_reminder_tick_once();
+    check("★超时未复核必须落 HALF_EXPIRED（跳过，且不上报）",
+          saw(0, ELDER_RMD_HALF_EXPIRED) >= 1,
+          det("HALF_EXPIRED %d 次 —— 没跳过的话设备会一直催下去",
+              saw(0, ELDER_RMD_HALF_EXPIRED)));
+    check("★必须用 HALF_EXPIRED 而不是 SKIPPED（SKIPPED 会把云端「语音确认」覆盖成「跳过」）",
+          saw(0, ELDER_RMD_SKIPPED) == 0,
+          det("SKIPPED %d 次 —— 报了 SKIPPED，云端标记被覆盖",
+              saw(0, ELDER_RMD_SKIPPED)));
+    check("★跳过不得升级成 ESCALATED（否则子女端收到「漏服」假告警）",
+          saw(0, ELDER_RMD_ESCALATED) == 0,
+          det("ESCALATED %d 次", saw(0, ELDER_RMD_ESCALATED)));
+    check("★★跳过 ≠ 完成：done_today 绝不置位",
+          (tbl()->done_today & 1u) == 0,
+          det("%s —— 语音是半置信，置完成等于替老人谎报服药", dump_tbl(tbl())));
+    check("跳过之后不再算待办（pending_today 清掉）",
+          (tbl()->pending_today & 1u) == 0, det("%s", dump_tbl(tbl())));
+    check("★跳过必须停闪灯（nag_stop），否则整夜每 10 分钟闪一次",
+          stub_rgb_nag_stop_count() > nag_stop_before,
+          det("nag_stop %d -> %d", nag_stop_before, stub_rgb_nag_stop_count()));
+    check("跳过之后 #1 不再选得中（first_ringing == -1）",
+          elder_reminder_first_ringing() == -1,
+          det("first_ringing=%d", elder_reminder_first_ringing()));
+    check("跳过之后确认方式仍记 VOICE（服务端标记不被本地改写）",
+          elder_reminder_last_confirm_method() == ELDER_CFM_VOICE,
+          det("记成 %u", (unsigned)elder_reminder_last_confirm_method()));
 }
 
 /* ---- T14：晚开机（但没到过期阈值）不得一响就判漏服 ----
@@ -1809,6 +1883,7 @@ int main(void)
     test_restart_catchup_still_rings();
     test_stale_skip_no_false_missed();
     test_voice_confirm_no_false_missed();
+    test_half_confirm_skip_after_window();
     test_late_boot_no_instant_escalate();
     test_first_ringing_picks_ringing();
 

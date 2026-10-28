@@ -39,6 +39,27 @@ static const char *TAG = "elder.reminder";
  * 又短到不会把半天前的提醒翻出来。 */
 #define ELDER_RMD_STALE_MIN     60
 
+/* 半置信的「复核窗口」（2026-10-28 用户定义）。
+ *
+ * 语义：老人用语音说了「我吃过了」⇒ 进 HALF_CONFIRMED，设备提示他长按按钮
+ * 复核。这个窗口内按了 = 全置信（DONE）；窗口过了还没按 = **跳过这一次**
+ * （SKIPPED）—— 不再闪灯、不再橙色呼吸、不再升级漏服，服务端那边保持
+ * 已经上报的「语音确认」标记不变（子女端网页/APP 看得见）。
+ *
+ * 为什么是 10 分钟：
+ *   ① 老人可能正在倒水、找药，手也不一定利索，给 1~2 分钟等于逼他手忙脚乱；
+ *   ② 正好与 nag 的「每 10 分钟闪 10 秒」对齐 —— 窗口末尾那一次闪灯就是
+ *      最后一次提醒，闪完不按就安静下来，不需要额外定时器。
+ *
+ * 为什么必须有个上限、不能一直催：语音确认本身就是**半置信**。老人不按
+ * 按钮，说明他要么不方便、要么压根没听清设备在说什么。无限期橙色呼吸 +
+ * 每 10 分钟闪一次，夜里会一直折腾他 —— 而这条提醒在服务端已经标成
+ * 「语音确认」，子女端看得见，不需要靠设备继续骚扰来保证知情。
+ *
+ * ⚠️ 跳过**不等于完成**：done_today 绝不置位，否则「半置信」这个设计
+ *    就白做了（语音误识别会被当成真吃了药）。 */
+#define ELDER_HALF_REVIEW_MS    (10u * 60u * 1000u)
+
 static struct {
     elder_rmd_table_t table;
     elder_rmd_cb_t    cb;
@@ -49,6 +70,14 @@ static struct {
      * 「15 分钟未确认」的语义必须是**从响铃算起**，不能从计划时刻算起，
      * 否则设备晚开机 20 分钟就会在响铃的同一个 tick 里被判漏服。 */
     int64_t           pending_since_us[ELDER_REMINDER_MAX];
+    /* 进入 HALF_CONFIRMED 的时刻（RAM）。复核窗口从这个时刻起算，
+     * 见 ELDER_HALF_REVIEW_MS。
+     *
+     * 为什么只放 RAM、不落盘：状态机本身（state[]）就是 RAM 的，重启后
+     * 全部回 IDLE；而 fired_today 是落盘的，所以重启后这条提醒不会重响、
+     * 也就不会再有"复核窗口"。落盘一个和 state[] 生命周期不一致的时刻，
+     * 只会在跨重启时给出错误的窗口起点。 */
+    int64_t           half_since_us[ELDER_REMINDER_MAX];
     bool              fired_today[ELDER_REMINDER_MAX];
     bool              dirty;
     int64_t           last_flush_us;
@@ -328,7 +357,8 @@ static void set_state(int idx, elder_rmd_state_t st)
              st == ELDER_RMD_DONE ? "DONE" :
              st == ELDER_RMD_ESCALATED ? "ESCALATED" :
              st == ELDER_RMD_SKIPPED ? "SKIPPED" :
-             st == ELDER_RMD_HALF_CONFIRMED ? "HALF(语音已记，待按键复核)" : "IDLE");
+             st == ELDER_RMD_HALF_CONFIRMED ? "HALF(语音已记，待按键复核)" :
+             st == ELDER_RMD_HALF_EXPIRED ? "HALF_EXPIRED(未复核，跳过；不上报)" : "IDLE");
 
     /* 需求 8（2026-10-22 用户拍板，**覆盖**原「需求 11 红灯长亮」）：
      *
@@ -361,10 +391,18 @@ static void set_state(int idx, elder_rmd_state_t st)
          * 只是多了一条"老人说办完了"的记录。 */
         g.table.pending_today |= (1u << idx);
         g.table.done_today &= ~(1u << idx);
-    } else if (st == ELDER_RMD_SKIPPED) {
-        /* 过期作废：既不算完成（不能给绿灯），也不算待办（不能再提醒） */
+    } else if (st == ELDER_RMD_SKIPPED || st == ELDER_RMD_HALF_EXPIRED) {
+        /* 作废 / 跳过：既不算完成（不能给绿灯），也不算待办（不能再提醒）。
+         * HALF_EXPIRED 走这里是因为**本地语义和 SKIPPED 完全一样**，
+         * 两者的区别只在上报（sync 层对 HALF_EXPIRED 什么都不发）。 */
         g.table.pending_today &= ~(1u << idx);
         g.table.done_today &= ~(1u << idx);
+        /* 不再催：**只在没有别的提醒还在等确认时才停 nag**。
+         * nag 是全局单例（rgb.c 里只有一个 g.nag_active），
+         * 无条件停会把「B 还在响」的闪灯一起关掉。
+         * 此刻 g.state[idx] 已经是 SKIPPED，has_pending_confirm() 不会
+         * 把自己算进去，正好。 */
+        if (!has_pending_confirm()) elder_rgb_reminder_nag_stop();
     }
     g.dirty = true;
     /* #1 指示灯的"待确认"态跟着状态集合走。放在 g.cb 之前：
@@ -418,6 +456,7 @@ static void tick(void)
             g.fired_today[i] = false;
             g.confirm_deadline_us[i] = 0;
             g.pending_since_us[i] = 0;
+            g.half_since_us[i] = 0;
             g.table.items[i].fired_due_at = 0;
         }
         g.dirty = true;
@@ -492,6 +531,32 @@ static void tick(void)
                 ? (now_us() - g.pending_since_us[i]) >= (15LL * 60 * 1000 * 1000)
                 : (now_min - due) >= 15;
             if (overdue) set_state(i, ELDER_RMD_ESCALATED);
+        }
+
+        /* 半置信复核窗口超时 → **跳过这一次**（2026-10-28 用户定义）。
+         *
+         * 老人用语音说了「我吃过了」，设备提示他长按按钮复核；他一直不按，
+         * 就不再闪灯、不再橙色呼吸催他，本地落 HALF_EXPIRED。
+         *
+         * 为什么不是 SKIPPED：SKIPPED 会经 sync 层上报 ELDER_EV_SKIPPED
+         * （note 写死 "stale"），把服务端刚收到的「语音确认」覆盖成「跳过」，
+         * 理由还写成"设备离线错过" —— 与事实完全不符，子女端从此看不出
+         * 老人说过什么。HALF_EXPIRED 在 sync 层是**空 case，什么都不发**。
+         *
+         * ⚠️ 跳过 **不是完成**：done_today 绝不置位。语音是半置信，
+         *    万一误识别成"吃过了"，置了完成就等于替老人谎报服药。
+         *
+         * 基准取 half_since_us；为 0 时退回 pending_since_us（响铃时刻，
+         * 比它更早）⇒ 只会让窗口更早到期，是安全的方向。 */
+        if (g.state[i] == ELDER_RMD_HALF_CONFIRMED) {
+            int64_t base = g.half_since_us[i] ? g.half_since_us[i] : g.pending_since_us[i];
+            if (base && (now_us() - base) >= (int64_t)ELDER_HALF_REVIEW_MS * 1000LL) {
+                ESP_LOGW(TAG, "[%s] 语音确认后 %u 分钟未按键复核，跳过本次"
+                              "（服务端保持「语音确认」标记，设备不再提醒）",
+                         it->label, (unsigned)(ELDER_HALF_REVIEW_MS / 60000u));
+                g.half_since_us[i] = 0;
+                set_state(i, ELDER_RMD_HALF_EXPIRED);
+            }
         }
     }
 
@@ -962,8 +1027,14 @@ esp_err_t elder_reminder_confirm_ex(uint8_t id, uint8_t confirm_method)
      *      「语音+按键确认」（全置信）。
      * 按键/APP 确认本身就是"人在场"的证据，直接 DONE。 */
     if (confirm_method == ELDER_CFM_VOICE) {
+        /* 记下复核窗口的起点。必须在 set_state 之前 —— set_state 会同步
+         * 回调 sync 层，tick 也可能在别的任务上下文里跑，晚一行就可能
+         * 被 tick 读到 0 而用 pending_since_us 兜底（差几十毫秒，无伤，
+         * 但没必要留这种不确定性）。 */
+        g.half_since_us[id] = now_us();
         set_state(id, ELDER_RMD_HALF_CONFIRMED);
     } else {
+        g.half_since_us[id] = 0;
         set_state(id, ELDER_RMD_DONE);
     }
     elder_reminder_flush();

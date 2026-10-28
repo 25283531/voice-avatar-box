@@ -51,7 +51,26 @@ typedef enum {
      * 为什么追加在末尾而不是插在 PENDING 后面：这个值会经
      * elder_sync_on_reminder_state() 映射上报，也参与日志与界面判断，
      * 中间插入等于给所有既有取值重新编号。 */
-    ELDER_RMD_HALF_CONFIRMED
+    ELDER_RMD_HALF_CONFIRMED,
+    /* 半置信复核窗口过期 —— **本次跳过，且不上报**（2026-10-28 用户定义）。
+     *
+     * 语义：「老人语音说了『我吃过了』，设备提示他长按按钮复核，但他一直没按」。
+     * 用户原话：「半置信后不按按钮就跳过该次事件，仅在用户网页端和用户手机APP
+     * 上做标记。」于是：
+     *   · 本地：停止闪灯、#1 熄灭、不再算待办、done_today 绝不置位；
+     *   · 服务端：**什么都不发**。进 HALF 那一刻已经报过
+     *     CONFIRMED + method=VOICE，网页/APP 上「语音确认」的标记就保持原样。
+     *
+     * ⚠️ 为什么**不能复用 ELDER_RMD_SKIPPED**：SKIPPED 会经
+     *    elder_sync_on_reminder_state() 上报 ELDER_EV_SKIPPED（note 写死
+     *    "stale"）—— 那会把服务端刚收到的「语音确认」覆盖成「跳过」，
+     *    而且理由写成"设备离线错过"，与事实完全不符。子女端从此看不出
+     *    老人到底说过什么。这个状态存在的**唯一理由**就是"本地改状态、
+     *    但不上报"，所以它必须是独立取值。
+     *
+     * ⚠️ 跳过 ≠ 完成。语音是半置信，万一误识别成"吃过了"还置完成，
+     *    等于替老人谎报服药 —— 所以 done_today 不置位，这是硬约束。 */
+    ELDER_RMD_HALF_EXPIRED
 } elder_rmd_state_t;
 
 typedef enum {
