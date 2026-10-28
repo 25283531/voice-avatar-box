@@ -91,13 +91,15 @@ static void BootDiagInit() {
 
     /* NVS 余量：2026-10-27 语音调音量重启的现场是
      *   nvs_open("audio", RW) 失败 → 句柄 0 → nvs_set_i32 返回 0x1107 → abort。
-     * 本工程 nvs 分区只有 0x4000（16KB，3 个可用页），而 elder 的提醒表
-     * （~1KB 一条 blob）每次状态变化都整块重写，最容易把页吃干净。
-     * 这行日志是判断"NVS 是否已满"的唯一直接证据，别删。 */
+     * 当时 nvs 分区只有 0x4000（16KB，3 个可用页），而 elder 的两条 blob
+     * （evtq 约 90 entry、提醒表约 52 entry）几乎吃满了全部余量 ——
+     * 实测「已用 325 / 可用 53」，evtq 一次重写都写不进去。
+     * **2026-10-29 已扩到 0x10000（64KB，16 页，约 2016 entry，3.75 倍）。**
+     * 这行日志仍是判断"NVS 是否又快满"的唯一直接证据，别删。 */
     nvs_stats_t st;
     if (nvs_get_stats(NULL, &st) == ESP_OK) {
         ESP_LOGW("BootDiag", "NVS: 已用 %u / 共 %u 条，可用 %u 条，命名空间 %u 个"
-                             "（可用条数长期 <20 就该扩容 nvs 分区）",
+                             "（扩容后约 2016 条；可用长期 <100 才需要再看）",
                  (unsigned)st.used_entries, (unsigned)st.total_entries,
                  (unsigned)st.available_entries, (unsigned)st.namespace_count);
     } else {

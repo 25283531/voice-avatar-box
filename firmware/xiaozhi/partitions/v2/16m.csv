@@ -1,8 +1,34 @@
 # ESP-IDF Partition Table
 # Name,   Type, SubType, Offset,  Size, Flags
-nvs,      data, nvs,     0x9000,    0x4000,
-otadata,  data, ota,     0xd000,    0x2000,
-phy_init, data, phy,     0xf000,    0x1000,
+#
+# nvs 从 0x4000(16KB) 扩到 0x10000(64KB) —— 2026-10-29 用户拍板「直接扩容」。
+#
+# 为什么要扩：NVS 只有 4 页（可用 3 页 = 504 entry）时，两条自研 blob
+# 就吃掉了几乎全部余量 ——
+#   elder_sync/evtq   evt_t 72B × 32 深度 + 8B 头 = 2312B ⇒ 约 90 entry
+#   elder_rmd/table   items[16]×56 + when[16]×24 + 表头 = 1308B ⇒ 约 52 entry
+# 而设备实测「已用 325 / 可用 53」：evtq 一次重写要 90 条 > 可用 53 条，
+# 写不进去时 nvs_set_blob 会静默失败（sync.c 原先没检查返回值），
+# 老人的离线确认记录就丢了。
+#
+# 为什么 nvs 必须留在 0x9000 起、不能往后挪：**起始偏移不变 ⇒ 已有的
+# NVS 数据（提醒表 / WiFi 凭据 / 启动计数）原地保留**，扩容后 NVS 只是
+# 多扫到 12 个空页。挪起点等于把老人设备上的提醒表清空。
+#
+# 代价：otadata / phy_init 必须后移。
+#   · otadata 丢了无所谓 —— 它是 OTA 的启动槽位记录，重刷后从 ota_0 起。
+#   · phy_init 丢了也没关系 —— IDF 首次启动会重新做 RF 校准并写回
+#     （开机慢一两秒，发射功率自动恢复）。
+#   · **ota_0 的 0x20000 与 assets 的 0x800000 都没动**，所以 app 与
+#     8MB 形象包可以原地覆盖，不需要整机重刷。
+#
+# ⚠️ 别"顺手整理"成紧凑布局：0x1c000~0x20000 这 16KB 空档是刻意留的，
+#    将来再加分区时不用再挪 ota_0（挪 app 偏移 = 所有存量设备必须整机重刷）。
+#
+# 校验：16 页 × 126 entry = 2016 entry（原来 504），可用余量约 3.75 倍。
+nvs,      data, nvs,     0x9000,    0x10000,
+otadata,  data, ota,     0x19000,   0x2000,
+phy_init, data, phy,     0x1b000,   0x1000,
 ota_0,    app,  ota_0,   0x20000,   0x3f0000,
 ota_1,    app,  ota_1,   ,          0x3f0000,
 assets,   data, spiffs,  0x800000,  8M

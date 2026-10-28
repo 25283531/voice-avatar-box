@@ -123,11 +123,40 @@ static uint32_t crc32_simple(const void *data, size_t len)
 static void queue_save(void)
 {
     nvs_handle_t h;
-    if (nvs_open(NVS_NS, NVS_READWRITE, &h) != ESP_OK) return;
+    if (nvs_open(NVS_NS, NVS_READWRITE, &h) != ESP_OK) {
+        /* 命名空间都打不开 = NVS 已经满到连一个新 namespace 都塞不下，
+         * 或者分区没初始化。回执队列保不住，必须留痕。 */
+        ESP_LOGE(TAG, "回执队列落盘失败：nvs_open 打不开 %s", NVS_NS);
+        return;
+    }
     g.q.crc32 = 0;
     g.q.crc32 = crc32_simple(&g.q, sizeof(g.q));
-    nvs_set_blob(h, NVS_KEY_Q, &g.q, sizeof(g.q));
-    nvs_commit(h);
+
+    /* ⚠️ 返回值必须检查（2026-10-29 修）。
+     *
+     * 这条 blob 是 2312 字节 = 约 90 个 NVS entry（每 entry 只放 26 字节
+     * 有效数据）。扩容前 nvs 分区只有 4 页、实测可用 53 条 —— 也就是
+     * **这条 blob 根本写不进去**，而原来这里不看返回值，失败得无声无息：
+     * 老人的离线确认记录看着"存了"，其实全在 RAM 里，一重启就没了。
+     *
+     * 现在分区已扩到 64KB（约 2016 entry），正常不会再失败；但只要它
+     * 失败，就是"离线回执即将丢失"的医疗级信号，必须 ERROR 打出来，
+     * 并说清楚该怎么办。 */
+    esp_err_t err = nvs_set_blob(h, NVS_KEY_Q, &g.q, sizeof(g.q));
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "回执队列落盘失败（%s，需 %u 字节 / 约 %u entry）："
+                      "NVS 余量不足或分区异常，本次 %u 条待补发回执只存在 RAM 里，"
+                      "重启即丢",
+                 esp_err_to_name(err), (unsigned)sizeof(g.q),
+                 (unsigned)((sizeof(g.q) + 25u) / 26u + 1u),
+                 (unsigned)g.q.count);
+        nvs_close(h);
+        return;
+    }
+    err = nvs_commit(h);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "回执队列 commit 失败（%s）", esp_err_to_name(err));
+    }
     nvs_close(h);
 }
 

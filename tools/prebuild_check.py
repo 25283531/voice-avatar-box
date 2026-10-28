@@ -765,6 +765,100 @@ def main() -> int:
             fatal=True,
         )
 
+    # --------- C14 分区表布局自洽（2026-10-29 NVS 扩容 0x4000 → 0x10000）
+    # 分区表是"改错一个数字就整机变砖"的文件，而 IDF 自己的编译期检查只保证
+    # **不重叠、不越界**，它不保证：
+    #   ① nvs 的起始偏移没被挪 —— 挪了照样编译通过，但存量设备升级后 NVS
+    #      里的提醒表 / WiFi 凭据 / 启动计数全部读不出来（起点变了 = 换了一块
+    #      空白区）。老人设备要重新配网、提醒表靠服务端重下发，现场极难解释。
+    #   ② nvs 没被改小 —— evtq 一条 blob 就 2312 字节 ≈ 90 个 entry，
+    #      16KB 分区（504 entry、实测可用 53）根本写不进去，而 nvs_set_blob
+    #      失败是**静默**的，离线回执会悄悄丢。
+    #   ③ ota_0 / assets 的偏移没动 —— 一动，所有存量设备都必须整机重刷
+    #      （app 与 8MB 形象包都错位）。
+    # 这三条都是"编译全绿、上机才发现"的形态，所以必须在这里拦。
+    _c14_csv = ROOT / "firmware" / "xiaozhi" / "partitions" / "v2" / "16m.csv"
+    _c14_bad: list[str] = []
+    _c14_info = ""
+    if not _c14_csv.is_file():
+        _c14_bad.append("缺 partitions/v2/16m.csv")
+    else:
+        def _num(s: str) -> int:
+            s = s.strip()
+            if s.upper().endswith("M"):
+                return int(s[:-1]) * 1024 * 1024
+            if s.upper().endswith("K"):
+                return int(s[:-1]) * 1024
+            return int(s, 0)
+
+        _parts: list[tuple[str, int | None, int]] = []
+        for _ln, _line in enumerate(
+                _c14_csv.read_text(encoding="utf-8", errors="replace").splitlines(), 1):
+            _line = _line.split("#", 1)[0].strip()
+            if not _line:
+                continue
+            _cols = [c.strip() for c in _line.split(",")]
+            if len(_cols) < 5:
+                _c14_bad.append(f"第 {_ln} 行列数不足 5")
+                continue
+            try:
+                _off = _num(_cols[3]) if _cols[3] else None
+                _sz = _num(_cols[4])
+            except ValueError:
+                _c14_bad.append(f"第 {_ln} 行 offset/size 不是数字")
+                continue
+            _parts.append((_cols[0], _off, _sz))
+
+        # offset 留空 = 紧跟上一个分区（ota_1 就是这么写的）
+        _resolved: list[tuple[str, int, int]] = []
+        _cursor = 0
+        for _name, _off, _sz in _parts:
+            _real = _cursor if _off is None else _off
+            _resolved.append((_name, _real, _sz))
+            _cursor = _real + _sz
+
+        for _i, (_name, _off, _sz) in enumerate(_resolved):
+            if _off % 0x1000:
+                _c14_bad.append(f"{_name} offset 0x{_off:x} 未按 4KB 对齐")
+            if _sz <= 0 or _sz % 0x1000:
+                _c14_bad.append(f"{_name} size 0x{_sz:x} 未按 4KB 对齐")
+            if _i + 1 < len(_resolved):
+                _nn, _no, _ = _resolved[_i + 1]
+                if _off + _sz > _no:
+                    _c14_bad.append(
+                        f"{_name}(0x{_off:x}+0x{_sz:x}) 压到 {_nn}(0x{_no:x})")
+
+        _end = (_resolved[-1][1] + _resolved[-1][2]) if _resolved else 0
+        if _end > 16 * 1024 * 1024:
+            _c14_bad.append(f"末尾 0x{_end:x} 超出 16MB flash")
+
+        _by = {n: (o, s) for n, o, s in _resolved}
+        if "nvs" not in _by:
+            _c14_bad.append("没有 nvs 分区")
+        else:
+            _no, _ns = _by["nvs"]
+            if _no != 0x9000:
+                _c14_bad.append(
+                    f"nvs 起点被挪到 0x{_no:x}（必须 0x9000）—— "
+                    "挪起点 = 存量设备的提醒表/WiFi 凭据全部作废")
+            if _ns < 0x10000:
+                _c14_bad.append(
+                    f"nvs 只有 0x{_ns:x}（2026-10-29 已扩到 0x10000）—— "
+                    "evtq 一条 blob 约 90 entry，缩回去会静默写不进")
+        if _by.get("ota_0", (0, 0))[0] != 0x20000:
+            _c14_bad.append("ota_0 起点不是 0x20000（app 偏移一变必须整机重刷）")
+        if _by.get("assets", (0, 0))[0] != 0x800000:
+            _c14_bad.append("assets 起点不是 0x800000")
+
+        _c14_info = (f"{len(_resolved)} 个分区，nvs "
+                     f"0x{_by.get('nvs', (0, 0))[0]:x}+0x{_by.get('nvs', (0, 0))[1]:x}"
+                     f"，末尾 0x{_end:x}")
+
+    check("C14 分区表布局自洽（nvs 起点/大小、app 与 assets 偏移不许变）",
+          not _c14_bad,
+          ("⚠️ " + "；".join(_c14_bad[:5])) if _c14_bad else _c14_info,
+          fatal=True)
+
     # ------------------------------------------------------ 汇总
     failed = [r for r in results if not r[1] and r[3]]
     warned = [r for r in results if not r[1] and not r[3]]

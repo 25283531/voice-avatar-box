@@ -302,16 +302,48 @@ static esp_err_t load(void)
 esp_err_t elder_reminder_flush(void)
 {
     nvs_handle_t h;
-    ESP_ERROR_CHECK_WITHOUT_ABORT(nvs_open(NVS_NS, NVS_READWRITE, &h));
+
+    /* ⚠️ nvs_open 的返回值**必须**检查（2026-10-29 修）。
+     *
+     * 原来这里写的是 ESP_ERROR_CHECK_WITHOUT_ABORT(nvs_open(...))：
+     * 它在失败时只打印、不 abort，然后**继续用未初始化的 h** 去调
+     * nvs_set_blob —— 那就是拿一个随机句柄去写 NVS，轻则返回 0x1107，
+     * 重则 abort 重启（2026-10-27 语音调音量重启就是同一个根因，
+     * 只是发生在 xiaozhi 的 Settings 里）。
+     *
+     * NVS 满 / 分区异常时这条路径是**必然会走到**的，不能靠"大概不会发生"。 */
+    esp_err_t err = nvs_open(NVS_NS, NVS_READWRITE, &h);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "提醒表落盘失败：nvs_open(%s) 打不开（%s）—— "
+                      "本次 %u 条提醒只在 RAM 里，重启即丢",
+                 NVS_NS, esp_err_to_name(err), (unsigned)g.table.count);
+        /* 保留 g.dirty，让 tick 的 30s 去抖窗口过后再试一次。
+         * 这里不清 dirty 是刻意的：清掉就再也不会重试了。 */
+        return err;
+    }
+
     /* 版本号在落盘时统一写：任何一次写盘之后，NVS 里就一定是 V3 布局，
      * load() 才能按 sizeof(V3) 做 CRC 校验。 */
     g.table.fmt_ver = ELDER_RMD_FMT_V3;
     g.table.crc32 = 0;
     g.table.crc32 = crc32_simple(&g.table, sizeof(g.table));
-    esp_err_t err = nvs_set_blob(h, NVS_KEY, &g.table, sizeof(g.table));
+
+    err = nvs_set_blob(h, NVS_KEY, &g.table, sizeof(g.table));
     if (err == ESP_OK) err = nvs_commit(h);
     nvs_close(h);
-    g.dirty = false;
+
+    if (err != ESP_OK) {
+        /* 这张表 1308 字节 = 约 52 个 NVS entry。扩容前可用只有 53 条，
+         * 几乎是"刚好够一份"，任何别的写入都会把它挤掉。 */
+        ESP_LOGE(TAG, "提醒表落盘失败（%s，需 %u 字节 / 约 %u entry）："
+                      "NVS 余量不足，%u 条提醒只在 RAM 里，重启即丢",
+                 esp_err_to_name(err), (unsigned)sizeof(g.table),
+                 (unsigned)((sizeof(g.table) + 25u) / 26u + 1u),
+                 (unsigned)g.table.count);
+        /* 同上：失败不清 dirty，30s 后重试。 */
+    } else {
+        g.dirty = false;
+    }
     g.last_flush_us = now_us();
     return err;
 }
