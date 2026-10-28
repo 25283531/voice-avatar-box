@@ -687,7 +687,29 @@ extern "C" void elder_bridge_start(void)
     if (elder_rgb_init() != ESP_OK) {
         ESP_LOGW(TAG, "RGB 初始化失败（未外接 WS2812？），继续运行");
     } else {
-        elder_rgb_request(ELDER_RGB_PRIO_IDLE, ELDER_FX_BREATH, 0x8E24AA, 0);
+        /* 开机立刻进入"待机灯效"。
+         *
+         * ⚠️ 这里原来写的是
+         *     elder_rgb_request(ELDER_RGB_PRIO_IDLE, ELDER_FX_BREATH, 0x8E24AA, 0);
+         *    —— 那是 2026-10-27 之前"待机 = 紫色呼吸"的旧定义。四态重定义
+         *    （D66）之后灯效全改走 ELDER_RGB_PRIO_EMOTION 一个槽位，这句
+         *    却漏删了，成了一个**永远没人覆盖的低优先级常驻槽位**。
+         *
+         *    后果（2026-10-28 用户实报）：开机到第一次唤醒之间，EMOTION
+         *    槽位还是空的（OnSetEmotion 只设屏幕表情、不碰 RGB），
+         *    active_slot() 只能选到这个紫色呼吸 —— 老人看到的是"近似白光
+         *    的呼吸灯"。唤醒一次之后 OnDeviceStateChanged 才第一次写
+         *    EMOTION 槽位（prio 10 > 0），灯效才变成设计的样子。
+         *
+         * 为什么改成直接调 set_ui_state(IDLE)、而不只是把颜色改对：
+         *   ① 灯效定义只有一处真源（elder_rgb_set_ui_state 的 switch），
+         *      这里再写一份 BREATH/TWINKLE 就是第二份定义，早晚又漂移；
+         *   ② set_ui_state(IDLE) 会同时启动 g.idle_dim 的 1 分钟降亮计时
+         *      （60% → 30%），开机就算"刚进待机"，符合用户定义；
+         *   ③ 不再留 PRIO_IDLE 槽位：EMOTION 槽位被 release 的瞬间
+         *      （比如提醒结束）会露出这个旧槽位，表现为"灯先闪一下紫
+         *      再回星光"。四态互斥就该只有一个槽位在用。 */
+        elder_rgb_set_ui_state(ELDER_RGB_UI_IDLE);
     }
 #endif
 

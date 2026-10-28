@@ -82,16 +82,23 @@ typedef struct {
 
 /* ---- 待机"闪烁星光"（ELDER_FX_TWINKLE，2026-10-28 用户指定替掉幻彩）----
  *
- * 每颗灯一个**独立的伪随机节拍**：亮 ELDER_TWINKLE_ON_MS 然后长时间熄灭，
- * 周期在 1.2~3.0 秒之间按灯位散列。8 颗灯平均同时只亮 0.6~1 颗
- * （ON/周期 ≈ 10%，× 8 颗）—— 观感是"偶尔有颗星闪一下"。
+ * **全局一个节拍：一次只亮一颗，相邻两闪间隔 3~5 秒。**
  *
- * 为什么比整条幻彩更适合待机：幻彩是**整条**一直在变色，余光里"一直在动"，
- * 夜里躺着看会一直吸引注意力。星光绝大部分时间是黑的，只在某处亮一下，
- * 是"安静但不死"的信号。 */
-#define ELDER_TWINKLE_ON_MS      220u
-#define ELDER_TWINKLE_MIN_MS     1200u
-#define ELDER_TWINKLE_SPAN_MS    1800u   /* 周期 = MIN + [0,SPAN) ⇒ 1.2~3.0s */
+ * 第一版（已废弃）是"每颗灯各自一个 1.2~3.0s 的独立周期"，8 颗灯叠加
+ * 起来是每秒闪 3~4 次。用户实测反馈：「基本上每秒钟都有多颗灯在闪烁，
+ * 调低频率，每秒钟亮1颗灯，间隔3-5秒再亮下一颗…主要就是不能频率太快」。
+ * 那种观感不是星光，是噪点。
+ *
+ * 现在的做法：把时间轴切成固定的 PERIOD 一格，**每格只挑一颗灯亮**；
+ * 亮起的**时刻**在格内再抖 0~JITTER 毫秒，于是相邻两闪的间隔
+ * = PERIOD + (jit2 - jit1) ∈ (PERIOD-JITTER, PERIOD+JITTER)，
+ * 取 4000 ± 1000 正好落在用户要的 3~5 秒。
+ *
+ * 抖动上限 + 单次时长 300ms 远小于 4000ms，所以一闪绝不会跨格 ——
+ * 这是能"每格恰好一颗"的前提，调参时别让 JITTER + ON >= PERIOD。 */
+#define ELDER_TWINKLE_PERIOD_MS  4000u   /* 4 秒一格，一格闪一颗 */
+#define ELDER_TWINKLE_JITTER_MS  1000u   /* 格内抖动 ⇒ 间隔 3~5 秒 */
+#define ELDER_TWINKLE_ON_MS      300u    /* 单次亮 300ms，渐隐 */
 
 /* ---- 网络传输中"流星"（ELDER_FX_METEOR，2026-10-28 用户指定替掉 CHASE）----
  *
@@ -223,6 +230,30 @@ static uint32_t hsv2rgb(uint16_t h, uint8_t s, uint8_t v)
     case 4: return ((uint32_t)t << 16) | ((uint32_t)p << 8) | v;
     default:return ((uint32_t)v << 16) | ((uint32_t)p << 8) | q;
     }
+}
+
+/* 32 位整数散列（MurmurHash3 的 finalizer 变体）。
+ *
+ * 用途：待机星光要"第 N 闪亮哪颗灯、什么颜色、落在格内哪一刻"这三个
+ * 互相独立的伪随机量，而 fx_pixel() 是**纯函数**（每帧、每颗灯各调一次，
+ * 不许保存状态）。所以只能由"第几闪"这个序号散列出来。
+ *
+ * 为什么不用 rand()：rgb_task 每 30ms 调一次 fx_pixel()，rand() 会让同一
+ * 次闪烁的相位每帧都跳变 —— 出来的不是星光，是雪花噪点。而且 rand() 有
+ * 全局状态，在渲染循环里推进它会连带影响任何别处用 rand() 的地方。
+ *
+ * 为什么不用"乘法常数取不同位段"（第一版的做法）：Knuth 常数只把低位
+ * 搅匀，取 >>8 / >>16 / >>24 三段仍彼此相关，实测会出现"某几颗灯总是
+ * 连着亮"的规律感。这一版做了两轮异或-乘法-异或，雪崩效应足够，
+ * 从同一个 h 取任意位段都可以当独立随机数用。 */
+static uint32_t hash32(uint32_t x)
+{
+    x ^= x >> 16;
+    x *= 0x7FEB352Du;
+    x ^= x >> 15;
+    x *= 0x846CA68Bu;
+    x ^= x >> 16;
+    return x;
 }
 
 /* ---- gamma 2.2 查表：感知亮度 level(0..255) → 线性系数(0..255) ----
@@ -364,30 +395,52 @@ static uint32_t fx_pixel(const slot_t *s, uint32_t t_ms, int led_idx)
         break;
     }
     case ELDER_FX_TWINKLE: {
-        /* **闪烁星光**（待机用，2026-10-28 用户指定）。
+        /* **闪烁星光**（待机用，2026-10-28 用户指定；同日改版见下方说明）。
          *
-         * 散列用 Knuth 乘法常数：同一 led_idx 每帧结果完全一致（纯函数），
-         * 8 颗灯之间又互相错开。**绝对不能用 rand()** —— rgb_task 每 30ms
-         * 调一次，rand() 会让同一颗灯的相位每帧跳变，出来的不是星光、
-         * 是雪花噪点。
+         * 全局一个节拍：4 秒一格，**每格只挑一颗灯亮 300ms 渐隐**，
+         * 亮起时刻在格内抖 0~1 秒 ⇒ 相邻两闪间隔 3~5 秒。
          *
-         * 颜色每闪一次换一个：用"第几个周期"（round）参与散列，
-         * 于是同一个周期内颜色恒定、下一轮才换色。如果每帧算一次随机色，
-         * 220ms 的闪亮会被切成 7 段不同颜色，看着像坏点。 */
-        uint32_t seed   = (uint32_t)led_idx * 2654435761u;
-        uint32_t period = ELDER_TWINKLE_MIN_MS + ((seed >> 8) % ELDER_TWINKLE_SPAN_MS);
-        uint32_t t      = t_ms + (seed >> 16);            /* 相位错开 */
-        uint32_t phase  = t % period;
-        if (phase >= ELDER_TWINKLE_ON_MS) return 0u;      /* 大部分时间灭 */
-        mod = 255u - phase * 255u / ELDER_TWINKLE_ON_MS;  /* 亮起瞬间最亮，快速衰减 */
-        {
-            uint32_t round = t / period;
-            /* 137 / 61 都是质数：色相在相邻两次闪烁之间跳得够远，
-             * 不会连着两次都是绿。饱和度 220（不是 255）——
-             * 纯饱和的彩点在暗环境里仍然刺眼，略降一点更像"星光"。 */
-            uint32_t hue = (round * 137u + (seed >> 24) * 61u) % 360u;
-            c = hsv2rgb((uint16_t)hue, 220, 255);
+         * 为什么不是"每颗灯各自一个周期"（第一版）：8 颗灯各自 1.2~3.0s
+         * 独立散列，叠加起来每秒闪 3~4 次。用户实测原话：「基本上每秒钟
+         * 都有多颗灯在闪烁…主要就是不能频率太快」。那不是星光，是噪点。
+         *
+         * 三个随机量都由"第几闪"(cyc) 一次散列出来，所以：
+         *   · 同一闪内（同一格）三个量恒定 —— 颜色不会在 300ms 里被切成
+         *     十几段（每帧重算的话，看着像坏点）；
+         *   · 相邻两闪互相独立 —— 不会连着几次都是同一颗灯、同一个颜色。
+         *
+         * 位段选取（0x3FF/0xFF/0x1FF 之类）只是取模，散列已经雪崩过，
+         * 取任意段都独立。 */
+        const uint32_t cyc = t_ms / ELDER_TWINKLE_PERIOD_MS;   /* 第几闪 */
+        const uint32_t h   = hash32(cyc);
+
+        /* 谁亮：#2~#9 里挑一颗（led_idx 的有效段是 1..ELDER_RGB_LEDS-1）。
+         *
+         * 避开"同一颗灯连闪两次"：4 秒间隔下，同一颗连亮看着像这颗灯
+         * 坏了/程序卡住了，而不是星光。概率 1/8，复算脚本 30 闪里就撞到
+         * 过一次（#0 与 #1 都是 led1）。撞上就把这颗顶到下一颗 ——
+         * 代价是被顶开的那颗多出现一次（分布轻微偏斜），换掉的观感收益
+         * 更大。 */
+        int who = 1 + (int)(h % (uint32_t)(ELDER_RGB_LEDS - 1));
+        if (cyc > 0) {
+            const int prev = 1 + (int)(hash32(cyc - 1) % (uint32_t)(ELDER_RGB_LEDS - 1));
+            if (who == prev) who = 1 + (who % (ELDER_RGB_LEDS - 1));
         }
+        if (led_idx != who) return 0u;
+
+        /* 格内抖动：决定这一闪的起始时刻。上限 + ON 必须 < PERIOD，
+         * 否则会跨格、出现两闪重叠或某格不闪。 */
+        const uint32_t jit   = (h >> 10) % ELDER_TWINKLE_JITTER_MS;
+        const uint32_t start = cyc * ELDER_TWINKLE_PERIOD_MS + jit;
+
+        int32_t dt = (int32_t)(t_ms - start);
+        if (dt < 0 || dt >= (int32_t)ELDER_TWINKLE_ON_MS) return 0u;  /* 其余时间灭 */
+
+        mod = 255u - (uint32_t)dt * 255u / ELDER_TWINKLE_ON_MS;  /* 亮起最亮，线性渐隐 */
+
+        /* 颜色：饱和度 220（不是 255）—— 纯饱和彩点在暗环境里仍然刺眼，
+         * 略降一点更像"星光"。色相取 h 的高段，与 who/jit 用的低段无关。 */
+        c = hsv2rgb((uint16_t)((h >> 20) % 360u), 220, 255);
         break;
     }
     case ELDER_FX_METEOR: {

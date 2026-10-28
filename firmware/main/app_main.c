@@ -129,7 +129,10 @@ void app_main(void)
 
 #if CONFIG_ELDER_ENABLE_RGB
     ESP_ERROR_CHECK(elder_rgb_init());
-    elder_rgb_request(ELDER_RGB_PRIO_IDLE, ELDER_FX_BREATH, 0x8E24AA, 0);
+    /* 开机即待机灯效（与 elder_bridge.cc 同源）。
+     * 原来这里也是 PRIO_IDLE + BREATH 紫色呼吸，四态重定义后同样会露出
+     * 旧灯效 —— 见 elder_bridge.cc 里那段注释。 */
+    elder_rgb_set_ui_state(ELDER_RGB_UI_IDLE);
 #endif
     ESP_ERROR_CHECK(elder_input_init(on_key, NULL));
     ESP_ERROR_CHECK(elder_reminder_init(on_reminder, NULL));
