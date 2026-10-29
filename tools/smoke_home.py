@@ -19,8 +19,9 @@ import tempfile
 import time
 import urllib.error
 import urllib.request
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 ROOT = Path(__file__).resolve().parent.parent
 SERVER = ROOT / "server"
@@ -73,8 +74,25 @@ LEGACY_PW = "admin123"
 # 只剩 97 字节塞得进去 —— 恰好卡在 4096 边界上。
 SERVER_LOG = DB_PATH.with_name(DB_PATH.stem + "_server.log")
 
-# 当天（本机时区，与服务端 TZ 一致）与两个固定的服药时间点
-TODAY = datetime.now().strftime("%Y-%m-%d")
+# 「今天」必须按**服务端**的时区分日，不能按宿主时区。
+#
+# 原写法 `datetime.now()` 用的是宿主时区，注释还写着「与服务端 TZ 一致」——
+# 那句在 CI 上是假的：服务端 `config.TZ` 默认 Asia/Shanghai（与宿主无关），
+# 而 GitHub runner 是 UTC。北京时间 00:00–08:00（= UTC 前一天 16:00–24:00）
+# 这段窗口里两边算出的"今天"差一天 ⇒ 造出来的提醒落在"昨天"，确认接口按
+# "今天"查不到 ⇒ 4 条断言红。
+#
+# 2026-10-30 实测：CI 在 22:40 UTC 跑就红了 4 条（74/78），本地（北京时区）
+# 却全绿。这类「按钟点变红」的用例比没有用例更坏 —— 它教人忽略红灯。
+#
+# 两道保险：① 下面按 SMOKE_TZ 算日期；② 起服务时显式注入 ELDER_TZ=SMOKE_TZ，
+# 不靠"默认值恰好相同"。
+SMOKE_TZ = "Asia/Shanghai"
+try:
+    _TZINFO = ZoneInfo(SMOKE_TZ)
+except Exception:                      # 精简环境缺 tzdata：中国无夏令时，+08:00 等价
+    _TZINFO = timezone(timedelta(hours=8))
+TODAY = datetime.now(_TZINFO).strftime("%Y-%m-%d")
 DOSE_TIMES = ["08:00", "20:00"]
 
 results: list[tuple[str, bool, str]] = []
@@ -143,6 +161,10 @@ def main() -> int:
     env["ELDER_JWT_SECRET"] = "smoke-home-secret"
     env["ELDER_SCHEDULER_INTERVAL"] = "3600"   # 不跑后台调度，避免超时升级干扰计数
     env["PYTHONIOENCODING"] = "utf-8"
+    # 把服务端时区**钉死**成算 TODAY 用的那一个。不写这句就依赖
+    # config.TZ 的默认值恰好等于 SMOKE_TZ —— 默认值一改，两边又会错开一天，
+    # 而症状仍然是"某几个小时里莫名其妙红 4 条"。
+    env["ELDER_TZ"] = SMOKE_TZ
     # 种子管理员口令 bb5ca98 起不再硬编码：空库不配 ELDER_SEED_ADMIN_PASSWORD
     # 会生成随机口令。本脚本自己起服务却用 admin/admin123 登录 —— 不在这里
     # 显式注入，本地裸跑就是 401（CI 靠 job 级 env 兜住，掩盖了这个不自足）。
