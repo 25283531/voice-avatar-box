@@ -6,7 +6,7 @@
 在推 PR 之前，本地 ``python tools/ci_gate_check.py``  exit 0 才推。
 CI 与本地跑同一份代码，才不会出现「CI 绿本地红」或反过来。
 
-检查三项（任一失败 exit 1，全部通过 exit 0）
+检查五项（任一失败 exit 1，全部通过 exit 0）
 --------------------------------------------
 1. **CODEOWNERS 存在且语法合法**：每条非注释非空行都是一条规则，
    模式合法、至少一个 owner、每个 owner 以 ``@`` 开头。
@@ -18,6 +18,14 @@ CI 与本地跑同一份代码，才不会出现「CI 绿本地红」或反过�
    ``run``」。最后一条来自真实事故：一个悬空空步骤会让**整个 workflow
    启动失败** → jobs=0 → PR 上不产出任何检查项 → 后端业务冒烟静默失效，
    而它在 diff 里看起来只是一行无害的 ``name``。
+4. **SQLAlchemy URL 口令洗白**：禁止 ``str(make_url(...))`` 这类写法
+   （会把口令渲染成字面量 ``***``，连接串从此连不上且看不出为什么）。
+5. **冒烟脚本接线**：每个 ``tools/smoke_*.py`` 要么出现在某个 workflow 里，
+   要么在 ``MANUAL_SMOKE`` 里登记了「为什么不进 CI」。来自 2026-10-30 的
+   真实漏接线：11 个冒烟只登记了端口、从没被任何 workflow 调用，其中一个
+   守的正是当轮要交付的功能 —— **断言写了不跑 = 没有门禁**，而 CI 一路
+   绿灯。``smoke_ports.py`` 是「谁占哪个口」的清单，不是「CI 跑不跑」的
+   manifest，两者之间原本没有任何一致性约束，所以这种漏会静默重复。
 
 匹配口径（与 GitHub 真实语义的关系，必须读）
 --------------------------------------------
@@ -385,6 +393,100 @@ def check_no_url_str_trap(report: "CheckReport") -> None:
 
 
 # ---------------------------------------------------------------------------
+# 检查 5：冒烟脚本必须接线（或显式登记「为什么只手动跑」）
+# ---------------------------------------------------------------------------
+
+#: 允许「不接进 CI」的冒烟脚本，每条**必须**写明理由。
+#:
+#: 这张表存在的前提是「默认必须接线」：判据是 `tools/smoke_*.py` 要么出现在
+#: 某个 workflow 里，要么在这里。两边都没有 ⇒ 红。
+#:
+#: 2026-10-30 建档时审计出 11 个漏接线的脚本（smoke_ports.py 登记了端口、
+#: workflow 里一次都没调），已全部接进 server-ci；现在表里只剩一个真正的库。
+#: 以后要往这里加条目，问自己一句：**这条断言不进 CI，谁来跑它？**
+#: 答不上来就别加 —— 加了也只是一句自我安慰。
+MANUAL_SMOKE: dict[str, str] = {
+    "smoke_common.py": "冒烟脚本的公共收尾/环境助手，本身不含断言，不是冒烟脚本",
+}
+
+
+def check_smoke_wired(report: "CheckReport") -> None:
+    """每个 ``tools/smoke_*.py`` 必须接线或登记理由。
+
+    同时做三条**反向**检查，因为白名单的失效方式不是「漏登记」，而是
+    「登记了但早就不是那么回事」：
+
+    * 登记了、文件已删 ⇒ 死条目会让人以为「这道门有人管」；
+    * 登记了、其实已经接线 ⇒ 该删的没删，白名单在膨胀；
+    * 反过来，接线了但脚本名写错（workflow 里出现 `smoke_x` 而文件叫
+      `smoke_x2`）不会报错 —— 所以下面按**文件名精确匹配**判，不做前缀匹配。
+    """
+    tools_dir = ROOT / "tools"
+    smokes = sorted(p.name for p in tools_dir.glob("smoke_*.py"))
+    if not smokes:
+        report.fail("tools/ 下没有任何 smoke_*.py —— 目录结构不对，判据无从谈起")
+        return
+
+    # 把全部 workflow 拼成一份文本：接线可以出现在任何一个 workflow 里，
+    # 不限于 server-ci（固件相关也可能有 smoke）。
+    wf_text = ""
+    for wf in sorted(WORKFLOWS_DIR.glob("*.yml")):
+        try:
+            wf_text += wf.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as exc:
+            report.fail(f"读取 {wf.name} 失败，无法判断冒烟接线：{exc}")
+            return
+
+    wired: list[str] = []
+    manual: list[str] = []
+    orphan: list[str] = []
+    for name in smokes:
+        if name in wf_text:
+            wired.append(name)
+        elif name in MANUAL_SMOKE:
+            manual.append(name)
+        else:
+            orphan.append(name)
+
+    if orphan:
+        report.fail(
+            f"有 {len(orphan)} 个冒烟脚本既没接进任何 workflow、也没在 MANUAL_SMOKE "
+            f"登记理由：{orphan}\n"
+            "    断言写了不跑 = 没有门禁，而且不会有任何报错 —— CI 只会一路绿灯，"
+            "让人以为验过了。\n"
+            "    处置二选一：① 在 .github/workflows/ 里加一步 "
+            "`python tools/run_smoke.py logs/smoke_<name>.log python tools/<name>.py "
+            "<端口>`（端口先在 tools/smoke_ports.py 登记）；② 确实只能手动跑"
+            "（需要真机/真密钥/公网），在 tools/ci_gate_check.py 的 MANUAL_SMOKE "
+            "里登记一条**具体理由**。"
+        )
+    else:
+        report.ok(
+            f"冒烟脚本全部有归属（接线 {len(wired)} 个 / 登记手动 {len(manual)} 个）"
+        )
+
+    # ---- 反向 1：白名单里登记了、但文件已不存在 ----
+    gone = sorted(k for k in MANUAL_SMOKE if k not in smokes)
+    if gone:
+        report.fail(
+            f"MANUAL_SMOKE 里有 {len(gone)} 条指向已不存在的脚本：{gone}\n"
+            "    死条目会让人误以为「这道门有人在管」，请删掉。"
+        )
+    else:
+        report.ok("MANUAL_SMOKE 没有指向已删除脚本的死条目")
+
+    # ---- 反向 2：登记为手动、但其实已经接线 ----
+    stale = sorted(k for k in MANUAL_SMOKE if k in wf_text and k not in gone)
+    if stale:
+        report.fail(
+            f"MANUAL_SMOKE 里有 {len(stale)} 条其实已经接进 workflow 了：{stale}\n"
+            "    该删的没删 ⇒ 白名单在膨胀，而膨胀的白名单迟早退化成橡皮图章。"
+        )
+    else:
+        report.ok("MANUAL_SMOKE 没有「已接线却仍标手动」的过期条目")
+
+
+# ---------------------------------------------------------------------------
 # 主流程
 # ---------------------------------------------------------------------------
 
@@ -419,6 +521,9 @@ def main() -> int:
 
     # ---- 检查 4 ----
     check_no_url_str_trap(report)
+
+    # ---- 检查 5 ----
+    check_smoke_wired(report)
 
     print("-" * 72)
     print(f"通过 {len(report.passes)} 项，失败 {len(report.failures)} 项")
