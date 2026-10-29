@@ -1786,8 +1786,15 @@ class VoiceSession:
                 if isinstance(asr_res, BaseException):
                     raise asr_res
                 utterance = asr_res
-                speaker_hit = (None, 0.0) if isinstance(vp_res, BaseException) \
-                    else vp_res
+                # 声纹异常不外溢（认不出人不是事故），但**必须留一行日志**：
+                # 静默吞掉的表现和「没认出」一模一样（identify 计数 0、
+                # 日志空白），2026-10-29 因此连红 4 次才找到根因。
+                if isinstance(vp_res, BaseException):
+                    log.warning("[%s] 声纹识别异常，本轮按未认出处理：%s: %s",
+                                self.session_id, type(vp_res).__name__, vp_res)
+                    speaker_hit = (None, 0.0)
+                else:
+                    speaker_hit = vp_res
             else:
                 utterance = await run_in_threadpool(_asr)
                 speaker_hit = (None, 0.0)
@@ -1999,9 +2006,17 @@ class VoiceSession:
                     # 建提醒**成功**时记下真正落库的钟点。_speak_sentence 拿它
                     # 比模型嘴里的钟点，一个都对不上就拦下、改念真实时间。
                     elif _tname == "create_reminder":
-                        _h, _m = outcome.get("hour"), outcome.get("minute")
-                        if isinstance(_h, int) and isinstance(_m, int):
-                            speaker._reminder_clocks.add((_h % 12, _m))
+                        # ⚠️ 变量名**不许用 _m**：本函数的嵌套闭包 ``_identify()``
+                        # 引用模块别名 ``_m``（= app.models）。Python 的规则是
+                        # 「本函数给谁赋过值，谁就是本函数的局部变量」—— 于是闭包
+                        # 看到的是还没赋值的局部，抛
+                        # ``NameError: cannot access free variable '_m'``。
+                        # 2026-10-29 声纹冒烟连红 4 次就是这个（a9518f5 把 _m
+                        # 当分钟用了），而异常被 gather(return_exceptions) 吞成
+                        # 「没认出」，日志里一个字都没有。
+                        _hour, _minute = outcome.get("hour"), outcome.get("minute")
+                        if isinstance(_hour, int) and isinstance(_minute, int):
+                            speaker._reminder_clocks.add((_hour % 12, _minute))
                             speaker._reminder_clock_speak = str(
                                 outcome.get("clock") or "") \
                                 or speaker._reminder_clock_speak
