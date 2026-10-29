@@ -227,6 +227,66 @@ jobs:
       - name: 用户端音色清单冒烟（按生效厂商 + 失效回落默认）
         # 经 run_smoke 落盘：红灯时日志进 artifact（见末尾「失败诊断」步骤）
         run: python tools/run_smoke.py logs/smoke_smoke_voice_options.log python tools/smoke_voice_options.py 8136
+      # ===================================================================
+      # 补齐「只登记端口、从没接线」的十个冒烟（2026-10-30）
+      #
+      # 动因：`smoke_voice_options` 写了 28 条断言守的正是「角色音色选了不
+      # 生效」，端口也在 smoke_ports.py 登记了，但这份 workflow 里**一次都
+      # 没调** —— 断言写了不跑，等于没有门禁，而 CI 一路绿灯。
+      # 审计后发现同类还有 10 个（smoke_ports 是「谁占哪个口」的清单，不是
+      # 「CI 跑不跑」的 manifest，两者原本没有任何一致性约束）。
+      # 现在由 `tools/ci_gate_check.py` 的「冒烟接线」判据兜住：新写一个
+      # smoke_*.py 而不接线，pr-gate 直接红。
+      #
+      # 顺序：先跑**纯离线**的两条（秒级、失败信息最准），再跑起服务的，
+      # 让最快最有价值的那条先给出信号。
+      # ===================================================================
+      # tts_stream 分片契约：守的是 2026-10-20「设备连得上、收得到 LLM 文本、
+      # 一个音都没有」事故（`tts()` 返回整段 bytes 却被 for-in 逐字节迭代）。
+      # 进程内直调、不连网络、不依赖 libopus ⇒ 它是**唯一**能稳定守住音频
+      # 链路形态错配的用例，也是用户硬约束「声音千万别再坏」的机器化表达。
+      - name: TTS 分片契约冒烟（整段/流式形态错配的永久回归）
+        run: python tools/run_smoke.py logs/smoke_smoke_tts_stream.log python tools/smoke_tts_stream.py
+      # schema 迁移：两条启动期数据变换（token_epoch 回填 / MAC 归一化）在
+      # **真实老库数据**上的行为，含「冲突必须报错且零改动」——那条最要命，
+      # 直接 UPDATE 会撞 device_id 唯一约束、在启动路径抛异常 ⇒ 升级后服务
+      # 起不来。纯 SQLite + 临时库，不起服务。
+      - name: schema 迁移冒烟（老库回填 / MAC 归一化 / 冲突不合并）
+        run: python tools/run_smoke.py logs/smoke_smoke_schema_migrations.log python tools/smoke_schema_migrations.py
+      # 断网自建提醒上报：鉴权 + 幂等 + sync 可见性（端口 8123）。
+      # 设备断网时在本地建提醒、恢复后补报，这条链路错了老人会重复吃药。
+      - name: 断网自建提醒上报冒烟（鉴权 / 幂等 / sync 可见）
+        run: python tools/run_smoke.py logs/smoke_smoke_local_reminders.log python tools/smoke_local_reminders.py 8123
+      # hw_model 截断护栏（端口 8126）：SQLite 不强制列宽，`hw[:64]` 是唯一
+      # 护栏。脚本自带**变异自检**（把 [:64] 改成 [:200] 必须变红），所以它
+      # 不只是"跑通了"，还证明了自己的断言有鉴别力。
+      - name: hw_model 截断护栏冒烟（含变异自检）
+        run: python tools/run_smoke.py logs/smoke_smoke_hw_model_truncation.log python tools/smoke_hw_model_truncation.py 8126
+      # OTA 激活码配额（端口 8127）：`/api/voice/ota` 的新建配额被绕过 =
+      # 任何人可以无限刷激活码，是资源耗尽面。
+      - name: OTA 激活码配额冒烟
+        run: python tools/run_smoke.py logs/smoke_smoke_ota_ratelimit.log python tools/smoke_ota_ratelimit.py 8127
+      # 激活码 TTL（端口 8128）：10 分钟过期、服务端锁定、已绑定不发码、管理员
+      # 解绑。C9 专门钉「残留码不得把设备绑走」——过期码若仍能绑定，等于设备
+      # 被陌生人接管。
+      - name: 激活码 TTL 冒烟（过期 / 锁定 / 残留码不得绑走设备）
+        run: python tools/run_smoke.py logs/smoke_smoke_activation_ttl.log python tools/smoke_activation_ttl.py 8128
+      # 首页聚合 / 账户 / 设备角色（端口 8102）。
+      - name: 首页聚合与账户冒烟
+        run: python tools/run_smoke.py logs/smoke_smoke_home.log python tools/smoke_home.py 8102
+      # 长期记忆 + 人格演化（端口 8103）：抽取质量、跨轮去重、检索召回。
+      # 全程不调真实模型 API（假网关），所以进 CI 不花钱也不抖动。
+      - name: 长期记忆与人格冒烟
+        run: python tools/run_smoke.py logs/smoke_smoke_memory.log python tools/smoke_memory.py 8103
+      # 邮件 / SMTP / 邮箱找回密码（端口 8105）。自带假 SMTP 服务（纯 socket），
+      # 不需要外部邮箱，也不发真信。
+      - name: 邮件与找回密码冒烟
+        run: python tools/run_smoke.py logs/smoke_smoke_mail.log python tools/smoke_mail.py 8105
+      # 部署模式地址推导（端口 8122）：tunnel / direct / auto 三模式的
+      # ws+ota 地址、启动自检。这条守的是「固件拿到的地址不对 ⇒ 设备连不上」，
+      # 而地址是固件里写死的，改错只能靠重刷才能发现。
+      - name: 部署模式地址推导冒烟
+        run: python tools/run_smoke.py logs/smoke_smoke_deploy.log python tools/smoke_deploy.py --port 8122
       # 可信反代 + 307 scheme（端口 8125，已在 smoke_ports.py 登记）。
       # 守的是 2026-10-18 线上事故：管理后台在 HTTPS 页面里请求
       # /api/admin/presets 被浏览器 Mixed Content 拦掉（Failed to fetch），
