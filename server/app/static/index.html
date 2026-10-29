@@ -452,7 +452,7 @@
             <div><label>TTS 音色</label>
               <select v-model="aForm.tts_voice" style="width:100%">
                 <option value="">（不指定 · 用 TTS 配置的音色，或厂商默认）</option>
-                <optgroup label="── 预置音色（Edge TTS 在线可用）──">
+                <optgroup :label="voiceGroupLabel">
                   <option v-for="v in ttsVoices" :key="v.id" :value="v.id">
                     {{v.name}} — {{v.scene}}
                   </option>
@@ -560,7 +560,7 @@
             <div><label>音色</label>
               <select v-model="pEdit.tts_voice" style="width:100%">
                 <option value="">（不指定 · 用 TTS 配置的音色，或厂商默认）</option>
-                <optgroup label="── 预置音色（Edge TTS 在线可用）──">
+                <optgroup :label="voiceGroupLabel">
                   <option v-for="v in ttsVoices" :key="v.id" :value="v.id">
                     {{v.name}} — {{v.scene}}
                   </option>
@@ -1178,10 +1178,12 @@
           <div class="row">
             <select v-model="usageFilter" @change="loadUsage">
               <option value="">全部用途</option>
-              <option value="chat">chat 对话</option>
-              <option value="light">light 轻任务</option>
-              <option value="embed">embed 向量化</option>
-              <option value="rerank">rerank 重排</option>
+              <option value="chat">对话模型</option>
+              <option value="light">轻量任务模型（记忆抽取等）</option>
+              <option value="embed">向量化模型</option>
+              <option value="rerank">重排模型</option>
+              <option value="asr">语音识别</option>
+              <option value="tts">语音合成</option>
             </select>
             <button @click="loadUsage">刷新</button>
           </div>
@@ -1204,12 +1206,17 @@
       </div>
 
       <div class="card" v-if="usageSummary && Object.keys(usageSummary.by_usage||{}).length">
-        <h2>按用途分布（tokens）</h2>
+        <h2>按模型类别分布</h2>
+        <p class="muted" style="font-size:12px;margin:0 0 8px">
+          语音识别 / 语音合成按次计费、不按 token 计，它们的 tokens 恒为 0，
+          看「调用次数」那一列。
+        </p>
         <table>
-          <thead><tr><th>用途</th><th class="num">tokens</th></tr></thead>
+          <thead><tr><th>模型类别</th><th class="num">调用次数</th><th class="num">tokens</th></tr></thead>
           <tbody>
             <tr v-for="(v,k) in usageSummary.by_usage" :key="k">
-              <td>{{usageName(k)}}</td>
+              <td>{{usageKind(k)}}</td>
+              <td class="num">{{(usageSummary.by_usage_calls||{})[k]||0}}</td>
               <td class="num">{{v}}</td>
             </tr>
           </tbody>
@@ -1232,14 +1239,16 @@
       <div class="card">
         <h2>最近调用流水</h2>
         <table v-if="usageRows.length">
-          <thead><tr><th>时间</th><th>来源</th><th>用途</th><th>设备</th><th>模型</th>
+          <thead><tr><th>时间</th><th>来源</th><th>模型类别</th><th>设备</th><th>具体模型</th>
             <th class="num">tokens</th><th>结果</th></tr></thead>
           <tbody>
             <tr v-for="r in usageRows" :key="r.id">
               <td class="muted">{{fmt(r.created_at)}}</td>
               <td>{{r.source||'—'}}</td>
-              <td><span class="tag">{{usageName(r.usage)}}</span></td>
+              <td><span class="tag">{{r.kind_label || usageKind(r.usage)}}</span></td>
               <td class="num">{{r.device_id||'—'}}</td>
+              <!-- 管理端保留具体模型：排查"这笔钱花在哪家哪版"必须看得到。
+                   用户端不显示这一列（那里只显示类别）。 -->
               <td>{{r.provider_name||'—'}}<div class="muted" style="font-size:12px">{{r.model}}</div></td>
               <td class="num">{{r.total_tokens}}</td>
               <td><span class="tag" :class="r.ok?'ok':'bad'">{{r.ok?'成功':'失败'}}</span></td>
@@ -1498,6 +1507,10 @@ createApp({
       // 出厂默认音色以服务端 app/voice/catalog.py 为单一真源，前端再抄一份必然
       // 出现「下拉框里有的音色，恢复默认后却是另一个」。
       voiceCatalog: {voices:[], allow_custom:true, custom_hint:'', custom_mismatch_hint:''},
+      // 当前生效 TTS 厂商的音色清单（GET /api/providers/voice-options）。
+      // 与上面的 voiceCatalog.voices 是**两件事**：那份是 Edge 全量目录，
+      // 这份是"这台部署现在真能用"的那几家之一。见 ttsVoices 的注释。
+      activeVoices: [], activeVoiceVendor: '', activeVoiceDefault: '',
       // TTS 厂商预置（也来自 /api/providers/catalog）。
       // ⚠️ 必须服务端下发：三家要填的字段差别太大（火山是 AK:SK 两段、
       // Edge 完全不用填），硬编码在前端等于把「每家要什么」抄成第二份真源。
@@ -1530,7 +1543,23 @@ createApp({
     };
   },
   computed:{
-    ttsVoices(){ return this.voiceCatalog.voices || []; },
+    // 音色下拉的数据源：**优先用当前生效厂商的清单**，拿不到才退回 Edge 全量。
+    //
+    // 为什么必须这样：voiceCatalog.voices 是 Edge 的 11 个音色（VOICE_CATALOG），
+    // 与"这台部署实际在用哪家 TTS"无关。腾讯云只认整数 ID、火山只认
+    // BV001_streaming，拿 Edge 的名字去选，后端 _shape_ok_voice() 会静默置空 ——
+    // 管理员以为换成功了，老人听到的还是默认音色。生产上角色表存着
+    // zh-CN-XiaoxiaoNeural 而 TTS 走腾讯云，就是这个坑。
+    ttsVoices(){
+      if (this.activeVoices && this.activeVoices.length) return this.activeVoices;
+      return this.voiceCatalog.voices || [];
+    },
+    // 下拉里那个 optgroup 的标题：告诉管理员"这是哪家厂商的音色"。
+    voiceGroupLabel(){
+      return this.activeVoiceVendor
+        ? ('── ' + this.activeVoiceVendor + ' 的音色 ──')
+        : '── 预置音色（Edge TTS 在线可用）──';
+    },
     customVoicePlaceholder(){
       return '例：cosyvoice-zh-female、GPT_SoVITS 角色名…';
     },
@@ -1955,6 +1984,26 @@ createApp({
           if (this.aForm) Object.assign(this.aForm, this.splitVoice(this.aForm.tts_voice));
         }
       }catch(e){ /* 目录缺失不致命：自定义输入仍然可用 */ }
+      // 再取一次「当前生效厂商的音色」。
+      //
+      // 为什么不能只用上面那份 /api/providers/catalog：那份的 voices 是
+      // **Edge 全量清单**（VOICE_CATALOG），而部署实际在用的可能是腾讯云 ——
+      // 于是在管理后台给角色/形象选音色，选出来的是 Edge 的名字，
+      // 服务端 _shape_ok_voice() 发现形态不符会静默置空，管理员以为换成功了。
+      // 生产上角色 tts_voice 存着 zh-CN-XiaoxiaoNeural 而 TTS 走腾讯云，
+      // 就是这么来的。voice-options 按 resolve_row(db,"tts") 的真实结果给清单。
+      try{
+        const o = await this.api('/api/providers/voice-options');
+        if (o){
+          this.activeVoices = Array.isArray(o.voices) ? o.voices : [];
+          this.activeVoiceVendor = o.vendor_label || o.vendor || '';
+          this.activeVoiceDefault = o.default_voice || '';
+          // 清单变了要重新拆分：原本判成「自定义」的 Edge 音色，
+          // 现在应该显示成「不在清单里」，而不是被静默当成合法值。
+          if (this.pEdit) Object.assign(this.pEdit, this.splitVoice(this.pEdit.tts_voice));
+          if (this.aForm) Object.assign(this.aForm, this.splitVoice(this.aForm.tts_voice));
+        }
+      }catch(e){ /* 拿不到就沿用 Edge 清单，至少不空白 */ }
     },
     // 语音侧的「测试连接」走独立端点：**真打一次**合成。
     // 不能复用 /api/providers/test —— 那个只覆盖 chat/embed/rerank，
@@ -2333,7 +2382,17 @@ createApp({
       }catch(e){ this.err = '用量统计加载失败：' + e.message; }
     },
     usageName(u){
-      return {chat:'对话', light:'轻任务', embed:'向量化', rerank:'重排'}[u] || u || '—';
+      return {chat:'对话', light:'轻任务', embed:'向量化', rerank:'重排',
+              vision:'视觉理解', asr:'语音识别', tts:'语音合成',
+              vad:'端点检测'}[u] || u || '—';
+    },
+    // 模型类别：与 model_catalog.USAGE_KIND_LABELS 同一套口径。
+    // 前端留一份兜底，是为了"新接口还没上线、库里已有老数据"时不显示空白；
+    // 服务端下发 kind_label 时以服务端为准。
+    usageKind(u){
+      return {chat:'正式对话模型', light:'轻量任务模型', embed:'向量化模型',
+              rerank:'重排模型', vision:'视觉模型', asr:'语音识别',
+              tts:'语音合成', vad:'端点检测'}[u] || '其他';
     },
 
     // -------- 账号安全（修改密码）--------

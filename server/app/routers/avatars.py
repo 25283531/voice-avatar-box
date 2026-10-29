@@ -121,7 +121,13 @@ def delete_avatar(avatar_pk: int, db: Session = Depends(get_db),
 @router.post("/{avatar_pk}/apply/{device_pk}", status_code=status.HTTP_200_OK)
 def apply_avatar(avatar_pk: int, device_pk: int, db: Session = Depends(get_db),
                  user: models.User = Depends(get_current_user)):
-    """把形象应用到指定设备（设备下次心跳即生效）。"""
+    """把形象应用到指定设备（设备下次心跳即生效）。
+
+    返回里带 ``device_name`` / ``avatar_name`` 是给前端做成功提示用的：
+    应用形象是个"看不见"的操作（设备要等下一次心跳才换脸），页面不给人话
+    反馈的话，用户只会看到下拉框跳回原位 —— 2026-10-29 用户报「选择后无法
+    应用，会自动恢复到选择设备」就是这个：接口其实成功了，界面一句话都没有。
+    """
     from ..deps import require_device_owner
 
     dev = require_device_owner(device_pk, user, db)
@@ -130,4 +136,5 @@ def apply_avatar(avatar_pk: int, device_pk: int, db: Session = Depends(get_db),
         raise HTTPException(status.HTTP_404_NOT_FOUND, "形象不存在")
     dev.avatar_id = av.id
     db.commit()
-    return {"ok": True, "device_id": dev.device_id, "avatar_id": av.id}
+    return {"ok": True, "device_id": dev.device_id, "device_pk": dev.id,
+            "device_name": dev.name, "avatar_id": av.id, "avatar_name": av.name}

@@ -57,6 +57,9 @@
   .bars .b{flex:1;background:var(--brand);border-radius:4px 4px 0 0;min-height:2px;position:relative}
   .bars .x{text-align:center;font-size:11px;color:var(--muted);margin-top:4px}
   .err{background:#fdeaea;color:var(--bad);padding:8px 12px;border-radius:6px;margin-bottom:10px}
+  /* 成功/中性提示条：与 .err 同形不同色。为什么要单独一条而不是复用 err ——
+     "操作成功了"和"操作失败了"必须一眼分得开，红色条里写"已应用"会被当成失败。 */
+  .okbar{background:#e8f7ee;color:var(--ok);padding:8px 12px;border-radius:6px;margin-bottom:10px}
   .mask{position:fixed;inset:0;background:rgba(15,23,42,.45);display:flex;
         align-items:flex-start;justify-content:center;padding:40px 16px;overflow:auto}
   .modal{background:#fff;border-radius:12px;padding:18px;width:100%;max-width:720px}
@@ -200,6 +203,7 @@
     </nav>
 
     <div v-if="err" class="err">{{err}}</div>
+    <div v-if="flash" class="okbar">{{flash}}</div>
 
     <!-- ---------------------- 我的设备 ---------------------- -->
     <section v-if="tab==='devices'">
@@ -546,12 +550,17 @@
               <td class="muted">{{a.description}}</td>
               <td><span class="tag" :class="a.record_type==='preset'?'':'ok'">
                 {{a.record_type==='preset'?'平台':'我的'}}</span></td>
-              <td>{{a.tts_voice||'—'}}</td>
+              <td>{{voiceLabel(a.tts_voice)}}</td>
               <td>
-                <select :value="''" @change="applyAvatarTo(a,$event)">
-                  <option value="">选择设备</option>
+                <!-- 选中值 = 这个形象当前应用的设备（从 devices 推出来），
+                     不再是恒空的 ":value=\"''\"" —— 那会让人以为选择没生效。
+                     一个形象应用到多台设备时显示第一台，下面一行列全。 -->
+                <select :value="avatarBoundDevice(a.id)" @change="applyAvatarTo(a,$event)">
+                  <option value="">选择设备…</option>
                   <option v-for="d in devices" :key="d.id" :value="d.id">{{d.name}}</option>
                 </select>
+                <div class="muted" style="font-size:12px;margin-top:2px"
+                     v-if="avatarBoundName(a.id)">已应用到 {{avatarBoundName(a.id)}}</div>
               </td>
               <td class="row">
                 <template v-if="a.record_type!=='preset'">
@@ -572,7 +581,20 @@
           <h2>{{aForm.id?'编辑形象':'新建形象'}}</h2>
           <div class="grid g2">
             <div><label>名称</label><input v-model="aForm.name" style="width:100%" /></div>
-            <div><label>默认音色</label><input v-model="aForm.tts_voice" style="width:100%" placeholder="zh-CN-XiaoxiaoNeural" /></div>
+            <div>
+              <label>默认音色</label>
+              <!-- 有清单就给下拉（用户不可能知道系统提供哪些音色）；
+                   自建语音服务没有清单，退回手填。 -->
+              <select v-if="!voiceIsCustom" v-model="aForm.tts_voice" style="width:100%">
+                <option value="">跟随系统默认</option>
+                <option v-for="v in voiceOptions" :key="v.id" :value="v.id">
+                  {{v.name}}（{{v.gender}}）— {{v.id}}
+                </option>
+              </select>
+              <input v-else v-model="aForm.tts_voice" style="width:100%"
+                     placeholder="音色名（自建服务请按该服务命名填写）" />
+              <div class="muted" style="font-size:12px;margin-top:4px;line-height:1.5">{{voiceHint}}</div>
+            </div>
           </div>
           <div style="margin-top:10px">
             <label>简介</label><input v-model="aForm.description" style="width:100%" />
@@ -598,7 +620,7 @@
             <tr v-for="r in rolePresets" :key="r.id">
               <td>{{r.name}}</td>
               <td class="muted">{{r.description}}</td>
-              <td>{{r.tts_voice||'—'}}</td>
+              <td>{{voiceLabel(r.tts_voice)}}</td>
               <td><button @click="openDerive(r)">派生为我的角色</button></td>
             </tr>
           </tbody>
@@ -618,7 +640,7 @@
               <td>{{r.name}}</td>
               <td class="muted">{{r.description}}</td>
               <td class="muted" style="font-size:12px">{{parentName(r)}}</td>
-              <td>{{r.tts_voice||'—'}}</td>
+              <td>{{voiceLabel(r.tts_voice)}}</td>
               <td>
                 <select :value="agentBind_dev(r.id)" @change="bindRoleTo(r,$event)">
                   <option value="">选择设备</option>
@@ -659,7 +681,21 @@
           <h2>{{rEdit.id?'编辑角色':'原创角色'}}</h2>
           <div class="grid g2">
             <div><label>名称</label><input v-model="rEdit.name" style="width:100%" /></div>
-            <div><label>音色</label><input v-model="rEdit.tts_voice" style="width:100%" /></div>
+            <div>
+              <label>音色</label>
+              <!-- 需求：用户不可能知道系统提供哪些音色，必须由后台下发清单。
+                   清单 = **当前生效的 TTS 厂商**的音色（音色 ID 不跨厂商通用）。
+                   自建服务没有清单，退回手填。 -->
+              <select v-if="!voiceIsCustom" v-model="rEdit.tts_voice" style="width:100%">
+                <option value="">跟随形象 / 系统默认</option>
+                <option v-for="v in voiceOptions" :key="v.id" :value="v.id">
+                  {{v.name}}（{{v.gender}}）— {{v.id}}
+                </option>
+              </select>
+              <input v-else v-model="rEdit.tts_voice" style="width:100%"
+                     placeholder="音色名（自建服务请按该服务命名填写）" />
+              <div class="muted" style="font-size:12px;margin-top:4px;line-height:1.5">{{voiceHint}}</div>
+            </div>
           </div>
           <div style="margin-top:10px">
             <label>简介</label><input v-model="rEdit.description" style="width:100%" />
@@ -701,10 +737,12 @@
           <div class="row">
             <select v-model="usageFilter">
               <option value="">全部用途</option>
-              <option value="chat">chat 对话</option>
-              <option value="light">light 轻任务</option>
-              <option value="embed">embed 向量化</option>
-              <option value="rerank">rerank 重排</option>
+              <option value="chat">对话模型</option>
+              <option value="light">轻量任务模型（记忆抽取等）</option>
+              <option value="embed">向量化模型</option>
+              <option value="rerank">重排模型</option>
+              <option value="asr">语音识别</option>
+              <option value="tts">语音合成</option>
             </select>
             <button @click="loadUsage">刷新</button>
           </div>
@@ -726,12 +764,17 @@
       </div>
 
       <div class="card" v-if="usageSummary && Object.keys(usageSummary.by_usage||{}).length">
-        <h2>按用途分布（tokens）</h2>
+        <h2>按模型类别分布</h2>
+        <p class="muted" style="font-size:12px;margin:0 0 8px">
+          语音识别与语音合成按次计费、不按 token 计，所以它们的 tokens 恒为 0，
+          看「调用次数」那一列。
+        </p>
         <table>
-          <thead><tr><th>用途</th><th class="num">tokens</th></tr></thead>
+          <thead><tr><th>模型类别</th><th class="num">调用次数</th><th class="num">tokens</th></tr></thead>
           <tbody>
             <tr v-for="(v,k) in usageSummary.by_usage" :key="k">
-              <td>{{usageName(k)}}</td>
+              <td>{{usageKind(k)}}</td>
+              <td class="num">{{(usageSummary.by_usage_calls||{})[k]||0}}</td>
               <td class="num">{{v}}</td>
             </tr>
           </tbody>
@@ -752,13 +795,15 @@
       <div class="card">
         <h2>最近调用流水</h2>
         <table v-if="usageRows.length">
-          <thead><tr><th>时间</th><th>来源</th><th>用途</th><th>模型</th><th class="num">tokens</th><th>结果</th></tr></thead>
+          <thead><tr><th>时间</th><th>来源</th><th>模型类别</th><th class="num">tokens</th><th>结果</th></tr></thead>
           <tbody>
             <tr v-for="r in usageRows" :key="r.id">
               <td class="muted">{{fmt(r.created_at)}}</td>
-              <td>{{r.source||'—'}}</td>
-              <td><span class="tag">{{usageName(r.usage)}}</span></td>
-              <td>{{r.provider_name||'—'}}<div class="muted" style="font-size:12px">{{r.model}}</div></td>
+              <td>{{sourceName(r.source)}}</td>
+              <!-- 用户端**只显示模型类别**，不显示具体模型/厂商：
+                   家属关心的是"钱花在哪个环节"，不是我们用了哪家哪版模型；
+                   具体型号在管理后台看。 -->
+              <td><span class="tag">{{r.kind_label || usageKind(r.usage)}}</span></td>
               <td class="num">{{r.total_tokens}}</td>
               <td><span class="tag" :class="r.ok?'ok':'bad'">{{r.ok?'成功':'失败'}}</span></td>
             </tr>
@@ -1001,6 +1046,15 @@ createApp({
         {k:'usage',n:'用量统计'},{k:'stats',n:'交互统计'},{k:'support',n:'帮助与工单'}
       ],
       err: '', busy: false,
+      // 操作成功的提示条（.okbar）。与 err 分开：成功用绿色、失败用红色，
+      // 同一个位置、同一种形状，用户不需要读字就知道成没成。
+      flash: '',
+      // 音色清单：GET /api/providers/voice-options。null = 还没取到。
+      // ⚠️ 音色 ID **不跨厂商通用**（腾讯云是纯数字 601009、Edge 是 BCP-47 名、
+      // 火山是 BV001_streaming），所以清单必须由服务端按**当前生效的 TTS 厂商**
+      // 下发，前端绝不能自己硬编码一份 —— 硬编码的结果就是"选了也不生效"：
+      // 后端 _shape_ok_voice() 发现形态不符会静默置空，用户以为换了，其实没换。
+      voiceOpts: null,
       // 登录 / 注册：regMode=false 是登录态（默认），true 切到注册态
       regMode: false,
       loginForm: { username:'', password:'' },
@@ -1040,6 +1094,29 @@ createApp({
     // 设备/角色下拉共用的「全部可见角色」（平台预设 + 我的）
     allRoles(){
       return this.rolePresets.concat(this.myRoles);
+    },
+    // 当前语音服务提供的音色。voiceOpts 为 null（还没取到 / 取失败）时是空数组，
+    // 模板据此退回手填输入框 —— 宁可让人手打，也不能给一个空下拉把人卡死。
+    voiceOptions(){
+      return (this.voiceOpts && this.voiceOpts.voices) || [];
+    },
+    // 自建 / OpenAI 兼容的 TTS 服务：音色清单我们不知道，只能手填。
+    voiceIsCustom(){
+      return !this.voiceOpts || !!this.voiceOpts.allow_custom;
+    },
+    // 下拉框下面那行说明：告诉用户"现在到底能用哪几个音色、默认是哪个"。
+    // 这行字是需求的一半 —— 用户不可能知道系统提供哪些音色，只能由我们告诉他。
+    voiceHint(){
+      const o = this.voiceOpts;
+      if (!o) return '正在读取当前语音服务的音色清单…';
+      if (o.allow_custom){
+        return (o.custom_hint || '当前使用自建语音服务，音色名请按该服务的命名手填。');
+      }
+      const n = (o.voices || []).length;
+      if (!n) return '当前语音服务没有预置音色，留空表示使用服务默认音色。';
+      return '当前语音服务：' + (o.vendor_label || o.vendor || '未配置')
+           + '；共 ' + n + ' 个可选音色，默认「' + this.voiceLabel(o.default_voice) + '」。'
+           + '留空表示跟随形象 / 系统默认。';
     }
   },
   methods:{
@@ -1148,7 +1225,10 @@ createApp({
     logout(){ this.token=''; localStorage.removeItem('elder_token'); },
     async loadAll(){
       this.err = '';
-      await Promise.all([this.loadDevices(), this.loadAvatars(), this.loadRoles()]);
+      // 音色清单与其余概览一起并行拉：编辑形象/角色的弹窗一打开就要用它，
+      // 等用户点开再拉会闪一下空下拉。
+      await Promise.all([this.loadDevices(), this.loadAvatars(),
+                         this.loadRoles(), this.loadVoiceOptions()]);
       if (this.curDeviceId) await this.loadReminders();
     },
 
@@ -1316,6 +1396,47 @@ createApp({
       }catch(e){ this.err = e.message; }
     },
 
+    // -------- 音色（形象 / 角色共用的下拉清单） --------
+    async loadVoiceOptions(){
+      try{
+        const o = await this.api('/api/providers/voice-options');
+        if (o) this.voiceOpts = o;
+      }catch(e){
+        // 拿不到清单**不阻塞页面**：voiceIsCustom 会退回手填输入框。
+        // 但要留一句人话，否则用户看到的是"音色变成一个空框"，不知道为什么。
+        this.voiceOpts = {voices:[], default_voice:'', allow_custom:true,
+                          custom_hint:'音色清单读取失败（' + e.message + '），请手动填写音色名。'};
+      }
+    },
+    // 音色 id -> 人看得懂的名字。查不到就原样返回 id ——
+    // 库里存着一个当前清单里没有的音色时，至少还能看见它是什么。
+    voiceLabel(id){
+      if (!id) return '—';
+      const hit = this.voiceOptions.filter(v => String(v.id) === String(id))[0];
+      return hit ? (hit.name || hit.id) : id;
+    },
+    // 把「已经不在清单里」的音色换回后台给的默认音色，返回是否发生了回落。
+    //
+    // 为什么必须做：换过 TTS 厂商、或某个音色下架之后，库里还留着旧值。
+    // 直接把它塞进 <select> 会显示成空白（选中项不存在），用户以为音色丢了；
+    // 而后端 _shape_ok_voice() 又会因为形态不符把它静默置空 —— 于是
+    // "界面上写着 A、实际用的是厂商默认 B"。这里显式回落并提示，两边才一致。
+    // 自建服务（allow_custom）没有清单可比，原样保留。
+    clampVoice(obj){
+      const o = this.voiceOpts;
+      if (!o || o.allow_custom || !obj) return false;
+      const cur = String(obj.tts_voice || '');
+      if (!cur) return false;                       // 空 = 跟随，合法
+      if (this.voiceOptions.some(v => String(v.id) === cur)) return false;
+      obj.tts_voice = o.default_voice || '';
+      return true;
+    },
+    setFlash(msg){
+      this.flash = msg || '';
+      if (this._flashTimer) clearTimeout(this._flashTimer);
+      if (msg) this._flashTimer = setTimeout(() => { this.flash = ''; }, 8000);
+    },
+
     // -------- 形象 --------
     async loadAvatars(){
       try{
@@ -1325,6 +1446,11 @@ createApp({
     editAvatar(a){
       this.aForm = a ? JSON.parse(JSON.stringify(a))
                      : {name:'', description:'', tts_voice:''};
+      const old = this.aForm.tts_voice || '';
+      if (this.clampVoice(this.aForm)){
+        this.setFlash('原音色「' + old + '」已不在当前语音服务的清单里，'
+                    + '已自动改为默认音色「' + this.voiceLabel(this.aForm.tts_voice) + '」，保存后生效。');
+      }
       this.aBox = true;
     },
     async saveAvatar(){
@@ -1344,13 +1470,34 @@ createApp({
         await this.loadAvatars();
       }catch(e){ this.err = e.message; }
     },
+    // 这个形象现在应用在哪些设备上。
+    //
+    // 为什么要显示它：原来那个下拉是**一次性动作**（`:value="''"`，选完立刻弹回
+    // 「选择设备」），接口其实成功了，但界面上没有任何痕迹 —— 用户看到的就是
+    // "选了又跳回去，没生效"。选择器必须能表达"当前状态"，不能只表达"上一次点击"。
+    avatarBoundDevices(avatarId){
+      return this.devices.filter(d => Number(d.avatar_id) === Number(avatarId));
+    },
+    avatarBoundName(avatarId){
+      return this.avatarBoundDevices(avatarId).map(d => d.name).join('、');
+    },
+    avatarBoundDevice(avatarId){
+      const list = this.avatarBoundDevices(avatarId);
+      return list.length ? list[0].id : '';
+    },
     async applyAvatarTo(a, ev){
       const v = Number(ev.target.value);
       if (!v){ return; }
+      this.err = '';
       try{
-        await this.api('/api/avatars/'+a.id+'/apply/'+v, {method:'POST'});
+        const r = await this.api('/api/avatars/'+a.id+'/apply/'+v, {method:'POST'});
+        // 先刷设备再提示：下拉的选中值是从 devices 推出来的，
+        // 不刷新的话它会停在上一个形象上，看起来又像"没生效"。
         await this.loadDevices();
-      }catch(e){ this.err = e.message; }
+        const dev = (r && r.device_name) || '该设备';
+        this.setFlash('已把形象「' + a.name + '」应用到「' + dev + '」。'
+                    + '设备下次心跳（最多 5 分钟）后换脸。');
+      }catch(e){ this.err = '应用形象失败：' + e.message; }
     },
 
     // -------- 角色 / 人格预设 --------
@@ -1406,6 +1553,11 @@ createApp({
       this.rEdit = r ? JSON.parse(JSON.stringify(r)) : {
         name:'', description:'', system_prompt:'', tts_voice:'', traits:{} };
       this.rEdit.traits = Object.assign({}, this.rEdit.traits_effective || this.rEdit.traits || {});
+      const old = this.rEdit.tts_voice || '';
+      if (this.clampVoice(this.rEdit)){
+        this.setFlash('原音色「' + old + '」已不在当前语音服务的清单里，'
+                    + '已自动改为默认音色「' + this.voiceLabel(this.rEdit.tts_voice) + '」，保存后生效。');
+      }
       this.rEditBox = true;
     },
     closeRole(){ this.rEditBox = false; this.rEdit = null; },
@@ -1469,7 +1621,21 @@ createApp({
       }catch(e){ this.err = '用量统计加载失败：' + e.message; }
     },
     usageName(u){
-      return {chat:'对话', light:'轻任务', embed:'向量化', rerank:'重排'}[u] || u || '—';
+      return {chat:'对话', light:'轻任务', embed:'向量化', rerank:'重排',
+              vision:'视觉理解', asr:'语音识别', tts:'语音合成',
+              vad:'端点检测'}[u] || u || '—';
+    },
+    // 模型类别：与服务端 model_catalog.USAGE_KIND_LABELS 同一套口径。
+    // 前端留一份兜底是为了「新接口还没上线、老数据还在」时不显示成空白 ——
+    // 服务端下发 kind_label 时以服务端为准（模板里是 `r.kind_label || usageKind(...)`）。
+    usageKind(u){
+      return {chat:'正式对话模型', light:'轻量任务模型', embed:'向量化模型',
+              rerank:'重排模型', vision:'视觉模型', asr:'语音识别',
+              tts:'语音合成', vad:'端点检测'}[u] || '其他';
+    },
+    sourceName(s){
+      return {voice:'设备语音', memory:'记忆整理', web:'网页对话',
+              admin:'后台任务'}[s] || s || '—';
     },
 
     // -------- 交互统计 + 今日概况 --------
