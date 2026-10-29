@@ -1872,6 +1872,45 @@ static void test_screen_reconcile_after_sync(void)
     elder_ui_hide_reminder();   /* 别把状态漏给后面的用例 */
 }
 
+static void test_content_fallback_claims_once(void)
+{
+    printf("\n[T19] 内容兜底必须「一条旧记录只被认领一次」（防替老人谎报服药）\n");
+    stub_nvs_init();
+    stub_time_set(1772665200L);      /* 07:00，可信时钟 */
+    rec_reset();
+    elder_reminder_init(rec_cb, NULL);
+
+    elder_rmd_item_t srv = mk_med(8, 0, "降压药", 101);
+    check("服务端下发 1 条（server_id=101）",
+          elder_reminder_replace_all(&srv, NULL, 1) == ESP_OK, NULL);
+
+    /* 08:00 响铃 → 按键确认 → DONE */
+    stub_time_advance(3600);
+    rec_reset();
+    elder_reminder_tick_once();
+    check("08:00 已响铃", elder_reminder_first_ringing() == 0, det("%s", dump_tbl(tbl())));
+    check("按键确认成功",
+          elder_reminder_confirm_ex(0, ELDER_CFM_BUTTON) == ESP_OK, NULL);
+    check("前置：今天已完成 1 条",
+          tbl()->done_today == 1u, det("%s", dump_tbl(tbl())));
+
+    /* 子女在网页端重复建了两次「08:00 降压药」（内容完全相同，id 不同），
+     * 服务端一次性下发两条。按内容兜底时，两条都会匹配到旧的那一条 DONE ——
+     * 若不加"认领位"，两条都会继承 DONE ⇒ 今天两条都算"已服"，
+     * 其中一条是老人根本没吃的药。 */
+    elder_rmd_item_t dup[2];
+    dup[0] = mk_med(8, 0, "降压药", 202);
+    dup[1] = mk_med(8, 0, "降压药", 303);
+    check("服务端下发两条内容完全相同的提醒",
+          elder_reminder_replace_all(dup, NULL, 2) == ESP_OK, NULL);
+
+    int done_bits = 0;
+    for (int i = 0; i < 16; i++) if (tbl()->done_today & (1u << i)) done_bits++;
+    check("★只有一条继承 DONE（旧记录只被认领一次，另一条是全新提醒）",
+          done_bits == 1, det("done_today=0x%04x ⇒ %d 条被标成已完成",
+                              tbl()->done_today, done_bits));
+}
+
 static void test_first_ringing_picks_ringing(void)
 {
     printf("\n[T15] 确认必须落在正在响铃的那条（喝水响了别记到吃药上）\n");
@@ -2004,6 +2043,7 @@ int main(void)
     test_late_boot_no_instant_escalate();
     test_replace_all_server_id_change();
     test_screen_reconcile_after_sync();
+    test_content_fallback_claims_once();
     test_first_ringing_picks_ringing();
 
     printf("\n=== 堆对账（T16）===\n");

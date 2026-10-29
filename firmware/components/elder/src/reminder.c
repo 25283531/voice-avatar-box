@@ -938,11 +938,25 @@ esp_err_t elder_reminder_replace_all(const elder_rmd_item_t *items,
         n++;
     }
 
+    /* 一条旧条目只能被一条新条目"认领"。
+     *
+     * 为什么需要（2026-10-29 加内容兜底时发现）：按 server_id 匹配时天然不会
+     * 重复（id 唯一），但**按内容兜底**可以重复 —— 两条内容完全相同的提醒
+     * （同类型、同时刻、同标签，只是 server_id 不同，例如子女在网页端重复
+     * 建了两次「08:00 降压药」）会**双双认领同一条旧记录**，于是同时继承
+     * 同一个运行态。若旧的那条是 DONE，两条新条目都会被标成"今天已服"——
+     * 等于替老人谎报服药，医疗事故级。
+     *
+     * ELDER_REMINDER_MAX 是 16，用 uint32_t 位图就够（标量，不占栈数组，
+     * 门禁 C13 不受影响）。 */
+    uint32_t claimed = 0;
+
     for (uint8_t i = 0; i < n; i++) {
         const elder_rmd_item_t *it = &g.table.items[i];
         int old_idx = -1;
         if (it->server_id != 0) {
             for (uint8_t j = 0; j < old_n; j++) {
+                if (claimed & (1u << j)) continue;
                 if (old[j].server_id == it->server_id) { old_idx = (int)j; break; }
             }
             /* server_id 匹配不上时**按内容兜底**（2026-10-29 用户实报后加）。
@@ -962,6 +976,7 @@ esp_err_t elder_reminder_replace_all(const elder_rmd_item_t *items,
              * 就是同一条。 */
             if (old_idx < 0) {
                 for (uint8_t j = 0; j < old_n; j++) {
+                    if (claimed & (1u << j)) continue;
                     if (same_content(&old[j], it)) {
                         old_idx = (int)j;
                         ESP_LOGW(TAG, "server_id 变了（旧 %lu → 新 %lu），按内容"
@@ -975,6 +990,7 @@ esp_err_t elder_reminder_replace_all(const elder_rmd_item_t *items,
             }
         } else {
             for (uint8_t j = 0; j < old_n; j++) {
+                if (claimed & (1u << j)) continue;
                 if (old[j].server_id == 0 && same_content(&old[j], it)) {
                     old_idx = (int)j;
                     break;
@@ -982,6 +998,7 @@ esp_err_t elder_reminder_replace_all(const elder_rmd_item_t *items,
             }
         }
         if (old_idx >= 0) {
+            claimed |= (1u << old_idx);   /* 这条旧条目已被认领，后面的条目不许再认 */
             /* 沿用旧表同一条的运行态，避免同步打断老人当天的进度 */
             g.state[i] = old_state[old_idx];
             g.fired_today[i] = old_fired[old_idx];
