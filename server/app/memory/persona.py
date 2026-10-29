@@ -417,9 +417,13 @@ def tone_profile(db, user_id: int, agent_id: int | None) -> dict[str, Any]:
         # 口头禅要**跨多轮**重复才算数：一次回复内部重复两遍多半是"好的好的"
         # 这种口误，累计到 3 轮还在说才是习惯。低于门槛的一律不显示 ——
         # 画像里写一句假口头禅，比空着更伤信任。
+        #
+        # ⚠️ 读侧也要再过一遍 _CATCH_STOP：库里存着的旧值是在加这道过滤**之前**
+        # 攒的（"喝水的""是十二"就是那批），只改写入侧的话它们会一直显示到
+        # 自然衰减为止。
         "catchphrases": [p for p, c in sorted(
             (prof.catchphrases or {}).items(), key=lambda kv: -kv[1]
-        ) if int(c) >= 3][:8] if prof else [],
+        ) if int(c) >= 3 and not (set(p) & _CATCH_STOP)][:8] if prof else [],
     }
     manual = dict(prof.manual or {}) if prof else {}
 
