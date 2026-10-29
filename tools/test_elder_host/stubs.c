@@ -177,6 +177,22 @@ void elder_ui_notice(const char *t, const char *emotion)
     if (t && t[0]) s_notice_count++;
 }
 
+/* 全屏提醒的显隐。2026-10-29（D71）起 reminder.c 的 replace_all 末尾会
+ * **对账**：引擎里没有待确认项、屏幕却还挂着 ⇒ 收掉。这条兜底要用到
+ * elder_ui_show_reminder / elder_ui_hide_reminder / elder_ui_reminder_showing。
+ * ⚠️ 只加调用不加桩 ⇒ 宿主测试链接期 undefined reference
+ *    （nag_start / button_pending 都踩过同一个坑）。
+ * 这里保留一个布尔状态，T18 才能断言"后端删掉提醒后屏幕真的收了"。 */
+static bool s_reminder_showing;
+esp_err_t elder_ui_show_reminder(const char *t)
+{
+    (void)t;
+    s_reminder_showing = true;
+    return ESP_OK;
+}
+void elder_ui_hide_reminder(void) { s_reminder_showing = false; }
+bool elder_ui_reminder_showing(void) { return s_reminder_showing; }
+
 void elder_rgb_med_done(void) { s_rgb_count++; s_rgb_done++; }
 void elder_rgb_med_pending(void) { s_rgb_count++; s_rgb_pending++; }
 void elder_rgb_med_escalate(void) { s_rgb_count++; s_rgb_escalate++; }

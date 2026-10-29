@@ -1818,6 +1818,60 @@ static void test_replace_all_server_id_change(void)
     check("确认后不再待确认", elder_reminder_first_ringing() == -1, NULL);
 }
 
+static void test_screen_reconcile_after_sync(void)
+{
+    printf("\n[T18] 后端把提醒删了 ⇒ 屏幕必须跟着收（2026-10-29 现场兜底）\n");
+    stub_nvs_init();
+    stub_time_set(1772665200L);      /* 07:00，可信时钟 */
+    rec_reset();
+    elder_reminder_init(rec_cb, NULL);
+
+    elder_rmd_item_t srv = mk_med(8, 0, "降压药", 101);
+    check("服务端下发 1 条（server_id=101）",
+          elder_reminder_replace_all(&srv, NULL, 1) == ESP_OK, NULL);
+
+    /* 08:00 响铃，屏幕全屏显示（模拟 elder_bridge 的 OnReminder） */
+    stub_time_advance(3600);
+    rec_reset();
+    elder_reminder_tick_once();
+    elder_ui_show_reminder("该吃降压药了\n\n长按按钮 3 秒确认");
+    check("前置：屏幕挂着全屏提醒，引擎里也有待确认项",
+          elder_ui_reminder_showing() && elder_reminder_first_ringing() == 0,
+          det("%s", dump_tbl(tbl())));
+
+    /* 09:30：升级 ESCALATED，仍在待确认集合里 —— 这时屏幕和引擎是一致的 */
+    stub_time_advance(90 * 60);
+    rec_reset();
+    elder_reminder_tick_once();
+    check("前置：已升级 ESCALATED（屏幕与引擎仍一致）",
+          elder_ui_reminder_showing() && elder_reminder_first_ringing() == 0,
+          det("%s", dump_tbl(tbl())));
+
+    /* ---- 反向断言先做：提醒**还在**等确认时，同步绝不能顺手把屏幕收了 ----
+     * 只写正向会让"每次同步都收屏"这种过度修复漏过去。 */
+    check("重新下发同一条（内容未变）",
+          elder_reminder_replace_all(&srv, NULL, 1) == ESP_OK, NULL);
+    check("★反向：仍有待确认项时，同步不得收屏",
+          elder_ui_reminder_showing() && elder_reminder_first_ringing() == 0,
+          det("%s", dump_tbl(tbl())));
+
+    /* ---- 正向：服务端把这条停用/删除了：同步下发 0 条 ----
+     * ⚠️ 这一条**不会**产生任何 OnReminder 回调（没有状态迁移可报），
+     * 所以「SKIPPED/HALF_EXPIRED 收屏」那条兜底覆盖不到它 ——
+     * 正是用户实报的形态：屏幕还挂着，长按选不中目标。 */
+    check("后端下发 0 条（提醒被删除/停用）",
+          elder_reminder_replace_all(NULL, NULL, 0) == ESP_OK, NULL);
+
+    /* ★ 核心断言 */
+    check("★同步后屏幕被收掉（不许对着一条不存在的提醒喊长按确认）",
+          !elder_ui_reminder_showing(),
+          "屏幕还挂着 = 老人按 3 秒毫无反应，只能先唤醒再走服务端确认");
+    check("★引擎里也确实没有待确认项了",
+          elder_reminder_first_ringing() == -1, det("%s", dump_tbl(tbl())));
+
+    elder_ui_hide_reminder();   /* 别把状态漏给后面的用例 */
+}
+
 static void test_first_ringing_picks_ringing(void)
 {
     printf("\n[T15] 确认必须落在正在响铃的那条（喝水响了别记到吃药上）\n");
@@ -1949,6 +2003,7 @@ int main(void)
     test_half_confirm_skip_after_window();
     test_late_boot_no_instant_escalate();
     test_replace_all_server_id_change();
+    test_screen_reconcile_after_sync();
     test_first_ringing_picks_ringing();
 
     printf("\n=== 堆对账（T16）===\n");

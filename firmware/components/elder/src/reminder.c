@@ -1038,6 +1038,26 @@ esp_err_t elder_reminder_replace_all(const elder_rmd_item_t *items,
      * 合并前的状态：提醒被后端删了灯还亮着（催老人确认一条不存在的任务），
      * 或者后端新下发的提醒在等确认、灯却不亮。 */
     elder_rgb_button_pending(has_pending_confirm());
+
+    /* ---- 7. 同步后对账：屏幕与引擎状态必须同源 ----
+     * replace_all 是**全表替换**：被后端删掉/停用的条目会整条消失，这时
+     * 根本不会有 OnReminder 回调（没有状态迁移可报），而屏幕的 4 小时计时
+     * 是 elder_ui 自己的、独立走的 ⇒ 老人对着一份已经不存在的提醒长按按钮，
+     * 按键选不中目标（first_ringing() = -1），屏幕却还在喊「长按确认」。
+     *
+     * 2026-10-29 用户实报的正是这个形态：8 点服药提醒，10 点屏幕还挂着提示，
+     * 语音和长按都没反应，唤醒后走服务端 MCP 才确认成功（MCP 只看服务端，
+     * 不经过设备的 first_ringing()，所以"语音能用、按键不能"）。
+     *
+     * 前面几处修的是"为什么会脱节"，这里是**兜底对账**：只要引擎里没有
+     * 待确认项，屏幕就不许留着提醒。宁可少显示一条，也不能让屏幕指着一个
+     * 按不动的操作。elder_ui_hide_reminder() 自带"没在显示就直接返回"，幂等。 */
+    if (!has_pending_confirm() && elder_ui_reminder_showing()) {
+        elder_ui_hide_reminder();
+        ESP_LOGW(TAG, "同步后引擎里没有待确认项，但全屏提醒还挂着 ⇒ 收掉"
+                      "（屏幕指向了一个按不动的操作）");
+    }
+
     ESP_LOGI(TAG, "提醒表已合并：后端 %u 条 + 本地 %u 条 = %u 条", srv_n, keep_n, n);
     esp_err_t rc = elder_reminder_flush();
     heap_caps_free(sc);
