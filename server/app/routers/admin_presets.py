@@ -50,7 +50,7 @@ from ..schemas import (
     RolePromptOut,
     SoftGuardrailIn,
 )
-from .roles import build_spec_for_preset
+from .roles import _clamp_voice, build_spec_for_preset
 
 log = logging.getLogger("elder.admin_presets")
 
@@ -148,23 +148,32 @@ def _preset_out(db: Session, row: models.AIProvider) -> PresetOut:
         archived=row.archived_at is not None,
         bound_device_count=_bound_device_count(db, int(row.id)),
         derived_role_count=_derived_role_count(db, int(row.id)),
-        dirty_fields=_dirty_fields(row, traits),
+        dirty_fields=_dirty_fields(db, row, traits),
     )
 
 
-def _dirty_fields(row: models.AIProvider, traits: dict[str, Any]) -> list[str]:
+def _dirty_fields(db: Session, row: models.AIProvider,
+                  traits: dict[str, Any]) -> list[str]:
     """与出厂默认不一致的字段（**后端算**，前端不做比较）。
 
     只算**可重置的 3 个**字段：name/description 不可重置，拿它们判"偏离默认"
     会让"运营改了个名字"被标成偏离，而 reset 也不会把它改回去 —— badge 与
     按钮行为对不上。
+
+    ``tts_voice`` 的基准是**当前生效厂商的默认音色**，不是
+    ``catalog.DEFAULT_PRESET_TTS_VOICE``（那个是 Edge 专属值）。否则在腾讯云
+    部署里刚点完「恢复默认」、值已经是正确默认了，badge 却一直亮着 ——
+    badge 与 reset 判据不同源，就是「点了恢复默认但看起来没恢复」。
     """
+    from ..voice import catalog as voice_catalog
+
     dirty: list[str] = []
     if str(row.system_prompt or "") != catalog.DEFAULT_PRESET_PROMPT:
         dirty.append("system_prompt")
     if traits != dict(catalog.DEFAULT_TRAITS):
         dirty.append("traits")
-    if str(row.tts_voice or "") != catalog.DEFAULT_PRESET_TTS_VOICE:
+    default_voice = str(voice_catalog.options_for(db).get("default_voice") or "")
+    if default_voice and str(row.tts_voice or "") != default_voice:
         dirty.append("tts_voice")
     return dirty
 
@@ -336,7 +345,12 @@ def update_preset(preset_pk: int, payload: PresetPatchIn, db: Session = Depends(
     if payload.system_prompt is not None:
         row.system_prompt = payload.system_prompt
     if payload.tts_voice is not None:
-        row.tts_voice = payload.tts_voice
+        # 音色必须与**当前生效的 TTS 厂商**对齐，否则落库的是个永远不生效的
+        # 值：``asr_tts._shape_ok_voice()`` 发现形态不符会静默置空，管理员在
+        # 后台选了「晓晓」、老人听到的却一直是厂商默认音色。
+        # 判据复用 ``roles._clamp_voice``（与用户端写路径**同源**）——
+        # 两处各写一份，迟早出现「后台存得进、用户端存不进」的自相矛盾。
+        row.tts_voice = _clamp_voice(db, payload.tts_voice)
     if payload.traits is not None:
         row.traits = dict(payload.traits)
     after = admin_audit.snapshot(row)
@@ -416,7 +430,25 @@ def reset_preset(preset_pk: int, payload: PresetResetIn, db: Session = Depends(g
         # 整体覆写为出厂完整声明（preset 的 traits 本就是完整声明，没有 overlay）
         row.traits = dict(catalog.DEFAULT_TRAITS)
     if "tts_voice" in fields:
-        row.tts_voice = catalog.DEFAULT_PRESET_TTS_VOICE
+        # ⚠️ **不再写 ``catalog.DEFAULT_PRESET_TTS_VOICE``**（= Edge 的
+        # ``zh-CN-XiaoxiaoNeural``）。那是个**厂商专属**的值，在腾讯云部署里
+        # 必然被 ``asr_tts._shape_ok_voice()`` 置空 —— 于是「恢复默认」等于
+        # 把音色清空，用户点了什么都没恢复，而页面上看不出任何异常。
+        # 改成取**当前生效厂商**的默认音色（``voice.catalog.options_for``，
+        # 与用户端下拉、``roles._clamp_voice`` 同一个真源）。
+        #
+        # 自建 / 认不出厂商时 ``default_voice`` 是空串（那家没有「默认音色」
+        # 这回事）：此时**保持原值不动**。写成空串会把管理员原先填的自建音色
+        # 抹掉 —— 「恢复默认」不该比不改更糟。
+        from ..voice import catalog as voice_catalog
+
+        default_voice = str(voice_catalog.options_for(db).get("default_voice") or "")
+        if default_voice:
+            row.tts_voice = default_voice
+        else:
+            log.info("平台预设 id=%s 恢复默认音色时跳过 tts_voice："
+                     "当前生效的是自建 TTS，没有可用的默认音色（保持原值）",
+                     row.id)
     after = admin_audit.snapshot(row)
     admin_audit.record(db, admin, row, "reset", before, after)
     db.commit()

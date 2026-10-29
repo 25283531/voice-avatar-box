@@ -546,7 +546,10 @@ def derive_role(role_pk: int, payload: RoleDeriveIn, db: Session = Depends(get_d
         name=payload.name,
         description=parent.description or "",
         system_prompt=parent.system_prompt or "",
-        tts_voice=parent.tts_voice or "",
+        # 母版多半是**平台预设**，而预设的 tts_voice 是出厂值（Edge 的音色名）。
+        # 部署换成腾讯云之后，原样复制等于把失效值再复制一份 —— 副本从此
+        # 「页面上显示选了音色，实际一直是厂商默认」。派生同样要过归一化。
+        tts_voice=_clamp_voice(db, parent.tts_voice or ""),
         avatar_id=parent.avatar_id,
         kind="",
         record_type=models.RECORD_TYPE_ROLE,

@@ -268,6 +268,37 @@ def main() -> int:
             check("C5 restore 也归一化（母版音色属别家厂商时不照抄）", False,
                   f"拿不到预设 id: code={code}")
 
+        # ============== E. 平台预设（管理端写路径）：PATCH / reset / dirty
+        print("\n── E. 平台预设：后台改音色与「恢复默认」──")
+        code, plist = req("GET", "/api/admin/presets/", token=admin)
+        preset_id = None
+        if code == 200 and isinstance(plist, dict) and plist.get("presets"):
+            preset_id = (plist["presets"][0] or {}).get("id")
+        if preset_id:
+            # 管理员在腾讯云部署下选了个 Edge 音色 —— 落库必须是该厂商能用的值
+            code, p1 = req("PATCH", f"/api/admin/presets/{preset_id}",
+                           {"tts_voice": "zh-CN-YunyangNeural"}, admin)
+            p1 = p1 if isinstance(p1, dict) else {}
+            check("E1 后台改预设音色也归一化（不能存一个永远不生效的值）",
+                  code == 200 and p1.get("tts_voice") == default_voice,
+                  f"code={code} got={p1.get('tts_voice')!r} 期望={default_voice!r}")
+
+            code, p2 = req("POST", f"/api/admin/presets/{preset_id}/reset",
+                           {"fields": ["tts_voice"]}, admin)
+            p2 = p2 if isinstance(p2, dict) else {}
+            check("E2 「恢复默认」写生效厂商的默认音色（不是 Edge 的出厂常量）",
+                  code == 200 and p2.get("tts_voice") == default_voice
+                  and p2.get("tts_voice") != "zh-CN-XiaoxiaoNeural",
+                  f"code={code} got={p2.get('tts_voice')!r}")
+            check("E3 刚恢复默认的预设不再被标 tts_voice 偏离（badge 与 reset 同源）",
+                  "tts_voice" not in (p2.get("dirty_fields") or []),
+                  f"dirty={p2.get('dirty_fields')!r}")
+        else:
+            for nm in ("E1 后台改预设音色也归一化（不能存一个永远不生效的值）",
+                       "E2 「恢复默认」写生效厂商的默认音色（不是 Edge 的出厂常量）",
+                       "E3 刚恢复默认的预设不再被标 tts_voice 偏离（badge 与 reset 同源）"):
+                check(nm, False, f"拿不到预设 id: code={code} {str(plist)[:120]}")
+
         # ==================================== D. 自建厂商：放行任意音色名
         print("\n── D. 自建 / 兼容网关（认不出厂商）──")
         for rid in (t_id, e_id):
@@ -299,6 +330,16 @@ def main() -> int:
         check("D5 自建厂商的自定义音色原样保留（不被当成非法值改掉）",
               code == 201 and r6.get("tts_voice") == "cosyvoice-zh-female",
               f"got={r6.get('tts_voice')!r}")
+
+        if preset_id:
+            req("PATCH", f"/api/admin/presets/{preset_id}",
+                {"tts_voice": "my-tts-voice"}, admin)
+            code, p3 = req("POST", f"/api/admin/presets/{preset_id}/reset",
+                           {"fields": ["tts_voice"]}, admin)
+            p3 = p3 if isinstance(p3, dict) else {}
+            check("E4 自建厂商时「恢复默认」不写空串（保持原值，别把管理员填的音色抹掉）",
+                  code == 200 and p3.get("tts_voice") == "my-tts-voice",
+                  f"code={code} got={p3.get('tts_voice')!r}")
 
     finally:
         cleanup_db(DB_PATH, procs=(proc,), handles=(log_fp,))
