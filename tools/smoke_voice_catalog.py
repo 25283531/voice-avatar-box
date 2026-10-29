@@ -45,6 +45,7 @@ import contextlib
 import io
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -119,6 +120,36 @@ def skip(name: str, reason: str) -> None:
     """
     skipped.append((name, reason))
     print(f"  [SKIP] {name}  -> {reason}")
+
+
+#: 各家 TTS 的**音色 ID 形态**。用来判「前端有没有抄第二份音色清单」。
+#:
+#: 只收「长得就有辨识度」的两种：Edge 的 BCP-47 名（zh-CN-XiaoxiaoNeural）、
+#: 火山的 ``BV001_streaming``。腾讯云的 ID 是 6 位纯数字（601009），
+#: 混在 CSS 数值/超时毫秒里全是假阳性，不适合做字面量判据 —— 这也是为什么
+#: 「有没有抄清单」不能只靠一种形态来判，G1 之外还有 B 组在做语义核对。
+_VOICE_ID_LITERAL = re.compile(
+    r"zh-[A-Za-z]{2,4}-[A-Za-z0-9]+Neural"      # Edge
+    r"|BV\d{2,4}_streaming"                      # 火山
+)
+
+
+def _strip_js_comments(src: str) -> str:
+    """去掉 HTML 注释、``/* */`` 块注释、``//`` 行注释，供「有没有硬编码」类判据使用。
+
+    **为什么必须先剥注释再判**：G1 原来是对整份 index.html 做子串匹配，
+    结果「生产上角色表存着 zh-CN-XiaoxiaoNeural 而 TTS 走腾讯云，就是这个坑」
+    这种**防回归说明**反而把红线踩红了。那是文档，不是数据 —— 而恰恰是这种
+    注释最该留着（后来人不知道有这个坑，就会再犯一次）。红线要防的是
+    「前端抄了一份音色清单」，不是「前端提到了一个音色名」。逼人删注释来
+    换绿灯，等于用错误的判据把最有价值的说明赶出代码。
+
+    ``(?<!:)`` 是为了不把 ``https://...`` 当成行注释起点 —— 前端里 URL 不少。
+    """
+    src = re.sub(r"<!--.*?-->", "", src, flags=re.S)      # HTML 注释
+    src = re.sub(r"/\*.*?\*/", "", src, flags=re.S)       # 块注释
+    src = re.sub(r"(?<!:)//[^\n]*", "", src)              # 行注释（含行尾）
+    return src
 
 
 def req(method: str, path: str, body: dict | None = None, token: str | None = None):
@@ -508,13 +539,27 @@ def main() -> int:
         # ============ G. 前端音色控件的静态核对（防「删了自定义入口」回归）
         print("\n── G. 前端音色控件静态核对 ──")
         html = (SERVER / "app" / "static" / "index.html").read_text(encoding="utf-8")
+        user_html = (SERVER / "app" / "static" / "user.html").read_text(encoding="utf-8")
         # 预置音色必须由服务端目录驱动，而不是前端硬编码 —— 前端硬编码等于
         # 第二份真源，「恢复默认」迟早对不上（见 app/voice/catalog.py 模块说明）。
-        check("G1 前端不再硬编码音色清单",
-              "zh-CN-XiaoxiaoNeural" not in html,
-              "index.html 里出现了字面音色名，说明前端又抄了一份真源")
+        #
+        # 判据按「代码里的字面音色 ID」判，不按「文件里出现过这个字符串」判：
+        # 先剥注释，再匹配音色 ID 形态（见 _strip_js_comments 的说明）。
+        # 两个页面都要查 —— 用户端（user.html）也有音色下拉，只查管理端
+        # 等于给用户端留了一道没上锁的门。
+        for page_name, page_src in (("index.html", html), ("user.html", user_html)):
+            hits = _VOICE_ID_LITERAL.findall(_strip_js_comments(page_src))
+            check(f"G1 前端不再硬编码音色清单（{page_name}）",
+                  not hits,
+                  f"{page_name} 代码里出现了字面音色 ID {sorted(set(hits))[:5]}，"
+                  f"说明前端又抄了一份真源（写在注释里举例不算）")
+        # label 既可以是字面量，也可以绑到变量（:label="voiceGroupLabel"）——
+        # 后者正是「标题跟着生效厂商变」的做法，不能因为绑了变量就判红。
+        # 这条要防的是「音色框退回成自由文本输入」，不是「标题怎么来的」。
         check("G2 音色框是下拉选择（optgroup 承载预置项）",
-              'optgroup label="── 预置音色' in html, "")
+              "optgroup" in html
+              and (':label="voiceGroupLabel"' in html or 'label="── 预置音色' in html),
+              "音色控件不再是 optgroup 分组的下拉框，用户无从知道系统提供哪些音色")
         check("G3 保留了自定义输入入口", '"__custom__"' in html, "")
         check("G4 保存前会把 __custom__ 收敛成真实音色名",
               "resolveVoice(" in html, "")
