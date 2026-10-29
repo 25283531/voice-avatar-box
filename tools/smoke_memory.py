@@ -608,6 +608,14 @@ def main() -> int:
             check("按 agent 列出的记忆不含通用记忆",
                   bool(la_ids) and bool(general_only) and not (la_ids & general_only),
                   f"agent={len(la_ids)} general={len(general_only)}")
+            # 2026-10-29 用户报「记忆是空的」的回归闸门。
+            # 真实数据全部挂在**设备挂的角色**上（语音链路传 dev.agent_id），
+            # 而家属端页面调的是不带 agent_id 的 GET /api/memory。
+            # 若这里退回 `agent_id IS NULL` 那种「L1 全局桶」语义，
+            # 页面就永远是空列表 —— 库里有多少条都白搭。
+            check("不带 agent_id 的列表包含挂在角色上的记忆（浏览不按 agent 收窄）",
+                  la_ids <= all_ids and len(all_ids) >= len(la_ids),
+                  f"全部={len(all_ids)} 该角色={len(la_ids)} 漏={sorted(la_ids - all_ids)}")
             code, bad = req("POST", "/api/memory/facts",
                             {"content": "测试不存在的角色", "agent_id": 999999},
                             token_a)

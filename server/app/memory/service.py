@@ -263,15 +263,21 @@ def _stamp(ts: float) -> str:
 
 
 def recent_turns(db: Session, user_id: int, agent_id: int | None,
-                 session_id: str | None = None, limit: int = 10) -> list[dict[str, Any]]:
-    """最近 N 句原话（短期上下文 / 家属回看"今天聊了什么"）。"""
+                 session_id: str | None = None, limit: int = 10,
+                 any_agent: bool = False) -> list[dict[str, Any]]:
+    """最近 N 句原话（短期上下文 / 家属回看"今天聊了什么"）。
+
+    ``any_agent=True`` 表示**不按角色过滤**（家属端浏览用）。
+    默认 ``False`` 保留「``agent_id=None`` = L1 全局桶」的老语义 ——
+    语音链路（``memory.bridge``）依赖它，别改默认值。
+    """
     from sqlalchemy import select
 
-    q = select(models.ChatMessage).where(
-        models.ChatMessage.user_id == user_id,
-        (models.ChatMessage.agent_id.is_(None) if agent_id is None
-         else models.ChatMessage.agent_id == agent_id),
-    )
+    q = select(models.ChatMessage).where(models.ChatMessage.user_id == user_id)
+    if not any_agent:
+        q = q.where(
+            models.ChatMessage.agent_id.is_(None) if agent_id is None
+            else models.ChatMessage.agent_id == agent_id)
     if session_id:
         q = q.where(models.ChatMessage.session_id == session_id)
     rows = db.scalars(q.order_by(models.ChatMessage.id.desc()).limit(limit)).all()

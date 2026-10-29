@@ -80,13 +80,47 @@ def _agent_or_400(db: Session, agent_id: int | None) -> int | None:
     return int(agent_id)
 
 
-def _agent_match(column, agent_id: int | None):
-    """agent_id 的匹配条件。
+def _browse_agent(db: Session, agent_id: int | None) -> int | None:
+    """浏览类接口（列表）的 agent 过滤：**不传就是全部**，传了才收窄到某个角色。
 
-    ⚠️ SQL 里 ``agent_id = NULL`` 永远不成立，必须用 ``IS NULL``。
-    详见 memory/store.py 的 _agent_match 注释。
+    ⚠️ 这里**不能**退回 ``store._agent_match(col, None)`` 那套写法。
+    「``agent_id`` 为空 = L1 全局桶」这个语义是给**检索**用的
+    （语音链路传的是设备挂的角色 ``dev.agent_id``），搬到浏览接口上就变成
+    「只查 ``agent_id IS NULL`` 的行」—— 而真实数据全部挂在角色上，
+    家属端于是永远看到空列表。
+
+    这就是 2026-10-29 用户报「记忆是空的」的真因：库里 21 条记忆、
+    316 条原话、一份 20 轮的语气画像**全部** ``agent_id=8``（家里那台设备
+    挂的角色），而 ``GET /api/memory`` 一条都查不出来。
+    排障时先看这个分布：
+    ``SELECT agent_id, COUNT(*) FROM agent_memories GROUP BY agent_id``。
     """
-    return column.is_(None) if agent_id is None else column == agent_id
+    return None if agent_id is None else _agent_or_400(db, agent_id)
+
+
+def _device_agent(db: Session, user: models.User, agent_id: int | None) -> int | None:
+    """人格类接口的 agent 兜底：不指定就看「家里那台设备挂的角色」。
+
+    语气画像 / 人格提示词是**按角色**存的，没有「全部角色」这种合并读法
+    （``merge_profiles`` 是 L1+L2 两层，不是多个角色）。
+    所以这里必须落到一个具体角色上，否则读到的就是 L1 全局桶 —— 空的。
+
+    为什么取设备而不是取"用户默认角色"：设备上挂的角色**就是**语音链路
+    实际用的那个（``bridge.build_persona_prompt(db, owner_id, dev.agent_id)``），
+    家属端预览的提示词因此与机器人真正注入的逐字一致 —— 这张卡片
+    自己写的就是「现在实际注入 system prompt 的内容」。
+    没有设备就退回 L1，此时确实只有全局画像可看。
+    """
+    if agent_id is not None:
+        return _agent_or_400(db, agent_id)
+    row = db.scalars(
+        select(models.Device.agent_id)
+        .where(models.Device.owner_id == user.id,
+               models.Device.agent_id.is_not(None))
+        .order_by(models.Device.id)
+        .limit(1)
+    ).first()
+    return int(row) if row is not None else None
 
 
 def _own_memory(db: Session, user: models.User, memory_id: int) -> models.AgentMemory:
@@ -147,7 +181,7 @@ def search_memories(payload: MemorySearchIn, db: Session = Depends(get_db),
     任何「看起来不相关」的判断都不该在接口层做 —— 接口层看不到三路得分，
     硬过滤只会把「关键词精确命中」的好结果误杀。
     """
-    agent_id = _agent_or_400(db, payload.agent_id)
+    agent_id = _device_agent(db, user, payload.agent_id)
     hits = service.search(db, payload.q, user.id, agent_id, top_k=payload.top_k)
     return MemorySearchOut(
         query=payload.q,
@@ -166,7 +200,7 @@ def memory_context(payload: MemoryContextIn, db: Session = Depends(get_db),
     单开一个端点而不是在 search 结果里带 context：APP 调试页要结构化命中列表，
     语音链路要一段文本，合成一个接口只会让两边都多拿一半无用字段。
     """
-    agent_id = _agent_or_400(db, payload.agent_id)
+    agent_id = _device_agent(db, user, payload.agent_id)
     ctx = service.build_context(db, payload.q, user.id, agent_id, top_k=payload.top_k)
     return SimpleOut(ok=True, detail=ctx)
 
@@ -182,8 +216,9 @@ def list_turns(limit: int = Query(30, ge=1, le=200),
     存在的意义是**可核对**：记忆是机器抽的，家属有权回到原话确认
     「它凭什么这么记我」。没有这一层，机器的概括就成了唯一可信的版本。
     """
-    agent_id = _agent_or_400(db, agent_id)
-    rows = service.recent_turns(db, user.id, agent_id, session_id, limit=limit)
+    agent_id = _browse_agent(db, agent_id)
+    rows = service.recent_turns(db, user.id, agent_id, session_id, limit=limit,
+                                any_agent=agent_id is None)
     return [ChatTurnOut(**r) for r in rows]
 
 
@@ -196,7 +231,7 @@ def add_fact(payload: MemoryFactIn, db: Session = Depends(get_db),
     给「机器人漏记了」准备的兜底：家属明确知道「爸每周三去透析」，
     让他去教机器人怎么抽取既不现实也没必要。
     """
-    agent_id = _agent_or_400(db, payload.agent_id)
+    agent_id = _device_agent(db, user, payload.agent_id)
     category = (payload.category if payload.category in models.MemoryCategory.LIST
                 else models.MemoryCategory.OTHER)
     # 手动补写也要抽实体：否则这条记忆**永远不会被实体路召回**
@@ -243,7 +278,7 @@ def get_tone(agent_id: int | None = Query(None), db: Session = Depends(get_db),
     路径放在 ``/persona/profile`` 而不是 ``/persona/{x}``：``/api/memory/{id}``
     已经是记忆详情的路由，字面量路径必须排在它前面才不会抢匹配。
     """
-    agent_id = _agent_or_400(db, agent_id)
+    agent_id = _device_agent(db, user, agent_id)
     return ToneProfileOut(**tone_profile(db, user.id, agent_id))
 
 
@@ -256,7 +291,7 @@ def patch_tone(payload: PersonaManualIn, agent_id: int | None = Query(None),
     人永远压过机器：自动演化再准也会有偏差，而家属一句「别跟他开玩笑」
     比任何统计都权威。
     """
-    agent_id = _agent_or_400(db, agent_id)
+    agent_id = _device_agent(db, user, agent_id)
     out = update_manual(db, user.id, agent_id, payload.model_dump(exclude_unset=True))
     db.commit()
     return ToneProfileOut(**out)
@@ -270,7 +305,7 @@ def get_persona_prompt(agent_id: int | None = Query(None),
 
     给家属一个「所以机器人现在到底是按什么在说话」的透明窗口。
     """
-    agent_id = _agent_or_400(db, agent_id)
+    agent_id = _device_agent(db, user, agent_id)
     return SimpleOut(ok=True, detail=build_persona_prompt(db, user.id, agent_id))
 
 
@@ -287,7 +322,7 @@ def get_examples(status_: str | None = Query(None, alias="status"),
     决定（含 kind_text / source_text 等展示字段），再抄一份 schema 等于把
     同一份字段清单维护两遍，改一处忘一处是迟早的事。
     """
-    agent_id = _agent_or_400(db, agent_id)
+    agent_id = _device_agent(db, user, agent_id)
     return list_examples(db, user.id, agent_id, status=status_, limit=limit)
 
 
@@ -318,7 +353,7 @@ def post_feedback(payload: MemoryFeedbackIn, db: Session = Depends(get_db),
     家属因此能看到「机器人刚才差点被逗，还好没学」——
     这比事后无法解释要好得多。
     """
-    agent_id = _agent_or_400(db, payload.agent_id)
+    agent_id = _device_agent(db, user, payload.agent_id)
     out = record_feedback(db, user.id, agent_id, payload.user_text,
                           bot_text=payload.bot_text,
                           prev_bot_text=payload.prev_bot_text,
@@ -346,7 +381,7 @@ def get_audits(valid: bool | None = Query(None),
 
     ``?valid=false`` 专门看被挡下来的那些 —— 那才是防污染机制真正在干活的证据。
     """
-    agent_id = _agent_or_400(db, agent_id)
+    agent_id = _device_agent(db, user, agent_id)
     return list_audits(db, user.id, agent_id, only_valid=valid, limit=limit)
 
 
@@ -378,7 +413,7 @@ def memorize_turns(payload: MemoryTurnIn, db: Session = Depends(get_db),
     它明确需要「写完了」的回执来刷新列表。记忆抽取要走一次 LLM，
     慢在几百毫秒量级，APP 可以接受；语音链路那种「不能等」的场景才用后台线程。
     """
-    agent_id = _agent_or_400(db, payload.agent_id)
+    agent_id = _device_agent(db, user, payload.agent_id)
     ids = service.memorize(db, user.id, agent_id, payload.turns,
                            session_id=payload.session_id)
     reason = "" if ids else "本轮没有新增记忆（没有值得记的事实，或与已有记忆重复）"
@@ -396,11 +431,10 @@ def list_memories(limit: int = _LIST_LIMIT,
     ``include_superseded=true`` 才带出已作废的条目：家属偶尔需要确认
     「我删过什么」，但默认列表里堆一堆灰色划掉的记忆会让 APP 很难看懂。
     """
-    agent_id = _agent_or_400(db, agent_id)
-    q = select(models.AgentMemory).where(
-        models.AgentMemory.user_id == user.id,
-        _agent_match(models.AgentMemory.agent_id, agent_id),
-    )
+    agent_id = _browse_agent(db, agent_id)
+    q = select(models.AgentMemory).where(models.AgentMemory.user_id == user.id)
+    if agent_id is not None:
+        q = q.where(models.AgentMemory.agent_id == agent_id)
     if not include_superseded:
         q = q.where(models.AgentMemory.superseded_at.is_(None))
     rows = db.scalars(q.order_by(models.AgentMemory.id.desc()).limit(limit)).all()
