@@ -215,6 +215,18 @@ jobs:
       - name: 音色目录与就绪度冒烟（零配置如实反映 + 音色单一真源）
         # 经 run_smoke 落盘：红灯时日志进 artifact（见末尾「失败诊断」步骤）
         run: python tools/run_smoke.py logs/smoke_smoke_voice_catalog.log python tools/smoke_voice_catalog.py 8124
+      # 用户端音色下拉：清单按**生效厂商**下发 + 失效音色回落默认（端口 8136）。
+      #
+      # 与上一条是两件事：voice_catalog 守的是「预置目录本身对不对」，
+      # 这条守的是「**这台部署实际在用的那家**厂商的清单」——
+      # 生产 ai_providers 里 tencent(priority 6) 与 edge(priority 10) 并存，
+      # resolve_row 取第一条 ⇒ 生效的是腾讯云，而角色表里存着 Edge 的音色名。
+      # asr_tts._shape_ok_voice() 发现形态不符会**静默置空**，于是「换了音色」
+      # 从来没生效过，界面上一点痕迹都没有。这类「配了但没生效」的坑，
+      # 只有断言「生效厂商 + 清单形态 + 写库归一化」三者对齐才抓得到。
+      - name: 用户端音色清单冒烟（按生效厂商 + 失效回落默认）
+        # 经 run_smoke 落盘：红灯时日志进 artifact（见末尾「失败诊断」步骤）
+        run: python tools/run_smoke.py logs/smoke_smoke_voice_options.log python tools/smoke_voice_options.py 8136
       # 可信反代 + 307 scheme（端口 8125，已在 smoke_ports.py 登记）。
       # 守的是 2026-10-18 线上事故：管理后台在 HTTPS 页面里请求
       # /api/admin/presets 被浏览器 Mixed Content 拦掉（Failed to fetch），
