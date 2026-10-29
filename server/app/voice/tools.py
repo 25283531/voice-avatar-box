@@ -75,7 +75,12 @@ TOOL_DEFS: list[dict[str, Any]] = [
                 "properties": {
                     "title": {
                         "type": "string",
-                        "description": "提醒内容，十几个字以内，如「吃药」「喝水」「测血压」",
+                        "description": (
+                            "提醒**做什么**，十几个字以内，如「吃药」「喝水」「下楼走走」。"
+                            "⚠️ 必须是老人说的那件具体的事。**绝对不许**填「提醒」"
+                            "「提醒事项」「事项」「任务」「日程」这类分类词 —— "
+                            "填了服务端会退回让你重问。老人没说清内容就反问，别猜。"
+                        ),
                     },
                     "when": {
                         "type": "string",
@@ -415,7 +420,12 @@ def _period_phrase(minutes: int) -> str:
 
 
 def _clock_phrase(minutes: int) -> str:
-    """把分钟数说成老人习惯的说法：八点 / 八点半 / 八点一刻。"""
+    """把分钟数说成老人习惯的说法：八点 / 八点半 / 八点一刻。
+
+    ⚠️ 45 分**不说"三刻"**（2026-10-29 改）：老人对"三刻"的把握远不如
+    "45 分"，而且这三个字在 TTS 里容易被连读成"三点"。这一刻钟的差别不值得
+    冒"听错时间"的风险 —— 服药提醒错半小时是事故。
+    """
     h, m = divmod(minutes, 60)
     hh = h if h <= 12 else h - 12
     if m == 0:
@@ -424,9 +434,62 @@ def _clock_phrase(minutes: int) -> str:
         return f"{hh}点半"
     if m == 15:
         return f"{hh}点一刻"
-    if m == 45:
-        return f"{hh}点三刻"
     return f"{hh}点{m:02d}分"
+
+
+# ---------------------------------------------------------------- 钟点对账
+#
+# 2026-10-29 真机事故：老人说「今天中午十二点四十五提醒我下楼」。模型把
+# ``title`` 填成「提醒」、把 ``when`` 填成「12:55」——**两个参数都错**，
+# 但它复述给老人的是「好的，我给您记着，十二点四十五提醒您下楼」。
+# 复述完全正确，落库完全错误：12:45 什么都没响，12:55 响了一条叫「提醒」的
+# 提醒。老人对着一条不知道是什么的提醒按了确认，然后认定"设备不准"。
+#
+# 这里只提供"从一段话里把钟点抽出来"的能力，**对账逻辑在 session.py**
+# （只有那边同时拿得到模型的复述和工具落库的结果）。
+_CLOCK_MENTION_RE = re.compile(
+    r"(\d{1,2}|[零〇一二两三四五六七八九十]{1,3})\s*点\s*"
+    r"(?:(半)|(一刻)|(三刻)|(\d{1,2}|[零〇一二两三四五六七八九十]{1,3})\s*分?)?"
+)
+
+#: 光杆「一点」几乎都是「慢一点 / 早一点 / 差一点 / 快一点」，不是钟点。
+#: 只有紧跟这几个字时才当时间看（「一点整」「一点提醒我」）。
+_CLOCK_ONE_OK_NEXT = ("整", "提", "吃", "该", "要", "去", "我", "叫", "半", "钟")
+
+
+def clock_mentions(text: str) -> list[tuple[int, int]]:
+    """把一段话里出现的所有钟点抽出来，返回 ``[(hour12, minute), ...]``。
+
+    ``hour12`` 是**取模 12 后**的小时（下午一点和凌晨一点都返回 1），因为
+    复述里带不带「下午」完全取决于模型的措辞，不能拿它当判据。
+
+    刻意做得**宽进严出**：
+    * 抽不全没关系（漏了只是少一条对账依据）；
+    * 抽错会误拦正确播报 —— 所以「一点」这种高频歧义词单独加了白名单，
+      宁可漏掉一个真钟点，也不要把「您慢一点」当成 1 点钟。
+    """
+    s = _normalize(text)
+    out: list[tuple[int, int]] = []
+    for m in _CLOCK_MENTION_RE.finditer(s):
+        h = _cn_number(m.group(1))
+        if h is None or not 0 <= h <= 24:
+            continue
+        if m.group(2):
+            mm = 30
+        elif m.group(3):
+            mm = 15
+        elif m.group(4):
+            mm = 45
+        elif m.group(5):
+            mm = _cn_number(m.group(5))
+            if mm is None or not 0 <= mm < 60:
+                continue
+        else:
+            mm = 0
+            if h == 1 and s[m.end():m.end() + 1] not in _CLOCK_ONE_OK_NEXT:
+                continue
+        out.append((h % 12, mm))
+    return out
 
 
 def parse_when(text: str, now: datetime | None = None) -> ParsedWhen:
@@ -658,6 +721,34 @@ def _guess_rtype(title: str) -> int:
     if re.search(r"运动|锻炼|散步|走路|太极|广场舞", title):
         return int(models.ReminderType.EXERCISE)
     return int(models.ReminderType.CUSTOM)
+
+
+#: 这些词当标题 = 模型没听清内容，拿**分类词**凑数（2026-10-29 真机事故：
+#: 老人说「十二点四十五提醒我下楼」，落库的标题就是「提醒」两个字）。
+#: 一条叫「提醒」的提醒对老人毫无意义 —— 到点响了，他不知道要做什么，
+#: 只能按确认把它消掉。**这比不建还糟**：他会以为事情已经安排好了。
+_TITLE_PLACEHOLDERS = frozenset({
+    "提醒", "提醒事项", "提醒我", "提醒一下", "提醒您", "提醒他",
+    "事项", "任务", "日程", "日程提醒", "待办", "待办事项",
+    "闹钟", "闹铃", "定时", "事情", "内容", "未命名", "新建提醒", "新提醒",
+})
+
+#: 占位词 + 语气词/代词（「提醒一下吧」「事项提醒」「提醒我」）。带**内容**的
+#: 标题（「提醒我下楼」「提醒吃药」）不会命中 —— 后半段不在可选集合里。
+_PLACEHOLDER_TITLE_RE = re.compile(
+    r"(?:请)?(?:提醒|提醒我|提醒您|事项|任务|日程|闹钟|待办|定时)"
+    r"(?:我|您|一下|我一下|您一下|一下我|事项|提醒|吧|了|啊)*"
+)
+
+
+def _is_placeholder_title(title: str) -> bool:
+    """标题是不是「提醒 / 事项」这类占位词（= 模型没听清内容就拿分类词凑数）。"""
+    t = _normalize(title)
+    if not t:
+        return True
+    if t in _TITLE_PLACEHOLDERS:
+        return True
+    return bool(_PLACEHOLDER_TITLE_RE.fullmatch(t))
 
 
 def _find_reminders(db: Any, device_pk: int, keyword: str) -> list[models.Reminder]:
@@ -1033,6 +1124,16 @@ def _create_reminder(db: Any, device_pk: int, args: dict[str, Any]) -> dict[str,
     if not title:
         return {"ok": False, "need_clarify": True,
                 "message": "没听清要提醒什么，请反问老人提醒的内容"}
+    # ---- 占位标题闸门（2026-10-29 真机事故后加）----
+    # 模型听不清内容时会把 title 填成「提醒」「事项」这种分类词凑数。落库后
+    # 到点响的是一条没有内容的提醒，老人只能按确认消掉 —— 他会以为事情
+    # 已经安排好了。**宁可多问一句，不许存一条空壳提醒。**
+    if _is_placeholder_title(title):
+        log.warning("拒绝创建占位标题的提醒：title=%r when=%r", title, when)
+        return {"ok": False, "need_clarify": True,
+                "message": "老人没说清要提醒什么（title 是「提醒」这类空词）。"
+                           "请反问一句「提醒您做什么？」，把老人说的**那件事**"
+                           "填进 title，不要填分类词"}
     if not when and not repeat:
         return {"ok": False, "need_clarify": True,
                 "message": "没听出时间，请反问老人具体时间（如「明天早上八点」）"}
@@ -1083,12 +1184,27 @@ def _create_reminder(db: Any, device_pk: int, args: dict[str, Any]) -> dict[str,
     # 立即排期，保证设备下次心跳就能拉到（与 routers/reminders.create 同口径）
     materialize_events(db, device_pk)
     nxt = next_occurrence(r)
+    # 结构化时间供**服务端复述对账**用（session._ReplySpeaker 拿它比模型嘴里
+    # 说的钟点）。不给结构化字段的话，复述错了没有任何办法发现 —— 事故里
+    # summary 本身就写着错的 12:55，从文本里根本看不出问题。
+    hour = minute = None
+    if parsed.times_of_day:
+        try:
+            hh, mm = parsed.times_of_day[0].split(":")
+            hour, minute = int(hh), int(mm)
+        except (ValueError, TypeError):
+            hour = minute = None
     return {
         "ok": True,
         "id": int(r.id),
+        "title": r.title,
         "summary": f"「{r.title}」，{parsed.speak}",
+        "hour": hour,
+        "minute": minute,
+        "clock": parsed.speak,
         "next_fire_at": nxt.isoformat() if nxt else None,
-        "hint": "请用一句话跟老人复述确认，把时间说清楚",
+        "hint": "请用一句话跟老人复述确认。时间**照抄 clock 里的说法**，"
+                "不要自己换算成几点几分；内容照抄 title，不要换成别的词",
     }
 
 

@@ -62,7 +62,7 @@ from .prompts import (
     TOOL_LOOP_FALLBACK,
     now_context,
 )
-from .tools import TOOL_DEFS, execute_tool
+from .tools import TOOL_DEFS, clock_mentions, execute_tool
 
 log = logging.getLogger(__name__)
 
@@ -214,6 +214,19 @@ UNSPEAKABLE_REPLY_FALLBACK: Final[str] = "这个我一时没说明白，您再�
 #:    调大只是让首句更晚开口 —— 所以只许往大调，不许往小调。
 _TOOL_ROUND_HOLD_CHARS: Final[int] = 40
 
+#: 只有**像要调工具**的话才值得为了防抢跑多等那几个字（见 _chat_round 的
+#: ``hold_chars``）。这道闸门对每一句话都生效的话，等于给所有闲聊都加上
+#: "攒够 40 字才开口"的代价 —— smoke 第 13 组直接量出来首帧 400ms → 500ms。
+#: 而"模型抢先说一句、再调工具"只发生在要调工具的话上，所以先花一次正则判。
+#:
+#: 判错的代价是**单向**的：漏判 = 这一轮少了保护网（prompt 里那条硬约束
+#: 还在，只是没有代码兜底）；多判 = 这一轮多等几十毫秒。所以宁可写宽。
+_TOOL_HINT_RE: Final[re.Pattern[str]] = re.compile(
+    r"提醒|叫我|喊我|叫一下|记得|记一下|记着|别忘|日程|闹钟|定时|待办|"
+    r"音量|声音|大声|小声|静音|亮度|屏幕|亮一点|暗一点|"
+    r"电量|电池|充电|天气|气温|温度|下雨|刮风|预报|"
+    r"查一下|帮我查|几点|星期几|几号|日期|明天|后天|早上|中午|晚上|下午")
+
 #: 纯标点（"。" / "……" / 只有标点和空白）。这种片段**不算事故**：
 #: 它是切句的副产物（整句已播完，缓冲区里只剩那个句号），
 #: 送去 TTS 会念出一声怪响。必须与"不可播报"分开计数 ——
@@ -296,6 +309,22 @@ def _dismiss_tier(utterance: str) -> str:
     if _DISMISS_WEAK_RE.search(utterance):
         return "weak"
     return ""
+
+
+def _looks_toolish(messages: list[dict[str, Any]]) -> bool:
+    """这条用户话像不像"要调工具"的（决定要不要为防抢跑多等几个字）。
+
+    只看**最后一条 user 消息**：历史里的"提醒我吃药"不该让本轮闲聊也背上
+    缓发代价。``content`` 不是字符串（多模态分块）时按"不像"处理。
+    """
+    for m in reversed(messages):
+        if m.get("role") != "user":
+            continue
+        content = m.get("content")
+        if not isinstance(content, str):
+            return False
+        return _TOOL_HINT_RE.search(content) is not None
+    return False
 
 
 # ---------------------------------------------------------------- 提醒确认兜底
@@ -403,6 +432,25 @@ _DISMISS_REPLY: Final[str] = "好的，您先忙，有需要再叫我。"
 #: （"没听出具体时间…请老人像「明天早上八点」那样再说一遍"），优先用它；
 #: 拿不到时才用这句兜底。
 _CLAIM_FALLBACK: Final[str] = "我没太听清，您再说一遍具体时间好吗？"
+
+#: 「复述时间」对账闸门（2026-10-29 真机事故后加）
+#: ---------------------------------------------------------------
+#: 事故：老人说「今天中午十二点四十五提醒我下楼」。模型把 ``title`` 填成
+#: 「提醒」、把 ``when`` 填成「12:55」，**两个参数都错**，可它复述给老人的是
+#: 「好的，我给您记着，十二点四十五提醒您下楼」—— 复述正确，落库错误。
+#: 结果 12:45 什么都没响，12:55 响了一条叫「提醒」的提醒。老人对着一条不知道
+#: 是什么的提醒按了确认，然后认定"设备不准"。
+#:
+#: 上面那道 ``_SUCCESS_CLAIM_RE`` **拦不住它**：那道闸门只在工具**失败**时启动，
+#: 而这次工具是"成功"的 —— 它忠实地存了模型给的错参数。所以需要第二道判据：
+#: 把模型嘴里说的钟点，和工具真正落库的钟点对账。
+#:
+#: 判据刻意做成「**只要有一个钟点对上就放行**」，不是"必须全对上"：老人常会
+#: 听到「现在是十二点四十三，我给您定十二点四十五」这种一句话里带两个钟点的
+#: 播报，全都要对上会把正确播报也拦掉。宁可漏，不可误拦 —— 误拦会让老人听到
+#: 一句莫名其妙的反问，比漏掉更难解释。
+_CLOCK_MISMATCH_FALLBACK: Final[str] = (
+    "我记的是{clock}，您听对不对？要是不对，您再跟我说一遍。")
 
 
 # ============================================================ 情绪表情（F4）
@@ -1941,16 +1989,26 @@ class VoiceSession:
                     # 提醒类工具失败 ⇒ 记下名字与人话，_speak_sentence 靠它
                     # 拦下"记好了/已经建好"这类措辞。只记**提醒类**：
                     # 同轮里天气查询失败不该顺带拦掉正常的天气播报。
+                    _tname = str((call.get("function") or {}).get("name") or "")
                     if not outcome.get("ok"):
-                        _tname = str((call.get("function") or {}).get("name") or "")
                         if _tname in _REMINDER_TOOLS:
                             speaker.failed_tools.add(_tname)
                             speaker._fail_message = str(
                                 outcome.get("message") or "") or speaker._fail_message
+                    # ---- 复述时间对账的燃料（2026-10-29）----
+                    # 建提醒**成功**时记下真正落库的钟点。_speak_sentence 拿它
+                    # 比模型嘴里的钟点，一个都对不上就拦下、改念真实时间。
+                    elif _tname == "create_reminder":
+                        _h, _m = outcome.get("hour"), outcome.get("minute")
+                        if isinstance(_h, int) and isinstance(_m, int):
+                            speaker._reminder_clocks.add((_h % 12, _m))
+                            speaker._reminder_clock_speak = str(
+                                outcome.get("clock") or "") \
+                                or speaker._reminder_clock_speak
                     messages.append({
                         "role": "tool",
                         "tool_call_id": str(call.get("id") or ""),
-                        "name": str((call.get("function") or {}).get("name") or ""),
+                        "name": _tname,
                         "content": json.dumps(outcome, ensure_ascii=False),
                     })
             else:
@@ -2104,6 +2162,12 @@ class VoiceSession:
         # 40 字这个门槛的依据：实测那句抢跑的"好的，我给您记着，十二点
         # 四十五提醒您下楼。"是 21 字，稳稳落在门槛内；而正常回答的第一句
         # 很少短于 40 字才会开始念，多出来的等待只有小几百毫秒。
+        #
+        # ⚠️ 但这道闸门**不能对所有话都生效**：smoke 第 13 组量出来，一句
+        # 15 字的普通回复会被整段攒到 done 才念，首帧 400ms → 500ms，
+        # 流式白做了。所以先用 _looks_toolish 判一次：不像要调工具的话
+        # （讲笑话、聊家常）hold_chars=0，一个字都不等。
+        hold_chars = _TOOL_ROUND_HOLD_CHARS if _looks_toolish(messages) else 0
         held: list[str] = []
         held_chars = 0
         committed = False
@@ -2147,12 +2211,18 @@ class VoiceSession:
                                         "".join(held)[:120])
                             held.clear()
                             held_chars = 0
-                        if committed:
+                        if committed and hold_chars:
                             # 已经越过门槛念出去了，撤不回来 —— 至少留证据。
+                            # hold_chars=0 的轮次是**主动**不设防（不像要调
+                            # 工具），它调工具属于判错，不算"漏网"，不报。
                             log.warning("[%s] 第 %d 轮是工具轮，但文字已超过 %d 字"
                                         "门槛、前段已念出（漏网）：老人可能听到"
                                         "两段答复", self.session_id, round_no,
-                                        _TOOL_ROUND_HOLD_CHARS)
+                                        hold_chars)
+                        elif committed:
+                            log.info("[%s] 第 %d 轮不像要调工具却调了工具，"
+                                     "文字已念出（未设防，属预期内）",
+                                     self.session_id, round_no)
                         return payload
                     # 收尾轮（没有工具调用）：把攒下的文字念掉。
                     if held_chars:
@@ -2169,12 +2239,15 @@ class VoiceSession:
                         await speaker.flush_rest()
                     return payload
                 if kind == "text" and payload:
-                    if committed:
+                    if committed or not hold_chars:
+                        # hold_chars=0（不像要调工具）：一个字都不等，照旧
+                        # 边生成边念 —— 首句时延与加闸门之前逐字一致。
+                        committed = True
                         await speaker.push_text(payload)
                     else:
                         held.append(payload)
                         held_chars += len(payload)
-                        if held_chars >= _TOOL_ROUND_HOLD_CHARS:
+                        if held_chars >= hold_chars:
                             committed = True
                             await speaker.push_text("".join(held))
                             held.clear()
@@ -2315,6 +2388,7 @@ class VoiceSession:
         dropped = int(getattr(speaker, "dropped", 0) or 0)
         dropped_reasons = list(getattr(speaker, "dropped_reasons", []) or [])
         claim_blocked = int(getattr(speaker, "claim_blocked", 0) or 0)
+        clock_blocked = int(getattr(speaker, "clock_blocked", 0) or 0)
         failed_tools = sorted(getattr(speaker, "failed_tools", set()) or set())
         ttft = list(timing.get("ttft_ms") or [])
         rounds = list(timing.get("round_ms") or [])
@@ -2326,16 +2400,24 @@ class VoiceSession:
         # 不需要去翻 Interaction 表算减法。
         log.info("[%s] 时延 asr=%dms ttft=%s round=%s tool=%dms "
                  "首帧=%dms tts=%dms 帧间隔峰值=%dms 积压峰值=%d帧 "
-                 "总=%dms 轮数=%d 丢弃句=%d 假成功拦下=%d",
+                 "总=%dms 轮数=%d 丢弃句=%d 假成功拦下=%d 时间不符拦下=%d",
                  self.session_id, t_asr, ttft or "-", rounds or "-",
                  int(timing.get("tool_ms") or 0), tts_first_ms, tts_total_ms,
                  tts_max_gap, tts_max_pending,
-                 elapsed_ms, len(results), dropped, claim_blocked)
+                 elapsed_ms, len(results), dropped, claim_blocked,
+                 clock_blocked)
         if claim_blocked:
             # 单独一行 WARNING：这是"老人以为建好了其实没建"的事故痕迹，
             # 混在 INFO 里没人看。出现一次就该查一次模型为什么谎报成功。
             log.warning("[%s] 本轮拦下 %d 句假成功播报（失败工具 %s）",
                         self.session_id, claim_blocked, failed_tools)
+        if clock_blocked:
+            # 同上，且更贵：提醒**建成了**、但时间/内容和老人说的不一致。
+            # 出现一次就说明模型填错了工具参数，去查本轮 create_reminder 的
+            # 入参与老人原话差在哪。
+            log.warning("[%s] 本轮拦下 %d 句时间不符的复述 —— 模型说的时间和"
+                        "实际落库的不一致，老人差点记住错时间",
+                        self.session_id, clock_blocked)
         if tts_max_gap > gap_warn_ms:
             # 每帧 frame_ms 音频，间隔超过 3 帧就意味着设备在这一大段里
             # **没有声音可播**。这条 WARNING 是"断断续续"的判决书：它在
@@ -2391,6 +2473,7 @@ class VoiceSession:
                     "total_ms": elapsed_ms,
                     "dropped_sentences": dropped,
                     "claim_blocked": claim_blocked,
+                    "clock_blocked": clock_blocked,
                 }
                 if dropped_reasons:
                     meta["dropped_reasons"] = sorted(set(dropped_reasons))
@@ -2518,6 +2601,16 @@ class _ReplySpeaker:
         #: 工具失败时给老人的人话（取最近一次失败工具的 message）。
         #: 假成功闸门改念的就是这一句。
         self._fail_message = ""
+        # ---- 复述时间对账（2026-10-29）----
+        #: 本轮 create_reminder **真正落库**的钟点 ``(hour12, minute)``。
+        #: 空集 = 本轮没建提醒 ⇒ 闸门不启动（闲聊里提到钟点不该被拦）。
+        #: 用集合而不是单值：一轮里可能建了两条（早一次晚一次）。
+        self._reminder_clocks: set[tuple[int, int]] = set()
+        #: 工具返回的口语时间（"今天中午12点55分"），拦下错误复述时念给老人听，
+        #: 让他自己判断存的对不对。
+        self._reminder_clock_speak = ""
+        self.clock_blocked = 0    # 被时间对账闸门拦下的句数
+        self._clock_fallback_done = False
         self.tts_first_ms = 0     # 首帧音频发出耗时（从 speaker 创建算起）
         self.tts_ms = 0           # 全部合成下发累计耗时
         self.max_gap_ms = 0       # 相邻两帧的最大间隔（>60ms 即供给不足）
@@ -2605,7 +2698,8 @@ class _ReplySpeaker:
         # prompt 里的硬约束拦不住（模型照样违反，见文件头部事故记录），
         # 所以在这里拦：宁可少说一句，也不能让老人以为提醒建好了。
         # 注意递归调用时传 _allow_claim=True —— 兜底话术本身是反问句，
-        # 不含成功措辞，但显式放开比"赌它不命中"更诚实。
+        # 不含成功措辞，但显式放开比"赌它不命中"更诚实。这个开关同时
+        # 关掉下面的**时间对账**闸门（两个兜底话术都不该被二次拦截）。
         if (not _allow_claim and self.failed_tools
                 and _SUCCESS_CLAIM_RE.search(text)):
             self.claim_blocked += 1
@@ -2616,6 +2710,28 @@ class _ReplySpeaker:
                 await self._speak_sentence(
                     self._fail_message or _CLAIM_FALLBACK, _allow_claim=True)
             return
+
+        # ---- 复述时间对账闸门（2026-10-29）----
+        # 本轮建过提醒（_reminder_clocks 非空），这句话里报了钟点，而报的钟点
+        # **一个都对不上**真正落库的时间 ⇒ 模型说的和存的不是一回事。
+        # 念出去老人会记住错时间，比不念危险得多。
+        #
+        # 只在这一轮建过提醒时判：闲聊里老人说「今天下午三点孙子来」不该被拦。
+        if not _allow_claim and self._reminder_clocks:
+            mentions = clock_mentions(text)
+            if mentions and not (set(mentions) & self._reminder_clocks):
+                self.clock_blocked += 1
+                log.warning("[%s] 拦住时间不符的复述（模型说 %s，实际存 %s）：%r",
+                            s.session_id, mentions,
+                            sorted(self._reminder_clocks), text[:80])
+                if not self._clock_fallback_done:
+                    self._clock_fallback_done = True
+                    await self._speak_sentence(
+                        _CLOCK_MISMATCH_FALLBACK.format(
+                            clock=self._reminder_clock_speak
+                            or "刚才说的那个时间"),
+                        _allow_claim=True)
+                return
 
         if not self._started:
             # 控制消息走节流器的插队通道：立即发、不占播放时间，且与音频帧

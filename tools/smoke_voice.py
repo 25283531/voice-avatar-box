@@ -2040,6 +2040,12 @@ async def t_tools_protocols(ids: dict) -> None:
 async def t_stream_latency(ids: dict, libopus) -> None:
     print("── 13. 流式 TTS：首句延迟必须早于整段完成 ──")
     await _settle()
+    # ⚠️ 这一组量的是**流式管线本身**，所以要用一句"不像要调工具"的话。
+    # 2026-10-29 加了工具轮「缓发」闸门（防模型抢先说一句再调工具，见
+    # session._TOOL_ROUND_HOLD_CHARS）：像要调工具的话会先攒 40 字才开口，
+    # 用「提醒我吃药」这类话量首帧，量到的是闸门的代价而不是管线的能力。
+    # 闸门自己的代价另有断言（见 12h 末尾），不在这里量。
+    UP.asr_text = "小暖小暖，给我讲个笑话吧"
     reply_chunks = ["第一句话。", "第二句话。", "第三句话。"]
     n_chat_before = len(UP.chat_events)
     n_tts_before = len(UP.tts_events)
@@ -2094,6 +2100,7 @@ async def t_stream_latency(ids: dict, libopus) -> None:
         if backup is not None:
             _restore_opus(backup)
         UP.plan = []
+        UP.asr_text = FAKE_ASR_TEXT
         UP.tts_chunk_delay = 0.0
         UP.tts_chunks = 1
 
@@ -2839,6 +2846,13 @@ def t_emotion_tag() -> None:
     sp.claim_blocked = 0
     sp._claim_fallback_done = False
     sp._fail_message = ""
+    # ---- 复述时间对账闸门（2026-10-29）----
+    # 用 __new__ 绕过 __init__，新增字段必须在这里补，否则 _speak_sentence
+    # 会在 self._reminder_clocks 上抛 AttributeError。
+    sp._reminder_clocks = set()
+    sp._reminder_clock_speak = ""
+    sp.clock_blocked = 0
+    sp._clock_fallback_done = False
     sp.tts_first_ms = 0
     sp.tts_ms = 0
     pacer = _Pacer()
@@ -3047,6 +3061,13 @@ def t_false_success_gate() -> None:
     sp.claim_blocked = 0
     sp._claim_fallback_done = False
     sp._fail_message = ""
+    # ---- 复述时间对账闸门（2026-10-29）----
+    # 用 __new__ 绕过 __init__，新增字段必须在这里补，否则 _speak_sentence
+    # 会在 self._reminder_clocks 上抛 AttributeError。
+    sp._reminder_clocks = set()
+    sp._reminder_clock_speak = ""
+    sp.clock_blocked = 0
+    sp._clock_fallback_done = False
     sp.tts_first_ms = 0
     sp.tts_ms = 0
     sp.max_gap_ms = 0
@@ -3096,6 +3117,76 @@ def t_false_success_gate() -> None:
         check("12h · 同轮里非提醒内容不得被连带误拦",
               spoken == ["平顶山今天晴，最高十八度，出门不冷"],
               f"spoken={spoken}")
+
+        # ---- ⑤~⑦ 复述时间对账闸门（2026-10-29 真机事故）----
+        # 事故现场：老人说「十二点四十五提醒我下楼」，模型把 when 填成 12:55
+        # （工具成功落库），却复述成「十二点四十五」。复述正确、落库错误，
+        # 上面那道假成功闸门管不到（工具是成功的），只能靠对账。
+        sp.failed_tools = set()
+        sp._claim_fallback_done = False
+        sp._clock_fallback_done = False
+        sp._reminder_clocks = {(0, 55)}          # 真正存的是 12:55
+        sp._reminder_clock_speak = "今天中午12点55分"
+
+        spoken.clear()
+        await sp._speak_sentence("好的，我给您记着，十二点四十五提醒您下楼。")
+        check("12h ★ 复述的钟点与实际落库不符 ⇒ 必须拦下"
+              "（老人差点记住错时间）",
+              sp.clock_blocked == 1
+              and not any("十二点四十五" in t for t in spoken),
+              f"clock_blocked={sp.clock_blocked} spoken={spoken}")
+        check("12h ★ 拦下后要念出**真实存的时间**，让老人自己核对",
+              any("12点55分" in t for t in spoken), f"spoken={spoken}")
+
+        # ⑥ 同一句里有两个钟点、其中一个对得上 ⇒ 不得误拦
+        #    （老人常听到「现在是十二点五十三，我给您定十二点五十五」）
+        spoken.clear()
+        sp._clock_fallback_done = False
+        await sp._speak_sentence("现在是十二点五十三，我给您定十二点五十五。")
+        check("12h · 句中只要有一个钟点对得上就不许误拦",
+              sp.clock_blocked == 1
+              and any("十二点五十五" in t for t in spoken),
+              f"clock_blocked={sp.clock_blocked} spoken={spoken}")
+
+        # ⑦ 这一轮没建提醒（_reminder_clocks 空）⇒ 闲聊里的钟点不该被拦
+        spoken.clear()
+        sp._reminder_clocks = set()
+        await sp._speak_sentence("今天下午三点孙子过来看您。")
+        check("12h · 没建提醒时闲聊提到的钟点不得被误拦",
+              spoken == ["今天下午三点孙子过来看您。"], f"spoken={spoken}")
+
+        # ⑧ 「慢一点」不是钟点 —— 不能被当成 1 点钟
+        spoken.clear()
+        sp._reminder_clocks = {(0, 55)}
+        sp._clock_fallback_done = False
+        await sp._speak_sentence("您慢一点，别着急。")
+        check("12h · 「慢一点」不是钟点，不得触发时间对账",
+              sp.clock_blocked == 1
+              and spoken == ["您慢一点，别着急。"], f"spoken={spoken}")
+        sp._reminder_clocks = set()
+
+        # ---- ⑨ 缓发闸门的触发判据 ----
+        # 闸门对每句话都生效的话，闲聊也要多等"攒够 40 字"那几个字
+        # （smoke 第 13 组量到首帧 400ms → 500ms）。所以先判这句话像不像
+        # 要调工具；不像就一个字都不等。
+        toolish = ["小暖小暖，明天早上八点提醒我吃药", "现在几点了",
+                   "今天天气怎么样", "声音小一点", "把屏幕调亮一点",
+                   "我明天要去医院"]
+        not_toolish = ["给我讲个笑话吧", "你叫什么名字", "我有点闷",
+                       "说说你年轻时候的事"]
+        wrong = [t for t in toolish
+                 if not S._looks_toolish([{"role": "user", "content": t}])]
+        wrong += [t for t in not_toolish
+                  if S._looks_toolish([{"role": "user", "content": t}])]
+        check("12h ★ 缓发闸门只对「像要调工具」的话生效"
+              "（闲聊不该多等那几个字）", not wrong, f"判错：{wrong}")
+        check("12h · 判据只看最后一条 user 消息"
+              "（历史里的提醒不该让本轮闲聊也背上缓发）",
+              not S._looks_toolish([
+                  {"role": "user", "content": "提醒我明天吃药"},
+                  {"role": "assistant", "content": "好"},
+                  {"role": "user", "content": "给我讲个笑话吧"}]),
+              "被历史带偏了")
 
     asyncio.run(_run())
 
