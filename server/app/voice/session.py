@@ -202,6 +202,18 @@ _MD_BULLET: Final[re.Pattern[str]] = re.compile(r"^\s*(?:[-•·]|\d+[.、)])\s*
 #: 措辞必须"承认没办好"，不能假装答了 —— 老人会以为设备坏了。
 UNSPEAKABLE_REPLY_FALLBACK: Final[str] = "这个我一时没说明白，您再问一遍，我重新查"
 
+#: 工具轮「缓发」门槛（字符数）。一轮生成的文字先攒着，攒到这个长度才认为
+#: 「这是一段正经回答」并开始边生成边念；一轮结束时若发现是工具轮，攒下的
+#: 直接丢弃不念。见 _chat_round 里那段长注释（2026-10-29 用户实报
+#: 「一句话回答两次」）。
+#:
+#: 取值依据：实测模型抢跑的那句「好的，我给您记着，十二点四十五提醒您下楼。」
+#: 是 21 字，稳稳落在门槛内；而正常回答攒到 40 字才开始念，多等的只有
+#: 小几百毫秒（模型吐 40 字的时间），首句时延基本不变。
+#: ⚠️ 调小会让抢跑的话漏出来（门槛低于 21 就等于没有闸门），
+#:    调大只是让首句更晚开口 —— 所以只许往大调，不许往小调。
+_TOOL_ROUND_HOLD_CHARS: Final[int] = 40
+
 #: 纯标点（"。" / "……" / 只有标点和空白）。这种片段**不算事故**：
 #: 它是切句的副产物（整句已播完，缓冲区里只剩那个句号），
 #: 送去 TTS 会念出一声怪响。必须与"不可播报"分开计数 ——
@@ -2072,6 +2084,29 @@ class VoiceSession:
         # 播报阻塞都算进去了，看那个数永远分不清是谁慢。
         t_round = _now_ms()
         got_first = False
+        # ---- 工具轮「缓发」闸门（2026-10-29 用户实报「一句话回答两次」后加）----
+        #
+        # 事故现场（设备串口 turn-diag2.log，一轮之内、中间没有 listening）：
+        #     6026743 << " 好的，我给您记着，十二点四十五提醒您下楼。"
+        #     6034003 << " 您说的是十二点四十五分，还是十二点十五分？我没听太准…"
+        # 第 1 段说"记着了"，第 2 段却问"哪个时间"——**互相矛盾**，一次生成
+        # 不可能这样。真相是同一轮里跑了两次 LLM：
+        #   第 1 轮模型还没拿到工具结果就抢先说"记着了"（提示词明令禁止，
+        #   但它看不到结果，只能猜），工具返回"需要澄清"，第 2 轮才问。
+        # 而 text 增量是**无条件**推给 speaker 念的 ⇒ 老人听到两段完整答复。
+        #
+        # 为什么不能在 done 事件里再判断：tool_calls 只在 done 里给，那时
+        # 文字早念出去了，撤不回来。所以只能**先攒着**：
+        #   * 攒够 _TOOL_ROUND_HOLD_CHARS 才认为"这是一段正经回答"并开始
+        #     边生成边念 —— 保住正常对话的首句时延；
+        #   * 一轮结束时若发现这轮是工具轮，攒下的文字**直接丢弃**（照旧
+        #     进上下文，只是不念）。
+        # 40 字这个门槛的依据：实测那句抢跑的"好的，我给您记着，十二点
+        # 四十五提醒您下楼。"是 21 字，稳稳落在门槛内；而正常回答的第一句
+        # 很少短于 40 字才会开始念，多出来的等待只有小几百毫秒。
+        held: list[str] = []
+        held_chars = 0
+        committed = False
         try:
             def _open() -> Any:
                 return chat_stream(db, "chat", messages, tools=TOOL_DEFS,
@@ -2099,6 +2134,31 @@ class VoiceSession:
                         timing["ttft_ms"].append(_now_ms() - t_round)
                 kind, payload = event
                 if kind == "done":
+                    calls = (getattr(payload, "tool_calls", None)
+                             if payload is not None else None)
+                    if calls:
+                        # 工具轮：这一轮生成的文字**一个字都不念**。
+                        # 它照旧由调用方 append 进 messages（模型下一轮要看），
+                        # 只是不进 TTS —— 老人只会听到最后一轮那份正式答复。
+                        if held_chars:
+                            log.warning("[%s] 第 %d 轮是工具轮，丢弃它已生成的"
+                                        " %d 字（不念给老人）：%r",
+                                        self.session_id, round_no, held_chars,
+                                        "".join(held)[:120])
+                            held.clear()
+                            held_chars = 0
+                        if committed:
+                            # 已经越过门槛念出去了，撤不回来 —— 至少留证据。
+                            log.warning("[%s] 第 %d 轮是工具轮，但文字已超过 %d 字"
+                                        "门槛、前段已念出（漏网）：老人可能听到"
+                                        "两段答复", self.session_id, round_no,
+                                        _TOOL_ROUND_HOLD_CHARS)
+                        return payload
+                    # 收尾轮（没有工具调用）：把攒下的文字念掉。
+                    if held_chars:
+                        await speaker.push_text("".join(held))
+                        held.clear()
+                        held_chars = 0
                     # ⚠️ 非流式兜底：厂商没理会 stream:true 时（网关 documented
                     # 的降级路径），整段文本只在 done 事件里，一个 text 增量都
                     # 没有。不补推的话 speaker 是空的 —— 老人什么都听不到，
@@ -2109,7 +2169,16 @@ class VoiceSession:
                         await speaker.flush_rest()
                     return payload
                 if kind == "text" and payload:
-                    await speaker.push_text(payload)
+                    if committed:
+                        await speaker.push_text(payload)
+                    else:
+                        held.append(payload)
+                        held_chars += len(payload)
+                        if held_chars >= _TOOL_ROUND_HOLD_CHARS:
+                            committed = True
+                            await speaker.push_text("".join(held))
+                            held.clear()
+                            held_chars = 0
             # abort 提前退出：关生成器（finally 关连接），没有 ChatResult
             return None
         finally:
