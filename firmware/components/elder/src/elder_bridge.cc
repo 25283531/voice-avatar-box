@@ -317,25 +317,27 @@ void OnReminder(const elder_rmd_item_t *item, elder_rmd_state_t st, void *ctx)
             snprintf(text, sizeof(text), "%s时间到了", item->label);
         }
 
-        /* 需求 8：屏幕图片不再显示，全屏大字显示任务内容，直到确认或 4 小时。
+        /* ⚠️ 2026-10-29 用户实报后**重写**：确认话术的主行动必须是
+         * 「长按按钮」，不能是「说一句」。
          *
-         * 全屏文字里**多一行确认提示**：老人看到"该吃药了"之后的第一反应
-         * 是"我该怎么办"。只写任务、不写怎么确认，等于把下一步留成空白 ——
-         * 而这正是按键/SOS 都取消之后最容易卡住的地方。
-         * 提示不进 TTS：语音只念事项本身，多念一句"请说吃过了"很吵。
+         * 现场：8 点的服药提醒，老人 10 点看到屏幕写着"说「我吃过了」"，
+         * 照着念 —— 设备毫无反应；长按按键也没反应；最后只能喊"你好小智"
+         * 唤醒，唤醒后才确认成功。
          *
-         * ⚠️ 2026-10-22 两处修正：
-         *  ① 确认话术**必须按类型分开**。原来不管什么提醒都写「说「我吃过了」」，
-         *     于是「喝水」提醒的屏上写着"说「我吃过了」"—— 老人照念反而答非所问，
-         *     而且服务端的确认正则按语义分档，对不上就是白念。
-         *  ② 删掉「或按一下按钮」。用户明确说 GPIO11 还没接开关，屏幕上让人
-         *     按按钮，老人只会摸半天找不到 —— 提示不能指向不存在的操作。
-         *     （开关接上后要同时改回这里和服务端 session.py 的 _PENDING_REMINDER_HINT。） */
-        const char *how_to_confirm = (item->type == ELDER_RMD_TYPE_MEDICINE)
-                                         ? "说「我吃过了」" : "说「弄好了」";
+         * 为什么念了没用：xiaozhi 只在 **listening** 状态才把音频上传到
+         * 服务端 ASR，待机时麦克风不上行（离线命令词在 2026-10-20 回归
+         * 上游时已全部删除，见 prebuild_check 的 C9）。所以**待机时对着
+         * 设备说任何话都不可能有反应** —— 屏幕却把这句话写成了唯一指引，
+         * 等于让老人去按一个不存在的按钮。
+         *
+         * 待机时唯一可行的确认动作就是长按 GPIO11（input.c 轮询，不依赖
+         * 联网、不依赖唤醒）。所以它必须是第一行、是唯一的大字。
+         * 语音那条彻底不写了：唤醒后老人本来就会说话，不需要屏幕教。
+         *
+         * 历史注释（2026-10-22）说"删掉「或按一下按钮」因为 GPIO11 还没接
+         * 开关"—— 开关现在接了，那条结论已经过期。 */
         char screen_text[160];
-        snprintf(screen_text, sizeof(screen_text), "%s\n\n%s", text,
-                 how_to_confirm);
+        snprintf(screen_text, sizeof(screen_text), "%s\n\n长按按钮 3 秒确认", text);
         elder_ui_show_reminder(screen_text);
 
         /* 1) 先响固件内置的提醒音乐（约 4.9 秒，离线也有声音）
@@ -356,6 +358,30 @@ void OnReminder(const elder_rmd_item_t *item, elder_rmd_state_t st, void *ctx)
          * 交给 elder_rgb 的 2 小时节奏，见 reminder.c 的说明。 */
         elder_ui_set_state(ELDER_UI_MISSED, 0);
         elder_ui_play_tone(ELDER_TONE_EXCLAMATION);
+        break;
+    case ELDER_RMD_SKIPPED:
+    case ELDER_RMD_HALF_EXPIRED:
+        /* 这两态都是"这一次作废/跳过了" —— 引擎里已经没有待确认项，
+         * #1 的橙色呼吸也已经灭了（set_state 里调了 button_pending(false)）。
+         * **全屏提醒必须一起收掉**（2026-10-29 用户实报后加）。
+         *
+         * 事故现场：8 点的服药提醒，10 点屏幕还挂着"说「我吃过了」"，
+         * 老人念了没反应、长按按钮也没反应，只能先唤醒再确认。
+         * 根因就是这里 —— 屏幕的显示时长是 elder_ui 的 4 小时（独立计时），
+         * 而按键确认的判据是 elder_reminder_first_ringing()（只认 PENDING /
+         * CONFIRM_WIN / ESCALATED / HALF_CONFIRMED）。一旦引擎把这条判成
+         * SKIPPED，屏幕还在喊、按键却选不中目标 ⇒ 彻底没反应。
+         *
+         * 而语音那条反而"能用"，因为服务端 MCP 直接调 confirm(id)，
+         * 不经过 first_ringing()。两条确认路判据不一致，症状就是
+         * "语音能确认、按键不能"。
+         *
+         * 收掉屏幕是**兜底**：根治在 reminder.c 的 replace_all
+         * （server_id 变了要按内容兜底继承运行态，别把已响过的提醒
+         * 当成全新条目重置成 IDLE）。 */
+        elder_ui_hide_reminder();
+        ESP_LOGW(TAG, "提醒 '%s' 作废/跳过 ⇒ 收掉全屏提醒（不再让屏幕"
+                      "提示一个按不动的操作）", item->label);
         break;
     default:
         break;
@@ -463,6 +489,10 @@ void OnKey(elder_key_event_t ev, void *ctx)
              * 不发声、不闪屏：没有提醒可确认时，「安静地没反应」比
              * 「莫名其妙开始说话/静音」安全得多。按下的即时反馈由
              * #1 指示灯给（input.c 调 elder_rgb_button_press/release）。 */
+            if (elder_ui_reminder_showing()) {
+                ESP_LOGE(TAG, "⚠️ 全屏提醒还挂着，但引擎里没有待确认项 —— "
+                              "短按无效。screen 与引擎状态已脱节");
+            }
             ESP_LOGI(TAG, "短按：当前没有待确认的提醒 —— 本按键只做确认，不做对话开关");
         }
         break;
@@ -486,6 +516,15 @@ void OnKey(elder_key_event_t ev, void *ctx)
             elder_rgb_button_confirmed();
             ConfirmMedicine(idx, ELDER_CFM_BUTTON);
         } else {
+            /* 诊断：这是 2026-10-29「屏幕挂着提醒但按什么都没反应」的现场
+             * 特征 —— 屏幕（elder_ui，4 小时独立计时）说要做，引擎里却
+             * 没有待确认项（已判 SKIPPED / 被 replace_all 重置成 IDLE）。
+             * 打出来是为了下次一眼能看出来，不用再靠猜。 */
+            if (elder_ui_reminder_showing()) {
+                ESP_LOGE(TAG, "⚠️ 全屏提醒还挂着，但引擎里没有待确认项 —— "
+                              "长按无效。screen 与引擎状态已脱节，"
+                              "请把这条日志连同开机日志一起反馈");
+            }
             ESP_LOGI(TAG, "长按 3 秒：当前没有待确认的提醒，不确认");
         }
         break;

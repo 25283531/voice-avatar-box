@@ -1755,6 +1755,69 @@ static void test_late_boot_no_instant_escalate(void)
  *
  * 变异提示：把 elder_reminder_first_ringing() 的 `>` 改成 `<`、
  * 或把 fired_due_at 比较删掉（改成取第一条响铃的），本组必须变红。 */
+/* =================================================================== */
+/* T17：server_id 变了（服务端重建/编辑提醒）→ 按内容认作同一条           */
+/* =================================================================== */
+/* 2026-10-29 真机现场：8 点的服药提醒，10 点屏幕还挂着"长按按钮 3 秒"，
+ * 但长按毫无反应（#1 不渐变、也不闪结果），只有唤醒后走服务端 MCP 的
+ * 语音确认才成功。根因链：
+ *   ① 服务端重新下发了这条提醒（重建/编辑都换 server_id）；
+ *   ② replace_all 只按 server_id 找旧条目 ⇒ 找不到 ⇒ 当成全新提醒，
+ *      state 重置 IDLE、fired_today 清零；
+ *   ③ 下一个 tick 重新触发，此时 late_min 已 > 60 分钟 ⇒ 判 SKIPPED；
+ *   ④ 引擎里没有待确认项 ⇒ first_ringing() = -1 ⇒ 按键选不中目标。
+ *      而全屏提醒是 elder_ui 自己的 4 小时计时，**还在显示**。
+ * 两条确认路判据不一致，症状就是"语音能确认、按键不能"。
+ */
+static void test_replace_all_server_id_change(void)
+{
+    printf("\n[T17] server_id 变了仍按内容继承运行态（2026-10-29 现场）\n");
+    stub_nvs_init();
+    stub_time_set(1772665200L);      /* 07:00，可信时钟 */
+    rec_reset();
+    elder_reminder_init(rec_cb, NULL);
+
+    elder_rmd_item_t srv = mk_med(8, 0, "降压药", 101);
+    check("服务端下发 1 条（server_id=101）",
+          elder_reminder_replace_all(&srv, NULL, 1) == ESP_OK, NULL);
+
+    /* 08:00 响铃 */
+    stub_time_advance(3600);
+    rec_reset();
+    elder_reminder_tick_once();
+    check("前置：08:00 已响铃（待确认）",
+          elder_reminder_first_ringing() == 0, det("%s", dump_tbl(tbl())));
+
+    /* 走到 09:30：已过 15 分钟 ⇒ ESCALATED，仍在待确认集合里 */
+    stub_time_advance(90 * 60);
+    rec_reset();
+    elder_reminder_tick_once();
+    check("前置：已升级 ESCALATED（仍在待确认集合）",
+          elder_reminder_first_ringing() == 0, det("%s", dump_tbl(tbl())));
+
+    /* 服务端重新下发同一条，但 server_id 换了 */
+    elder_rmd_item_t again = mk_med(8, 0, "降压药", 202);
+    check("重新下发（server_id 101 → 202）",
+          elder_reminder_replace_all(&again, NULL, 1) == ESP_OK, NULL);
+
+    /* ★ 核心断言 */
+    check("★server_id 变化后仍选得中（按内容继承运行态，没被重置成 IDLE）",
+          elder_reminder_first_ringing() == 0,
+          "返回 -1 就是 2026-10-29 那次「屏幕提示要做、按什么都没反应」");
+    check("★fired_today 也继承了（今天不再二次响铃）",
+          (tbl()->fired_today & 1u) != 0, det("%s", dump_tbl(tbl())));
+
+    stub_time_advance(60);
+    rec_reset();
+    elder_reminder_tick_once();
+    check("★迟到 90 分钟也不得被判 SKIPPED（已经响过的提醒不该作废）",
+          elder_reminder_first_ringing() == 0, det("%s", dump_tbl(tbl())));
+
+    check("确认仍然有效",
+          elder_reminder_confirm_ex(0, ELDER_CFM_BUTTON) == ESP_OK, NULL);
+    check("确认后不再待确认", elder_reminder_first_ringing() == -1, NULL);
+}
+
 static void test_first_ringing_picks_ringing(void)
 {
     printf("\n[T15] 确认必须落在正在响铃的那条（喝水响了别记到吃药上）\n");
@@ -1885,6 +1948,7 @@ int main(void)
     test_voice_confirm_no_false_missed();
     test_half_confirm_skip_after_window();
     test_late_boot_no_instant_escalate();
+    test_replace_all_server_id_change();
     test_first_ringing_picks_ringing();
 
     printf("\n=== 堆对账（T16）===\n");

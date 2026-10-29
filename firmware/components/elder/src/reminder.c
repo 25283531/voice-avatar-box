@@ -945,6 +945,34 @@ esp_err_t elder_reminder_replace_all(const elder_rmd_item_t *items,
             for (uint8_t j = 0; j < old_n; j++) {
                 if (old[j].server_id == it->server_id) { old_idx = (int)j; break; }
             }
+            /* server_id 匹配不上时**按内容兜底**（2026-10-29 用户实报后加）。
+             *
+             * 现场：8 点的服药提醒，10 点屏幕还挂着提示，但语音/按键都
+             * 确认不了。根因是这条链路 ——
+             *   ① 服务端重新下发了这条提醒（重建/编辑都会换 server_id）；
+             *   ② 设备按 server_id 找不到旧条目 ⇒ 当成"全新提醒"，
+             *      state 重置成 IDLE、fired_today 清掉；
+             *   ③ 下一个 tick 重新触发，此时 late_min 已经 > 60 分钟，
+             *      被判 SKIPPED（"设备离线错过"）；
+             *   ④ 引擎里没有待确认项了，但屏幕的全屏提醒是 elder_ui 自己
+             *      的 4 小时计时，**还在显示** ⇒ 老人照着做，设备不理。
+             *
+             * 同一提醒换了个 id 就丢掉"今天已经响过、正在等确认"这个事实，
+             * 在服药场景里是不可接受的。内容（类型+时刻+标签）相同的，
+             * 就是同一条。 */
+            if (old_idx < 0) {
+                for (uint8_t j = 0; j < old_n; j++) {
+                    if (same_content(&old[j], it)) {
+                        old_idx = (int)j;
+                        ESP_LOGW(TAG, "server_id 变了（旧 %lu → 新 %lu），按内容"
+                                      "认作同一条并继承运行态: %s %02d:%02d",
+                                 (unsigned long)old[j].server_id,
+                                 (unsigned long)it->server_id,
+                                 it->label, it->hour, it->minute);
+                        break;
+                    }
+                }
+            }
         } else {
             for (uint8_t j = 0; j < old_n; j++) {
                 if (old[j].server_id == 0 && same_content(&old[j], it)) {
