@@ -223,7 +223,8 @@ def usage_summary(
     过滤条件全部可选且是 AND 关系；都不传 = 全量（仅管理端允许）。
     返回：
         calls / prompt_tokens / completion_tokens / total_tokens
-        by_usage: {usage: total_tokens}
+        by_usage:       {usage: total_tokens}
+        by_usage_calls: {usage: 调用次数}
         by_day:   [{"date": "YYYY-MM-DD", "total_tokens": int}]（by_day=True 时）
         failed_calls
     """
@@ -249,6 +250,10 @@ def usage_summary(
         "completion_tokens": 0,
         "total_tokens": 0,
         "by_usage": {},
+        # 次数与 token 分开两个字典：ASR / TTS 的 tokens 恒为 0（按次/按秒
+        # 计费，没有 token 口径），合并成一个字典就只能二选一，无论选哪个
+        # 都会让另一类在界面上显示 0。
+        "by_usage_calls": {},
     }
     if by_day:
         summary["by_day"] = {}
@@ -259,8 +264,12 @@ def usage_summary(
         summary["prompt_tokens"] += int(r.prompt_tokens or 0)
         summary["completion_tokens"] += int(r.completion_tokens or 0)
         summary["total_tokens"] += int(r.total_tokens or 0)
-        bucket = summary["by_usage"].setdefault(r.usage or "", 0)
-        summary["by_usage"][r.usage or ""] = bucket + int(r.total_tokens or 0)
+        key = r.usage or ""
+        bucket = summary["by_usage"].setdefault(key, 0)
+        summary["by_usage"][key] = bucket + int(r.total_tokens or 0)
+        # 失败调用也计一次：用户端问的是「调用了多少次」，不是「成功多少次」
+        # （成功数由 calls - failed_calls 得到，不必再开一个字段）。
+        summary["by_usage_calls"][key] = summary["by_usage_calls"].get(key, 0) + 1
         if by_day:
             # ⚠️ 必须按**北京时间**分日（不是 UTC）：created_at 是 naive UTC，
             # 直接 .date() 会把北京 00:00–08:00 的调用算到前一天，

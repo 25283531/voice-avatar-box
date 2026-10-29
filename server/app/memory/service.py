@@ -56,6 +56,29 @@ def _commit(db: Session, user_id: int, agent_id: int | None) -> None:
 
 
 # ---------------------------------------------------------------- 写
+def _embed(cli: ModelClient, texts: list[str], *,
+           device_id: int | None, user_id: int | None) -> list[list[float]]:
+    """调 embed，并把用量归属一起带过去。
+
+    为什么要容忍老签名（``TypeError`` 后退回一次）
+    --------------------------------------------
+    ``ModelClient`` 协议的最小实现是 ``embed(texts)``（测试里的假客户端就是
+    这样写的，它们不该为了记账被迫改造）。带 context 的调用打在老签名上会
+    在**绑定参数阶段**抛 ``TypeError``，此时一次网络请求都还没发出去，退回
+    老调用是安全的。
+
+    ⚠️ 绝不能让这个 TypeError 冒泡到上层：``memorize`` 的 embed 是包在
+    ``except Exception`` 里降级成"无向量写入"的，冒泡的表现是**记忆全部
+    退化成无向量**（检索质量静默下降），而不是"记账丢了"。
+    """
+    if device_id is None and user_id is None:
+        return cli.embed(texts)
+    try:
+        return cli.embed(texts, device_id=device_id, user_id=user_id)
+    except TypeError:
+        return cli.embed(texts)
+
+
 def memorize(
     db: Session,
     user_id: int,
@@ -67,6 +90,7 @@ def memorize(
     embedding_model: str = "",
     commit: bool = True,
     observe: bool = True,
+    device_id: int | None = None,
 ) -> list[int]:
     """把一轮对话沉淀成长期记忆，返回新写入的记忆 id 列表。
 
@@ -77,6 +101,11 @@ def memorize(
       4. **批量**向量化一次（不是每条一次），然后逐条 INSERT；
       5. 顺带更新语气画像（把机器人这一轮的说法当成"被接受"来统计 ——
          真出现消极反应时由上层调 record_feedback(hint="negative") 反向修正）。
+
+    ``device_id`` 只用于**用量记账归属**（记忆本身按 user_id + agent_id 组织）：
+    用户端按设备过滤用量流水，行上没有 device_id 就等于家属永远看不到
+    「轻量任务模型 / 向量化模型」这两类调用。可不传（后台任务 / HTTP 直写
+    记忆没有设备上下文），此时记一条 device_id 为空的行 —— 管理端仍能对账。
     """
     turns = as_turns(conversation)
     if not turns:
@@ -111,7 +140,8 @@ def memorize(
     # 2) 抽事实（失败返回 []，绝不抛异常，见 extract.py）
     #    注意：此处已不持锁，慢速调用不再堵死其他写请求。
     known = store.entity_types(user_id, agent_id)
-    facts: list[Fact] = extract_facts(turns, client=client, known_entities=known)
+    facts: list[Fact] = extract_facts(turns, client=client, known_entities=known,
+                                      device_id=device_id, user_id=user_id)
     if not facts:
         return []
 
@@ -150,7 +180,8 @@ def memorize(
     vectors: list[list[float]] = []
     try:
         cli = client or get_default_client()
-        vectors = cli.embed([f.content for f in fresh]) or []
+        vectors = _embed(cli, [f.content for f in fresh],
+                         device_id=device_id, user_id=user_id) or []
     except Exception as exc:  # noqa: BLE001  没配向量模型也要能把记忆写进去
         log.warning("记忆向量化失败，本次按「无向量」写入（仍可被关键词/实体路召回）：%s: %s",
                     type(exc).__name__, exc)
@@ -192,11 +223,17 @@ def memorize(
 
 def memorize_background(db_factory, user_id: int, agent_id: int | None,
                         conversation: Sequence[Any], *, session_id: str = "",
-                        client: ModelClient | None = None) -> threading.Thread | None:
+                        client: ModelClient | None = None,
+                        device_id: int | None = None) -> threading.Thread | None:
     """后台线程里跑 memorize（不阻塞本次对话响应）。
 
     ``db_factory`` 传 ``app.db.SessionLocal``：新线程必须用自己的会话，
     SQLAlchemy 的 Session 不是线程安全的，不能把请求的会话带过来。
+
+    ⚠️ ``device_id`` 必须**作为参数显式传进来**，不能在 ``_run`` 里读
+    contextvars：这里是裸 ``threading.Thread``，contextvars 不会跨线程传播，
+    读到的永远是默认值 None ⇒ 记账行没有设备归属 ⇒ 用户端按设备过滤时
+    这些调用**一条都看不到**（而且不会报错，最难查的那种）。
 
     ⚠️ 这是**最小实现**（一个 daemon 线程）。真到量大的时候应该换成有界队列 +
     工作线程池，并设置"进程退出前 flush"的钩子 —— 见文档遗留问题。
@@ -205,7 +242,7 @@ def memorize_background(db_factory, user_id: int, agent_id: int | None,
         db = db_factory()
         try:
             memorize(db, user_id, agent_id, conversation, session_id=session_id,
-                     client=client, commit=True)
+                     client=client, commit=True, device_id=device_id)
         except Exception as exc:  # noqa: BLE001  后台任务绝不能把进程带崩
             log.warning("后台记忆提取失败：%s: %s", type(exc).__name__, exc)
         finally:

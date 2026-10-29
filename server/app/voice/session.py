@@ -526,6 +526,74 @@ def _now_ms() -> int:
     return int(time.time() * 1000)
 
 
+# ---------------------------------------------------------------- 语音侧用量记账
+# 为什么 ASR / TTS 的记账单独抽一个函数
+# ------------------------------------
+# 1. **tokens 恒为 0**：这两家按次 / 按秒计费，没有 token 口径。用户端看到的
+#    是「语音识别 · N 次」「语音合成 · N 次」，次数才是唯一有意义的口径，
+#    所以 ok / elapsed_ms 必须准（失败也要落一行，否则"调用过但失败"与
+#    "从没调用过"无法区分）。
+# 2. **必须在音频通路之外写库**：SQLite 的 commit 在极端情况下会等到
+#    busy_timeout（15s），直接写在 `_stream_sentence` 里就是"说话说到一半
+#    卡住"——用户对这块的硬要求是「声音现在正常，千万不要再修出破音、卡顿」。
+#    所以 TTS 的记账是「先收集、后落库」（见 `_ReplySpeaker._tts_calls`
+#    与 `_record_usage` 里的 flush），ASR 的记账落在**已有的线程池**里。
+# 3. 失败只 log.warning：记账是旁路，绝不能影响发声。
+def _record_voice_call(db: Any, *, usage: str, device_id: int | None,
+                       user_id: int | None, agent_id: int | None,
+                       session_id: str = "", ok: bool = True,
+                       error: str = "", elapsed_ms: int = 0) -> None:
+    """落一行 ASR/TTS 的调用流水（source="voice"，tokens 记 0）。"""
+    try:
+        provider_name = ""
+        model = ""
+        # 厂商名只是**展示**用：真正落到哪条配置由 asr_tts 内部按序兜底决定，
+        # 而它没有把命中的 row 返回出来。这里取优先级最高的那条（正常情况
+        # 就是实际使用的那条），不为了一行记账去改音频模块的返回值签名 ——
+        # 改签名的风险远大于"回落时厂商名不准"这一点点收益。
+        try:
+            from ..llm_gateway import resolve_row
+            row = resolve_row(db, usage)
+            if row is not None:
+                provider_name = str(getattr(row, "name", "") or "")
+                model = str(getattr(row, "model", "") or "")
+        except Exception:  # noqa: BLE001  取不到厂商名不影响记账本身
+            pass
+        usage_svc.record_model_usage(
+            db, source="voice", usage=usage,
+            device_id=device_id, user_id=user_id, agent_id=agent_id,
+            provider_name=provider_name, model=model,
+            request_id=usage_svc.new_request_id(),
+            session_id=session_id, ok=ok, error=error[:255],
+            elapsed_ms=elapsed_ms,
+        )
+    except Exception as exc:  # noqa: BLE001  记账失败绝不能影响发声
+        log.warning("语音侧用量记账失败（不影响音频）：%s: %s",
+                    type(exc).__name__, exc)
+
+
+def _flush_tts_usage(db: Any, *, speaker: Any, dev: Any,
+                     session_id: str = "") -> None:
+    """把 speaker 收集的 TTS 调用清单落库，并清空清单（**同步**，勿在音频通路上调）。
+
+    TTS 是流式的：一句一次 ``tts_stream``、一次合成几十个分片。所以
+    "整句一条"的粒度在这里（``speaker._tts_calls`` 每句 append 一项），
+    而不是每个分片一条 —— 分片级记账既没有意义，也会把音频通路拖垮。
+    """
+    calls = getattr(speaker, "_tts_calls", None)
+    if not calls:
+        return
+    for call in list(calls):
+        _record_voice_call(
+            db, usage="tts", device_id=dev.id, user_id=dev.owner_id,
+            agent_id=dev.agent_id, session_id=session_id,
+            ok=bool(call.get("ok", True)),
+            error=str(call.get("error", "")),
+            elapsed_ms=int(call.get("elapsed_ms", 0)),
+        )
+    calls.clear()
+
+
 class VoiceSession:
     """一次 WS 连接的会话。**所有公开方法都是 async**，内部自行切线程池。"""
 
@@ -1753,8 +1821,27 @@ class VoiceSession:
         pcm_all = b"".join(pcm)
 
         def _asr() -> str:
+            # 记账在**线程池里**（本函数就是被 run_in_threadpool 调起来的），
+            # 不在事件循环上；失败也要落一行（ok=False），否则"识别过但失败"
+            # 与"从没识别过"在用量页上无法区分。
+            started = time.monotonic()
             with SessionLocal() as db:
-                return asr_tts.asr(db, pcm_all)
+                try:
+                    text = asr_tts.asr(db, pcm_all)
+                except Exception as exc:
+                    _record_voice_call(
+                        db, usage="asr", device_id=self.dev.id,
+                        user_id=self.dev.owner_id, agent_id=self.dev.agent_id,
+                        session_id=self.session_id, ok=False,
+                        error=f"{type(exc).__name__}: {exc}",
+                        elapsed_ms=int((time.monotonic() - started) * 1000))
+                    raise
+                _record_voice_call(
+                    db, usage="asr", device_id=self.dev.id,
+                    user_id=self.dev.owner_id, agent_id=self.dev.agent_id,
+                    session_id=self.session_id,
+                    elapsed_ms=int((time.monotonic() - started) * 1000))
+                return text
 
         # ---- F3 声纹：与 ASR **并行**发起（复刻上游 connection.py 的并行触发）
         # 为什么并行而不是串在 ASR 后面：声纹服务按设计在局域网，通常比 ASR
@@ -2353,6 +2440,18 @@ class VoiceSession:
         # 不 flush 的话这句话永远留在缓冲区里，老人听到的是静音。
         await speaker.flush_rest()
         await speaker.finish()
+        # 这条路不经过 _record_usage（没有 LLM 调用可挂），但 TTS 确实用了：
+        # 单独补一次记账。**放在 finish() 之后**——音频已播完，不占音频通路。
+        try:
+            def _flush() -> None:
+                with SessionLocal() as db:
+                    _flush_tts_usage(db, speaker=speaker, dev=self.dev,
+                                     session_id=self.session_id)
+
+            await run_in_threadpool(_flush)
+        except Exception as exc:  # noqa: BLE001  记账失败不影响已经播完的话
+            log.warning("[%s] 固定话术 TTS 记账失败：%s: %s", self.session_id,
+                        type(exc).__name__, exc)
 
 
     # ================================================================ 埋点
@@ -2466,6 +2565,14 @@ class VoiceSession:
                         request_id=usage_svc.new_request_id(),
                         session_id=self.session_id,
                     )
+                # ---- TTS 用量：在这里落库，**不在音频通路上** ----
+                # speaker 在流式播报期间只把每句的 (ok, error, elapsed_ms)
+                # append 进列表（纯内存），真正的 INSERT 攒到这里一次做完。
+                # 为什么不能写在 _stream_sentence 里：那是在按 60ms 一帧推
+                # 音频的同一个事件循环上，SQLite 一次 commit 若撞上锁就要等
+                # busy_timeout（15s）—— 老人听到的是"说着说着卡住"。
+                _flush_tts_usage(db, speaker=speaker, dev=self.dev,
+                                 session_id=self.session_id)
                 record_chat_usage(db, self.dev.id, local_date_str(),
                                   max(1, elapsed_ms // 1000),
                                   is_reminder=is_reminder)
@@ -2522,6 +2629,10 @@ class VoiceSession:
                  {"role": "assistant", "content": reply}],
                 session_id=self.session_id,
                 user_text=utterance, bot_text=reply,
+                # 用量归属：记忆抽取（light）与向量化（embed）两条流水要靠它
+                # 才能被用户端按设备过滤看到 —— 后台线程里 contextvars 不传播，
+                # 必须显式传。
+                device_id=self.dev.id,
             )
         except Exception as exc:  # noqa: BLE001
             log.warning("[%s] 记忆沉淀启动失败：%s: %s", self.session_id,
@@ -2631,6 +2742,13 @@ class _ReplySpeaker:
         self.max_gap_ms = 0       # 相邻两帧的最大间隔（>60ms 即供给不足）
         self._last_frame_at = 0.0
         self._t0 = time.monotonic()
+        # ---- 用量流水（2026-10-29）----
+        #: 本轮的 TTS 调用清单 ``[{ok, error, elapsed_ms}]``。
+        #: **只收集、不落库**：TTS 是流式的，每句一次 ``tts_stream``，一次合成
+        #: 又产出几十个分片 —— 在分片里写库就是每句几十次 commit 打在音频
+        #: 通路上（SQLite 一旦等锁就是秒级卡顿）。收集是纯内存 append，
+        #: 真正的 INSERT 交给 `_record_usage`（本来就在线程池里）。
+        self._tts_calls: list[dict[str, Any]] = []
 
         # ---- 下行节流器（2026-10-22）----
         # 发送回调用 _send_frame：统计埋点全部留在这里，节流器只是
@@ -2845,6 +2963,11 @@ class _ReplySpeaker:
         gen = None
         carry = b""            # 跨分片的不足一帧残留
         frame_bytes = opus_codec.frame_bytes(config.VOICE_OUTPUT_SAMPLE_RATE)
+        # 用量流水：**整句记一条**（不是每个分片一条）。时间在这里掐表，
+        # 落库在 _record_usage 里 —— 见 self._tts_calls 的注释。
+        t_tts = time.monotonic()
+        tts_ok = True
+        tts_error = ""
         try:
             def _open() -> Any:
                 return asr_tts.tts_stream(db, sentence, voice=self._voice)
@@ -2890,7 +3013,21 @@ class _ReplySpeaker:
                     return
                 if packet:
                     self._enqueue(packet)
+        except Exception as exc:
+            # 只**记录**失败原因，异常照旧上抛（_speak_sentence 有兜底）。
+            # 用量页要能区分「合成过但失败」与「根本没调用过」。
+            tts_ok = False
+            tts_error = f"{type(exc).__name__}: {exc}"
+            raise
         finally:
+            # 整句结束后记一条（纯内存 append，**不碰数据库**）。
+            # 放在 finally 里是为了让打断 / 无 libopus 提前 return 的路径
+            # 也有记录 —— 那些路径确实调用过 TTS。
+            self._tts_calls.append({
+                "ok": tts_ok,
+                "error": tts_error,
+                "elapsed_ms": int((time.monotonic() - t_tts) * 1000),
+            })
             if gen is not None:
                 try:
                     await run_in_threadpool(gen.close)

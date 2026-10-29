@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 from typing import Any, Protocol, runtime_checkable
 
 log = logging.getLogger("elder.memory.client")
@@ -60,6 +61,53 @@ class ModelClientNotReady(RuntimeError):
     """
 
 
+# ---------------------------------------------------------------- 用量记账
+def _elapsed_ms(started: float) -> int:
+    return max(0, int((time.monotonic() - started) * 1000))
+
+
+def _record(db: Any, *, usage: str, result: Any = None, ok: bool = True,
+            error: str = "", elapsed_ms: int = 0,
+            device_id: int | None = None, user_id: int | None = None) -> None:
+    """给一次记忆侧的模型调用落一行 model_usage（source="memory"）。
+
+    为什么记账写在这一层而不是 ``service.memorize``
+    ---------------------------------------------
+    这里才是**真正发请求的地方**：只有这里知道网关最终落到哪条配置、
+    返回的 provider_name / model 是什么、耗时多少、失败原因是什么。
+    写到上层就只能拿到"调用了一次"，厂商与耗时全是猜的。
+
+    为什么必须显式收 device_id / user_id
+    ----------------------------------
+    用户端按**设备**过滤（``usage.recent_usage_rows(device_ids=...)``），
+    行上没有 device_id 就等于「记了但家属永远看不到」。而
+    ``memorize_background`` 是裸 ``threading.Thread``，contextvars
+    **不会**传播过去 —— 所以只能从调用方一路显式传下来，不能图省事用
+    contextvar。
+
+    任何异常都只记 warning：记账是旁路，绝不能让记忆写入失败。
+    """
+    try:
+        from .. import usage as usage_svc  # 局部导入：本模块要能在网关缺失时被 import
+
+        if result is not None:
+            usage_svc.record_from_result(
+                db, result, source="memory", usage=usage,
+                device_id=device_id, user_id=user_id,
+                request_id=usage_svc.new_request_id(),
+            )
+        else:
+            usage_svc.record_model_usage(
+                db, source="memory", usage=usage,
+                device_id=device_id, user_id=user_id,
+                ok=ok, error=error[:255], elapsed_ms=elapsed_ms,
+                request_id=usage_svc.new_request_id(),
+            )
+    except Exception as exc:  # noqa: BLE001  记账失败绝不能影响记忆写入
+        log.warning("记忆侧用量记账失败（不影响记忆写入）：%s: %s",
+                    type(exc).__name__, exc)
+
+
 @runtime_checkable
 class ModelClient(Protocol):
     """记忆模块需要的最小模型能力面。
@@ -72,7 +120,7 @@ class ModelClient(Protocol):
         """发一次对话，返回**纯文本**（不是 ChatResult 之类的包装对象）。"""
         ...
 
-    def embed(self, texts: list[str]) -> list[list[float]]:
+    def embed(self, texts: list[str], **kw: Any) -> list[list[float]]:
         """把一批文本变成向量，返回与输入等长、同序的二维列表。"""
         ...
 
@@ -110,6 +158,11 @@ class GatewayClient:
         gw = self._gateway()
         usage = self._usage_of(kind)
         db = kw.pop("db", None)
+        # ⚠️ 这两个是**记账上下文**，不是厂商参数：必须在转发前 pop 掉，
+        # 否则会被 _chat_payload 原样塞进 HTTP 报文（厂商多半直接 400，
+        # 而症状是「记忆抽取突然全失败」，极难联想到记账）。
+        device_id = kw.pop("device_id", None)
+        user_id = kw.pop("user_id", None)
         # 网关签名是 chat(db, usage, messages, ...)：它要一个会话去查 ai_providers。
         # 这里允许调用方自带 db（HTTP 请求内复用同一个会话），否则自己开一个短会话，
         # 用完立刻关掉，避免长事务占着 SQLite 的文件锁。
@@ -117,28 +170,67 @@ class GatewayClient:
             from ..db import SessionLocal  # 局部导入，避免循环依赖
 
             with SessionLocal() as own:
-                return self._chat(own, gw, usage, messages, kw)
-        return self._chat(db, gw, usage, messages, kw)
+                return self._chat(own, gw, usage, messages, kw,
+                                  device_id=device_id, user_id=user_id)
+        return self._chat(db, gw, usage, messages, kw,
+                          device_id=device_id, user_id=user_id)
 
     @staticmethod
-    def _chat(db: Any, gw: Any, usage: str, messages: list[dict], kw: dict) -> str:
-        res = gw.chat(db, usage, list(messages), **kw)
+    def _chat(db: Any, gw: Any, usage: str, messages: list[dict], kw: dict,
+              *, device_id: int | None = None,
+              user_id: int | None = None) -> str:
+        started = time.monotonic()
+        try:
+            res = gw.chat(db, usage, list(messages), **kw)
+        except Exception as exc:
+            # 失败也记一行（ok=False + error）：排查「为什么轻量模型的用量是 0」
+            # 时，「调用过但全失败」与「从来没调用过」必须可区分。
+            _record(db, usage=usage, ok=False, device_id=device_id,
+                    user_id=user_id, elapsed_ms=_elapsed_ms(started),
+                    error=f"{type(exc).__name__}: {exc}")
+            raise
+        _record(db, usage=usage, result=res, device_id=device_id,
+                user_id=user_id, elapsed_ms=_elapsed_ms(started))
         # 网关返回的是 ChatResult 数据类；这里只要文本，
         # 但也要能容忍将来网关直接返回 str（别把兼容性钉死在一个类型上）。
         text = getattr(res, "text", None)
         return text if isinstance(text, str) else (res if isinstance(res, str) else "")
 
-    def embed(self, texts: list[str]) -> list[list[float]]:
+    def embed(self, texts: list[str], **kw: Any) -> list[list[float]]:
         gw = self._gateway()
         if not texts:
             return []
+        device_id = kw.pop("device_id", None)
+        user_id = kw.pop("user_id", None)
+        db = kw.pop("db", None)
         from ..db import SessionLocal  # 局部导入，避免循环依赖
 
         # 网关的 embed 也要 db（查 ai_providers）。这里自己开一个短会话并在 finally
         # 里关掉 —— 记忆写入可能一次 embed 几十条，会话不能一直挂着，
         # 否则 SQLite 的写锁会被读连接长时间占住。
-        with SessionLocal() as db:
+        if db is None:
+            with SessionLocal() as own:
+                return self._embed(own, gw, texts, device_id=device_id,
+                                   user_id=user_id)
+        return self._embed(db, gw, texts, device_id=device_id, user_id=user_id)
+
+    @staticmethod
+    def _embed(db: Any, gw: Any, texts: list[str],
+               *, device_id: int | None = None,
+               user_id: int | None = None) -> list[list[float]]:
+        started = time.monotonic()
+        try:
             res = gw.embed(db, list(texts), usage=USAGE_EMBED)
+        except Exception as exc:
+            _record(db, usage=USAGE_EMBED, ok=False, device_id=device_id,
+                    user_id=user_id, elapsed_ms=_elapsed_ms(started),
+                    error=f"{type(exc).__name__}: {exc}")
+            raise
+        # ⚠️ VectorResult 上**没有** token 字段（见 llm_gateway 的类注释：
+        # embed/rerank 的 usage 段本轮未接），所以这一行 total_tokens 恒为 0。
+        # 用户端看到的是「向量化模型 · N 次调用」，这正是按次口径该有的样子。
+        _record(db, usage=USAGE_EMBED, result=res, device_id=device_id,
+                user_id=user_id, elapsed_ms=_elapsed_ms(started))
         vectors = getattr(res, "vectors", None)
         if isinstance(vectors, list):
             return [list(map(float, v)) for v in vectors]

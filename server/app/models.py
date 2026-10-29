@@ -768,6 +768,27 @@ class ModelUsage(Base):
     elapsed_ms: Mapped[int] = mapped_column(Integer, default=0)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
+    @property
+    def kind_label(self) -> str:
+        """用户端展示用的「模型类别」（如「正式对话模型」）。
+
+        为什么是 property 而不是一个真列
+        ------------------------------
+        类别是 ``usage`` 的**纯函数**（映射表在 ``model_catalog``）。存成列
+        等于把同一件事写两遍：改了映射表，老行还是旧文案；更糟的是新老行
+        混在一张表里，谁也说不清哪一行才是对的。property 保证**任何一行
+        取出来的类别都跟着当前映射表走**，零迁移。
+
+        为什么可以只写 property：``schemas.ORMBase`` 是
+        ``from_attributes=True``，pydantic 取值走 ``getattr`` —— 属性（property）
+        与真列一视同仁，所以 ``UsageRowOut.kind_label`` 直接就能拿到值，
+        不需要在 router / usage 层再 setattr 一遍（两套做法并存必然会漂移）。
+        """
+        from . import model_catalog  # 局部导入：models 几乎被每个模块 import，
+        # 而映射表只在**序列化一行时**才需要。放函数里既不给启动路径增加
+        # 依赖，也彻底避开将来 model_catalog 反过来 import models 时的循环。
+        return model_catalog.usage_kind_label(self.usage)
+
 
 class ReminderKeyword(Base):
     """服药/提醒关键词表，下发给设备做本地意图判定（命中则不占用陪聊配额）。"""

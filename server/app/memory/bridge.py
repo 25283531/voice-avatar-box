@@ -104,6 +104,7 @@ def remember_after_reply(
     prev_bot_text: str = "",
     signal: str = "",
     client: ModelClient | None = None,
+    device_id: int | None = None,
 ) -> None:
     """说话后：异步沉淀记忆 + 记录本轮反馈。
 
@@ -114,6 +115,11 @@ def remember_after_reply(
 
     ``db_factory`` 传 ``app.db.SessionLocal``：新线程必须有自己的会话，
     SQLAlchemy 的 Session 不是线程安全的。
+
+    ``device_id`` 是**用量记账归属**（记忆本身仍按 user_id + agent_id 组织）：
+    语音链路必须传 ``self.dev.id``，否则记忆抽取（light）与向量化（embed）
+    两条流水没有设备归属，家属在用户端一条都看不到。它会一路显式传到
+    ``extract_facts`` / ``embed`` —— 后台线程里 contextvars 不传播，只能这么传。
 
     传入 ``signal``（correction / retry / positive / negative）时会走人格演化；
     不传则只写事实记忆。**信号识别交给调用方**是有意的：语音链路最清楚
@@ -134,7 +140,8 @@ def remember_after_reply(
     # 2) 事实记忆：后台线程，不等它
     try:
         memorize_background(db_factory, user_id, agent_id, turns,
-                            session_id=session_id, client=client)
+                            session_id=session_id, client=client,
+                            device_id=device_id)
     except Exception as exc:  # noqa: BLE001
         log.warning("启动后台记忆写入失败：%s: %s", type(exc).__name__, exc)
 

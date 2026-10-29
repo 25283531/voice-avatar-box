@@ -138,6 +138,48 @@ USAGE_LABELS: Final[dict[str, str]] = {
     USAGE_VAD: "端点检测",
 }
 
+# ---------------------------------------------------------------- 用途 -> 模型类别（给用户看）
+# 为什么单独一张表，不复用上面的 USAGE_LABELS
+# ------------------------------------------
+# ``USAGE_LABELS`` 是**管理端**口径：管理员要看得出「chat 与 light 的区别
+# 是带不带工具」，所以文案里带括号解释。而这两个字串会**直接显示给家属**，
+# 「轻量任务（记忆抽取等，不带工具）」出现在老人子女的手机上就是天书。
+#
+# 用户端还多一条硬约束：**不显示具体模型名**（DeepSeek-V4-Flash / glm-4-flash
+# / BAAI-bge-large-zh 这些对家属没有意义，还会暴露平台采购细节）。所以用户端
+# 只显示「类别」这一层抽象，类别名必须自解释、不带厂商与技术术语。
+#
+# ⚠️ 这是**唯一真源**：``models.ModelUsage.kind_label``（property）与
+# ``schemas.UsageRowOut.kind_label`` 都从这里取，前端不许再抄一份映射
+# —— 抄一份的下场是加一个新 usage 时，管理端显示"正式对话"、用户端显示空白。
+USAGE_KIND_LABELS: Final[dict[str, str]] = {
+    USAGE_CHAT: "正式对话模型",
+    USAGE_LIGHT: "轻量任务模型",
+    USAGE_EMBED: "向量化模型",
+    USAGE_RERANK: "重排模型",
+    USAGE_VISION: "视觉模型",
+    USAGE_ASR: "语音识别",
+    USAGE_TTS: "语音合成",
+    USAGE_VAD: "端点检测",
+}
+
+#: 空 usage 的类别名。历史库里可能有 usage 为空串的行（早期记账没有 usage
+#: 参数），显示「其他」比显示一个空白单元格好 —— 空白会被当成渲染 bug。
+USAGE_KIND_UNKNOWN: Final = "其他"
+
+
+def usage_kind_label(usage: str) -> str:
+    """用途 -> 用户端可显示的「模型类别」。
+
+    未知 usage 原样返回：将来新增 usage 而忘了登记时，界面上会显示
+    ``foo`` 这种原始值 —— **能被发现**，而不是悄悄显示成「其他」再也
+    没人注意。空串返回「其他」（见 ``USAGE_KIND_UNKNOWN``）。
+    """
+    key = (usage or "").strip()
+    if not key:
+        return USAGE_KIND_UNKNOWN
+    return USAGE_KIND_LABELS.get(key, key)
+
 
 # ---------------------------------------------------------------- 厂商 API 风格
 # OpenAI 的 /chat/completions 已经是事实标准：DeepSeek、通义、智谱、豆包、

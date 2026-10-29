@@ -967,7 +967,10 @@ class _FakeClient:
             out.append({"content": s, "category": cat})
         return json.dumps(out, ensure_ascii=False)
 
-    def embed(self, texts):
+    def embed(self, texts, **kw):
+        # **kw 是记账上下文（device_id / user_id）。假客户端不记账，但必须
+        # 收下 —— 否则 service._embed 会走"老签名兜底"再调一次，embed_calls
+        # 翻倍，断言就变成了测兜底逻辑而不是被测逻辑。
         import math
         import re
         self.embed_calls += 1

@@ -1472,6 +1472,12 @@ class UsageSummaryOut(ORMBase):
     completion_tokens: int = 0
     total_tokens: int = 0
     by_usage: dict[str, int] = Field(default_factory=dict)
+    # 按用途分组的**调用次数**（by_usage 是 token 数，两者不是一回事）。
+    #
+    # 为什么必须单独一个字段：ASR / TTS 按次或按秒计费，**tokens 恒为 0**，
+    # 只有 by_usage 的话这两类在界面上永远显示 0 —— 家属会以为「语音识别
+    # 一次都没用过」，而实际上每轮对话都在用。次数才是这两类唯一有意义的口径。
+    by_usage_calls: dict[str, int] = Field(default_factory=dict)
     by_day: list[UsageDayOut] = Field(default_factory=list)
 
 
@@ -1488,6 +1494,13 @@ class UsageRowOut(ORMBase):
     created_at: datetime
     source: str = ""
     usage: str = ""
+    # 用户端展示的「模型类别」（「正式对话模型」「语音识别」…）。
+    #
+    # 从 ``models.ModelUsage.kind_label``（property）取，映射表在
+    # ``model_catalog.USAGE_KIND_LABELS``。这里**只给类别不给模型名**是有意的：
+    # 家属看得懂"正式对话模型"，看不懂 DeepSeek-V4-Flash；而 model 字段
+    # 仍然返回给管理端对账用（用户端前端不展示它即可）。
+    kind_label: str = ""
     device_id: int | None = None
     user_id: int | None = None
     provider_name: str = ""

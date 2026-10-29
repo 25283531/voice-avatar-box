@@ -11,7 +11,14 @@
        user_id / usage / since 过滤；
     E. 权限：普通用户访问管理端 403、未登录 401、非法时间参数 422；
     F. 响应契约：summary / rows 的键集合逐字锁定（多一个键就可能是
-       把正文或内部字段泄出来了）。
+       把正文或内部字段泄出来了）；
+    G. **模型类别 + 补齐的多模型记账**（2026-10-29）：
+       * 每条流水都带非空 ``kind_label``，chat 那条是「正式对话模型」；
+       * ``summary.by_usage_calls`` 的 chat 次数 == rows 里 chat 条数；
+       * 走**真实记忆链路**（``service.memorize`` → ``extract_facts`` /
+         ``embed``）触发一次 light + embed 后，库里多出对应的行，且
+         ``device_id`` 非空（否则用户端按设备过滤永远看不到）。
+       这一段用**假网关**（替掉 GatewayClient._mod），不连任何真实厂商。
 
 两个基础设施决策
 ----------------
@@ -284,6 +291,81 @@ def chat_and_record(ids: dict, device_id: int, user_id: int) -> object:
         db.close()
 
 
+# ================================================================ 假网关（G 段）
+class _FakeGateway:
+    """假 llm_gateway：只实现 GatewayClient 真正用到的那两个方法。
+
+    为什么要"换掉网关"而不是"换掉客户端"
+    ----------------------------------
+    **记账代码在 ``memory.client.GatewayClient`` 里**（它才知道网关最终落到
+    哪条配置、耗时多少）。换成假客户端就等于把被测的那一层整个替换掉，
+    断言会变成"假客户端不记账"—— 永远绿。
+    所以这里保留 GatewayClient，只把它背后的 ``_mod`` 换成假的：
+    记忆链路（memorize → extract_facts / embed → 记账）全部照真跑，
+    唯一的假是"没有真的发 HTTP 请求"。
+    """
+
+    def __init__(self, provider_pk: int) -> None:
+        self.provider_pk = provider_pk
+
+    def chat(self, db, usage, messages, **kw):
+        from app.llm_gateway import ChatResult
+
+        return ChatResult(
+            text='[{"content": "每天早上吃一片降压药", "category": "medicine"}]',
+            provider_pk=self.provider_pk, provider_name="假轻量上游",
+            kind="llm_light", model="fake-light-1", usage=usage,
+            elapsed_ms=7, prompt_tokens=40, completion_tokens=12,
+            total_tokens=52,
+        )
+
+    def embed(self, db, texts, *, usage="embed"):
+        from app.llm_gateway import VectorResult
+
+        n = len(texts or [])
+        return VectorResult(
+            vectors=[[0.5, 0.25, 0.125, 0.0625] for _ in range(n)],
+            provider_pk=self.provider_pk, provider_name="假向量上游",
+            kind="embedding", model="fake-embed-1", usage=usage,
+            dimensions=4, elapsed_ms=5,
+        )
+
+
+def memorize_with_fake_gateway(ids: dict) -> list[int]:
+    """走**真实记忆链路**触发一次 light（事实抽取）+ 一次 embed（向量化）。
+
+    只把网关换成假的，不连任何真实厂商。返回新写入的记忆 id。
+    """
+    from app.db import SessionLocal
+    from app.memory import service as memory_service
+    from app.memory.client import GatewayClient
+
+    client = GatewayClient()
+    client._mod = _FakeGateway(ids["provider_id"])   # 绕开懒加载的真实网关
+
+    db = SessionLocal()
+    try:
+        return memory_service.memorize(
+            db, ids["u1_id"], None,
+            [{"role": "user", "content": "我每天早上吃一片降压药"},
+             {"role": "assistant", "content": "好的，我记住了"}],
+            client=client,
+            device_id=ids["dev_u1"],       # ← 必须显式传，后台线程不传播 contextvar
+        )
+    finally:
+        db.close()
+
+
+def usage_rows_by(db_query: str, **params) -> int:
+    """直连 SQLite 数行数（断言"库里真的多了这几行"，不信接口自述）。"""
+    from sqlalchemy import text as _text
+
+    from app.db import SessionLocal
+
+    with SessionLocal() as db:
+        return int(db.execute(_text(db_query), params).scalar() or 0)
+
+
 def main() -> int:
     upstream, up_port = start_fake_upstream()
     print(f"[boot] fake upstream on 127.0.0.1:{up_port} (db: {DB_PATH})")
@@ -378,12 +460,16 @@ def main() -> int:
               s1.get("prompt_tokens") == FAKE_PROMPT_TOKENS
               and s1.get("completion_tokens") == FAKE_COMPLETION_TOKENS,
               f"{s1.get('prompt_tokens')}/{s1.get('completion_tokens')}")
-        check("u1 summary 键集合逐字锁定（7 个）",
+        check("u1 summary 键集合逐字锁定（8 个）",
               set(s1) == {"calls", "failed_calls", "prompt_tokens",
-                          "completion_tokens", "total_tokens", "by_usage", "by_day"},
+                          "completion_tokens", "total_tokens", "by_usage",
+                          "by_usage_calls", "by_day"},
               ",".join(sorted(s1)))
         check("u1 by_usage 按用途分解", s1.get("by_usage") == {"chat": 155},
               str(s1.get("by_usage")))
+        check("★ u1 by_usage_calls 按用途数**次数**（chat 1 次）",
+              s1.get("by_usage_calls") == {"chat": 1},
+              str(s1.get("by_usage_calls")))
         check("u1 by_day 一条且总数对（不断言日期串：UTC/本地日界会 flake）",
               len(s1.get("by_day") or []) == 1
               and s1["by_day"][0]["total_tokens"] == 155,
@@ -400,10 +486,11 @@ def main() -> int:
               f"code={code} total={s1x.get('total_tokens')}")
 
         code, rows1 = req("GET", "/api/usage/rows", token=u1)
-        row_keys = {"id", "created_at", "source", "usage", "device_id", "user_id",
+        row_keys = {"id", "created_at", "source", "usage", "kind_label",
+                    "device_id", "user_id",
                     "provider_name", "model", "prompt_tokens", "completion_tokens",
                     "total_tokens", "ok", "error", "elapsed_ms"}
-        check("u1 rows 有 1 条且键集合逐字锁定（14 个，无正文字段）",
+        check("u1 rows 有 1 条且键集合逐字锁定（15 个，无正文字段）",
               code == 200 and len(rows1) == 1
               and set(rows1[0]) == row_keys,
               f"code={code} n={len(rows1) if isinstance(rows1, list) else '?'}")
@@ -484,6 +571,67 @@ def main() -> int:
               code == 422, f"code={code}")
         code, _ = req("GET", "/api/usage/rows?limit=999", token=u1)
         check("limit 超上限 -> 422（Query ge/le 约束）", code == 422, f"code={code}")
+
+        # ---- G. 模型类别 + 补齐的多模型记账 ----
+        print("── G. 模型类别（kind_label）+ light / embed 记账 ──")
+        code, rows_k = req("GET", "/api/usage/rows", token=u1)
+        ok_list = isinstance(rows_k, list) and bool(rows_k)
+        check("G1 · /api/usage/rows 每条都有非空 kind_label",
+              code == 200 and ok_list and all(r.get("kind_label") for r in rows_k),
+              f"code={code} labels={[r.get('kind_label') for r in (rows_k or [])]}")
+        chat_row = next((r for r in (rows_k or []) if r.get("usage") == "chat"), None)
+        check("★ G1 · chat 那条的 kind_label == 「正式对话模型」",
+              bool(chat_row) and chat_row.get("kind_label") == "正式对话模型",
+              str(chat_row and chat_row.get("kind_label")))
+
+        code, s_k = req("GET", "/api/usage/summary", token=u1)
+        by_calls = (s_k or {}).get("by_usage_calls") or {}
+        n_chat_rows = sum(1 for r in (rows_k or []) if r.get("usage") == "chat")
+        check("★ G2 · by_usage_calls 的 chat 次数 == rows 里 chat 条数",
+              by_calls.get("chat") == n_chat_rows and n_chat_rows >= 1,
+              f"by_usage_calls={by_calls} rows_chat={n_chat_rows}")
+
+        # G3：走真实记忆链路触发 light（事实抽取）+ embed（向量化）。
+        #     device_id 是显式传的 —— 这正是「后台线程不传播 contextvar」
+        #     那个坑的回归网：漏传的话下面 device_id 非空的断言会红。
+        new_ids = memorize_with_fake_gateway(ids)
+        check("G3 · 记忆链路跑通（写入 ≥1 条事实）", len(new_ids) >= 1, str(new_ids))
+        n_light = usage_rows_by(
+            "SELECT COUNT(*) FROM model_usage WHERE source='memory'"
+            " AND usage='light' AND device_id = :d", d=ids["dev_u1"])
+        n_embed = usage_rows_by(
+            "SELECT COUNT(*) FROM model_usage WHERE source='memory'"
+            " AND usage='embed' AND device_id = :d", d=ids["dev_u1"])
+        check("★ G3 · 库里多出 light 行且 device_id 非空", n_light >= 1, f"{n_light} 行")
+        check("★ G3 · 库里多出 embed 行且 device_id 非空", n_embed >= 1, f"{n_embed} 行")
+        n_no_dev = usage_rows_by(
+            "SELECT COUNT(*) FROM model_usage WHERE source='memory'"
+            " AND device_id IS NULL")
+        check("G3 · 记忆侧没有「无设备归属」的行（漏传会记成 NULL）",
+              n_no_dev == 0, f"{n_no_dev} 行")
+
+        code, rows_g = req("GET", "/api/usage/rows", token=u1)
+        labels = {r.get("usage"): r.get("kind_label") for r in (rows_g or [])}
+        check("★ G4 · 用户端能看到 light / embed（带正确类别，不露模型名）",
+              code == 200 and labels.get("light") == "轻量任务模型"
+              and labels.get("embed") == "向量化模型",
+              f"code={code} labels={labels}")
+        light_row = next((r for r in (rows_g or []) if r.get("usage") == "light"), None)
+        check("G4 · light 行的 provider_name / model 来自网关返回对象",
+              bool(light_row) and light_row.get("provider_name") == "假轻量上游"
+              and light_row.get("model") == "fake-light-1"
+              and light_row.get("total_tokens") == 52,
+              f"{light_row and (light_row.get('provider_name'), light_row.get('model'), light_row.get('total_tokens'))}")
+
+        code, s_g = req("GET", "/api/usage/summary", token=u1)
+        by_calls_g = (s_g or {}).get("by_usage_calls") or {}
+        check("★ G5 · 补记后 by_usage_calls 里 light / embed 各 1 次",
+              by_calls_g.get("light") == 1 and by_calls_g.get("embed") == 1,
+              str(by_calls_g))
+        check("★ G5 · embed 的 tokens 是 0（向量化没有 token 口径），"
+              "次数照样记 1",
+              (s_g or {}).get("by_usage", {}).get("embed") == 0,
+              str((s_g or {}).get("by_usage")))
 
         passed = sum(1 for _, ok, _ in results if ok)
         total = len(results)

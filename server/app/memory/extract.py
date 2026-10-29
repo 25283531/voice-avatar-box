@@ -470,6 +470,8 @@ def extract_facts(
     client: ModelClient | None = None,
     known_entities: dict[str, str] | None = None,
     max_facts: int = MAX_FACTS_PER_TURN,
+    device_id: int | None = None,
+    user_id: int | None = None,
 ) -> list[Fact]:
     """从一轮对话里抽事实。**只抽不比对、只追加不修改**，且绝不抛异常。
 
@@ -478,6 +480,11 @@ def extract_facts(
     conversation  一轮对话，支持 Turn / dict / (role, content) / 纯字符串
     client        模型客户端；不传就用 ``get_default_client()``
     known_entities 已有实体词典，用于补全实体（查询时的实体路要靠它）
+    device_id / user_id
+                  用量记账的归属。**必须显式传**：本函数跑在
+                  ``memorize_background`` 的裸线程里，contextvars 不会
+                  传播过去；行上没有 device_id，用户端按设备过滤就永远
+                  看不到这条轻量模型的调用。
 
     返回
     ----
@@ -497,7 +504,8 @@ def extract_facts(
     # ⚠️ 这里吞掉一切异常是**有意为之**，理由见模块头部"健壮性要求"。
     # 记忆提取是"锦上添花"，它挂了绝不能连累正在进行的对话。
     try:
-        raw = cli.chat(USAGE_LIGHT, messages, temperature=0.0)
+        raw = cli.chat(USAGE_LIGHT, messages, temperature=0.0,
+                       device_id=device_id, user_id=user_id)
     except Exception as exc:  # noqa: BLE001
         log.warning("事实提取调用模型失败，本次不写入记忆：%s: %s",
                     type(exc).__name__, exc)

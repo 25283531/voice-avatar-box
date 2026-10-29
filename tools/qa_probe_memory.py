@@ -427,7 +427,9 @@ class _FakeClient:
             out.append({"content": s, "category": "other"})
         return json.dumps(out, ensure_ascii=False)
 
-    def embed(self, texts):
+    def embed(self, texts, **kw):
+        # **kw 是记账上下文（device_id / user_id），假客户端收下即可
+        # （不收会被 service._embed 当成"老签名"再调一次）。
         return [self._vec(t) for t in (texts or [])]
 
     @staticmethod
