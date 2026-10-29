@@ -419,6 +419,35 @@ def _edge_available() -> bool:
     return edge_available()
 
 
+@router.get("/voice-options")
+def voice_options(db: Session = Depends(get_db),
+                  user: models.User = Depends(get_current_user)):
+    """**用户端**改角色时那个音色下拉的数据源（登录即可，不要求管理员）。
+
+    为什么不能直接用 ``/catalog``
+    ----------------------------
+    ``/catalog`` 是给**管理端**的：它按厂商分组列出**全部四家**的音色，
+    因为管理员正在挑厂商、随时可能换。用户端完全不同 —— 用户改的是角色，
+    角色只有一个 ``tts_voice``，最终会被原样塞进**当前生效那一条** TTS 配置的
+    请求里。而音色 ID 不跨厂商通用（Edge 是 BCP-47 名、腾讯云是纯整数、
+    火山是 ``BV001_streaming``），列出生效厂商之外的音色等于给用户一个
+    **选了也不生效**的选项。
+
+    更糟的是失效是**静默**的：``asr_tts._shape_ok_voice`` 发现形态与目标厂商
+    不符时会置空（宁可让厂商用默认音色，也不能整句没声音）。生产上真实发生过：
+    生效的是腾讯云，角色里存的却是 ``zh-CN-XiaoxiaoNeural``，用户以为选了
+    「晓晓」，实际一直是厂商默认音色。
+
+    所以这个端点只回答一个问题：**现在能选哪些、默认是哪个**。
+    判据与回落逻辑全在 ``voice.catalog.options_for``（单一真源，
+    ``routers/roles._clamp_voice`` 读的是同一个函数 —— 分开写两份判据，
+    迟早出现「下拉里选得到、保存时被改掉」）。
+    """
+    from ..voice import catalog as voice_catalog
+
+    return voice_catalog.options_for(db)
+
+
 @router.get("/catalog/voice-preview")
 def voice_preview(voice: str, text: str = "您好，我是小智。",
                   user: models.User = Depends(get_current_user)):

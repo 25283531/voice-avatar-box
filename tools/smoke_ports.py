@@ -151,6 +151,9 @@ DEFAULT_PORTS: dict[str, int] = {
     # 见 smoke_geo.py 顶部注释），由 ELDER_GEO_API 指过去 —— 这样断言
     # **不依赖公网**，也不会因为真实服务抖动而假红。
     "smoke_geo": 8135,
+    # 用户端音色下拉：按**生效厂商**给清单 + 失效音色回落默认。
+    # 它会直连同一份库造 tts 配置行（含换厂商），故独占一个端口。
+    "smoke_voice_options": 8136,
 }
 
 

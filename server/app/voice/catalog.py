@@ -30,6 +30,35 @@ Edge TTS（微软）官方音色。它不需要自建服务、免费，
 失败，混在一起会让管理员误以为「从下拉框里选就能用」。
 
 选型依据与完整对比见 ``docs/免费语音服务商选型.md`` §2 / §5。
+
+为什么给**用户端**的清单必须按「当前生效的那一家」算
+--------------------------------------------------
+上面的 ``catalog_payload()`` 是给**管理端**的：管理员正在挑厂商，所以要看到
+全部四家的音色（``vendors_payload`` 按厂商分组）。用户端完全不同 —— 用户改的是
+**角色**，而角色只有一个 ``tts_voice`` 字段，它最终会被 ``pick_voice()`` 原样
+塞进**当前生效的那一条** TTS 配置的请求里。
+
+而音色 ID **不跨厂商通用**：
+
+* Edge 是 BCP-47 名（``zh-CN-XiaoxiaoNeural``）
+* 腾讯云是**纯整数**（``601009``）
+* 火山是 ``BV001_streaming`` 这种带后缀的串
+* 百炼是 ``Cherry`` 这种英文名
+
+跨厂商混用的后果**不是报错可见，而是静默失效**：``asr_tts._shape_ok_voice()``
+发现形态与目标厂商不符时会**置空**（宁可让厂商用自己的默认音色，也不能整句
+没声音）。于是用户在下拉框里选了「晓晓」，保存成功、页面显示「晓晓」，
+实际听到的却一直是厂商默认音色 —— 生产上真实发生过：生效的是腾讯云，
+角色里存的却是 ``zh-CN-XiaoxiaoNeural``，那个音色**从来没生效过**。
+
+所以用户端的音色下拉必须满足两条：
+  1. **只列出生效厂商的音色** —— 让用户选到的每一个都真的能生效；
+  2. **存的旧值若已不在清单里，就回落到该厂商默认** —— 换过厂商的存量数据
+     不该继续躺着一个永远不生效的值（回落要留日志，不能静默）。
+
+:func:`options_for` 就是这两条的单一真源，``GET /api/providers/voice-options``
+与 ``routers/roles._clamp_voice`` 都读它 —— 分开写两份判据，迟早出现
+「下拉里选得到、保存时被改掉」的自相矛盾。
 """
 
 from __future__ import annotations
@@ -350,4 +379,143 @@ def vendors_payload() -> dict:
         "vendors": [dict(v) for v in VENDOR_CATALOG],
         "voices_by_vendor": {v["value"]: list(v["voices"]) for v in VENDOR_CATALOG},
         "default_vendor": "edge",
+    }
+
+
+# ============================================================================
+# 用户端：**当前生效**厂商的音色选项
+# ============================================================================
+
+#: ``api_style`` -> 厂商值。只收**能唯一确定厂商**的三种。
+#:
+#: ⚠️ ``openai_compatible`` **刻意不在表内**：它是「自建 / 兼容网关」的通用风格，
+#: 阿里百炼也用它 —— 把它映射成某一家会把自建服务误判成百炼，进而给出一份
+#: 它根本不认的音色清单（比不给清单更坏）。百炼行靠 ``provider="aliyun"``
+#: 在 :func:`_vendor_of` 的第一步就命中，轮不到这张表。
+#:
+#: ⚠️ 也**不能**拿 ``asr_tts._tts_dispatch_style()`` 的返回值当厂商名：
+#: 它把 ``aliyun`` 归到 ``openai_compatible``（因为调用上确实是 OpenAI 兼容），
+#: 用它的返回值当 vendor key 会把百炼的身份丢掉。
+_STYLE_VENDORS: Final[dict[str, str]] = {
+    "edge": "edge",
+    "volcengine": "volcengine",
+    "tencent": "tencent",
+}
+
+#: 认不出厂商时（自建 / 兼容网关）给人看的说明。
+_CUSTOM_HINT: Final[str] = (
+    "当前部署的 TTS 是**自建服务或 OpenAI 兼容网关**，音色名由那家服务自己定义，"
+    "本平台无从预置 —— 请按该服务的文档手填音色名；留空则用它的默认音色。"
+)
+
+
+def _vendor_of(row) -> str | None:
+    """这条配置**实际会走**哪一家 TTS。认不出返回 ``None``（自建/兼容网关）。
+
+    判据顺序（与 ``asr_tts._tts_dispatch_style`` 保持一致，别换）：
+      1. ``provider`` 命中预置厂商 —— **必须排第一**。管理后台选厂商时会把
+         ``api_style`` 一并预填，若让 api_style 优先，火山/腾讯云行会被判成
+         别家（同一个坑在分发层已经踩过一次，见那里「判据优先级不能换」）。
+      2. ``api_style`` 是能唯一确定厂商的三种之一。
+      3. 都不认 -> ``None``。
+    """
+    provider = (getattr(row, "provider", "") or "").strip().lower()
+    entry = vendor_entry(provider)
+    if entry is not None:
+        return str(entry["value"])
+    style = (getattr(row, "api_style", "") or "").strip().lower()
+    return _STYLE_VENDORS.get(style)
+
+
+def _vendor_default_voice(vendor: str, voices: list[dict]) -> str:
+    """该厂商的**出厂默认**音色（调用方已保证 ``voices`` 非空）。
+
+    ⚠️ 优先用厂商实现模块自己声明的默认常量，**不是**简单取清单第一条：
+    腾讯云清单第一条是男声 ``601008``，而它的默认是女声 ``601009``
+    （``tts_tencent.DEFAULT_VOICE``，见那里的选型说明）。取第一条会让
+    「配置行没填音色」时下拉框的默认值与老人**实际听到的声音**不是同一个。
+    """
+    ids = {str(v.get("id") or "") for v in voices}
+    if vendor == "edge" and DEFAULT_PRESET_TTS_VOICE in ids:
+        return DEFAULT_PRESET_TTS_VOICE
+    if vendor == "tencent":
+        from .tts_tencent import DEFAULT_VOICE as tencent_default
+
+        if tencent_default in ids:
+            return tencent_default
+    return str(voices[0].get("id") or "")
+
+
+def options_for(db) -> dict:
+    """当前部署**实际生效**的 TTS 厂商 -> 该厂商可选音色 + 默认音色。
+
+    给用户端角色编辑用（``GET /api/providers/voice-options``）。返回体字段名
+    已被前端依赖，**不要改名**：
+
+    ``vendor`` / ``vendor_label`` / ``voices`` / ``default_voice`` /
+    ``allow_custom`` / ``custom_hint``
+
+    为什么按「生效厂商」而不是「全部厂商」
+    ------------------------------------
+    音色 ID 不跨厂商通用，而角色只有一个 ``tts_voice`` 字段，最终会被原样塞进
+    当前生效那条配置的请求里。列出生效厂商之外的音色，等于给用户一个
+    **选了也不生效**的选项 —— 而失效是静默的（``_shape_ok_voice`` 会置空），
+    用户完全看不出来。详见模块文档字符串「为什么给用户端的清单必须按当前生效的那一家算」。
+
+    ``default_voice`` 的三级回落（顺序不能换）
+    ----------------------------------------
+      ① 该配置行**自己**填的音色（``asr_tts._row_voice``，同时认 ``tts_voice``
+         列与 ``params.voice``）且确实在该厂商清单里 —— 管理员显式指定过就用它；
+      ② 否则该厂商的出厂默认（见 :func:`_vendor_default_voice`）；
+      ③ 自建/认不出厂商 -> ``""``（没有清单，也就没有「默认音色」这回事）。
+
+    第①级必须校验「在清单里」：配置行里可能躺着上一家厂商的音色名（换厂商时
+    不会自动清理），照抄它会把这个失效值当成默认值再传播给所有角色。
+
+    :return: 见上；``vendor`` 为空串表示自建/认不出，此时 ``voices`` 为 ``[]``、
+        ``allow_custom`` 为 True。
+    """
+    from ..llm_gateway import resolve_row      # 懒 import：避免循环依赖
+
+    row = resolve_row(db, "tts")
+    # 一条 tts 配置都没有：按 Edge 处理。理由 —— Edge 是零配置成本的那条路，
+    # 也是本项目历史上所有部署的默认技术栈；给空清单会让「还没配 TTS 的
+    # 新部署」的用户端下拉框彻底没东西可选，比给一份 Edge 清单更没用。
+    vendor = "edge" if row is None else _vendor_of(row)
+
+    if not vendor:
+        return {
+            "vendor": "",
+            "vendor_label": "自建 / OpenAI 兼容 TTS",
+            "voices": [],
+            "default_voice": "",
+            "allow_custom": True,
+            "custom_hint": _CUSTOM_HINT,
+        }
+
+    voices = voices_for_vendor(vendor)
+    entry = vendor_entry(vendor)
+    default_voice = ""
+
+    if row is not None:
+        from .asr_tts import _row_voice      # 只 import，不改它的逻辑
+
+        own = _row_voice(row)
+        if own and own in {str(v.get("id") or "") for v in voices}:
+            default_voice = own
+    if not default_voice:
+        default_voice = _vendor_default_voice(vendor, voices)
+
+    return {
+        "vendor": vendor,
+        "vendor_label": str((entry or {}).get("label") or vendor),
+        "voices": [dict(v) for v in voices],
+        "default_voice": default_voice,
+        "allow_custom": False,
+        "custom_hint": (
+            "当前生效的是「" + str((entry or {}).get("label") or vendor) + "」，"
+            "上面列出的就是它认的全部音色 —— 换成别的厂商的音色名会**静默失效**"
+            "（厂商回参数错误时整句没有声音，所以平台会退回它的默认音色）。"
+            "换厂商请先在「AI 接入」里改配置，再回来重选音色。"
+        ),
     }

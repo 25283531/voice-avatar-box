@@ -431,6 +431,50 @@ def get_role(role_pk: int, db: Session = Depends(get_db),
 
 
 # ================================================================ 写
+def _clamp_voice(db: Session, voice: str) -> str:
+    """把角色音色收敛到**当前生效 TTS 厂商**的清单里（写路径统一过这一道）。
+
+    为什么必须在**写**的时候收敛，而不是读的时候兜底
+    ----------------------------------------------
+    音色 ID 不跨厂商通用（Edge 是 ``zh-CN-XiaoxiaoNeural``、腾讯云是纯整数
+    ``601009``）。而角色只有一个 ``tts_voice``，最终会被原样塞进当前生效那条
+    TTS 配置的请求里。塞错了不会报错 —— ``asr_tts._shape_ok_voice`` 会**静默
+    置空**（宁可让厂商用自己的默认音色，也不能整句没声音）。
+
+    生产上真实发生过：生效的是腾讯云，角色里存的是 Edge 的音色名，
+    那个音色**从来没生效过**，而用户在页面上一直看到「晓晓」。
+    写时收敛让"存下来的值"与"实际生效的值"永远一致，用户不会看到假的选中态。
+
+    三种放行，其余一律回落（顺序即判据）
+    ----------------------------------
+      1. **空串原样返回** —— 它的语义是「继承形象 / 配置行」，不是无效值；
+      2. 自建 / 认不出厂商（``allow_custom``）—— 那家的音色名我们无从校验，
+         拦它等于让自建 TTS 彻底不可用；
+      3. 在该厂商清单里 —— 正常路径。
+
+    第 3 条之外的值回落到 ``default_voice`` 并留一条 warning：
+    **回落必须留痕**，否则「我明明选了音色」会变成没有线索的悬案。
+
+    :return: 可安全落库的音色（空串 / 原值 / 该厂商默认值）。
+    """
+    voice = voice or ""
+    if not voice.strip():
+        return voice
+    from ..voice import catalog as voice_catalog
+
+    opts = voice_catalog.options_for(db)
+    if opts.get("allow_custom"):
+        return voice
+    if voice.strip() in {str(v.get("id") or "") for v in (opts.get("voices") or [])}:
+        return voice
+    fallback = str(opts.get("default_voice") or "")
+    log.warning(
+        "角色音色 %r 不在当前 TTS 厂商 %s 的音色清单里，已回落到默认 %r"
+        "（各厂商音色 ID 不通用，留着它只会静默失效）",
+        voice, opts.get("vendor") or "自建", fallback)
+    return fallback
+
+
 @router.post("", response_model=RoleOut, status_code=status.HTTP_201_CREATED)
 def create_role(payload: RoleIn, db: Session = Depends(get_db),
                 user: models.User = Depends(get_current_user)):
@@ -463,7 +507,7 @@ def create_role(payload: RoleIn, db: Session = Depends(get_db),
         name=payload.name,
         description=payload.description,
         system_prompt=payload.system_prompt,
-        tts_voice=payload.tts_voice,
+        tts_voice=_clamp_voice(db, payload.tts_voice),
         avatar_id=payload.avatar_id,
         kind="",                      # 角色行的 kind 恒为空（不参与下发/导出）
         record_type=models.RECORD_TYPE_ROLE,
@@ -563,7 +607,7 @@ def update_role(role_pk: int, payload: RoleIn, db: Session = Depends(get_db),
         row.name = payload.name
     row.description = payload.description
     row.system_prompt = payload.system_prompt
-    row.tts_voice = payload.tts_voice
+    row.tts_voice = _clamp_voice(db, payload.tts_voice)
     row.avatar_id = payload.avatar_id
     if payload.traits:
         for name, value in payload.traits.items():
@@ -639,7 +683,9 @@ def restore_role(role_pk: int, payload: RoleRestoreIn, db: Session = Depends(get
 
     row.traits = {}                                  # 清空 overlay
     row.system_prompt = parent.system_prompt or ""  # 回到母版当前值
-    row.tts_voice = parent.tts_voice or ""
+    # 母版可能是**另一家厂商**的音色（换过 TTS 配置后不会自动清理），
+    # 照抄等于把失效值再传播一次，所以还原也要过归一化。
+    row.tts_voice = _clamp_voice(db, parent.tts_voice or "")
     row.description = parent.description or ""
     row.guardrails = guardrails.merge_stored(parent.guardrails)
     db.commit()
