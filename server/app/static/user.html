@@ -1413,7 +1413,16 @@ createApp({
     voiceLabel(id){
       if (!id) return '—';
       const hit = this.voiceOptions.filter(v => String(v.id) === String(id))[0];
-      return hit ? (hit.name || hit.id) : id;
+      if (hit) return hit.name || hit.id;
+      // 查不到 = 这个音色已经不在当前语音服务的清单里（后台换厂商/删音色）。
+      // 不能原样显示 ID —— 那看起来跟「正常选了一个音色」一模一样，
+      // 而实际上设备侧 _shape_ok_voice() 早把它置空了，老人听到的是默认音色。
+      // 「显示的值 ≠ 生效的值」是最难被发现的一类假象，必须显式标出来。
+      // 后端拿不到清单时（voiceOpts 为 null / allow_custom）不标 —— 那种情况下
+      // 手填音色名是正当用法，标「已失效」反而是误报。
+      const known = this.voiceOpts && !this.voiceOpts.allow_custom
+                 && (this.voiceOpts.voices || []).length > 0;
+      return known ? (id + '（已失效，将用默认音色）') : id;
     },
     // 把「已经不在清单里」的音色换回后台给的默认音色，返回是否发生了回落。
     //
