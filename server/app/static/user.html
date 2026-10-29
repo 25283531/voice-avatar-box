@@ -406,6 +406,19 @@
         <div class="modal">
           <button class="close" @click="rBox=null">&times;</button>
           <h2>{{rForm.id?'编辑提醒':'新增提醒'}}</h2>
+          <!-- 同步时延告知（2026-10-29 用户要求）。
+               为什么是 5 分钟：提醒由**设备本地**响，服务端新加的提醒要等设备
+               下次心跳才拿到，心跳周期 sync_interval_sec 默认 300 秒
+               （server/app/schemas.py）。写死成静态文案而不是按当前时间动态
+               判断 —— times_of_day 是**设备所在时区**的钟点，而浏览器在
+               家属所在时区，两边可能不同，动态判断会给出错误的红色警告。 -->
+          <div style="margin:10px 0 2px;padding:9px 12px;border-radius:8px;
+                      background:#fff7e6;border:1px solid #ffd591;
+                      color:#874d00;font-size:12px;line-height:1.7">
+            ⏱ <b>保存后最多需要 5 分钟才会同步到设备。</b>
+            提醒时间如果距离现在不足 5 分钟，这一次设备会<b>漏报</b>
+            —— 请把时间设在 5 分钟以后。
+          </div>
           <div class="grid g2">
             <div><label>标题</label><input v-model="rForm.title" style="width:100%" /></div>
             <div><label>类型</label>

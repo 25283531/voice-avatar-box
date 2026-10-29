@@ -128,6 +128,16 @@ onLoad((options: any) => {
 
 <template>
   <view class="page">
+    <!-- 同步时延告知（2026-10-29 用户要求）。
+         为什么是 5 分钟：提醒由**设备本地**响，服务端新加的提醒要等设备下次
+         心跳才拿到，心跳周期 sync_interval_sec 默认 300 秒（server/app/schemas.py）。
+         刻意写成**静态文案**、不按当前时间动态变红：times_of_day 是设备所在
+         时区的钟点，而手机在用户所在时区，两边可能不同，动态判断会误报。 -->
+    <view class="card notice">
+      <text class="notice-t">保存后最多需要 5 分钟才会同步到设备</text>
+      <text class="notice-s">提醒时间如果距离现在不足 5 分钟，这一次设备会漏报 —— 请把时间设在 5 分钟以后。</text>
+    </view>
+
     <view class="card">
       <text class="label">标题</text>
       <input v-model="form.title" class="input" placeholder="如：降压药" />
@@ -224,6 +234,9 @@ onLoad((options: any) => {
 .chip { padding: 10rpx 24rpx; margin: 8rpx 12rpx 0 0; border-radius: 28rpx; background: #f1f3f6; color: #6b7280; font-size: 26rpx; }
 .chip.on { background: #2563eb; color: #fff; }
 .tip { font-size: 22rpx; color: #8a8f99; margin-top: 12rpx; }
+.notice { background: #fff7e6; border: 1rpx solid #ffd591; }
+.notice-t { display: block; font-size: 26rpx; font-weight: 600; color: #874d00; }
+.notice-s { display: block; font-size: 22rpx; color: #ad6800; margin-top: 8rpx; line-height: 1.6; }
 .btn { background: #2563eb; color: #fff; border-radius: 12rpx; font-size: 30rpx; padding: 22rpx 0; }
 .save { margin-top: 12rpx; }
 </style>
