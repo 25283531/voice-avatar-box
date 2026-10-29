@@ -22,7 +22,8 @@ from sqlalchemy.orm import Session
 
 from .. import config, models
 from .client import ModelClient, get_default_client
-from .extract import Fact, as_turns, extract_facts
+from .extract import (Fact, as_turns, dedup_key_of, extract_facts,
+                      is_duplicate)
 from .persona import observe_reply
 from .retrieve import MemoryHit, search as _search
 from .store import NewFact, SqliteMemoryStore, invalidate
@@ -114,10 +115,30 @@ def memorize(
     if not facts:
         return []
 
-    # 3) 幂等去重：完全相同的句子不再写一条
-    #    （注意这不是 UPDATE —— 只是避免重复数据，矛盾的说法照旧并存）
-    existing = {fingerprint(r.content) for r in store.corpus(user_id, agent_id)}
-    fresh = [f for f in facts if fingerprint(f.content) not in existing]
+    # 3) 去重，两道：
+    #    ① 幂等：完全相同的句子不再写一条；
+    #    ② **跨轮同义**：同时间、同实体的用药/日程不再写一条。
+    #       老人会反复说同一件事（"明天早上八点吃鼻炎药"能说四遍，跨四个会话），
+    #       只靠 ① 挡不住 —— 句子不同但说的是同一件事，库里于是堆出四五条，
+    #       检索时同一条信息被放大，家属在记忆页看到一屏重复。
+    #       判据见 extract.dedup_key_of（保守：只对 medicine/schedule、
+    #       必须时间键完全相等、必须有共同实体，任一条不满足就不去重）。
+    #    ⚠️ 这不是 UPDATE：矛盾的、时间不同的说法照旧并存。
+    rows = store.corpus(user_id, agent_id)
+    existing = {fingerprint(r.content) for r in rows}
+    existing_keys = {k for k in (dedup_key_of(r.content, r.category, r.entities)
+                                 for r in rows) if k is not None}
+    fresh: list[Fact] = []
+    dup = 0
+    for f in facts:
+        if fingerprint(f.content) in existing:
+            dup += 1
+            continue
+        if is_duplicate(f, existing_keys):
+            dup += 1
+            log.info("记忆：与已有记忆同时间同实体，跳过：%r", f.content[:60])
+            continue
+        fresh.append(f)
     if not fresh:
         log.info("记忆：本轮 %d 条事实全部与已有记忆重复，未写入", len(facts))
         if commit:
@@ -164,7 +185,8 @@ def memorize(
         # 统一走 _commit：commit 之后必须让语料缓存失效，否则刚写入的记忆
         # 在 TTL 内召不回（详见 _commit 的注释）
         _commit(db, user_id, agent_id)
-    log.info("记忆：本轮写入 %d 条（抽取 %d 条，去重后 %d 条）", len(ids), len(facts), len(fresh))
+    log.info("记忆：本轮写入 %d 条（抽取 %d 条，重复丢弃 %d 条，去重后 %d 条）",
+             len(ids), len(facts), dup, len(fresh))
     return ids
 
 

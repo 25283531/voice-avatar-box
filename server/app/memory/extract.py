@@ -47,7 +47,7 @@ from typing import Any, Sequence
 
 from ..models import MemoryCategory
 from .client import USAGE_LIGHT, ModelClient, get_default_client
-from .textutil import entity_names, fingerprint
+from .textutil import entity_names, fingerprint, normalize
 
 log = logging.getLogger("elder.memory.extract")
 
@@ -81,14 +81,30 @@ _EXTRACT_SYSTEM = """你是一个**事实提取器**，服务于一位老年人�
 - 用户明确表达的好恶（爱听京剧、不吃香菜、讨厌被催）；
 - 已经发生的重要事件（上周摔了一跤、昨天女儿来看他）。
 
-什么不该抽：
-- 寒暄与礼貌用语（你好、谢谢、再见）；
-- 只在这一轮有用的临时信息（"现在几点"、"帮我放首歌"）；
-- 你的猜测和推断 —— 只抽对话里**明确说出来**的；
-- 重复的事实：同一条信息只输出一次。
+什么不该抽（这一节最容易出错，**逐条对照**）：
+- 寒暄与礼貌用语（你好、谢谢、再见、我知道了）；
+- **给机器人下的指令与操作**：调音量/调亮度/建提醒/删东西/放歌/查天气。
+  这些是"要做的事"，不是"关于老人的事实"。日程类只抽**老人自己的安排**
+  （"每周三去透析""每天早上八点吃降压药"），不抽"帮我定个八点的闹钟"；
+- **只发生一次的动作**："我喝完了""我起来了""我吃过了"。
+  例外：本身是健康或安全事件时要抽（摔了一跤、去了医院、忘了吃药）；
+- **纯时间或纯数字的碎片**："今天中午12:45""是今天中午十二点四十五"。
+  一条事实必须带上"做什么"，只有时间不构成事实；
+- **读不通的碎片**：语音识别有错字、句子残缺、前后不搭（如"31天要上晚都"）。
+  这种情况**宁可不抽**，绝对不要猜、不要替老人补全成一句看似合理的话；
+- 机器人自己说的话不算老人的事实（除非老人明确附和或确认）；
+- 重复的事实：同一条信息只输出一次；同一件事有多种说法时，只输出**最完整**那句。
 
 每条 fact 必须**独立可理解**，不要出现"他""这个""上次"这类依赖上下文的指代，
-要把指代替换成人名或事物名。"""
+要把指代替换成人名或事物名。
+
+⚠️ **必须改写成陈述句，不要照抄原话。**
+原话「提醒我12:45下楼」本身不是事实；若他确实需要长期记住这件事，
+改写成「老人 12:45 要下楼办事」才算。凡是以「我」「帮我」「提醒我」「把…」
+开头的**照抄**，一律不要输出 —— 服务端会把这类原话直接丢掉（见 _is_low_value）。
+
+每条 fact 必须是一句**通顺、有主谓、能独立看懂**的中文。写完自己读一遍：
+读着别扭、缺主语、像是半句话 —— 说明抽错了，删掉。"""
 
 _EXTRACT_USER = """对话内容：
 {conversation}
@@ -258,6 +274,196 @@ def _is_small_talk(fact: Fact) -> bool:
     return any(key == fingerprint(w) for w in _SMALL_TALK)
 
 
+# ================================================================ 低价值闸门
+#
+# 为什么提示词写了"不要抽"还要再来一道代码闸门
+# ------------------------------------------------
+# 2026-10-29 用户报「记忆是空的」，查库时顺带看到 21 条记忆里有 9 条是垃圾：
+#
+#     创建一个下午12点55分的提醒 / 提醒我12:45下楼 / 今天中午12:45
+#     是今天中午十二点四十五 / 声音调到30 / 屏幕调暗一点儿
+#     你的日常删除吧 / 31天要上晚都 / 我扔两天儿吧。我得。我的。
+#
+# 它们的共同点是**把老人原话照抄下来**，而不是写成"关于老人的事实"。
+# 提示词已经把「不要照抄」写进去了，但模型（尤其是小模型）在这件事上极不稳定，
+# 而记忆一旦写脏就再也洗不干净（ADD-only，只追加）。所以必须有一道
+# **不依赖模型听话**的闸门兜底 —— 与 voice/tools.py 的 `_is_placeholder_title`
+# 同一条设计：模型给的参数直接落库的工具，都要有服务端自己的合法性判据。
+#
+# 判据刻意保守：**只丢"明显不是事实"的**，可疑的一律放行。理由不对称 ——
+# 误丢一条真实记忆（老人说了却没记住）比多留一条废话（检索时被 BM25 压下去）
+# 代价大得多。
+_STOP_CHARS = frozenset(
+    # 虚词与系动词
+    "的了是在有和就都也还要把被给对向从与及或吧呢啊吗呀哦嗯很太最不没别"
+    # 方位/量词
+    "上下里外个些点儿"
+    # 时间单字（时间由 _TIME_WORDS 整体剥掉，剩下的单字时间词没有信息量）
+    "天晚早号月年日时秒分"
+    # 代词与指示
+    "我你他她它们这那哪个么什怎"
+)
+_TIME_WORDS = (
+    "今天", "明天", "昨天", "后天", "前天", "每天", "每月", "每周", "每年",
+    "今年", "去年", "明年", "明早", "明晚", "今早", "今晚", "昨早", "昨晚",
+    "早上", "上午", "中午", "下午", "晚上", "夜里", "凌晨", "半夜",
+    "星期", "礼拜", "周末", "点钟", "点半", "分钟", "小时", "现在", "刚才",
+)
+#: 主语样板：说"老人怎么怎么样"时的套话，不算实义字（但也不丢弃）。
+_BOILERPLATE = ("老人", "用户", "自己", "机器人", "对方")
+_DIGIT_RE = re.compile(r"[0-9]+")
+
+#: 命令式开头：这是"给机器人下指令"，不是关于老人的事实。
+_IMPERATIVE_RE = re.compile(
+    r"^(?:请|麻烦|帮我|给我|替我|帮忙|快|你|您)?"
+    r"(?:创建|新建|建一个|设一个|定一个|加一个|设置|设定|添加|增加|"
+    r"删|删除|删掉|去掉|取消|关掉|关闭|打开|开启|调|调整|调大|调小|"
+    r"放|播放|唱|暂停|停止|提醒我|提醒一下|叫我|喊我|查一下|查查|告诉我)"
+)
+#: 设备操作对象开头：模型把「声音调到30」重写成名词开头时，同样不是事实。
+_DEVICE_RE = re.compile(r"^(?:声音|音量|屏幕|亮度|灯光|彩灯|灯|麦克风|静音|字体)")
+#: 一次性完成态动作（"我喝完了""我起来了"）——不是长期事实。
+#: 只在**非**健康/事件分类时丢：摔了一跤、去了医院这类必须留。
+_DONE_ACTION_RE = re.compile(r"^(?:我|老人)?(?:已经|刚刚|刚才|刚)?[^，。；]{1,10}(?:了|啦)$")
+#: 片段切分（句读与空白）。用于识别 ASR 碎片。
+_SEG_SPLIT_RE = re.compile(r"[，。；！？、,.;!?\s]+")
+
+#: 时间表达：只做**抽取**不做解析。同一件事反复被说起时，时间说法几乎总一致，
+#: 拿来当去重键足够；解析成绝对时间会把"每周三"和"明天"这种区别弄丢。
+_TIME_TOKEN_RE = re.compile(
+    r"每天|每月|每周|每年|工作日|周末|今天|明天|昨天|后天|前天|明早|明晚|今早|今晚|"
+    r"早上|上午|中午|下午|晚上|夜里|凌晨|半夜|星期[一二三四五六日天]|"
+    r"[0-9一二两三四五六七八九十]{1,2}\s*点"
+    r"(?:\s*(?:半|[0-9一二两三四五六七八九十]{1,3}\s*分?))?"
+)
+#: 口语时间词先展开成标准写法，否则「明早八点」和「明天早上八点」会算成两件事。
+_TIME_ALIAS = (
+    ("明早", "明天早上"), ("明晚", "明天晚上"), ("今早", "今天早上"),
+    ("今晚", "今天晚上"), ("昨早", "昨天早上"), ("昨晚", "昨天晚上"),
+    ("明儿", "明天"), ("今儿", "今天"), ("昨儿", "昨天"),
+)
+#: 数字折叠：让「八点」和「8点」算同一个时间（只用于比较，不用于展示）。
+_CN_DIGIT = str.maketrans("零〇一二两三四五六七八九十", "0012234567899")
+
+
+def _expand_time(text: str) -> str:
+    s = text
+    for a, b in _TIME_ALIAS:
+        s = s.replace(a, b)
+    return s
+
+
+def _meaningful_chars(text: str) -> str:
+    """取出"实义字"：剥掉时间表达、主语样板、数字、虚词后剩下的字。
+
+    不做真正的分词（见 textutil 的设计原则：零新增依赖），只按字表筛。
+    对"这句话有没有信息量"这个判断来说足够了 —— 它不需要知道词边界。
+
+    ⚠️ 必须**先**用 ``_TIME_TOKEN_RE`` 整段剥掉时间表达，再逐字筛。
+    只按字表筛挡不住中文数字：「是今天中午十二点四十五」里的"十二""四十五"
+    既不是虚词也不是阿拉伯数字，会被当成 5 个实义字而放行 —— 而这正是
+    生产库里那条垃圾记忆（2026-10-29）。
+    """
+    s = normalize(text)
+    s = _TIME_TOKEN_RE.sub(" ", _expand_time(s))
+    for w in _BOILERPLATE + _TIME_WORDS:
+        s = s.replace(w, " ")
+    s = _DIGIT_RE.sub(" ", s)
+    return "".join(ch for ch in s if ch not in _STOP_CHARS and not ch.isspace())
+
+
+def _is_low_value(fact: Fact) -> bool:
+    """明显不是"关于老人的长期事实"的，丢掉。**可疑的一律放行**（见上面注释）。"""
+    text = (fact.content or "").strip()
+    if not text:
+        return True
+
+    # ① 给机器人下的指令 / 设备操作
+    if _IMPERATIVE_RE.match(text) or _DEVICE_RE.match(text):
+        return True
+    # 「你的日常删除吧」：第二人称开头 + 删除类动作 = 指令，不是事实
+    if text[0] in "你您" and re.search(r"删|取消|去掉|关", text):
+        return True
+
+    # ② 实义字太少（纯时间、纯数字、残句）
+    if len(_meaningful_chars(text)) < 3:
+        return True
+
+    # ③ ASR 碎片：被句读切出来的段落里有「一两个实义字」的
+    #    （"我扔两天儿吧。我得。我的。" -> "我得""我的"）
+    # 判据是「被切成三截以上、其中至少两截只有一两个字」：
+    # 只看"存在一小截"会误杀正常的多分句（"老人每天早上六点起床，晚上九点睡"，
+    # 后半截剥掉时间词就只剩一个"睡"字，但它是一句完整的话）。
+    segs = [s for s in _SEG_SPLIT_RE.split(text) if s]
+    tiny = sum(1 for s in segs if len(_meaningful_chars(s)) < 2)
+    if len(segs) >= 3 and tiny >= 2:
+        return True
+
+    # ④ 一次性完成态动作（"我已经喝完水了"）。
+    #    判据用 (用药, 事件) 而不是 MemoryCategory.IMPORTANT ——
+    #    IMPORTANT 含 schedule，而"我已经喝完水了"恰恰被模型标成 schedule。
+    if fact.category not in (MemoryCategory.MEDICINE, MemoryCategory.EVENT) \
+            and _DONE_ACTION_RE.match(text):
+        return True
+
+    return False
+
+
+# ---------------------------------------------------------------- 跨轮重复
+def _time_key(text: str) -> str:
+    """把句子里的时间表达抽出来做键（只抽取、不解析）。
+
+    解析成绝对时间会把"每周三"和"明天"这种区别弄丢；而"明早"和"明天早上"
+    必须先展开成同一种写法，否则同一件事的两种说法会算成两件。
+    """
+    norm = _expand_time(normalize(text))
+    toks = [t.replace(" ", "").translate(_CN_DIGIT)
+            for t in _TIME_TOKEN_RE.findall(norm)]
+    return "|".join(sorted(set(toks)))
+
+
+def dedup_key(fact: Fact) -> tuple[str, frozenset[str]] | None:
+    """跨轮去重的键：``(时间键, 实体集合)``。返回 None 表示**不参与**去重。
+
+    只对**用药与日程**两类生效 —— 这两类的重复最伤：同一条"明天早上八点吃鼻炎药"
+    被反复说起时，库里会堆出四五条几乎一样的记忆，检索时同一条信息被放大四五倍，
+    而家属在记忆页看到的就是一屏重复。
+
+    ⚠️ 三个"宁可漏"的保守处：
+      * 没有实体就返回 None（没有"这件事是什么"的锚点，比了也不可信）；
+      * 时间键必须**完全相等**（"每天早上八点"和"明天早上八点"是不同的安排，
+        绝不能合并）；
+      * 分类不在 IMPORTANT 里就返回 None（喜好/画像这类反复说很正常）。
+    """
+    return dedup_key_of(fact.content, fact.category, fact.entities)
+
+
+def dedup_key_of(content: str, category: str,
+                 entities: Sequence[str] | None) -> tuple[str, frozenset[str]] | None:
+    """同 :func:`dedup_key`，但直接吃原始字段。
+
+    单独开一个是因为 ``service.memorize`` 要拿**库里已有的记忆行**（不是 Fact）
+    来构造键集合 —— 让那边自己拼一份等价逻辑，早晚会和这里分叉。
+    """
+    if category not in MemoryCategory.IMPORTANT:
+        return None
+    ents = frozenset(e for e in (entities or ()) if e)
+    if not ents:
+        return None
+    return _time_key(content), ents
+
+
+def is_duplicate(fact: Fact, existing: set[tuple[str, frozenset[str]]]) -> bool:
+    """这条事实是否与已有记忆**同时间、同实体**。"""
+    key = dedup_key(fact)
+    if key is None:
+        return False
+    tkey, ents = key
+    if not tkey:
+        return False
+    return any(tkey == t and (ents & e) for t, e in existing)
+
+
 def extract_facts(
     conversation: Sequence[Any],
     *,
@@ -305,8 +511,13 @@ def extract_facts(
 
     out: list[Fact] = []
     seen: set[str] = set()
+    # 同一轮里模型自己吐两条同义事实（"明天八点吃药" / "明早八点要吃药"）也要挡：
+    # 跨轮去重在 service.memorize 里做（那里能查库），这里只管本轮。
+    seen_keys: set[tuple[str, frozenset[str]]] = set()
+    dropped = 0
     for f in facts:
-        if not f.is_valid() or _is_small_talk(f):
+        if not f.is_valid() or _is_small_talk(f) or _is_low_value(f):
+            dropped += 1
             continue
         key = fingerprint(f.content)
         if key in seen:
@@ -314,15 +525,24 @@ def extract_facts(
         seen.add(key)
         # 实体补全：LLM 漏给实体时，用规则补一遍。
         # 实体路的召回完全依赖这里，宁可多补也不要漏。
+        # ⚠️ 必须在去重键判定**之前**补 —— 否则 LLM 没给实体的那条
+        #    会被 dedup_key 判成"不参与去重"而漏掉。
         if not f.entities:
             f.entities = entity_names(f.content, known_entities)
         elif known_entities:
             for name in entity_names(f.content, known_entities):
                 if name not in f.entities:
                     f.entities.append(name)
+        if is_duplicate(f, seen_keys):
+            dropped += 1
+            continue
+        dk = dedup_key(f)
+        if dk is not None:
+            seen_keys.add(dk)
         out.append(f)
         if len(out) >= max_facts:
             break
 
-    log.info("事实提取：本轮 %d 句对话 -> %d 条事实", len(turns), len(out))
+    log.info("事实提取：本轮 %d 句对话 -> %d 条事实（低价值/重复丢弃 %d 条）",
+             len(turns), len(out), dropped)
     return out

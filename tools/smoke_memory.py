@@ -802,6 +802,83 @@ def main() -> int:
               sanitize_for_prompt(NORMAL) == NORMAL,
               repr(sanitize_for_prompt(NORMAL)))
 
+        # ============================================================ L
+        print("── L. 记忆质量闸门（2026-10-29 用户报「记忆质量差」）──")
+        # 生产库 21 条记忆里有 9 条是垃圾，共同点是**把老人原话照抄下来**：
+        #   「创建一个下午12点55分的提醒」「提醒我12:45下楼」「声音调到30」
+        #   「今天中午12:45」「是今天中午十二点四十五」「31天要上晚都」
+        #   「我扔两天儿吧。我得。我的。」「你的日常删除吧」「我已经喝完水了」
+        # 提示词已写了"不要照抄"，但小模型在这件事上极不稳定，所以还有一道
+        # 不依赖模型听话的闸门。这一节守的就是那道闸门。
+        #
+        # ⚠️ 判据的不对称性：**误丢一条真实记忆的代价，远大于多留一条废话**。
+        # 所以下面同时钉住"该丢的丢"和"不该丢的绝不丢"两侧，
+        # 只钉一侧的话，把阈值调到最严就能全绿 —— 那等于没测。
+        from app.memory.extract import (Fact, _is_low_value, _is_small_talk,
+                                        dedup_key_of)
+
+        def _dropped(text: str, cat: str = "other") -> bool:
+            f = Fact(content=text, category=cat)
+            return _is_small_talk(f) or _is_low_value(f)
+
+        JUNK = [
+            "创建一个下午12点55分的提醒", "提醒我12:45下楼", "今天中午12:45",
+            "是今天中午十二点四十五", "声音调到30", "屏幕调暗一点儿",
+            "你的日常删除吧", "31天要上晚都", "我扔两天儿吧。我得。我的。",
+            "我已经喝完水了", "我今天起的很早",
+        ]
+        kept_wrong = [t for t in JUNK if not _dropped(t, "schedule")]
+        check("闸门：照抄原话的垃圾一律丢掉（指令/纯时间/ASR 碎片/一次性动作）",
+              not kept_wrong, f"漏放={kept_wrong}")
+
+        GOOD = [
+            ("老人有糖尿病，每天要打胰岛素。", "medicine"),
+            ("老人对青霉素过敏。", "medicine"),
+            ("张阿姨是老人的邻居，住在对门。", "relationship"),
+            ("老人每周三上午去市医院做透析。", "schedule"),
+            ("老人爱吃软一点的饭，不吃香菜。", "preference"),
+            ("老人摔了一跤，膝盖有点肿。", "event"),
+            ("老人每天早上六点起床，晚上九点睡。", "schedule"),
+            ("老人吃苯磺酸氨氯地平片，一天一片。", "medicine"),
+            ("老人喜欢听京剧，尤其爱《贵妃醉酒》。", "preference"),
+            ("老人住幸福小区三号楼二单元。", "profile"),
+            # 改写过的偏好必须留：闸门针对的是"照抄指令"，不是"提到设备"
+            ("老人喜欢把屏幕调暗一点。", "preference"),
+        ]
+        lost = [t for t, c in GOOD if _dropped(t, c)]
+        check("闸门：真实事实一条都不许丢（含改写过的偏好）",
+              not lost, f"误杀={lost}")
+
+        # 跨轮去重：同一件事被反复说四遍（生产库里真的堆了 4 条）
+        dup_keys = {dedup_key_of(t, "medicine", ["鼻炎药"]) for t in (
+            "老人有鼻炎药，安排在明天早上八点服用。",
+            "老人明天早上八点需要服用鼻炎药。",
+            "老人明早八点需要吃鼻炎药。",
+            "老人明天早上8点需要服用鼻炎药。",
+        )}
+        check("去重：同一件事的四种说法归成同一个键（明早/明天早上、8点/八点）",
+              len(dup_keys) == 1, f"键={dup_keys}")
+        base = next(iter(dup_keys))
+        check("去重：频率不同（每天 vs 明天）绝不合并",
+              dedup_key_of("老人每天早上八点需要服用鼻炎药。", "schedule",
+                           ["鼻炎药"]) != base, "每天≠明天")
+        check("去重：同时间不同药绝不合并",
+              dedup_key_of("老人明天早上八点要吃降压药。", "medicine",
+                           ["降压药"]) != base, "降压药≠鼻炎药")
+
+        # 黑盒：假模型会把每句话照抄成一条事实，闸门必须在下游拦住
+        code, wq = req("POST", "/api/memory", {"turns": [
+            {"role": "user", "content": "今天中午12:45"},
+            {"role": "user", "content": "老人对青霉素过敏"},
+        ], "session_id": "quality-gate"}, token_a)
+        code, lst2 = req("GET", "/api/memory?limit=200", token=token_a)
+        texts = [m["content"] for m in (lst2 if isinstance(lst2, list) else [])]
+        check("黑盒：纯时间碎片没有落库",
+              not any("今天中午12:45" in t for t in texts),
+              f"命中={[t for t in texts if '今天中午' in t]}")
+        check("黑盒：同一轮里的真实事实照旧落库",
+              any("青霉素" in t for t in texts), f"共 {len(texts)} 条")
+
         # ============================================================ 汇总
         print()
         passed = sum(1 for _, ok, _ in results if ok)

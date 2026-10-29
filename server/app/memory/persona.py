@@ -323,11 +323,23 @@ def _get_profile(db, user_id: int, agent_id: int | None, create: bool = True):
     return row
 
 
+#: 口头禅候选里不许出现的字。中文口头禅是"短语"，不是"含虚词的片段"——
+#: 统计出来的"喝水的""是十二"就是没做这一步的产物（2026-10-29 家属端
+#: 语气画像里真的显示了这两个词）。
+_CATCH_STOP = frozenset("的了是在有我你他她它们这那和就也都不到一个吧呢啊呀嘛个把被给对向从与及或很太最不没")
+
+
 def _catchphrases(text: str) -> list[str]:
-    """从一句话里挑候选口头禅：出现 ≥2 次的 3~4 字片段。
+    """从一句话里挑候选口头禅：出现 ≥2 次、且**不含虚词**的 3~4 字片段。
 
     为什么是 3~4 字：2 字片段（"的时""我们"）噪声太大，
-    5 字以上又几乎不可能重复出现。
+    5 字以上又几乎不可能在一句话里重复出现。
+
+    为什么还要过滤虚词：n-gram 会把跨词边界的碎片也切出来 ——
+    "十二点四十五" 能切出 "是十二"（如果前面有个"是"），"喝水的" 能切出
+    "喝水的"。这些片段在语言学上根本不是短语，只是相邻两三个字的巧合，
+    攒够次数就进了画像，家属看到的是一串不知所云的东西。
+    判据很粗（含虚词就丢），但方向对：**宁可一个口头禅都不显示，也不要显示假的**。
     """
     norm = "".join(normalize(text).split())
     if len(norm) < 6:
@@ -336,7 +348,8 @@ def _catchphrases(text: str) -> list[str]:
     for size in (3, 4):
         for i in range(len(norm) - size + 1):
             counter[norm[i:i + size]] += 1
-    return [p for p, c in counter.items() if c >= 2]
+    return [p for p, c in counter.items()
+            if c >= 2 and not (set(p) & _CATCH_STOP)]
 
 
 def observe_reply(db, user_id: int, agent_id: int | None, bot_text: str,
@@ -401,7 +414,12 @@ def tone_profile(db, user_id: int, agent_id: int | None) -> dict[str, Any]:
         "humor_score": float(prof.humor_score or 0.0) if prof else 0.0,
         "address": (prof.address or "") if prof else "",
         "speed": (prof.speed or "normal") if prof else "normal",
-        "catchphrases": list((prof.catchphrases or {}).keys())[:8] if prof else [],
+        # 口头禅要**跨多轮**重复才算数：一次回复内部重复两遍多半是"好的好的"
+        # 这种口误，累计到 3 轮还在说才是习惯。低于门槛的一律不显示 ——
+        # 画像里写一句假口头禅，比空着更伤信任。
+        "catchphrases": [p for p, c in sorted(
+            (prof.catchphrases or {}).items(), key=lambda kv: -kv[1]
+        ) if int(c) >= 3][:8] if prof else [],
     }
     manual = dict(prof.manual or {}) if prof else {}
 
