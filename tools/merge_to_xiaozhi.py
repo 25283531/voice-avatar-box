@@ -474,6 +474,12 @@ def check() -> int:
     # 也是直接改上游的定制。
     standby_ok = MCP_SERVER_CC.is_file() and "elder_enter_standby" in MCP_SERVER_CC.read_text(encoding="utf-8")
     ok &= standby_ok
+    # 2026-10-29：提醒表变更后叫设备立刻同步（self.elder.sync_now）。同样是
+    # 直接改上游 mcp_server.cc 的定制 —— 上游同步会冲掉，冲掉的症状是
+    # "服务端发了 tools/call 但设备答 unknown tool"，而**周期心跳照样兜底**，
+    # 所以不守这条门禁的话，退化成 300 秒盲区不会有任何报错。
+    sync_now_ok = MCP_SERVER_CC.is_file() and "elder_sync_request_now" in MCP_SERVER_CC.read_text(encoding="utf-8")
+    ok &= sync_now_ok
     print("[merge] 合并状态:", "已合并" if ok else "未合并/不完整")
     print(f"  components/elder : {'OK' if ELDER_DST.is_dir() else 'MISSING'}")
     print(f"  main/CMakeLists  : {'OK' if MAIN_CMAKE.is_file() and BEGIN in MAIN_CMAKE.read_text(encoding='utf-8') else 'MISSING'}")
@@ -484,6 +490,7 @@ def check() -> int:
     print(f"  lcd_display.h 全屏提醒: {'OK' if remind_h_ok else 'MISSING（需求 8）'}")
     print(f"  lcd_display.cc 全屏提醒: {'OK' if remind_cc_ok else 'MISSING（需求 8）'}")
     print(f"  mcp_server.cc 待机工具: {'OK' if standby_ok else 'MISSING（需求 7）'}")
+    print(f"  mcp_server.cc 立刻同步工具: {'OK' if sync_now_ok else 'MISSING（2026-10-29 提醒盲区）'}")
     return 0 if ok else 2
 
 

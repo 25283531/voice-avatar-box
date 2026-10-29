@@ -25,6 +25,9 @@
 extern "C" int elder_confirm_pending_medicine(void);
 /* 需求 7：进入待机（关收音、重开唤醒词）。服务端在念完告别语后调它。 */
 extern "C" void elder_enter_standby(void);
+/* 2026-10-29：叫设备立刻同步一次（不等下一个心跳周期）。
+ * 提醒表在服务端变了之后由服务端调 —— 见下面 self.elder.sync_now 的注释。 */
+extern "C" esp_err_t elder_sync_request_now(void);
 // <<< END elder-companion overlay <<<
 
 McpServer::McpServer() {
@@ -175,6 +178,34 @@ void McpServer::AddCommonTools() {
         [](const PropertyList& properties) -> ReturnValue {
             (void)properties;
             elder_enter_standby();
+            return true;
+        });
+
+    /* 2026-10-29：叫设备**立刻**同步一次。
+     *
+     * 为什么需要（真机事故）：提醒由设备本地响（断网也能响，刻意设计），
+     * 但服务端新加的提醒要等设备**下次心跳**才拿到 —— 心跳周期由服务端
+     * 下发的 sync_interval_sec 决定，默认 300 秒。老人 12:43:41 说
+     * 「十二点四十五提醒我下楼」，12:45 到点只有 79 秒 ⇒ 即使参数全对，
+     * 设备手里也还没有这条提醒，必然漏。
+     *
+     * 固件早有现成钩子 elder_sync_request_now()（把同步任务从"等到超时"
+     * 改成"立刻醒一次"），但全仓没有任何外部调用者。服务端在提醒表变更
+     * 成功之后调这个工具即可，**精度到秒级**，且不像"把心跳调成 60 秒"
+     * 那样付出 5 倍的 TLS 握手代价（那个会拖累音频）。
+     *
+     * 描述刻意写窄：这是服务端内部用的，不该让模型在对话里随手调。
+     * 返回 true 只表示"叫醒信号已发出"，不代表同步已经成功 —— 同步结果
+     * 照旧走周期心跳与回执，别在这里等。 */
+    AddTool("self.elder.sync_now",
+        "Ask the device to run its reminder/config sync immediately instead of "
+        "waiting for the next heartbeat.\n"
+        "The server calls this right after the reminder list changes.\n"
+        "Do NOT call it on your own during a conversation.",
+        PropertyList(),
+        [](const PropertyList& properties) -> ReturnValue {
+            (void)properties;
+            (void)elder_sync_request_now();
             return true;
         });
     // <<< END elder-companion overlay <<<

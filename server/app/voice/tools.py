@@ -779,6 +779,47 @@ def _describe_reminder(r: models.Reminder) -> str:
     return "，".join(parts)
 
 
+#: 设备侧「立刻同步一次」的 MCP 工具名（固件 main/mcp_server.cc 注册）。
+_DEVICE_SYNC_TOOL = "self.elder.sync_now"
+#: 等它回包的上限。它只是往事件组里置一个位、立刻返回 true，
+#: 给 2 秒已经宽得离谱 —— 真超时说明设备卡死，不该拖住老人的对话。
+_DEVICE_SYNC_TIMEOUT = 2.0
+
+
+def _request_device_sync(device_call: Any) -> None:
+    """提醒表刚变了 ⇒ 叫设备**立刻**同步一次，别等下一个心跳周期。
+
+    为什么必须有（2026-10-29 真机事故的第二层原因）：提醒由**设备本地**响
+    （断网也能响，刻意设计），但服务端新加的提醒要等设备下次心跳才拿到，
+    心跳周期由服务端下发的 ``sync_interval_sec`` 决定，默认 300 秒。
+    老人 12:43:41 说「十二点四十五提醒我下楼」，12:45 到点只有 79 秒
+    ⇒ **即使参数全对，设备手里也还没有这条提醒，必然漏**。
+
+    固件早有现成钩子 ``elder_sync_request_now()``，但全仓没有任何外部
+    调用者 —— 缺的就是这一下。它不像"把心跳调成 60 秒"那样要付 5 倍 TLS
+    握手代价（那会拖累音频），只在真的改了提醒表时才叫一次。
+
+    **失败一律静默**：设备离线 / 老固件没注册这个工具时，周期心跳照旧
+    兜底。绝不能因为这个"锦上添花"的动作把"提醒建成了"变成"提醒建失败了"
+    —— 调用方拿到的结果字典一个字都不改。
+    """
+    if device_call is None:
+        return
+    try:
+        device_call(_DEVICE_SYNC_TOOL, {}, _DEVICE_SYNC_TIMEOUT)
+        log.info("提醒表已变，已叫设备立刻同步（不必等下一个心跳）")
+    except Exception as exc:  # noqa: BLE001  设备离线 / 老固件无此工具
+        log.info("叫设备立刻同步没成功（%s: %s），等下一个心跳周期兜底",
+                 type(exc).__name__, exc)
+
+
+def _after_change(out: dict[str, Any], device_call: Any) -> dict[str, Any]:
+    """提醒表变更的收尾：**成功才**叫设备立刻同步，结果字典原样返回。"""
+    if out.get("ok"):
+        _request_device_sync(device_call)
+    return out
+
+
 def execute_tool(db: Any, device_pk: int, name: str,
                  arguments: str | dict[str, Any],
                  device_call: Any = None) -> dict[str, Any]:
@@ -804,13 +845,16 @@ def execute_tool(db: Any, device_pk: int, name: str,
 
     try:
         if name == "create_reminder":
-            return _create_reminder(db, device_pk, args)
+            return _after_change(_create_reminder(db, device_pk, args),
+                                 device_call)
         if name == "list_reminders":
             return _list_reminders(db, device_pk)
         if name == "delete_reminder":
-            return _delete_reminder(db, device_pk, args)
+            return _after_change(_delete_reminder(db, device_pk, args),
+                                 device_call)
         if name == "toggle_reminder":
-            return _toggle_reminder(db, device_pk, args)
+            return _after_change(_toggle_reminder(db, device_pk, args),
+                                 device_call)
         if name == "confirm_reminder":
             return _confirm_reminder(db, device_pk, device_call)
         if name == "get_weather":

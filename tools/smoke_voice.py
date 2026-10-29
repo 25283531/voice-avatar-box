@@ -160,6 +160,11 @@ FAKE_LOCAL_ASR_TEXT = "本地识别，明天早上八点提醒我吃药"
 FAKE_REPLY = "好的，明天早上八点我提醒您吃药。您也要记得多喝水。我陪您聊聊。"
 FAKE_TOTAL_TOKENS = 155
 
+#: 服务端通过 ``{"type":"mcp"}`` 下发给「设备」的 tools/call 名字，按序累积。
+#: 只有 ``_one_turn`` 里的假设备会记 —— 真设备也是收到就执行。
+#: 用来断言「提醒表变了 ⇒ 叫设备立刻同步」这条链路真的通（2026-10-29）。
+MCP_CALLS: list[str] = []
+
 # 假 TTS 的说话速度控制：默认每句 sleep 这么久才返回。
 # 第 7 条（打断）要把它调大，才能在播报中插进 abort。
 TTS_SENTENCE_DELAY_SEC = 0.0
@@ -1198,6 +1203,21 @@ async def _one_turn(ws, sid: str, *, frames: int = 6, wait: float = 30.0):
             events.append(("bin", len(msg)))
             continue
         obj = json.loads(msg)
+        # ---- 服务端下发的设备 MCP 调用（tools/call）----
+        # 真固件是收到就同步执行、立刻回包。假设备必须也回 —— 不回的话
+        # 服务端要等满超时（_DEVICE_SYNC_TIMEOUT），每条建提醒都白等 2 秒，
+        # 而且服务端日志里只剩一串"叫设备立刻同步没成功"，看不出是测试假象。
+        if obj.get("type") == "mcp":
+            _pl = obj.get("payload")
+            if isinstance(_pl, dict) and _pl.get("method") == "tools/call":
+                MCP_CALLS.append(str((_pl.get("params") or {}).get("name") or ""))
+                await ws.send(json.dumps({
+                    "type": "mcp",
+                    "payload": {"jsonrpc": "2.0", "id": _pl.get("id"),
+                                "result": {"content": [{"type": "text",
+                                                        "text": "true"}],
+                                           "isError": False}}}))
+                continue
         events.append(("json", str(obj.get("type")), str(obj.get("state")),
                        str(obj.get("text") or "")))
         if obj.get("type") == "tts" and obj.get("state") == "sentence_start":
@@ -1781,6 +1801,7 @@ async def t_tools_reminder(ids: dict) -> None:
     tomorrow = _tomorrow()
     before = _reminders(ids["device_pk"])
     chat_before = UP.get("chat_calls")
+    mcp_before = len(MCP_CALLS)
     UP.asr_text = "小暖小暖，明天早上八点提醒我吃药"
     UP.plan = [
         {"tool": {"name": "create_reminder",
@@ -1810,6 +1831,11 @@ async def t_tools_reminder(ids: dict) -> None:
     check("12a · 两轮 LLM（工具轮 + 口语确认轮）",
           UP.get("chat_calls") == chat_before + 2,
           f"{chat_before} -> {UP.get('chat_calls')}")
+    # 2026-10-29：提醒表变了必须**立刻**叫设备同步一次。不叫的话新提醒要等
+    # 设备下一个心跳（默认 300 秒）才拿到 —— 老人说"两分钟后提醒我"就必然漏。
+    check("12a ★ 提醒建成后叫设备立刻同步（self.elder.sync_now）",
+          "self.elder.sync_now" in MCP_CALLS[mcp_before:],
+          str(MCP_CALLS[mcp_before:]))
     check("12a · 回复是把时间念清楚的确认句",
           any("八点" in s for s in sentences), str(sentences))
     meta = _last_interaction_meta(ids["device_pk"])
