@@ -29,6 +29,9 @@ on:
       # 主机单测（host-test job）的用例文件：改它必须也跑一遍，
       # 否则"改了测试却没人跑"是比没有测试更糟的状态。
       - 'tools/test_rmd_sched.c'
+      # 固件静态闸门（fw-static job）：改断言本身也要跑一遍，
+      # 否则它可能早就跟代码脱节、却一直显示绿的。
+      - 'tools/smoke_wifi_trial.py'
       - '.github/workflows/firmware-build.yml'
   workflow_dispatch:
     inputs:
@@ -89,6 +92,34 @@ jobs:
             exit 1
           fi
           echo "OK：无 ESP-IDF 依赖"
+
+  # 固件「远程改 WiFi」的静态闸门（2026-10-31）。
+  #
+  # 为什么单独一个 job、且跑在编译之前：它守的三条不变量（验证之前不改配置、
+  # 试连只连目标、判据是实际关联的 AP）**没有任何运行时表现**能被冒烟脚本看到
+  # —— 违反了照样能联网、照样回报成功，只是失败时无法回滚，现场后果是
+  # 「老人家里设备失联、必须上门」。这类缺陷只能静态判。
+  # 放在 build 之前是因为它几毫秒就跑完，比等 8 分钟编译拿到同一句话有用得多。
+  fw-static:
+    name: 固件静态闸门（改 WiFi 安全不变量）
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 准备 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      # 断言按**代码位**判（先剥注释、按函数体切分），不做整文件子串匹配。
+      # 每条断言都附过「改坏 -> 变红」的证明，见 tools/smoke_wifi_trial.py 头注释。
+      - name: 改 WiFi 安全不变量（9 条）
+        run: python tools/smoke_wifi_trial.py
+
+      # 花括号配平：多/少一个 `}` 是编译期才发现的最贵错误，本地也跑同一条命令。
+      - name: 花括号配平自检
+        run: python tools/check_c_braces.py
 
   build:
     name: 编译 ESP32-S3 固件

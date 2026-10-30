@@ -317,10 +317,15 @@ _WIFI_OFFLINE_DETAIL = "设备当前不在线，等它连上网再改 WiFi"
 #: 状态 -> 给家属看的一句话。**由服务端派生**，不落库、不用设备回报的 reason：
 #: 固件的 reason 是内部错误码/英文，直接显示给家属毫无意义（见
 #: device_api.report_wifi_result 里"reason 只进日志"的说明）。
+#:
+#: `delivered` 的措辞 2026-10-31 改过：固件现在会先播报「1 分钟内切换、切换
+#: 过程中无法对话」，等满 60 秒才动网络（用户要求，见 wifi_change.cc 的
+#: ELDER_WIFI_ANNOUNCE_MS）。原文案「正在尝试连接」会让家属以为已经开始了，
+#: 实际设备还在正常联网 —— 说清楚"还没开始、稍后会短暂断一下"更准确。
 _WIFI_MESSAGES: Final = {
     "": "",
     "pending": "已提交，等待设备连接新 WiFi",
-    "delivered": "设备已收到，正在尝试连接新 WiFi",
+    "delivered": "设备已收到，将在 1 分钟内开始切换（期间无法对话）",
     "applied": "已切换到新 WiFi",
     "rolled_back": "设备连不上新 WiFi，已自动恢复原来的网络",
     "failed": "设备连接新 WiFi 失败，请重新设置",

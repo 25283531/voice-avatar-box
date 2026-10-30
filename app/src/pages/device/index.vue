@@ -303,11 +303,16 @@ async function onSubmitWifi() {
 }
 
 /** 状态 → 给家属看的一句话。服务端已按 state 派生 message，这里只补服务端
- *  不可能知道的「大概要等多久」，因为那是 APP 侧才知道的心跳节奏。 */
+ *  不可能知道的「大概要等多久」，因为那是 APP 侧才知道的心跳节奏。
+ *
+ *  delivered 的措辞 2026-10-31 改过：固件收到指令后**先播报 1 分钟预告**
+ *  才动网络（用户要求「提示用户设备即将在 1 分钟内进行 WiFi 切换」），
+ *  所以这一刻设备还在正常联网、对话也还通。写「正在切换」会让家属以为
+ *  已经断了，实际还要等 60 秒 + 最多 30 秒试连 —— 说清顺序更不容易误判。 */
 function wifiStateHint(s: DeviceWifiState | null) {
   if (!s || !s.state) return ''
   if (s.state === 'pending') return '设备最长要 5 分钟才会来取这条指令'
-  if (s.state === 'delivered') return '设备正在切换，会短暂断网，请不要关电源'
+  if (s.state === 'delivered') return '设备已收到：先播报 1 分钟预告，再切换（切换时无法对话）'
   return ''
 }
 

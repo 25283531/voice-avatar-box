@@ -38,16 +38,20 @@ idf_component_register(
         # 漏了它 net.c 直接 fatal error: esp_crt_bundle.h: No such file。
         mbedtls
         json
-    # wifi_change.cc 用到的头文件在下面两个组件里，**必须显式声明**：
+    # wifi_change.cc 用到的头文件在下面几个组件里，**必须显式声明**：
     #   * esp_wifi / esp_netif —— wifi_station.h 直接 include esp_wifi_types_generic.h
     #     和 esp_netif.h，漏了就是 fatal error: No such file；
+    #   * esp_event —— 2026-10-31 起 wifi_change.cc 自己挂 WIFI_EVENT/IP_EVENT
+    #     处理器做"只连目标"的试连（不再借道 WifiStation），要用
+    #     esp_event_handler_instance_register；
     #   * 78__esp-wifi-connect —— ssid_manager.h / wifi_station.h 所在组件，
     #     名字就是 managed_components 下的目录名（namespace__name，见 build.ninja
     #     里的 ___idf_78__esp-wifi-connect）。
-    # 用 PRIV_REQUIRES：这两个头文件只在本组件内部用，不该传染给依赖 elder 的 main。
+    # 用 PRIV_REQUIRES：这些头文件只在本组件内部用，不该传染给依赖 elder 的 main。
     PRIV_REQUIRES
         esp_wifi
         esp_netif
+        esp_event
         78__esp-wifi-connect
 )
 
