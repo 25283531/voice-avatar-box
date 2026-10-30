@@ -16,6 +16,8 @@
  *   T13 语音确认（MCP 工具）—— 落 DONE、记 VOICE 来源、此后不得再报漏服
  *   T14 晚开机 50 分钟 —— 要补响，但不得一响就判漏服（15 分钟从响铃起算）
  *   T15 确认选中正在响铃的那条 —— 喝水响了，说「弄好了」别记到吃药上
+ *   T19 后端把提醒全删光（下发空数组）—— 表清空、重启后不得复活
+ *       （对应 sync.c 里 ``count > 0`` 那条短路，2026-10-30「删了还每天响」）
  *
  * 全程**没有任何网络调用**：这正是要验证的场景。
  */
@@ -1872,6 +1874,73 @@ static void test_screen_reconcile_after_sync(void)
     elder_ui_hide_reminder();   /* 别把状态漏给后面的用例 */
 }
 
+/* =================================================================== */
+/* T19：服务端把提醒**全删光**（下发空表）—— 清空且重启后不得复活        */
+/* =================================================================== */
+static void test_replace_all_empty_clears_table(void)
+{
+    printf("\n[T19] 后端把提醒全删光（下发空数组）⇒ 表清空、重启后不复活\n");
+    stub_nvs_init();
+    stub_time_set(1772665200L);      /* 07:00，可信时钟 */
+    rec_reset();
+    elder_reminder_init(rec_cb, NULL);
+
+    /* 前置：老人**只有**服务端下发的两条，本地一条都没建。
+     * 这个形态是 T2 的反面 —— T2 测"清空时别把本地自建的删了"，
+     * 这里测"清空时真的把服务端的删了"。两个方向必须都断言，
+     * 只测一边就会把修复做偏（要么删不掉，要么误删本地）。 */
+    elder_rmd_item_t srv[2];
+    srv[0] = mk_med(8, 0, "降压药", 301);
+    srv[1] = mk_med(20, 0, "钙片", 302);
+    check("前置：服务端下发 2 条",
+          elder_reminder_replace_all(srv, NULL, 2) == ESP_OK && tbl()->count == 2,
+          det("%s", dump_tbl(tbl())));
+
+    /* 08:00 响过一次，让表里带上运行态（PENDING）—— 清空必须连它一起清 */
+    stub_time_advance(3600);
+    rec_reset();
+    elder_reminder_tick_once();
+    check("前置：08:00 已进入 PENDING",
+          elder_reminder_first_ringing() == 0,
+          det("first_ringing=%d，%s", elder_reminder_first_ringing(), dump_tbl(tbl())));
+
+    /* 家属在 APP 里把两条都删了 ⇒ 服务端下发空数组 ⇒ replace_all(…, 0)。
+     * 这正是 sync.c 里 ``count == 0`` 那条路径：修好之前它被短路掉，
+     * 表原封不动，于是老人每天照旧被叫去吃一份已经被取消的药。 */
+    check("后端下发空表（提醒被全部删除）",
+          elder_reminder_replace_all(NULL, NULL, 0) == ESP_OK, NULL);
+    const elder_rmd_table_t *t = tbl();
+    check("★表被真的清空了（count == 0）", t && t->count == 0,
+          det("实际 count=%u —— 不为 0 就是「删了还在响」",
+              t ? t->count : 0));
+    check("★运行态跟着清掉（没有残留的待确认项）",
+          elder_reminder_first_ringing() == -1,
+          det("first_ringing=%d（应为 -1，否则老人还在被催确认一条不存在的药）",
+              elder_reminder_first_ringing()));
+    check("★done/fired 位图也归零（不能指向已不存在的条目）",
+          t && t->done_today == 0 && t->fired_today == 0,
+          det("done=0x%04x fired=0x%04x", t ? t->done_today : 0xFFFF,
+              t ? t->fired_today : 0xFFFF));
+
+    /* ---- 重启：空表必须**已经落盘** ----
+     * 不清盘的话，重启后 init() 会把 NVS 里的旧表读回来，被删掉的提醒
+     * 原地复活 —— 用户看到的就是"删了还在响，重启也没用"。 */
+    rec_reset();
+    elder_reminder_init(rec_cb, NULL);
+    t = tbl();
+    check("★重启后仍是 0 条（删掉的提醒不得从 NVS 复活）", t && t->count == 0,
+          det("实际 count=%u", t ? t->count : 0));
+
+    /* 再走一整天：一条都不许响 */
+    rec_reset();
+    stub_time_advance(24 * 3600);
+    elder_reminder_tick_once();
+    check("★清空后第二天不得再响（PENDING 次数为 0）",
+          saw(0, ELDER_RMD_PENDING) == 0,
+          det("又响了 %d 次 —— 这就是用户实报的「删了还每天响」",
+              saw(0, ELDER_RMD_PENDING)));
+}
+
 static void test_content_fallback_claims_once(void)
 {
     printf("\n[T19] 内容兜底必须「一条旧记录只被认领一次」（防替老人谎报服药）\n");
@@ -2043,6 +2112,7 @@ int main(void)
     test_late_boot_no_instant_escalate();
     test_replace_all_server_id_change();
     test_screen_reconcile_after_sync();
+    test_replace_all_empty_clears_table();
     test_content_fallback_claims_once();
     test_first_ringing_picks_ringing();
 

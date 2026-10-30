@@ -1162,11 +1162,33 @@ static esp_err_t do_sync(void)
                  (unsigned)sizeof(*rb));
     } else {
         memset(rb->when, 0, sizeof(rb->when));
-        parse_reminders(cJSON_GetObjectItem(root, "reminders"), rb->items, rb->when, &count);
-        if (count > 0) {
+        /* 「服务端说没有」与「这轮响应不完整」必须分开判 —— 判据是
+         * **键是否存在、类型对不对**，而不是「解析出几条」。
+         *
+         * 2026-10-30 用户实报：家属在 APP 里把老人唯一的一条提醒删了，
+         * 设备**照旧每天响**，重启、断电、重新联网都不消失。根因就是这里
+         * 原来的 ``count > 0`` 短路：服务端下发的是"只含启用规则"的列表，
+         * 删光之后就是空数组 ⇒ count == 0 ⇒ 走 else 保留本地旧表 ⇒ 旧规则
+         * 永远活着；而每次心跳都走同一条短路，于是它"永远响下去"。
+         *
+         * 那个短路的**意图是对的**（防响应不完整把本地表清空），错的是判据：
+         * 「解析出 0 条」既可能是"服务端真的没有"，也可能是"这轮响应残缺"，
+         * 把两件事混成了一个条件。现在改成：
+         *   * reminders 是**数组**（含空数组）→ 整表替换，count 允许为 0；
+         *   * 不是数组（字段缺失/类型不对）→ 不动本地表。
+         * 原短路要防的那种情况由 cJSON_IsArray 接住 —— JSON 解析失败在上面
+         * 已经 return，走到这里说明响应本身是合法的。
+         *
+         * replace_all(…, 0) 只清掉服务端条目，老人自己在设备上建的
+         * （server_id == 0，服务端没有副本）会被原样保留，见 reminder.c 的
+         * keep[] 逻辑；这里不需要额外判空。 */
+        cJSON *jrem = cJSON_GetObjectItem(root, "reminders");
+        if (cJSON_IsArray(jrem)) {
+            parse_reminders(jrem, rb->items, rb->when, &count);
             elder_reminder_replace_all(rb->items, rb->when, count);
         } else {
-            ESP_LOGI(TAG, "后端没有启用中的提醒规则，保留本地表兜底");
+            ESP_LOGW(TAG, "响应里没有 reminders 数组（老服务端或字段缺失），"
+                          "本轮不动本地提醒表");
         }
         heap_caps_free(rb);
     }
