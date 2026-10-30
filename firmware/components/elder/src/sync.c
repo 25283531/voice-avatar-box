@@ -604,6 +604,14 @@ static void parse_reminders(cJSON *root, elder_rmd_item_t *out,
                             elder_rmd_when_t *when_out, uint8_t *out_count)
 {
     uint8_t n = 0;
+    /* 服务端这次**想要**下发多少条（把每条规则的 times_of_day 展开之后）。
+     *
+     * 为什么必须数它：``out[]`` 只有 ``ELDER_REMINDER_MAX`` 个位置，超出的
+     * 以前是**静默丢弃** —— 用户在 APP 上明明配了第 17 条提醒，设备上永远
+     * 不响，串口也没有任何一行日志说"我丢了几条"。这类"配置成功但不生效"
+     * 的故障，事后只能靠猜。2026-10-30 起改成：照旧丢弃（数组定长是硬约束，
+     * 见 elder_reminder.h 的 static assert），但**明确打出丢了几条**。 */
+    int wanted = 0;
     if (!cJSON_IsArray(root)) return;
 
     cJSON *r = NULL;
@@ -682,10 +690,15 @@ static void parse_reminders(cJSON *root, elder_rmd_item_t *out,
         if (cJSON_IsArray(jtimes) && cJSON_GetArraySize(jtimes) > 0) {
             cJSON *t = NULL;
             cJSON_ArrayForEach(t, jtimes) {
-                if (n >= ELDER_REMINDER_MAX) break;
                 if (!cJSON_IsString(t)) continue;
                 int hh = 0, mm = 0;
                 if (sscanf(t->valuestring, "%d:%d", &hh, &mm) != 2) continue;
+
+                /* 先记账再判容量：这样"本该有多少条"与"实际装了几条"是
+                 * 同一个口径，日志里的差额就是真实丢弃数（把无效时刻也算
+                 * 进去会让告警虚高，反而没人信）。 */
+                wanted++;
+                if (n >= ELDER_REMINDER_MAX) continue;
 
                 elder_rmd_item_t *it = &out[n];
                 memset(it, 0, sizeof(*it));
@@ -708,8 +721,18 @@ static void parse_reminders(cJSON *root, elder_rmd_item_t *out,
             /* 没有具体时刻的规则（理论上不会出现）跳过 */
             continue;
         }
-        if (n >= ELDER_REMINDER_MAX) break;
+        /* 这里**不再** ``break``：数组满了也要继续走完剩余规则，否则
+         * ``wanted`` 数不全，告警就报不出"到底丢了几条"。剩余规则只做
+         * 一次 sscanf 计数，代价可以忽略。 */
     }
+
+    if (wanted > (int)n) {
+        ESP_LOGW(TAG, "提醒超过本机上限：服务端下发 %d 条时刻，本机只装下 %d 条，"
+                      "**丢弃 %d 条**（ELDER_REMINDER_MAX=%d）。被丢弃的提醒在"
+                      "这台设备上不会响，请在 APP 里减少提醒条数或合并时刻",
+                 wanted, (int)n, wanted - (int)n, ELDER_REMINDER_MAX);
+    }
+
     *out_count = n;
 }
 
