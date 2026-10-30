@@ -507,6 +507,47 @@ def scan_file(path: Path) -> None:
     # 只对**用户端**断言：管理端本来就没有绑定入口（设备由家属在 / 页绑定）。
     if path == USER:
         check_single_bind_entry(tpl, script)
+        check_persisted_binding_state(tpl, script)
+
+
+def check_persisted_binding_state(tpl: str, script: str) -> None:
+    """L7：**绑定态只能有一个真源** —— 接口返回的 ``devices[].agent_id``。
+
+    2026-10-30 用户报「人格预设还是无法绑定到设备，选择之后再次登录就又丢失
+    绑定了」。查下来后端一直是好的：``POST /api/devices/{pk}/agent`` 正常落库，
+    ``DeviceOut`` 也早就带了 ``agent_id``（那一列的注释里甚至写了"此前缺这一列
+    导致每次刷新都显示未设置"）。坏的是前端 —— 绑定态记在一个内存映射
+    ``agentBind`` 里，初始 ``{}``、``loadDevices()`` 从不回填，于是**每次刷新 /
+    重新登录都显示「未设置」**。用户看到的是"选了又丢"，重选一次又"好了"，
+    直到下次刷新。当时那行注释还写着「刷新后显示未设置就重选一次即可」——
+    等于把 bug 写成了使用说明。
+
+    这类缺陷最坏的地方是它**自洽**：接口 200、库里有值、页面不报错，
+    只有"过一会儿再看"才会发现。所以只能静态钉死：
+      * 设备表的角色下拉必须读 ``d.agent_id``；
+      * 脚本里不许再出现那张本地映射；
+      * 角色表的反查必须遍历 devices 按 agent_id 过滤（详情接口返回的是设备的
+        agent_id，不是角色的"绑了谁"，反查本来就没有别的来源）。
+    """
+    code = strip_js_comments(script)
+
+    check("L7a 设备表的人格角色下拉直接读 devices[].agent_id",
+          ':value="d.agent_id' in tpl,
+          "设备表的角色下拉没有直接读设备行的 agent_id。用任何本地状态记绑定态，"
+          "刷新后都会显示「未设置」—— 因为刷新只重新拉接口，"
+          "不会重新跑你那次点击。")
+
+    # ⚠️ 同时查 tpl 与 code：只查 code 会漏掉"映射写进模板表达式、但 data 里
+    # 也补了声明"这种形态（那时 L2 的孤儿引用断言恰好是绿的）。
+    check("L7b 没有第二份绑定态真源（agentBind 之类）",
+          "agentBind" not in code and "agentBind" not in tpl,
+          "又出现了 agentBind 这类本地映射（模板或脚本里）。绑定态的唯一真源是 "
+          "devices[].agent_id（DeviceOut 本来就有这一列，不需要前端再记一份）。")
+
+    check("L7c 角色表反查设备走 devices 过滤",
+          "roleBoundDevice" in code,
+          "角色表的「绑定到设备」没有走 roleBoundDevice（遍历 devices 按 agent_id "
+          "过滤）。这个方向没有别的数据来源，另记一份必然与接口漂移。")
 
 
 def check_single_bind_entry(tpl: str, script: str) -> None:
