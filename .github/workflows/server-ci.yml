@@ -357,6 +357,15 @@ jobs:
       - name: 前端模板卫生冒烟（方法插值 / 孤儿引用 / 重复键）
         # 经 run_smoke 落盘：红灯时日志进 artifact（见末尾「失败诊断」步骤）
         run: python tools/run_smoke.py logs/smoke_smoke_frontend_hygiene.log python tools/smoke_frontend_hygiene.py
+      # 安卓返回键桥一致性（静态扫描，不起服务、不占端口）。
+      # 守的是 2026-10-30 事故：手机 APP 是自写的 Android WebView 薄壳 + H5，
+      # 壳的 onBackPressed 只做 `canGoBack() ? goBack() : 退出`，而 tabBar 页
+      # history 恒为空 ⇒ 弹层开着按返回键直接退出应用，H5 连 popstate 都收不到。
+      # 修法是壳 evaluateJavascript 主动询问 window.__elderHandleBack，
+      # **两侧靠字符串协议握手** —— 改名只改一边就静默退回原症状，构建全绿。
+      # 放在 server-ci 是因为它是纯静态源文件扫描，不需要 Android SDK。
+      - name: 安卓返回键桥一致性冒烟（壳 ↔ 页面握手 / 漏接线）
+        run: python tools/run_smoke.py logs/smoke_smoke_app_back_bridge.log python tools/smoke_app_back_bridge.py
       # 语音链路冒烟（WS 协议逐字段对固件 + Opus 编解码 + OTA 签发口径）。
       # 挂在 SQLite job：它直连 sqlite 造激活码/设备，且进程内起 uvicorn。
       #

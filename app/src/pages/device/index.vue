@@ -20,6 +20,7 @@ import {
 import type { Avatar, Device } from '@/api/elder'
 import { fmtDateTime } from '@/utils/time'
 import { getElderToken } from '@/http/elder'
+import { installBackBridge, pushBackCloser } from '@/utils/back-guard'
 
 const devices = ref<Device[]>([])
 const avatars = ref<Avatar[]>([])
@@ -46,6 +47,31 @@ const codeLen = computed(() => bindForm.value.code.replace(/\D/g, '').length)
 
 /** 正在配置哪台设备：null=关闭 / 'net'=配网 / 'agent'=绑角色 */
 const panel = ref<null | { devicePk: number, mode: 'net' | 'agent' }>(null)
+
+/* ---------------- 安卓返回键 ---------------- */
+/**
+ * 关掉本页最上层的浮层；没东西可关返回 false（交回壳的默认行为）。
+ *
+ * ⚠️ 本页弹层同样是 `v-if` + `.mask` 自己画的，框架不知道有东西要关；
+ * 而本项目手机端是 Android WebView 薄壳，返回键由壳的 onBackPressed 处理，
+ * 壳只会 `canGoBack() ? goBack() : 退出`，tabBar 页 history 为空 ⇒ 直接退出。
+ * 完整根因见 `utils/back-guard.ts` 与 profile 页「安卓返回键」一节。
+ */
+function closeTopOverlay(): boolean {
+  if (showBind.value) {
+    showBind.value = false
+    return true
+  }
+  if (panel.value) {
+    closePanel()
+    return true
+  }
+  return false
+}
+
+// tabBar 页长驻，注册一次即可；装晚了壳那边会拿到 0，照样退出应用。
+installBackBridge()
+pushBackCloser(closeTopOverlay)
 
 async function refresh() {
   if (!getElderToken()) return
@@ -258,6 +284,9 @@ onShow(() => { refresh() })
           已经绑定过的设备不会重复下发激活码：换绑需要先在原账户里解绑。
           忘记用户名、无法自行解绑的，请联系平台管理员。
         </view>
+        <button class="btn ghost" @click="showBind = false">
+          取消
+        </button>
       </view>
     </view>
 
@@ -268,8 +297,22 @@ onShow(() => { refresh() })
           <view class="title">
             给「{{ currentDevice()?.name }}」配网
           </view>
+          <!-- ⚠️ 原文案是「长按设备按键 5 秒，听到提示音后点下面按钮」——**这是假的**
+               （2026-10-30 用户质疑）。固件里按键只有短按 / 长按 3 秒两种，
+               语义都是「服药确认」（input.c 的 LONG_HOLD_MS =
+               ELDER_BTN_CONFIRM_HOLD_MS = 3s，elder_bridge.cc:501 的
+               ELDER_KEY_EV_LONG_HOLD 走 ConfirmMedicine），
+               全仓没有任何「长按进配网模式」的按键定义。
+               真实机制在 wifi_board.cc 的 StartNetwork()：
+                 1. 没配过任何 WiFi（SsidManager 为空）⇒ 自动进配网；
+                 2. 有配置但 60 秒内连不上 ⇒ Stop() 后进配网；
+                 3. 开机时按住 BOOT 键 ⇒ 进配网（这是上电时的按键，
+                    不是运行中长按）。
+               进配网后 EnterWifiConfigMode() 会 SetSsidPrefix("XiaoZhi") 起热点，
+               并用 application.Alert() 同时播语音 + 上屏热点名。
+               所以文案必须说「它会自己进配网模式」，而不是让人去长按。 -->
           <view class="tip left">
-            配网需要让设备进入配对模式：长按设备按键 5 秒，听到提示音后点下面按钮。
+            设备第一次开机、或者连不上 WiFi 时，会自己进入配网模式：屏幕和语音会报出热点名字（形如 XiaoZhi-1A2B）。用手机连上这个热点，再点下面的按钮。
           </view>
           <button class="btn" @click="goDeviceConfig">
             开始配网

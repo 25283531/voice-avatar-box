@@ -19,6 +19,7 @@ import {
 } from '@/api/elder'
 import type { VoiceItem } from '@/api/elder'
 import { clearElderToken, getElderBaseUrl, getElderToken } from '@/http/elder'
+import { installBackBridge, pushBackCloser } from '@/utils/back-guard'
 
 const account = ref<any>({})
 const logged = ref(true)
@@ -267,11 +268,23 @@ async function onOpenRole() {
  * ⇒ 「我的」这个 tab 切过去之后，栈里恒为只有它自己，length 恒为 1
  * ⇒ 物理返回键**永远走不到 onBackPress**，直接退出应用。
  *
- * 所以这里接两条路，判据只有一份（closeTopOverlay），任一条拦住即可：
+ * ⚠️⚠️⚠️ 第三层根因（2026-10-30 用户再次报「按返回键直接退出 APP」）：
+ * 上面两条**在本项目实际装到手机上的那个包里都是死代码**。因为本项目手机端
+ * 不是 DCloud 的 app-vue 运行时，而是自写的 Android WebView 薄壳
+ * （`android/.../MainActivity.kt`）加载编译好的 H5 —— 壳里没有 `plus` 对象
+ * （产物里 `plus.` 出现 0 次），返回键由壳自己的 `onBackPressed()` 处理，
+ * 而它当时只会 `canGoBack() ? goBack() : 退出`，tabBar 页 history 为空
+ * ⇒ 直接退出。H5 连 popstate 都收不到。
+ *
+ * 所以现在接**三条**路，判据只有一份（closeTopOverlay），任一条拦住即可：
  *   1. onBackPress —— 页面级钩子，栈里有多页时由框架调用；
- *   2. plus.key 'backbutton' —— Activity 级物理键监听，**与页面栈长度无关**，
- *      专门兜上一行那种 length===1 的场景。
- * 两条都做成幂等（关一个已关的弹窗是 no-op），不会出现「关两次」的可见副作用。
+ *   2. plus.key 'backbutton' —— DCloud app-vue 运行时的 Activity 级物理键
+ *      （app-pack.yml 的云打包形态走这条；本项目当前用的 WebView 壳没有它，
+ *      但留着不影响，且换打包方式时不用再补）；
+ *   3. `window.__elderHandleBack` —— **当前 WebView 壳真正走的那条**，
+ *      由壳在 onBackPressed 里 evaluateJavascript 主动询问，
+ *      页面侧实现在 `utils/back-guard.ts`。
+ * 三条都做成幂等（关一个已关的弹窗是 no-op），不会出现「关两次」的可见副作用。
  */
 /** 关掉最上层的那个弹窗；没有弹窗可关时返回 false（交回默认行为） */
 function closeTopOverlay(): boolean {
@@ -318,7 +331,13 @@ function bindNativeBack() {
 }
 
 // onLoad 时 plus 可能还没就绪，onShow 再兜一次（nativeBackBound 保证幂等）
-onLoad(bindNativeBack)
+onLoad(() => {
+  bindNativeBack()
+  // 第 3 条通路：WebView 壳专用。必须在页面挂载时就装上 ——
+  // 装晚了（比如等用户点开弹层才装）壳那边拿到 0，照样退出应用。
+  installBackBridge()
+  pushBackCloser(closeTopOverlay)
+})
 onShow(bindNativeBack)
 
 /** 关闭弹窗时必须停掉试听，否则弹窗没了声音还在放，很吵 */
@@ -552,6 +571,10 @@ onShow(() => { refresh() })
         <button class="btn" @click="onSubmitPwd">
           确认修改
         </button>
+        <!-- 与「创建我的角色」同批补的取消按钮：这几个弹层原本都只能点遮罩关闭 -->
+        <button class="btn ghost" @click="showPwd = false">
+          取消
+        </button>
       </view>
     </view>
 
@@ -564,6 +587,9 @@ onShow(() => { refresh() })
         <input v-model="email" class="input" placeholder="请输入新邮箱" />
         <button class="btn" @click="onSubmitEmail">
           确认更换
+        </button>
+        <button class="btn ghost" @click="showEmail = false">
+          取消
         </button>
       </view>
     </view>
@@ -639,6 +665,13 @@ onShow(() => { refresh() })
         </view>
         <button class="btn" @click="onSubmitRole">
           {{ roleParent === null ? '创建角色' : '基于平台角色创建' }}
+        </button>
+        <!-- ⚠️ 取消按钮不能省（2026-10-30 用户报「没有取消按钮，只能按安卓返回键，
+             而返回键直接退出 APP」）。原来唯一的退出方式是点遮罩，老人不会想到，
+             返回键又救不了（见下方「安卓返回键」一节的第三层根因）。
+             与「缓存管理」面板保持同一形态：主操作在上、取消在下。 -->
+        <button class="btn ghost" @click="closeRole">
+          取消
         </button>
       </view>
     </view>

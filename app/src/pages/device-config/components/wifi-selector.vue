@@ -225,7 +225,12 @@ onMounted(() => {
       <view v-if="!isConnectedToESP32" class="status-warning">
         <view class="status-content">
           <text class="warning-text">
-            {{ t('deviceConfig.connectXiaozhiHotspot') }} (xiaozhi-XXXXXX)
+            <!-- ⚠️ 热点名前缀的真源是固件 wifi_board.cc 的 SetSsidPrefix("XiaoZhi")，
+                 后缀是 GetSsid() 里 "%s-%02X%02X" 拼出的**4 位** MAC 末段。
+                 原来这里写的是小写 `xiaozhi-XXXXXX`（6 位），两处都不对：
+                 大小写不符用户按字样搜会以为是别的设备，位数不符会让他
+                 把后缀当校验位。 -->
+            {{ t('deviceConfig.connectXiaozhiHotspot') }} (XiaoZhi-XXXX)
           </text>
           <wd-button
             size="small"

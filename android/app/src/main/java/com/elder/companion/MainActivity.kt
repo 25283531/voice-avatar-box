@@ -150,9 +150,49 @@ class MainActivity : Activity() {
         if (this::web.isInitialized) web.saveState(outState)
     }
 
+    /**
+     * 返回键：**先问页面有没有浮层要关**，再决定是回退还是退出。
+     *
+     * ⚠️ 为什么不能只写 `web.canGoBack()`（2026-10-30 用户报「创建我的角色页面
+     * 按返回键直接退出 APP」）：本页弹层都是 H5 自己用 `v-if` + `.mask` 画的，
+     * 不是原生窗口，WebView 完全不知道有东西需要关闭；而 tabBar 各页切换
+     * 不产生 history 记录 ⇒ `canGoBack()` 恒为 false ⇒ 直接落到
+     * `super.onBackPressed()`，Activity 被 finish，用户看到的就是「退出应用」。
+     *
+     * 框架的 `onBackPress` 在这条链路上也救不了：它靠 popstate 触发，
+     * 而这里根本没有 popstate（history 是空的）。所以必须由壳主动询问，
+     * 页面侧的实现见 `app/src/utils/back-guard.ts`。
+     *
+     * 协议：`window.__elderHandleBack()` 返回 1 = 页面已消化（别退），
+     * 返回 0 / 函数不存在 / 抛异常 = 交回默认行为。三个兜底都写在这里，
+     * 页面侧哪天被改坏了也只是退回旧行为，不会让返回键彻底失灵。
+     */
     @Deprecated("Deprecated in Java")
     override fun onBackPressed() {
-        // uni-app H5 是 hash 路由，先交给页面自己回退
+        if (!this::web.isInitialized) {
+            super.onBackPressed()
+            return
+        }
+        web.evaluateJavascript(BACK_PROBE_JS) { raw ->
+            // evaluateJavascript 把返回值序列化成 JSON：数字 1 → "1"
+            if (raw != null && raw.trim().trim('"') == "1") {
+                return@evaluateJavascript
+            }
+            fallbackBack()
+        }
+    }
+
+    /**
+     * 页面没消化返回键时的默认行为：能回退就回退，否则退出。
+     *
+     * `@Suppress` 打在函数上而不是调用点上：`super.onBackPressed()` 从
+     * onBackPressed 的 override 里挪到普通成员函数后，Kotlin 不再把它当作
+     * 「override 里调用 super」看待，会在编译期报 deprecation warning；
+     * 而注解写在表达式语句前属于 EXPRESSION target，不同 Kotlin 版本解析
+     * 行为不一致，别赌。
+     */
+    @Suppress("DEPRECATION")
+    private fun fallbackBack() {
         if (this::web.isInitialized && web.canGoBack()) {
             web.goBack()
         } else {
@@ -165,5 +205,15 @@ class MainActivity : Activity() {
         private const val APP_DOMAIN = "elder.local"
         private const val REQ_FILE = 1001
         private const val REQ_PERM = 1002
+
+        /**
+         * 询问页面是否消化这次返回键。**字符串必须与 `back-guard.ts` 里的
+         * `window.__elderHandleBack` 逐字一致** —— 两侧改名只改一边的话，
+         * 页面永远返回 0，症状就退回「按返回键直接退出」，而且不报任何错。
+         * `tools/smoke_app_back_bridge.py` 会校验这个一致性。
+         */
+        private const val BACK_PROBE_JS =
+            "(function(){try{return (typeof window.__elderHandleBack==='function' && " +
+                "window.__elderHandleBack())?1:0}catch(e){return 0}})()"
     }
 }
