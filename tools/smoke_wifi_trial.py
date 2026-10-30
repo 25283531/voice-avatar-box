@@ -214,6 +214,35 @@ def run() -> int:
     check("W10 ★ finish() 之后催一次心跳（终态别等下一个 300 秒周期）",
           i_finish >= 0 and i_sync > i_finish, f"finish@{i_finish} sync@{i_sync}")
 
+    # ---- W12：试连栈必须建 STA netif ----
+    # 「失败路径全绿、成功路径永远走不通」的典型：
+    #   没有 netif 时驱动照样能关联（state: run），但 IP_EVENT_STA_GOT_IP
+    #   **永远不会触发** ⇒ 试连一律 timeout / gave_up。
+    # 而鉴权失败发生在拿 IP 之前，所以真机上「密码错 ⇒ 回滚」的用例照样通过，
+    # 甚至日志看起来完全正常。只有这条断言能拦住它。
+    check("W12 ★ trial_start() 里创建 STA netif（没它拿不到 IP，成功路径永远不可达）",
+          "esp_netif_create_default_wifi_sta" in body, "")
+    i_ni = pos(body, "esp_netif_init")
+    i_cn = pos(body, "esp_netif_create_default_wifi_sta")
+    check("W12 trial_start() 先 esp_netif_init 再建 netif（顺序反了 create 会失败）",
+          i_ni >= 0 and i_cn > i_ni, f"netif_init@{i_ni} create@{i_cn}")
+
+    # ---- W13：强制改连必须先等连接位掉下来 ----
+    # 不等它掉下来，`IsConnected()` 还是刚才那个 true ⇒ 一次都没等就误判成功。
+    hb = func_body(code, "handback_ensure_target")
+    if check("W13 能取到 handback_ensure_target() 的函数体", hb is not None):
+        assert hb is not None
+        i_down = hb.find("wait_bit(false")
+        # 用 rfind：函数开头那个 wait_bit(true, HANDBACK_TIMEOUT) 在掉线之前，
+        # 要比较的是**强制改连之后**那一次置位等待。
+        i_up = hb.rfind("wait_bit(true")
+        check("W13 ★ 强制改连后先判连接位掉下来（不能拿残留的 true 当成功）",
+              i_down >= 0 and "if (!wait_bit(false" in hb, f"down@{i_down}")
+        check("W13 ★ 掉下来之后才等它重新置位（顺序不能反）",
+              i_down >= 0 and i_up > i_down, f"down@{i_down} up@{i_up}")
+        check("W13 强制改连确实会覆盖配置：esp_wifi_set_config + esp_wifi_disconnect 都在",
+              "esp_wifi_set_config" in hb and "esp_wifi_disconnect" in hb, "")
+
     # ---- 头文件与实现的一致性（防止只改一头）----
     hdr = HDR.read_text(encoding="utf-8") if HDR.exists() else ""
     check("W11 头文件里不再宣称 pend_old_pwd 备份（文档不能描述旧机制）",
