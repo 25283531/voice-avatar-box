@@ -292,6 +292,15 @@ jobs:
       # 查询与 deleted_at 互为备份，且不留"已删除但仍启用"的矛盾数据）。
       - name: 提醒软删除与操作审计冒烟
         run: python tools/run_smoke.py logs/smoke_smoke_reminder_audit.log python tools/smoke_reminder_audit.py 8137
+      # 已配网设备「改 WiFi」（端口 8138，契约 build-out/_wifi-spec.md §一）：
+      # 守四条不变量 —— 离线必须 409（排队 = 假成功）、pending 只下发一次
+      # （重复下发让设备反复 Stop/Start，老人家里 WiFi 图标闪一整天）、
+      # 提速 15s 只生效一次（永久 15s = 全平台心跳量 ×20、收益为零）、
+      # 过期 req_id 的回报不得覆盖新请求（设备侧是"至少一次"语义）。
+      # 它会直连 SQLite 读 wifi_req_pwd：**"终态后清空明文密码"没有任何接口
+      # 能看到**，问接口等于让被测方自证。
+      - name: 改 WiFi 冒烟（离线 409 / 只下发一次 / 提速一次 / 过期回报忽略）
+        run: python tools/run_smoke.py logs/smoke_smoke_wifi_change.log python tools/smoke_wifi_change.py 8138
       # 老库升级补列（不绑端口、秒级）：本项目只用 create_all 建表，没有 Alembic，
       # 而 create_all **不给已存在的表补列**。所以「模型加了列、忘了登记
       # schema_patch.NEW_COLUMNS」的后果不是"少个字段"，是**生产老库升级后

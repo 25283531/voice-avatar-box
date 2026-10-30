@@ -215,6 +215,107 @@ class DeviceAgentOut(ORMBase):
     role_name: str
 
 
+# ================================================ 已配网设备「改 WiFi」
+# 契约唯一真源：build-out/_wifi-spec.md §一。三端（服务端 / 固件 / APP）共用
+# 同一套字段名，改字段必须同时改那份文档并通知另外两端。
+class DeviceWifiIn(ORMBase):
+    """家属提交一次改 WiFi 请求（``POST /api/devices/{pk}/wifi``）。"""
+
+    ssid: str
+    # 空密码 = 开放网络（无加密 AP）。**不是**「没填」，所以不做 min_length：
+    # 老人家里确实存在不加密的路由器（或把密码当成「不用填」的旧设备），
+    # 拒绝空密码等于让这类设备永远改不了网。
+    password: str = ""
+
+    @field_validator("ssid")
+    @classmethod
+    def _check_ssid(cls, v: str) -> str:
+        """SSID 非空且 ≤32 **字节**。
+
+        ⚠️ 上限按**字节**不是按字符：802.11 的 SSID 字段是 32 字节，
+        中文 SSID 一个汉字占 3 字节（UTF-8），"我家WiFi" 是 10 字节但 4 个字符。
+        按字符判会放过 11 个汉字（33 字节）—— 固件那边写 NVS 时被截断，
+        设备去连一个**前缀**，表现是「密码明明对，就是连不上」。
+        """
+        v = v.strip()
+        if not v:
+            raise ValueError("SSID 不能为空")
+        if len(v.encode("utf-8")) > 32:
+            raise ValueError("SSID 不能超过 32 字节（一个汉字算 3 字节）")
+        return v
+
+    @field_validator("password")
+    @classmethod
+    def _check_password(cls, v: str) -> str:
+        """空 = 开放网络；非空则 8..63 字符（WPA2-PSK 的合法长度区间）。
+
+        ⚠️ 这里**不能 strip**：WiFi 密码允许首尾空格（有些路由器真的这么设），
+        strip 掉就会让「密码正确却连不上」变成一个无法解释的故障。
+        长度按**字符**判（不是字节）：WPA2 的口令是 8..63 个 ASCII 字符，
+        而本项目允许中文密码（固件侧按 UTF-8 字节写 NVS，不受这个区间约束），
+        取字符数是对两端都安全的下界。
+        """
+        if not v:
+            return v
+        if not 8 <= len(v) <= 63:
+            raise ValueError("密码长度应为 8~63 个字符（开放网络可留空）")
+        return v
+
+
+class DeviceWifiOut(ORMBase):
+    """家属端读当前改 WiFi 状态（``GET /api/devices/{pk}/wifi``）。
+
+    同一个模型也用作 ``POST /api/devices/{pk}/wifi`` 的响应 —— 契约 §一 里
+    POST 的响应带 ``ok: true``，而 GET 的响应不带；多出来的 ``ok`` 对 GET 的
+    调用方是无害的（老客户端只读自己认识的键），所以不为此再定义一个模型。
+    """
+
+    #: 提交是否被受理。只有 POST 会看它；GET 恒为 True（读到就是成功）。
+    ok: bool = True
+    #: ``''``/pending/delivered/applied/rolled_back/failed，取值集合见
+    #: models.Device.wifi_state。``''`` = 从未改过。
+    state: str = ""
+    #: 0 = 无待下发（哨兵值，见 models.Device.wifi_req_id）。
+    req_id: int = 0
+    #: 目标 SSID。设备回报终态前**不清**（APP 靠它显示「正在切换到 xxx」）。
+    ssid: str = ""
+    #: 给 APP 直接展示的一句话。**由服务端按 state 派生**，不是设备原文 ——
+    #: 设备回报的 ``reason`` 只进日志（见 device_api.report_wifi_result），
+    #: 因为它可能是固件内部错误码/英文，直接显示给老人家属毫无意义。
+    message: str = ""
+    #: 最后一次状态变更时刻（取 wifi_req_at 与 wifi_result_at 的较晚者）。
+    updated_at: datetime | None = None
+
+
+class DeviceWifiResultIn(ORMBase):
+    """设备回报改 WiFi 结果（``POST /api/device/wifi-result``，device token）。"""
+
+    req_id: int
+    #: True = 试连成功已生效；False = 试连失败已回滚到原配置。
+    ok: bool
+    #: 设备实际连上的 SSID（仅用于日志对账；服务端**不以它为准**改状态）。
+    ssid: str = ""
+    #: 失败原因（固件自由文本）。只进日志，不进库、不下发给 APP。
+    reason: str = ""
+
+
+class DeviceWifiChangeOut(ORMBase):
+    """随 ``POST /api/device/sync`` 下发给固件的改 WiFi 指令。
+
+    ⚠️ 只在 ``wifi_state == "pending"`` 时出现，下发后服务端立刻把 state 置为
+    ``delivered`` —— 所以**同一条指令不会下两次**（重复下发 = 设备反复试连、
+    反复断网重连，老人家里会看到 WiFi 图标闪一整天）。
+
+    ⚠️ 老固件收到这个未知字段必须安全忽略（JSON 解析器跳过多余的 key），
+    这是跨端不变量之一，见 _wifi-spec.md §四。
+    """
+
+    req_id: int
+    ssid: str
+    #: 明文下发（走 HTTPS/局域网）。开放网络的密码就是空串。
+    password: str = ""
+
+
 class BindIn(ORMBase):
     """APP 侧用激活码绑定设备。"""
     code: str
@@ -1164,6 +1265,14 @@ class DeviceSyncOut(ORMBase):
     # 继续用它 NVS 里的旧值（默认 +480，与改造前逐字一致）。
     timezone: str = ""
     tz_offset_minutes: int | None = None
+    # 改 WiFi 指令（2026-10-30）：仅当 wifi_state == "pending" 时非 None，
+    # 下发后服务端立刻置 delivered ⇒ 同一条指令不会下第二次。
+    #
+    # ⚠️ **必须默认 None**：老固件不认识这个键，None 序列化成 ``null``
+    # （而不是省略），固件侧解析到 null 按「无待下发」处理即可；
+    # 若把它做成必填，老固件之外的所有既有调用方都会在反序列化时炸。
+    # 与 quota / tts_voice 同例：新增字段一律带默认值。
+    wifi_change: DeviceWifiChangeOut | None = None
 
 
 # ============================================================ 陪聊时长上报

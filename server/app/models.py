@@ -200,6 +200,50 @@ class Device(Base):
         Integer, default=0, server_default="0")
     ip: Mapped[str] = mapped_column(String(64), default="")
 
+    # ---- 已配网设备「改 WiFi」（契约见 build-out/_wifi-spec.md §一）----
+    # 六列一组，全部带 server_default（0 / 空串）：老库 ALTER 补列后既有行读出
+    # 默认值而不是 NULL —— NULL 会炸 Pydantic 序列化（见 schema_patch.NEW_COLUMNS）。
+    #
+    # 请求序号。**0 = 无待下发**，每次家属提交新请求 +1（不是 -1、不是 NULL，
+    # 因为「没有请求」必须是可比较的整数：固件回报里 req_id 是 int，服务端要拿
+    # 它与库里的值判等）。0 永远不可能是合法请求号，所以它天然是哨兵值。
+    wifi_req_id: Mapped[int] = mapped_column(
+        Integer, default=0, server_default="0")
+    # 目标 SSID / 密码。SSID 在设备回报终态前**不许清**：APP 靠它显示
+    # 「正在切换到 xxx」，清了就变成「正在切换到 」。
+    wifi_req_ssid: Mapped[str] = mapped_column(
+        String(64), default="", server_default="")
+    # ⚠️ 目标密码**明文落库**，这是有意的取舍，不是疏忽：
+    #   1. 本项目没有任何加密设施（provider 的 API key 也是明文存库），为一个
+    #      字段引入第二套密钥管理（KMS / 环境密钥 / 轮换）只会多一个能配错、
+    #      能丢密钥、能让全平台设备连不上网的故障面，换不来实际收益 ——
+    #      能读这张表的人本来就能读 API key。
+    #   2. 但**必须短命**：设备回报终态（applied / rolled_back / failed）后
+    #      立刻清空本列（见 routers/device_api.report_wifi_result）。长期留存
+    #      一个已经生效/已作废的 WiFi 密码，是纯粹的负资产。
+    #   3. 所以「设备一直不回报」时它确实会留到下一次请求覆盖 —— 这是已知的
+    #      残余窗口，接受它，因为另一条路（超时自动清）会让设备在弱网下拿到
+    #      空密码、连不上目标 AP 又回不到原 AP。
+    wifi_req_pwd: Mapped[str] = mapped_column(
+        String(128), default="", server_default="")
+    # 家属提交时刻（UTC，与 last_seen_at 同口径）。NULL = 从未改过 WiFi。
+    wifi_req_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True)
+    # 状态机取值集合（只有这 6 个，别再加）：
+    #   ''            —— 从未改过（存量设备/新设备）；
+    #   'pending'     —— 已受理、待下发。**只有这个状态才下发、才提速**；
+    #   'delivered'   —— 已随心跳下发。**不再重复下发**（重复下发 = 设备反复
+    #                    试连、反复断网重连，老人家里会看到 WiFi 图标闪一整天）；
+    #   'applied'     —— 设备试连成功，新配置已生效；
+    #   'rolled_back' —— 设备试连失败，已回滚到原配置（设备仍在线，只是没换成）；
+    #   'failed'      —— 设备侧异常（连回滚都失败/无法判定），需要人工介入。
+    # 带 server_default ''：老库补列后既有行读出空串，语义正是「从未改过」。
+    wifi_state: Mapped[str] = mapped_column(
+        String(16), default="", server_default="")
+    # 设备回报终态的时刻（UTC）。与 wifi_req_at 一起决定 APP 侧「最后更新」。
+    wifi_result_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True)
+
     # 端侧个性化配置（音量、亮度、灯效开关、离线提示音开关等）
     settings: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
 

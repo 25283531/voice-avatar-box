@@ -37,6 +37,8 @@ from ..schemas import (
     AvatarOut,
     DeviceQuotaOut,
     DeviceSyncOut,
+    DeviceWifiChangeOut,
+    DeviceWifiResultIn,
     EventOut,
     EventReportIn,
     InteractionReportIn,
@@ -308,6 +310,29 @@ def sync(request: Request, fw_version: str = "", hw_model: str = "",
     # 而音色是"这台设备现在该用谁的声音" —— 随角色变，不随形象变。
     voice = (role.tts_voice if role is not None else "") or \
             (avatar.tts_voice if avatar is not None else "")
+
+    # ---- 改 WiFi 下发（契约见 build-out/_wifi-spec.md §一）----
+    #
+    # 三条不变量，任何一条写错都会让老人家里的设备反复断网：
+    #   1. **只有 pending 才下发**：delivered 之后不再发 —— 设备拿到同一条指令
+    #      会再试连一次（Stop → Start → 等 45 秒），重复下发等于让 WiFi 反复闪；
+    #   2. **下发即置 delivered 并立刻 commit**：必须在构造响应之前落盘，
+    #      否则这次响应丢包/进程重启后设备再来问，服务端会**再发一遍**；
+    #   3. **提速只在 pending 这一次生效**：下发完下一跳就回 300 ——
+    #      不能因为"这台设备改过 WiFi"就永久 15 秒轮询（那会让全平台的
+    #      设备数 × 20 倍心跳量，而收益是零）。
+    wifi_change: DeviceWifiChangeOut | None = None
+    sync_interval = 300
+    if (dev.wifi_state or "") == "pending":
+        wifi_change = DeviceWifiChangeOut(
+            req_id=int(dev.wifi_req_id or 0),
+            ssid=dev.wifi_req_ssid or "",
+            password=dev.wifi_req_pwd or "",
+        )
+        dev.wifi_state = "delivered"
+        db.commit()
+        sync_interval = 15
+
     return DeviceSyncOut(
         server_time=now,
         device=dev,
@@ -321,7 +346,69 @@ def sync(request: Request, fw_version: str = "", hw_model: str = "",
         tts_voice=voice,
         timezone=tz_name,
         tz_offset_minutes=tz_offset,
+        wifi_change=wifi_change,
+        sync_interval_sec=sync_interval,
     )
+
+
+@router.post("/wifi-result", response_model=dict[str, Any])
+def report_wifi_result(payload: DeviceWifiResultIn, db: Session = Depends(get_db),
+                       dev: models.Device = Depends(get_current_device)):
+    """设备回报一次改 WiFi 的终态（契约见 build-out/_wifi-spec.md §一）。
+
+    鉴权与 ``/api/device/events`` 完全一致（device token，见 deps.get_current_device）：
+    这是设备侧接口，家属的 JWT 不该能调，所以不用 get_current_user。
+
+    终态映射只有两条：
+      * ``ok=True``  -> ``applied``（新配置已生效）
+      * ``ok=False`` -> ``rolled_back``（试连失败，设备已回到原配置，仍然在线）
+
+    两种情况都**立刻清空 wifi_req_pwd**：明文密码留在库里只在这一个窗口内有
+    意义（等设备来取），拿到终态后它就成了纯负资产 —— 而且下一次请求一定会
+    覆盖它，不清也不会"更安全"，只会让泄露面拖得更长。
+    ``wifi_req_ssid`` **不清**：APP 还要靠它显示「已经切换到 xxx」。
+
+    ⚠️ **req_id 与库里不一致时返回 200 但什么都不改。**
+    ------------------------------------------------------------------
+    为什么不能直接按收到的 req_id 改状态：设备侧的回报是**至少一次**语义
+    （断网时进 NVS 队列、联网后重发；sync 请求体里也会带 wifi_result，可能
+    与单独 POST 重复）。于是会出现这种顺序：
+
+        设备试连 A 失败 → 回报进队列（没发出去）
+        家属看到没动静 → 又提交一次 B（req_id 2）
+        队列 flush → 把 A 的"失败"回报补发上来
+
+    若照旧按 ok=False 写 ``rolled_back``，B 这条**还没试过**的请求就被上一次的
+    失败结果判死了：APP 显示"已回滚"，设备却可能已经连上 B。旧结果覆盖新请求
+    是这类"设备端至少一次 + 服务端有状态"的经典错序，判等 req_id 是最小代价的
+    修法。
+
+    为什么返回 200 而不是 4xx：固件把非 2xx 当失败、留在队列里**无限重试**，
+    那条过期回报会每轮心跳重发一次，永不收敛（与 /events 丢弃已删提醒回执
+    同一处理原则，见那里的注释）。
+    """
+    if int(payload.req_id) != int(dev.wifi_req_id or 0):
+        log.info("丢弃过期的改 WiFi 回报：device=%s 收到 req_id=%s 当前 req_id=%s",
+                 dev.id, payload.req_id, dev.wifi_req_id)
+        return {"ok": True, "ignored": "stale_req_id"}
+
+    dev.wifi_state = "applied" if payload.ok else "rolled_back"
+    # 明文密码到此为止：终态已拿到，不再需要它。
+    dev.wifi_req_pwd = ""
+    dev.wifi_result_at = utcnow()
+    db.commit()
+
+    # reason 只进日志、**不进库也不回给 APP**：它是固件内部错误码/英文，
+    # 家属看到"ESP_ERR_WIFI_NOT_CONNECT"没有任何可行动的信息；真正给家属看的
+    # 那句话由家属端按 state 派生（见 routers/devices._WIFI_MESSAGES）。
+    if not payload.ok:
+        log.warning("改 WiFi 失败已回滚：device=%s req_id=%s ssid=%s reason=%s",
+                    dev.id, dev.wifi_req_id, payload.ssid or "-",
+                    (payload.reason or "-")[:200])
+    else:
+        log.info("改 WiFi 已生效：device=%s req_id=%s ssid=%s",
+                 dev.id, dev.wifi_req_id, payload.ssid or "-")
+    return {"ok": True, "state": dev.wifi_state, "req_id": dev.wifi_req_id}
 
 
 @router.post("/events", response_model=EventOut | dict[str, Any])

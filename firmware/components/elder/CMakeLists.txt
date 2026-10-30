@@ -16,6 +16,11 @@ idf_component_register(
         # 编译单元 —— 无条件加入 SRCS 是为了让"换芯片"只改 Kconfig。
         "src/rtc_ds1302.c"
         "src/config_report.c"
+        # 远程改 WiFi 的试连/回滚（2026-10-30）。**必须是 .cc**：配置真源
+        # SsidManager / WifiStation 是 C++ 类（std::string / std::vector），
+        # C 里 include 不了。对外只暴露 elder_wifi_change.h 的纯 C 接口，
+        # 供同目录的 sync.c 调用。
+        "src/wifi_change.cc"
     INCLUDE_DIRS "include"
     REQUIRES
         driver
@@ -33,6 +38,17 @@ idf_component_register(
         # 漏了它 net.c 直接 fatal error: esp_crt_bundle.h: No such file。
         mbedtls
         json
+    # wifi_change.cc 用到的头文件在下面两个组件里，**必须显式声明**：
+    #   * esp_wifi / esp_netif —— wifi_station.h 直接 include esp_wifi_types_generic.h
+    #     和 esp_netif.h，漏了就是 fatal error: No such file；
+    #   * 78__esp-wifi-connect —— ssid_manager.h / wifi_station.h 所在组件，
+    #     名字就是 managed_components 下的目录名（namespace__name，见 build.ninja
+    #     里的 ___idf_78__esp-wifi-connect）。
+    # 用 PRIV_REQUIRES：这两个头文件只在本组件内部用，不该传染给依赖 elder 的 main。
+    PRIV_REQUIRES
+        esp_wifi
+        esp_netif
+        78__esp-wifi-connect
 )
 
 # 说明：src/elder_bridge.cc **不在这里编译**。

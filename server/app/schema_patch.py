@@ -25,6 +25,29 @@
 3. ``agent_persona_profiles`` 1 列：agent_key（哨兵列，修 L1 全局画像的
    唯一性漏洞，见 models.AgentPersonaProfile 的注释）。
 
+本轮新增（已配网设备「改 WiFi」，契约见 build-out/_wifi-spec.md §一）
+-----------------------------------------------------------------------
+``devices`` 6 列：wifi_req_id / wifi_req_ssid / wifi_req_pwd / wifi_req_at /
+wifi_state / wifi_result_at。
+
+三条列语义要点（细节见 models.Device 对应字段的注释，这里只记「补列时的坑」）：
+
+1. **三列字符串/整数必须带 DEFAULT**：``wifi_req_id`` 默认 0（0 = 无待下发）、
+   ``wifi_req_ssid`` / ``wifi_req_pwd`` / ``wifi_state`` 默认空串。存量设备补列
+   后读出的是「从未改过 WiFi」这一正确语义，不需要任何回填脚本 —— 反过来说，
+   一旦漏写 DEFAULT，老库升级后第一次 SELECT devices 就会因为 NULL 炸 Pydantic
+   序列化，**整个设备列表 + 心跳一起 500**。
+2. **两个时间列可空且不带默认**（``wifi_req_at`` / ``wifi_result_at``）：
+   NULL = 从未发生，与 ``bound_at`` / ``ai_providers.deleted_at`` 同例；
+   模型里也是 Optional，NULL 是合法值而不是待修的脏数据。
+3. ``wifi_req_pwd`` 明文存密码是**已确认的取舍**（本项目没有加密设施，不为一个
+   字段引入第二套密钥管理），纪律是「拿到设备终态回报后立刻清空」，写在这两处：
+   models.Device.wifi_req_pwd 与 routers/device_api.report_wifi_result。
+
+⚠️ 这六列**没有**任何「启动期改业务数据」的动作（不写回填、不改旧行），
+所以**不登记 PATCH_REGISTRY** —— 补列本身幂等且无副作用，按本文开头的
+铁律，只有 UPDATE/DELETE 业务数据的迁移才需要标记位。
+
 ⚠️ **顺带修掉的一处既有欠账**：api_style / supports_stream / timeout_sec /
 max_retries / context_window 这五列在 models 里**早就带 server_default**，
 但一直没有登记进本清单。后果是：比它们更老的老库升级上来后，第一次
@@ -344,6 +367,19 @@ NEW_COLUMNS: Final[list[tuple[str, str, str, str]]] = [
     ("reminders", "deleted_at", "DATETIME", "DATETIME NULL"),
     ("reminders", "deleted_by", "INTEGER", "INT NULL"),
     ("reminders", "deleted_via", "VARCHAR(16) DEFAULT ''", "VARCHAR(16) DEFAULT ''"),
+    # ---- devices：已配网设备「改 WiFi」（2026-10-30，契约见 _wifi-spec.md）----
+    # 前四列都带 DEFAULT：存量设备补列后读出 0 / '' / '' / ''，语义正是
+    # 「从未改过 WiFi」，不需要回填。**漏 DEFAULT 就会 NULL 炸序列化**，
+    # 后果不是「少个字段」而是设备列表与心跳一起 500（见本文开头的铁律）。
+    # 两个时间列可空且不带默认：NULL = 从未发生，模型侧也是 Optional。
+    # wifi_req_pwd 明文是已确认的取舍，纪律是「拿到终态回报后立刻清空」
+    # （models.Device.wifi_req_pwd / routers/device_api.report_wifi_result）。
+    ("devices", "wifi_req_id", "INTEGER DEFAULT 0", "INT NOT NULL DEFAULT 0"),
+    ("devices", "wifi_req_ssid", "VARCHAR(64) DEFAULT ''", "VARCHAR(64) DEFAULT ''"),
+    ("devices", "wifi_req_pwd", "VARCHAR(128) DEFAULT ''", "VARCHAR(128) DEFAULT ''"),
+    ("devices", "wifi_req_at", "DATETIME", "DATETIME NULL"),
+    ("devices", "wifi_state", "VARCHAR(16) DEFAULT ''", "VARCHAR(16) DEFAULT ''"),
+    ("devices", "wifi_result_at", "DATETIME", "DATETIME NULL"),
 ]
 
 # 本轮新增的索引。create_all 只为**新**库建索引，老库升级上来不会有，

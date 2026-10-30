@@ -158,6 +158,11 @@ DEFAULT_PORTS: dict[str, int] = {
     # 它会直连同一个库文件数 PENDING 实例（问接口等于让被测方自证），
     # 故独占一个端口。
     "smoke_reminder_audit": 8137,
+    # 已配网设备「改 WiFi」（2026-10-30）：离线 409 / pending→delivered 只下发一次 /
+    # 提速 15s 只生效一次 / 终态回报清空明文密码 / 过期 req_id 不覆盖新请求。
+    # 它会直连同一个库文件读 wifi_state 与 wifi_req_pwd（问接口等于让被测方自证），
+    # 故独占一个端口。
+    "smoke_wifi_change": 8138,
 }
 
 

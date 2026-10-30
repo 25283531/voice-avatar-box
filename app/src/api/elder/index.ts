@@ -462,6 +462,40 @@ export function bindAgentRole(devicePk: number, roleId: number) {
   return elderPost(`/api/devices/${devicePk}/agent`, { role_id: roleId })
 }
 
+// ============================================================ 改 WiFi（仅设备已联网时）
+/**
+ * 改 WiFi 的状态机。``state`` 为空串 = 这台设备从没远程改过 WiFi。
+ *
+ * ⚠️ 这是一条**异步**链路，APP 提交成功 ≠ 已经生效：设备每 300 秒才连一次
+ * 服务器（服务端只在有待下发指令时把这次间隔临时压到 15 秒），所以
+ * pending → delivered → applied/rolled_back 之间可能隔几分钟。UI 必须
+ * 按状态显示，不能提交完就报「已切换」。
+ *
+ * 另一个必须让用户知道的事实：切换过程中设备会**短暂断网**，失败则回到
+ * 原来的 WiFi —— 服务端和设备都保证「失败不会失联」。
+ */
+export interface DeviceWifiState {
+  ok: boolean
+  state: '' | 'pending' | 'delivered' | 'applied' | 'rolled_back' | 'failed'
+  req_id: number
+  ssid: string
+  /** 服务端按 state 派生的一句人话，APP 直接显示，不要自己再拼一份 */
+  message: string
+  updated_at?: string | null
+}
+
+export function getDeviceWifi(devicePk: number) {
+  return elderGet<DeviceWifiState>(`/api/devices/${devicePk}/wifi`)
+}
+
+/**
+ * 提交新 WiFi。设备离线时服务端返回 **409**（不是 4xx 里的其它码），
+ * 调用方要单独 catch 这个分支给「等设备上线再改」这句可行动的话。
+ */
+export function setDeviceWifi(devicePk: number, data: { ssid: string, password: string }) {
+  return elderPost<DeviceWifiState>(`/api/devices/${devicePk}/wifi`, data)
+}
+
 // ============================================================ 找回密码（邮箱验证码，全流程在 APP 完成）
 export interface PasswordResetRequestOut {
   ok: boolean

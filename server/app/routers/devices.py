@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime, timezone
+from typing import Final
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from sqlalchemy import delete, func, select
@@ -12,6 +13,7 @@ from .. import models
 from ..config import ACT_CODE_LEN
 from ..db import get_db
 from ..deps import get_current_user, require_device_owner, require_role
+from ..device_state import is_online
 from ..macs import mac_variants, norm_mac
 from ..ratelimit import bind_gate, clear_bind_failures, record_bind_failure
 from ..schemas import (
@@ -23,6 +25,8 @@ from ..schemas import (
     DeviceCreate,
     DeviceOut,
     DeviceUpdate,
+    DeviceWifiIn,
+    DeviceWifiOut,
     EventOut,
 )
 from ..security import (
@@ -298,6 +302,90 @@ def bind_agent(device_pk: int, payload: DeviceAgentIn, db: Session = Depends(get
     dev.agent_id = role.id
     db.commit()
     return DeviceAgentOut(device_pk=dev.id, role_id=role.id, role_name=role.name)
+
+
+# ==================================================== 已配网设备「改 WiFi」
+# 契约唯一真源：build-out/_wifi-spec.md §一。设备**首次**配网仍走热点 + 语音
+# 字幕提示（那条链路在这里完全不参与），本组接口只管「已经连上网的设备换网」。
+#
+# 离线为什么直接拒绝、而不是排队：见契约 §需求 决策 3。排队的代价是家属提交后
+# 拿到 200、以为改了，实际设备可能几小时后才上线试连、失败回滚 —— 老人家里
+# 断网几分钟，而家属完全不知道发生了什么。**宁可当场告诉他「设备不在线」**，
+# 那是一句能行动的话（等它连上网再改），假成功不是。
+_WIFI_OFFLINE_DETAIL = "设备当前不在线，等它连上网再改 WiFi"
+
+#: 状态 -> 给家属看的一句话。**由服务端派生**，不落库、不用设备回报的 reason：
+#: 固件的 reason 是内部错误码/英文，直接显示给家属毫无意义（见
+#: device_api.report_wifi_result 里"reason 只进日志"的说明）。
+_WIFI_MESSAGES: Final = {
+    "": "",
+    "pending": "已提交，等待设备连接新 WiFi",
+    "delivered": "设备已收到，正在尝试连接新 WiFi",
+    "applied": "已切换到新 WiFi",
+    "rolled_back": "设备连不上新 WiFi，已自动恢复原来的网络",
+    "failed": "设备连接新 WiFi 失败，请重新设置",
+}
+
+
+def _wifi_out(dev: models.Device) -> DeviceWifiOut:
+    """把设备的 WiFi 三列组装成家属端出参（POST 与 GET 共用一份，别写两遍）。"""
+    req_at = dev.wifi_req_at
+    result_at = dev.wifi_result_at
+    # updated_at 取较晚的那个：刚提交时只有 req_at，回报后 result_at 更晚。
+    # 用 max 而不是「有 result 就用 result」，是因为设备可能在**下一轮**请求
+    # 提交后才回报上一条 —— 那种情况下 req_at 才是最新的。
+    stamps = [t for t in (req_at, result_at) if t is not None]
+    return DeviceWifiOut(
+        ok=True,
+        state=dev.wifi_state or "",
+        req_id=int(dev.wifi_req_id or 0),
+        ssid=dev.wifi_req_ssid or "",
+        message=_WIFI_MESSAGES.get(dev.wifi_state or "", ""),
+        updated_at=max(stamps) if stamps else None,
+    )
+
+
+@router.post("/{device_pk}/wifi", response_model=DeviceWifiOut)
+def request_wifi_change(device_pk: int, payload: DeviceWifiIn,
+                        db: Session = Depends(get_db),
+                        user: models.User = Depends(get_current_user)):
+    """家属提交一次改 WiFi（只落库 + 置 pending，**不直接下发**）。
+
+    真正的下发发生在设备下一次 ``POST /api/device/sync``（心跳）—— 设备侧没有
+    长连接推送通道，服务端只能等它来拉。这也是契约里"临时提速到 15 秒"的由来：
+    不 pending 时设备 300 秒才来一次，家属最多等 5 分钟才看到「正在连接」。
+    """
+    dev = require_device_owner(device_pk, user, db)
+    # 在线判定与首页/后台清扫用**同一个函数**（app/device_state.is_online），
+    # 不在这里另写阈值：两处口径一旦分叉，就会出现「首页显示在线、改 WiFi 说
+    # 不在线」这种自相矛盾的画面（见该模块头部注释）。
+    if not is_online(dev.last_seen_at):
+        raise HTTPException(status.HTTP_409_CONFLICT, _WIFI_OFFLINE_DETAIL)
+
+    # req_id 单调 +1（0 是"无待下发"的哨兵值，永不复用）：
+    # 设备回报里带的是它，服务端靠判等丢弃过期回报（见 report_wifi_result）。
+    dev.wifi_req_id = int(dev.wifi_req_id or 0) + 1
+    dev.wifi_req_ssid = payload.ssid
+    dev.wifi_req_pwd = payload.password
+    dev.wifi_req_at = models.utcnow()
+    dev.wifi_state = "pending"
+    # 上一轮的回报时刻要清掉：它属于**上一次**请求，留着会让 APP 的
+    # 「最后更新」显示成上一轮的旧时间，看起来像这次提交没生效。
+    dev.wifi_result_at = None
+    db.commit()
+    db.refresh(dev)
+    return _wifi_out(dev)
+
+
+@router.get("/{device_pk}/wifi", response_model=DeviceWifiOut)
+def get_wifi_change(device_pk: int, db: Session = Depends(get_db),
+                    user: models.User = Depends(get_current_user)):
+    """家属端轮询改 WiFi 状态（APP 提交后按 pending 轮询到这里）。
+
+    ``state == ''`` 表示这台设备从未改过 WiFi（存量设备 / 新设备都是这个值，
+    见 schema_patch 里那几列的 DEFAULT 说明）。
+    """
+    return _wifi_out(require_device_owner(device_pk, user, db))
 
 
 # ============================================================ 激活码

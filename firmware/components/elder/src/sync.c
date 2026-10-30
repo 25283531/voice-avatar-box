@@ -21,6 +21,7 @@
 #include "elder_net.h"
 #include "elder_reminder.h"
 #include "elder_rtc.h"
+#include "elder_wifi_change.h"   /* 远程改 WiFi：试连/回滚 + 终态回报 */
 
 static const char *TAG = "elder.sync";
 
@@ -1131,13 +1132,55 @@ static esp_err_t do_sync(void)
     snprintf(path, sizeof(path), "/api/device/sync?fw_version=%s&hw_model=%s",
              g.fw_version, g.hw_model);
 
+    /* 请求体：平时就是 "{}"（与改造前逐字一致，老服务端照常解析）；只有存在
+     * 「改 WiFi 终态」要回报时才多一个 wifi_result 对象。
+     *
+     * 为什么用 cJSON 拼而不是 snprintf：SSID 里合法地可以出现 " 和 \，手拼必然
+     * 产出一段非法 JSON ⇒ 整条心跳被服务端拒掉 ⇒ 连带提醒都同步不了。
+     * 缓冲区由 cJSON 在**堆**上分配：同步任务栈只有 8KB，这里绝不能再加大局部数组
+     * （C13 红线）。 */
+    char *body = NULL;
+    elder_wifi_result_t wres = {0};
+    bool has_wres = elder_wifi_change_pending_result(&wres);
+    if (has_wres) {
+        /* 只用 cJSON 1.7 里**全仓已经在用**的那几个 API（CreateObject /
+         * AddItemToObject / AddNumberToObject / AddBoolToObject / AddStringToObject），
+         * 不用 AddObjectToObject 之类的便利宏 —— 本机没有 IDF 工具链，编不了的
+         * 东西不碰。 */
+        cJSON *b = cJSON_CreateObject();
+        cJSON *r = cJSON_CreateObject();
+        if (b && r) {
+            cJSON_AddNumberToObject(r, "req_id", (double)wres.req_id);
+            cJSON_AddBoolToObject(r, "ok", wres.ok);
+            cJSON_AddStringToObject(r, "ssid", wres.ssid);
+            cJSON_AddStringToObject(r, "reason", wres.reason);
+            cJSON_AddItemToObject(b, "wifi_result", r);
+            body = cJSON_PrintUnformatted(b);
+        } else if (r) {
+            cJSON_Delete(r);
+        }
+        if (b) cJSON_Delete(b);
+        if (!body) {
+            /* 拼不出来就这轮不带：结果还在 NVS 里，下一轮接着带。 */
+            ESP_LOGW(TAG, "wifi_result 序列化失败，本轮不带回报");
+            has_wres = false;
+        }
+    }
+
     size_t len = ELDER_NET_RESP_MAX;
     int status = 0;
-    esp_err_t err = elder_net_post(path, "{}", resp, &len, &status);
+    esp_err_t err = elder_net_post(path, body ? body : "{}", resp, &len, &status);
+    if (body) cJSON_free(body);
 
     if (err != ESP_OK) {
+        /* 没送达 ⇒ **不清** NVS 里的结果，下一轮心跳接着带。 */
         ESP_LOGW(TAG, "同步失败（%s）；离线期间本地提醒照常工作", esp_err_to_name(err));
         return err;
+    }
+    if (has_wres) {
+        /* 收到 2xx 才确认清除：服务端 req_id 对不上时会 200 但忽略，那条路径由
+         * 服务端自己保证幂等，设备侧不必区分。 */
+        elder_wifi_change_result_ack(wres.req_id);
     }
 
     cJSON *root = cJSON_ParseWithLength(resp, len);
@@ -1229,7 +1272,35 @@ static esp_err_t do_sync(void)
     ESP_LOGI(TAG, "本轮同步结束，elder_sync 栈余量 %u 字节（<1024 说明快压穿了）",
              (unsigned)(uxTaskGetStackHighWaterMark(NULL) * sizeof(StackType_t)));
 
-    /* 5) 形象 / 语音地址（记录到日志，接入层在 bridge 中处理） */
+    /* 5) 远程改 WiFi（2026-10-30）：**只解析，不动手**。
+     *
+     * 真正试连会 Stop() 掉整个 WiFi 栈几十秒，必须等本轮该发的请求都发完
+     * （见函数末尾）。这里先把字符串**拷出来**：cJSON_Delete(root) 之后
+     * valuestring 就是野指针了。
+     *
+     * 兼容性：老服务端不下发这个键 ⇒ wc_apply 恒 false，行为与改造前逐字一致；
+     * 字段缺失/类型不对也一律当「没有」（红线 7）。 */
+    char     wc_ssid[ELDER_WIFI_SSID_MAX] = "";
+    char     wc_pwd[ELDER_WIFI_PWD_MAX] = "";
+    uint32_t wc_req = 0;
+    bool     wc_apply = false;
+    cJSON *wc = cJSON_GetObjectItem(root, "wifi_change");
+    if (cJSON_IsObject(wc)) {
+        cJSON *rid   = cJSON_GetObjectItem(wc, "req_id");
+        cJSON *wssid = cJSON_GetObjectItem(wc, "ssid");
+        cJSON *wpwd  = cJSON_GetObjectItem(wc, "password");
+        if (cJSON_IsNumber(rid) && cJSON_IsString(wssid) && wssid->valuestring[0]) {
+            wc_req = (uint32_t)rid->valueint;
+            snprintf(wc_ssid, sizeof(wc_ssid), "%s", wssid->valuestring);
+            snprintf(wc_pwd, sizeof(wc_pwd), "%s",
+                     cJSON_IsString(wpwd) ? wpwd->valuestring : "");
+            wc_apply = true;
+        } else {
+            ESP_LOGW(TAG, "wifi_change 字段不完整（缺 req_id/ssid），忽略本次下发");
+        }
+    }
+
+    /* 6) 形象 / 语音地址（记录到日志，接入层在 bridge 中处理） */
     cJSON *avatar = cJSON_GetObjectItem(root, "avatar");
     if (cJSON_IsObject(avatar)) {
         cJSON *nm = cJSON_GetObjectItem(avatar, "name");
@@ -1246,6 +1317,14 @@ static esp_err_t do_sync(void)
     /* 联网成功 → 立刻补发离线期间攒下的回执 */
     flush_queue();
     ESP_LOGI(TAG, "同步完成，%u 条提醒，%u 秒后再次同步", count, (unsigned)g.interval_sec);
+
+    /* 7) 改 WiFi 放**最后**：它会 Stop() 掉 WiFi 栈（最长 45 秒），必须等本轮
+     *    该发的请求都发完再动手。apply() 只做参数校验 + 起任务，立刻返回 ——
+     *    绝不能在这里同步试连，那会把心跳任务卡住几十秒（红线：不阻塞同步）。 */
+    if (wc_apply) {
+        elder_wifi_change_apply(wc_req, wc_ssid, wc_pwd);
+    }
+
     return ESP_OK;
 }
 

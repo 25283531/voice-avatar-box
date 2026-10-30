@@ -14,6 +14,28 @@
         android:name="android.permission.READ_EXTERNAL_STORAGE"
         android:maxSdkVersion="32" />
 
+    <!--
+      WiFi 扫描（家属端「改 WiFi」选网络）。
+
+      ⚠️ 两个权限**按 SDK 版本二选一**，缺一个就是「扫描永远返回空列表」：
+        · Android 13+（API 33）：NEARBY_WIFI_DEVICES。带 neverForLocation 声明
+          「不拿扫描结果推导位置」，这样系统不要求定位权限、也不会因定位开关关闭而拦扫描；
+        · Android 12 及以下：系统只认 ACCESS_FINE_LOCATION，没有别的选择
+          （ACCESS_COARSE_LOCATION 不够，getScanResults 会直接返回空）。
+
+      ACCESS_WIFI_STATE / CHANGE_WIFI_STATE 是 startScan + getScanResults 的前提，
+      属于普通权限（装包即授予，不弹窗），但漏声明会抛 SecurityException。
+    -->
+    <uses-permission
+        android:name="android.permission.NEARBY_WIFI_DEVICES"
+        android:minSdkVersion="33"
+        android:usesPermissionFlags="neverForLocation" />
+    <uses-permission
+        android:name="android.permission.ACCESS_FINE_LOCATION"
+        android:maxSdkVersion="32" />
+    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+    <uses-permission android:name="android.permission.CHANGE_WIFI_STATE" />
+
     <application
         android:allowBackup="true"
         android:hardwareAccelerated="true"

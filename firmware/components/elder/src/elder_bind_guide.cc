@@ -81,6 +81,7 @@
 #include "elder_activation.h"   // elder_activation_format：码分组 123-4567（C 接口，.cc 可直接调）
 #include "elder_net.h"
 #include "config_report.h"
+#include "elder_wifi_change.h"  // 远程改 WiFi 的断电恢复（必须早于 app.Start()）
 
 #define TAG "elder.bind"
 
@@ -414,6 +415,13 @@ extern "C" esp_err_t elder_bind_guide_start(void)
     // 开机配置自检：放在这里是因为本函数是本项目**保证会执行**的最早钩子
     // （在 app.Start() 之前，且已绑定/未绑定两种设备都会走到）。
     elder_config_report();
+
+    // 远程改 WiFi 的断电恢复（2026-10-30）。挂在这里同样是「最早钩子」的理由：
+    // 上一次试连如果死在半路，pend_* 还留在 NVS 里，而 SsidManager 里可能已经是
+    // 一个没验证过的新密码 —— 必须赶在 app.Start() → StartNetwork() 拿它去连
+    // 之前把配置复原，否则这一次开机会直接连不上、进配网 AP 模式（= 上门）。
+    // 函数内部自己判「有没有 pend_*」，正常开机是 0 成本的 3 次 NVS 读。
+    elder_wifi_change_boot_recover();
 
     // 栈 6144：guide_task 里 Http + std::string 链比纯 NVS 操作深。
     // 栈不够的症状是第一次进循环就随机崩在 esp_http_client 里，
