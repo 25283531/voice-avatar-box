@@ -283,6 +283,17 @@ jobs:
       # 查询与 deleted_at 互为备份，且不留"已删除但仍启用"的矛盾数据）。
       - name: 提醒软删除与操作审计冒烟
         run: python tools/run_smoke.py logs/smoke_smoke_reminder_audit.log python tools/smoke_reminder_audit.py 8137
+      # 老库升级补列（不绑端口、秒级）：本项目只用 create_all 建表，没有 Alembic，
+      # 而 create_all **不给已存在的表补列**。所以「模型加了列、忘了登记
+      # schema_patch.NEW_COLUMNS」的后果不是"少个字段"，是**生产老库升级后
+      # 第一次 SELECT 抛 no such column、服务起不来**。
+      # 这条路径原先没有任何机器证据（smoke_schema_migrations.py 里 grep 不到
+      # NEW_COLUMNS，它守的是回填逻辑），2026-10-30 加 reminders 三列时只能靠
+      # 人工读代码判断"看着对"。本脚本对 NEW_COLUMNS 的**每一条**登记做
+      # 退化→升级→回读，并区分可空/不可空列断言默认值（不可空列漏 DEFAULT
+      # 会让老行读成 NULL、Pydantic 序列化直接炸）。
+      - name: 老库升级补列冒烟（NEW_COLUMNS 全量）
+        run: python tools/smoke_new_columns.py
       # hw_model 截断护栏（端口 8126）：SQLite 不强制列宽，`hw[:64]` 是唯一
       # 护栏。脚本自带**变异自检**（把 [:64] 改成 [:200] 必须变红），所以它
       # 不只是"跑通了"，还证明了自己的断言有鉴别力。
