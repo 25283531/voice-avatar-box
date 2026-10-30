@@ -1183,24 +1183,69 @@ createApp({
     }
   },
   methods:{
-    // 与管理后台同一套 fetch 包装：Bearer 注入、401 回登录态、detail 人话化
+    // 统一的网络层：**硬超时 + 幂等重试 + 人话错误**。
+    //
+    // 为什么必须自己加超时：``fetch`` 默认**永不超时**。弱网、或连接被中间
+    // 设备静默丢弃时，请求会一直挂着，页面就永远停在"加载中"—— 用户看到
+    // 的是"打不开"，而我们这边一条日志都没有（请求根本没到服务端）。
+    // 20s 是权衡：普通 CRUD 远小于它；慢接口的耗时由后端自己控制。
+    //
+    // 为什么只重试 GET：POST 有真实副作用（新建提醒、绑定设备），重试会
+    // 变成"点一次建两条"。GET 天然幂等，弱网下第一次失败率很高，重试一次
+    // 能挡掉绝大部分偶发抖动。
     async api(path, opt){
-      const res = await fetch(path, Object.assign({
-        headers: Object.assign(
-          // X-Client: 后端用它区分「网页」与「手机 APP」（提醒操作历史里会记
-          // 一条 via=web/app）。放在这个公共封装里而不是每个调用点 ——
-          // 漏一个调用点，那次操作就会被记成"来源未知"，而那种缺口在流水里
-          // 看起来跟"用户从别处操作"一模一样，事后无法分辨。
-          {'Content-Type':'application/json', 'X-Client':'web'},
-          this.token ? {Authorization:'Bearer '+this.token} : {}
-        )
-      }, opt || {}));
-      if (res.status === 401){ this.token=''; localStorage.removeItem('elder_token'); return null; }
-      const text = await res.text();
-      let data = null;
-      try { data = text ? JSON.parse(text) : null; } catch(e){ data = text; }
-      if (!res.ok){ throw new Error(this.errText(data, res.status)); }
-      return data;
+      const o = opt || {};
+      const method = String(o.method || 'GET').toUpperCase();
+      const tries = (method === 'GET' || method === 'HEAD') ? 2 : 1;
+      let lastErr = null;
+      for (let attempt = 0; attempt < tries; attempt++){
+        const ac = new AbortController();
+        const timer = setTimeout(() => ac.abort(), 20000);
+        try{
+          const res = await fetch(path, Object.assign({}, o, {
+            signal: ac.signal,
+            headers: Object.assign(
+              // X-Client: 后端用它区分「网页」与「手机 APP」（提醒操作历史里会记
+              // 一条 via=web/app）。放在这个公共封装里而不是每个调用点 ——
+              // 漏一个调用点，那次操作就会被记成"来源未知"，而那种缺口在流水里
+              // 看起来跟"用户从别处操作"一模一样，事后无法分辨。
+              {'Content-Type':'application/json', 'X-Client':'web'},
+              this.token ? {Authorization:'Bearer '+this.token} : {},
+              o.headers || {}
+            )
+          }));
+          if (res.status === 401){ this.token=''; localStorage.removeItem('elder_token'); return null; }
+          const text = await res.text();
+          let data = null;
+          try { data = text ? JSON.parse(text) : null; } catch(e){ data = text; }
+          if (!res.ok){
+            // 服务端已经给了人话（errText），这不是网络问题：不重试、不改写。
+            const err = new Error(this.errText(data, res.status));
+            err.network = false;
+            throw err;
+          }
+          return data;
+        }catch(e){
+          if (e && e.network === false) throw e;
+          lastErr = e;
+          if (attempt + 1 < tries){ await new Promise(r => setTimeout(r, 600)); continue; }
+        }finally{ clearTimeout(timer); }
+      }
+      throw new Error(this.netErrText(lastErr));
+    },
+    // 把浏览器/运行时的网络异常翻成用户看得懂的一句话。
+    //
+    // ⚠️ 原来这里直接把 ``e.message`` 抛给界面，于是 Chrome 下用户看到的就是
+    // 一行英文 ``Failed to fetch`` —— 既不知道发生了什么，也不知道该干什么。
+    // 三种形态都要认：超时（AbortError）、连接中断（Failed to fetch /
+    // NetworkError / Safari 的 Load failed）、其它。
+    netErrText(e){
+      const name = (e && e.name) || '';
+      const msg = (e && e.message) || '';
+      if (name === 'AbortError') return '请求超时（20 秒无响应），请检查网络后重试';
+      if (/Failed to fetch|NetworkError|Load failed|Network request failed/i.test(msg))
+        return '网络连接中断，请检查网络后重试';
+      return msg || '网络异常，请稍后重试';
     },
     errText(data, status){
       const d = data && data.detail;
@@ -1235,11 +1280,21 @@ createApp({
     async loginWith(username, password){
       this.busy = true; this.err = '';
       try{
-        const r = await fetch('/api/auth/login', {
-          method:'POST',
-          headers:{'Content-Type':'application/json', 'X-Client':'web'},
-          body: JSON.stringify({username: username, password: password})
-        });
+        // 登录不走 api()：那条封装把 401 当成"令牌失效，回登录态"，
+        // 而登录接口的 401 恰恰是"用户名或密码错"，必须原样报给用户。
+        // 但**超时与错误翻译要和 api() 一致** —— 否则登录这一步仍是
+        // 无限等待 + 英文 Failed to fetch，而它偏偏是用户最常走的入口。
+        const ac = new AbortController();
+        const timer = setTimeout(() => ac.abort(), 20000);
+        let r;
+        try{
+          r = await fetch('/api/auth/login', {
+            method:'POST',
+            signal: ac.signal,
+            headers:{'Content-Type':'application/json', 'X-Client':'web'},
+            body: JSON.stringify({username: username, password: password})
+          });
+        }finally{ clearTimeout(timer); }
         const d = await r.json();
         if (!r.ok) throw new Error((d && typeof d.detail === 'string' && d.detail) || '登录失败');
         this.token = d.access_token;
@@ -1247,7 +1302,7 @@ createApp({
         localStorage.setItem('elder_token', this.token);
         localStorage.setItem('elder_user', JSON.stringify(this.user));
         await this.loadAll();
-      }catch(e){ this.err = e.message; }
+      }catch(e){ this.err = this.netErrText(e); }
       finally{ this.busy = false; }
     },
     // 注册：POST /api/auth/register 无鉴权，成功返 201 + UserOut（不含 token），

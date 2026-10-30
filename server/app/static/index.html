@@ -1779,19 +1779,55 @@ createApp({
     },
   },
   methods:{
+    // 统一的网络层：**硬超时 + 幂等重试 + 人话错误**（与用户端 user.html 同一套）。
+    //
+    // fetch 默认**永不超时**：弱网或连接被中间设备静默丢弃时请求会一直挂着，
+    // 页面就永远停在加载态，用户看到的是"打不开"，服务端连一条日志都没有。
+    // 只重试 GET —— POST 有真实副作用（改配置、删数据），重试等于重复执行。
     async api(path, opt){
-      const res = await fetch(path, Object.assign({
-        headers: Object.assign(
-          {'Content-Type':'application/json'},
-          this.token ? {Authorization:'Bearer '+this.token} : {}
-        )
-      }, opt || {}));
-      if (res.status === 401){ this.token=''; localStorage.removeItem('elder_token'); return null; }
-      const text = await res.text();
-      let data = null;
-      try { data = text ? JSON.parse(text) : null; } catch(e){ data = text; }
-      if (!res.ok){ throw new Error(this.errText(data, res.status)); }
-      return data;
+      const o = opt || {};
+      const method = String(o.method || 'GET').toUpperCase();
+      const tries = (method === 'GET' || method === 'HEAD') ? 2 : 1;
+      let lastErr = null;
+      for (let attempt = 0; attempt < tries; attempt++){
+        const ac = new AbortController();
+        const timer = setTimeout(() => ac.abort(), 20000);
+        try{
+          const res = await fetch(path, Object.assign({}, o, {
+            signal: ac.signal,
+            headers: Object.assign(
+              {'Content-Type':'application/json'},
+              this.token ? {Authorization:'Bearer '+this.token} : {},
+              o.headers || {}
+            )
+          }));
+          if (res.status === 401){ this.token=''; localStorage.removeItem('elder_token'); return null; }
+          const text = await res.text();
+          let data = null;
+          try { data = text ? JSON.parse(text) : null; } catch(e){ data = text; }
+          if (!res.ok){
+            const err = new Error(this.errText(data, res.status));
+            err.network = false;
+            throw err;
+          }
+          return data;
+        }catch(e){
+          if (e && e.network === false) throw e;
+          lastErr = e;
+          if (attempt + 1 < tries){ await new Promise(r => setTimeout(r, 600)); continue; }
+        }finally{ clearTimeout(timer); }
+      }
+      throw new Error(this.netErrText(lastErr));
+    },
+    // 浏览器/运行时的网络异常 → 用户看得懂的一句话。
+    // 原来直接把 e.message 抛出去，运营看到的就是英文 `Failed to fetch`。
+    netErrText(e){
+      const name = (e && e.name) || '';
+      const msg = (e && e.message) || '';
+      if (name === 'AbortError') return '请求超时（20 秒无响应），请检查网络后重试';
+      if (/Failed to fetch|NetworkError|Load failed|Network request failed/i.test(msg))
+        return '网络连接中断，请检查网络后重试';
+      return msg || '网络异常，请稍后重试';
     },
     // 把后端的 detail 变成**人能读的一句话**。
     //
@@ -1820,10 +1856,20 @@ createApp({
     async doLogin(){
       this.busy = true; this.err = '';
       try{
-        const r = await fetch('/api/auth/login', {
-          method:'POST', headers:{'Content-Type':'application/json'},
-          body: JSON.stringify(this.loginForm)
-        });
+        // 登录不走 api()：那条封装把 401 当成"令牌失效回登录态"，
+        // 而登录接口的 401 恰恰是"用户名或密码错"。但超时与错误翻译
+        // 必须和 api() 一致，否则运营看到的是英文 Failed to fetch。
+        const ac = new AbortController();
+        const timer = setTimeout(() => ac.abort(), 20000);
+        let r;
+        try{
+          r = await fetch('/api/auth/login', {
+            method:'POST',
+            signal: ac.signal,
+            headers:{'Content-Type':'application/json'},
+            body: JSON.stringify(this.loginForm)
+          });
+        }finally{ clearTimeout(timer); }
         const d = await r.json();
         if (!r.ok) throw new Error(d.detail || '登录失败');
         this.token = d.access_token;
@@ -1831,7 +1877,7 @@ createApp({
         localStorage.setItem('elder_token', this.token);
         localStorage.setItem('elder_user', JSON.stringify(this.user));
         await this.loadAll();
-      }catch(e){ this.err = e.message; }
+      }catch(e){ this.err = this.netErrText(e); }
       finally{ this.busy = false; }
     },
     logout(){ this.token=''; localStorage.removeItem('elder_token'); },

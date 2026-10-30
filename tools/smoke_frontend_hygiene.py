@@ -452,6 +452,49 @@ def scan_file(path: Path) -> None:
     # ---------------------------------------------------------- L4 卡片归属
     check_card_ownership(tpl)
 
+    # ---------------------------------------------------------- L5 网络层
+    # ⚠️ 传 script 而不是 tpl：tpl 是**剥掉 <script> 之后**的模板，
+    # api() 在 script 里。传错对象会让这条断言永远「找不到 api()」。
+    check_network_layer(script)
+
+
+def check_network_layer(src: str) -> None:
+    """L5：前端请求层必须带**硬超时 + 幂等重试 + 人话错误**。
+
+    为什么这条要进门禁：``fetch`` 默认**永不超时**。把它改回裸 fetch，
+    语法照样合法、页面照样能打开、单测也照样绿 —— 只有在弱网下才会暴露，
+    而那时的表现是"页面一直转圈"或页面里出现一行英文 ``Failed to fetch``，
+    用户既看不懂也等不到结果。2026-10-30 用户反馈的正是这两句话。
+
+    反过来，这几个特征一旦被后人"顺手简化"掉，也是**零报错**的，
+    所以只能靠静态断言守住。
+    """
+    i = src.find("async api(path, opt){")
+    if i < 0:
+        check("L5 找得到 api() 请求封装", False, "没有 async api(path, opt)")
+        return
+    body = src[i:i + 2600]
+
+    check("L5a api() 带硬超时（AbortController + 定时 abort）",
+          "AbortController" in body and "ac.abort()" in body,
+          "没有超时 ⇒ 连接卡住时页面永远停在加载态")
+    check("L5b api() 把 signal 传给了 fetch",
+          "signal: ac.signal" in body,
+          "建了 AbortController 却没传 signal，等于没做超时")
+    check("L5c api() 只对幂等方法重试",
+          "const tries" in body and "'GET'" in body,
+          "没有按方法区分重试 ⇒ POST 重试会重复创建（点一次建两条）")
+    check("L5d 网络异常经 netErrText 翻译（不把英文原文抛给用户）",
+          "netErrText(lastErr)" in src and "netErrText(e){" in src.replace(" ", ""),
+          "用户会直接看到 Failed to fetch")
+    # 登录是唯一绕开 api() 的裸 fetch（401 语义不同），也必须走同一套翻译。
+    # 只在**有这个入口的文件**里断言：管理端 index.html 没有登录表单，
+    # 对它硬要求这句会得到一条永远红的假断言（而假红比没有断言更坏）。
+    if "/api/auth/login" in src:
+        check("L5e 登录的裸 fetch 也用 netErrText",
+              "this.err = this.netErrText(e)" in src,
+              "登录入口仍会显示英文 Failed to fetch")
+
 
 APP_SRC = SERVER.parent / "app" / "src"
 
@@ -511,7 +554,6 @@ def main() -> int:
     for path in (INDEX, USER):
         scan_file(path)
     scan_app_templates()
-
     passed = sum(1 for _n, ok, _d in results if ok)
     failed = [n for n, ok, _d in results if not ok]
     print("\n" + "=" * 64)

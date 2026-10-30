@@ -524,10 +524,21 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title=APP_NAME, version=APP_VERSION, lifespan=lifespan,
               description="老人陪伴 & 提醒助手业务后端（业务 API + 管理后台 + 用户端 + 自研语音链路，同源同端口）")
 
+# CORS：**必须** allow_credentials=False。
+#
+# 本服务全部走 ``Authorization: Bearer``，服务端**一个 Cookie 都不发**
+# （全仓 grep 不到 set_cookie），所以凭据模式根本用不上。
+# 而 ``allow_origins=["*"]`` 与 ``allow_credentials=True`` 同时成立时，
+# Starlette 在**简单请求**上会同时发 ``Access-Control-Allow-Origin: *``
+# 和 ``Access-Control-Allow-Credentials: true`` —— 这个组合被浏览器规范
+# 明确禁止，只要调用方写了 ``withCredentials: true``（或 fetch 的
+# ``credentials:'include'``），响应会被**整体丢弃**，前端只看到
+# ``TypeError: Failed to fetch``，控制台里连 4xx 都没有。
+# 2026-10-30 用户反馈"页面内经常出现 Failed to fetch"时查到这一处。
 app.add_middleware(
     CORSMiddleware,
     allow_origins=CORS_ORIGINS,
-    allow_credentials=True,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
