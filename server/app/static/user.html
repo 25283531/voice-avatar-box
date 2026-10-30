@@ -210,23 +210,17 @@
 
     <!-- ---------------------- 我的设备 ---------------------- -->
     <section v-if="tab==='devices'">
-      <div class="card">
-        <h2>添加设备</h2>
-        <p class="muted" style="font-size:12px;margin:0 0 10px">
-          设备连上 Wi-Fi 后，屏幕上会显示 <b>7 位数字激活码</b>（形如 <code>123-4567</code>），
-          在下方「输入激活码绑定设备」里填入该码即完成绑定。
-          激活码 <b>10 分钟内有效</b>，过期后设备会自动换一枚新码，照着屏幕重输即可。
-        </p>
-        <p class="muted" style="font-size:12px;margin:0 0 10px">
-          下面的「设备标识」是<b>可选</b>的备用登记方式：正常流程不需要手填，
-          绑定激活码时会按设备自报的 MAC 自动建档。
-        </p>
-        <div class="row">
-          <div><label>设备标识（eFuse MAC）</label><input v-model="devForm.device_id" placeholder="aabbccddeeff" /></div>
-          <div><label>名称</label><input v-model="devForm.name" placeholder="客厅陪伴助手" /></div>
-          <button class="primary" :disabled="busy" @click="createDevice">添加</button>
-        </div>
-      </div>
+      <!-- 这里曾有一个「添加设备」表单（填 eFuse MAC + 名称 → POST /api/devices）。
+           2026-10-30 删掉：它和下面「输入激活码绑定设备」**结果完全重复**
+           （两者都只是建一行 Device 并把 owner_id 设成当前用户），但凭证是
+           硬件 MAC —— 而设备屏幕只显示 7 位激活码（elder_bind_guide.cc:303），
+           机身标签印没印这串地址在仓库里查无依据，本页帮助区自己也写着
+           「要求用户提供它 = 把求助门槛设在他够不到的地方」。
+           于是那块表单在正常流程里**没人填得出来**，只会让人以为有两套流程。
+           而且它比激活码路径少了三件事：不作废同设备残留的码、不返回设备 token、
+           没有归属保护（已登记就直接 400，连"这行是别人不要的空壳"都救不回来）。
+           后端 POST /api/devices 保留（QA 脚本用它造测试设备），只是不再暴露给用户。
+           ⚠️ 以后要加"按 MAC 预登记"，应该做成管理端功能，不要放回用户端。 -->
 
       <!-- 激活码绑定：设备屏幕显示 7 位码（OTA 下发），用户在本页输入即可完成绑定，
            绑定后设备归到当前账号名下，随即出现在下方「我的设备」列表。
@@ -239,6 +233,10 @@
         <p class="muted" style="font-size:12px;margin:0 0 10px">
           让设备屏幕显示 <b>7 位数字激活码</b>，在本页输入即可完成绑定。
           多输的短横线（<code>123-4567</code>）或空格会被自动忽略。
+        </p>
+        <p class="muted" style="font-size:12px;margin:0 0 10px">
+          激活码 <b>10 分钟内有效</b>，过期后设备会自动换一枚新码，照着屏幕重输即可。
+          「设备标识」不用手填 —— 绑定时会按设备自报的 MAC 自动建档。
         </p>
         <div class="row">
           <div><label>激活码</label>
@@ -350,7 +348,7 @@
             </tr>
           </tbody>
         </table>
-        <div v-else class="empty">还没有设备，先在上方登记一台</div>
+        <div v-else class="empty">还没有设备，先在上面输入屏幕上的激活码完成绑定</div>
       </div>
     </section>
 
@@ -933,7 +931,7 @@
           </div>
         </template>
         <div v-else class="empty" id="stEmpty">
-          {{devices.length ? '该设备暂无统计数据' : '还没有设备，先到「我的设备」登记一台'}}
+          {{devices.length ? '该设备暂无统计数据' : '还没有设备，先到「我的设备」用激活码绑定一台'}}
         </div>
       </div>
 
@@ -1118,7 +1116,8 @@ createApp({
       loginForm: { username:'', password:'' },
       regForm: { username:'', nickname:'', password:'', password2:'', phone:'', email:'' },
       // 设备
-      devices: [], devForm: { device_id:'', name:'我的陪伴助手' },
+      // devForm（按 MAC 登记设备）已随「添加设备」表单一起删除，见 devices 页顶部注释
+      devices: [],
       bindForm: { code:'', device_id:'', alias:'' }, bindMsg: '',
       // 管理员联系邮箱：来自 GET /api/support-contact（config.SUPPORT_EMAIL）。
       // 刻意不在前端写死 —— 换邮箱只该改服务端配置，不该改这份 HTML。
@@ -1363,16 +1362,8 @@ createApp({
         if (!this.curDeviceId && r.length) this.curDeviceId = r[0].id;
       }catch(e){ this.err = '设备列表加载失败：' + e.message; }
     },
-    async createDevice(){
-      if (!this.devForm.device_id){ this.err = '请填写设备标识（MAC）'; return; }
-      this.busy = true;
-      try{
-        await this.api('/api/devices', {method:'POST', body:JSON.stringify(this.devForm)});
-        this.devForm = {device_id:'', name:'我的陪伴助手'};
-        await this.loadDevices();
-      }catch(e){ this.err = e.message; }
-      finally{ this.busy = false; }
-    },
+    // createDevice()（按 MAC 登记设备）已删：它与 bindDeviceByCode 结果重复，
+    // 且要求的 MAC 用户拿不到。详见 devices 页顶部注释。
     // 激活码绑定：客户端只做「去分隔符 + 长度 7」的粗筛，
     // 真正的 Luhn 校验位由服务端判定（security.verify_activation_code），
     // 这里不重复实现，避免两套规则漂移。

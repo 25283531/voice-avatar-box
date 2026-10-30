@@ -340,6 +340,52 @@ def strip_comments(html: str) -> str:
     return re.sub(r"<!--.*?-->", "", html, flags=re.S)
 
 
+def strip_js_comments(src: str) -> str:
+    """剥掉 JS 的 ``//`` 与 ``/* */`` 注释，**不动字符串里的内容**。
+
+    为什么必须有这一步：本文件的断言大多是"某段代码必须存在 / 必须不存在"，
+    而**防回归注释天生会引用被禁的那段代码** —— 例如删掉某个方法后，按惯例要
+    在原地留一句"xxx() 已删，原因见…"。不剥注释，这句注释自己就把断言踩红。
+
+    这条坑踩过不止一次（判据要按"代码位"判，不能整文件子串匹配）。假红比没有
+    断言更坏：它会教人忽略红灯。
+
+    已知局限：不识别正则字面量里的 ``//``（如 ``/a\\/\\/b/``）。本仓库的内联
+    script 里没有这种写法；真出现了也不会造成漏判，最多把一段字符串误当注释。
+    """
+    out: list[str] = []
+    i, n = 0, len(src)
+    quote: str | None = None
+    while i < n:
+        c = src[i]
+        if quote:
+            out.append(c)
+            if c == "\\" and i + 1 < n:          # 转义：整对吞掉
+                out.append(src[i + 1])
+                i += 2
+                continue
+            if c == quote:
+                quote = None
+            i += 1
+            continue
+        if c in "'\"`":
+            quote = c
+            out.append(c)
+            i += 1
+            continue
+        if c == "/" and i + 1 < n and src[i + 1] == "/":
+            j = src.find("\n", i)
+            i = n if j < 0 else j
+            continue
+        if c == "/" and i + 1 < n and src[i + 1] == "*":
+            j = src.find("*/", i + 2)
+            i = n if j < 0 else j + 2
+            continue
+        out.append(c)
+        i += 1
+    return "".join(out)
+
+
 def scan_file(path: Path) -> None:
     print(f"\n==== {path.relative_to(SERVER.parent)} ====")
     html = path.read_text(encoding="utf-8")
@@ -456,6 +502,48 @@ def scan_file(path: Path) -> None:
     # ⚠️ 传 script 而不是 tpl：tpl 是**剥掉 <script> 之后**的模板，
     # api() 在 script 里。传错对象会让这条断言永远「找不到 api()」。
     check_network_layer(script)
+
+    # ---------------------------------------------------------- L6 单一绑定入口
+    # 只对**用户端**断言：管理端本来就没有绑定入口（设备由家属在 / 页绑定）。
+    if path == USER:
+        check_single_bind_entry(tpl, script)
+
+
+def check_single_bind_entry(tpl: str, script: str) -> None:
+    """L6：用户端绑定设备**只能有一条路径** —— 输入屏幕上的 7 位激活码。
+
+    2026-10-30 用户问「添加设备这两项是不是重复了」。查下来不是"看起来像"：
+    页面上并排放着两个表单，都只是「建一行 Device 并把 owner_id 设成当前用户」，
+    但一个要 7 位激活码、另一个要 **eFuse MAC**。而设备屏幕只显示激活码
+    （elder_bind_guide.cc:303），机身标签印没印那串地址在仓库里查无依据，
+    本页帮助区自己也写着「要求用户提供它 = 把求助门槛设在他够不到的地方」。
+    ⇒ 按 MAC 的那块**在正常流程里没人填得出来**，只会让人以为有两套流程；
+    而且它比激活码路径少了三件事：不作废同设备残留码、不返回设备 token、
+    没有归属保护（已登记就直接 400）。
+
+    这条断言守的是"别再长回来"：它属于**零报错**的那类问题（页面照样能开、
+    语法照样合法），只能静态拦。真要按 MAC 预登记，应该做在管理端。
+    """
+    # ⚠️ 必须先剥注释再匹配：删除这两个东西时，原地按惯例会留一句
+    # "devForm / createDevice 已删，原因见…"，那句注释自己就会把断言踩红。
+    # tpl 在 scan_file 里已剥过 HTML 注释；script 是原始的，这里补剥 JS 注释。
+    code = strip_js_comments(script)
+
+    if "输入激活码绑定设备" not in tpl:
+        check("L6a 用户端有激活码绑定入口", False,
+              "找不到「输入激活码绑定设备」卡片 —— 绑定入口没了？")
+        return
+    check("L6a 用户端有激活码绑定入口", True)
+
+    check("L6b 用户端没有第二套「按 MAC 登记设备」表单",
+          "devForm" not in tpl and "devForm" not in code,
+          "又出现了按 MAC 登记设备的表单/方法。它与激活码绑定结果重复，"
+          "且 MAC 在设备屏幕上根本不显示（用户拿不到）——"
+          "要按 MAC 预登记请做在管理端")
+
+    check("L6c 没有残留的 createDevice 方法",
+          "createDevice" not in code,
+          "createDevice() 还在 ⇒ 可能又挂回了某个按钮上")
 
 
 def check_network_layer(src: str) -> None:
