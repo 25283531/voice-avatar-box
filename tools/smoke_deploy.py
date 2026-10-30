@@ -288,9 +288,22 @@ def git_show(ref: str, rel_path: str) -> str:
                           capture_output=True, text=True,
                           encoding="utf-8", errors="replace")
     if proc.returncode != 0:
+        # 两种原因要分开说，否则会把人带偏：
+        #   ① 浅克隆（CI 默认 depth=1）—— 对象在远端历史里，只是没取下来；
+        #   ② ref 真的不存在（历史被重写 / 分支删了）—— 那才要换 BASELINE_REF。
+        # 2026-10-30 实际踩过：CI 报的就是 ①，而原错误信息只说「请更新
+        # BASELINE_REF」，于是我一度以为基线提交丢了，实际它好好地在 main 上。
+        shallow = subprocess.run(
+            ["git", "rev-parse", "--is-shallow-repository"], cwd=str(ROOT),
+            capture_output=True, text=True).stdout.strip() == "true"
+        if shallow:
+            hint = ("当前是**浅克隆**（git rev-parse --is-shallow-repository = true），"
+                    "对象可能只是没取下来。先 `git fetch --unshallow`；"
+                    "CI 侧把 actions/checkout 的 fetch-depth 设成 0。")
+        else:
+            hint = f"仓库不是浅克隆，说明 {ref} 真的不可达 —— 请更新 BASELINE_REF。"
         raise RuntimeError(
-            f"git show {ref}:{rel_path} 失败（{proc.stderr.strip()[:200]}）—— "
-            f"请把 smoke_deploy.py 的 BASELINE_REF 更新到本特性之前的提交")
+            f"git show {ref}:{rel_path} 失败（{proc.stderr.strip()[:200]}）—— {hint}")
     return proc.stdout
 
 

@@ -48,6 +48,20 @@ jobs:
     steps:
       - name: 检出代码
         uses: actions/checkout@v4
+        with:
+          # 取**全历史**，不是默认的 depth=1。
+          #
+          # 唯一动因是 `tools/smoke_deploy.py` 的 H 组：它用
+          # `git show c6f00e8:server/app/{config,device_api}.py` 取出**改动前**
+          # 的源码，在内存里 exec 一遍，再和新代码的 8 组输入逐字比对 ——
+          # 这是「这次重构没有改变 auto/direct 模式行为」的唯一机器证据。
+          # 浅克隆里没有那个对象，H 组会抛
+          # `RuntimeError: git show c6f00e8:... 失败（invalid object name）`。
+          #
+          # 代价可忽略：本仓 .git 约 15MB / 266 个提交。
+          # 反过来，若把 H 组改成「取不到就 SKIP」，就等于让 8 条断言在 CI 里
+          # 永远不执行 —— 正是这道 CI 之前反复犯的病（写了不跑、还全绿）。
+          fetch-depth: 0
 
       - name: 准备 Python 3.11
         uses: actions/setup-python@v5
