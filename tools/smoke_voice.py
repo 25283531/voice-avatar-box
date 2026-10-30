@@ -790,7 +790,13 @@ def _db_count(sql: str, params: dict | None = None) -> int:
 
 
 def _reminders(device_pk: int) -> list[dict]:
-    """这台设备当前的提醒（断言"真的建进/删掉了没有"的唯一真源）。"""
+    """这台设备当前的提醒（断言"真的建进/删掉了没有"的唯一真源）。
+
+    ⚠️ 这里**刻意不过滤** ``deleted_at`` —— 它是"库里到底有什么"的真源，
+    不是"用户看到什么"。2026-10-30 提醒改软删除后，删除不再物理删行，
+    所以"删掉了没有"必须看 ``deleted_at`` 而不是看行是否存在（见 12c）。
+    用户视角的列表另有断言（走 ``filter(deleted_at IS NULL)``）。
+    """
     from app.db import SessionLocal
     from app.models import Reminder
 
@@ -802,7 +808,8 @@ def _reminders(device_pk: int) -> list[dict]:
                  "once_date": r.once_date,
                  "kind": int(r.schedule_kind),
                  "weekdays": list(r.weekdays or []),
-                 "enabled": bool(r.enabled)} for r in rows]
+                 "enabled": bool(r.enabled),
+                 "deleted_at": r.deleted_at} for r in rows]
 
 
 def _last_interaction_meta(device_pk: int) -> dict:
@@ -1940,9 +1947,19 @@ async def t_tools_delete_toggle(ids: dict) -> None:
     finally:
         await ws.close()
     rows = _reminders(ids["device_pk"])
-    check("12c · delete_reminder 删除成功（表里真没有了）",
-          not any(r["title"] == "喝水" for r in rows),
-          str([r["title"] for r in rows]))
+    # 软删除（2026-10-30）：删除不再物理删行（用户要求"删了也能看到历史"）。
+    # 所以"删掉了没有"的判据从「行还在不在」改成两条：
+    #   ① 库里那行还在，但 deleted_at 已置 —— 证明软删除真的生效了；
+    #   ② 用户视角的列表里已经看不到它 —— 证明"删了"对老人/家属成立。
+    # 只判①会漏掉"标记了但查询忘了过滤"（那等于没删，提醒还会响）；
+    # 只判②会漏掉"物理删了但历史也没了"（用户诉求没满足）。
+    hit = next((r for r in rows if r["title"] == "喝水"), None)
+    check("12c ★ delete_reminder 软删除：行保留但 deleted_at 已置",
+          hit is not None and hit.get("deleted_at") is not None, str(hit))
+    check("12c · 对外列表里已经没有这条（用户视角等于删了）",
+          not any(r["title"] == "喝水" and r.get("deleted_at") is None
+                  for r in rows),
+          str([(r["title"], bool(r.get("deleted_at"))) for r in rows]))
     UP.plan = []
     UP.asr_text = FAKE_ASR_TEXT
 
