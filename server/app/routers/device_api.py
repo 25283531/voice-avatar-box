@@ -10,7 +10,7 @@ import logging
 from datetime import timedelta
 from typing import Any
 
-from fastapi import APIRouter, Depends, Request, status
+from fastapi import APIRouter, Body, Depends, Request, status
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -36,6 +36,7 @@ from ..schedule import (TZ_MARGIN, event_due_utc, local_now, materialize_events,
 from ..schemas import (
     AvatarOut,
     DeviceQuotaOut,
+    DeviceSyncIn,
     DeviceSyncOut,
     DeviceWifiChangeOut,
     DeviceWifiResultIn,
@@ -162,6 +163,7 @@ def _device_tz_for(request: Request, dev: models.Device,
 
 @router.post("/sync", response_model=DeviceSyncOut)
 def sync(request: Request, fw_version: str = "", hw_model: str = "",
+         payload: DeviceSyncIn | None = Body(default=None),
          db: Session = Depends(get_db),
          dev: models.Device = Depends(get_current_device)):
     """心跳 + 拉全量配置。
@@ -171,6 +173,9 @@ def sync(request: Request, fw_version: str = "", hw_model: str = "",
     param、同形态上报。非空即写入设备行（用户端/管理端设备表的「硬件型号」
     列读它）；空 = 老固件未升级，保留原值不清空 —— 心跳是周期动作，
     一次异常请求不该把已采到的型号抹掉。
+
+    ``payload``：**可选**请求体，目前只承载 ``wifi_result``（改 WiFi 终态）。
+    老固件发 ``{}`` 或不发 body ⇒ ``None``，行为与改造前逐字一致。
     """
     dev.online = True
     dev.last_seen_at = utcnow()
@@ -180,6 +185,22 @@ def sync(request: Request, fw_version: str = "", hw_model: str = "",
     if hw:
         dev.hardware_model = hw[:64]     # 与 Device.hardware_model 列宽对齐
     db.commit()
+
+    # ---- 改 WiFi 终态（固件随心跳带上来，见 DeviceSyncIn 的说明）----
+    #
+    # **必须排在下发新指令之前**：先收掉"上一次的结果"，再决定"这一轮要不要
+    # 下发新的"。反过来的话，同一轮里刚写完 rolled_back 又把新指令发下去，
+    # APP 那 5 秒一次的轮询恰好可能看到那个自相矛盾的中间态。
+    #
+    # req_id 判等与 /wifi-result 完全一致（过期回报只记日志、不改状态），
+    # 所以重复回报（心跳带一次 + 单独 POST 一次）是幂等的。
+    if payload is not None and payload.wifi_result is not None:
+        wr = payload.wifi_result
+        if int(wr.req_id) == int(dev.wifi_req_id or 0):
+            _apply_wifi_result(dev, wr.ok, wr.ssid, wr.reason, db)
+        else:
+            log.info("丢弃过期的改 WiFi 回报（心跳体）：device=%s 收到 req_id=%s 当前 req_id=%s",
+                     dev.id, wr.req_id, dev.wifi_req_id)
 
     # 为该设备排期（幂等）
     materialize_events(db, dev.id, hours=SCHEDULE_AHEAD_HOURS)
@@ -351,6 +372,37 @@ def sync(request: Request, fw_version: str = "", hw_model: str = "",
     )
 
 
+def _apply_wifi_result(dev: models.Device, ok: bool, ssid: str, reason: str,
+                       db: Session) -> None:
+    """把一条「改 WiFi 终态」写进设备行。**两条入口共用这一份实现。**
+
+    入口有两条：
+      * ``POST /api/device/wifi-result``（设备单独回报）；
+      * ``POST /api/device/sync`` 的**请求体**（设备随心跳回报）。
+
+    ⚠️ 写成两份必然漂移，而漂移的那一份就是「某条路径下密码清不掉」这种缺陷的
+    温床。2026-10-31 之前正是这个形态：固件一直在心跳请求体里带 ``wifi_result``，
+    而 ``/sync`` 从头到尾没读过 request body —— 200 返回、固件认为送达并删掉
+    本地结果，终态**永久丢失**（APP 永远停在「正在切换」，明文密码一直留在库里）。
+    现在两条入口都调这里，回归判据见 ``tools/smoke_wifi_change.py`` 的 C11。
+    """
+    dev.wifi_state = "applied" if ok else "rolled_back"
+    # 明文密码到此为止：终态已拿到，不再需要它。
+    dev.wifi_req_pwd = ""
+    dev.wifi_result_at = utcnow()
+    db.commit()
+
+    # reason 只进日志、**不进库也不回给 APP**：它是固件内部错误码/英文，
+    # 家属看到"ESP_ERR_WIFI_NOT_CONNECT"没有任何可行动的信息；真正给家属看的
+    # 那句话由家属端按 state 派生（见 routers/devices._WIFI_MESSAGES）。
+    if not ok:
+        log.warning("改 WiFi 失败已回滚：device=%s req_id=%s ssid=%s reason=%s",
+                    dev.id, dev.wifi_req_id, ssid or "-", (reason or "-")[:200])
+    else:
+        log.info("改 WiFi 已生效：device=%s req_id=%s ssid=%s",
+                 dev.id, dev.wifi_req_id, ssid or "-")
+
+
 @router.post("/wifi-result", response_model=dict[str, Any])
 def report_wifi_result(payload: DeviceWifiResultIn, db: Session = Depends(get_db),
                        dev: models.Device = Depends(get_current_device)):
@@ -392,22 +444,7 @@ def report_wifi_result(payload: DeviceWifiResultIn, db: Session = Depends(get_db
                  dev.id, payload.req_id, dev.wifi_req_id)
         return {"ok": True, "ignored": "stale_req_id"}
 
-    dev.wifi_state = "applied" if payload.ok else "rolled_back"
-    # 明文密码到此为止：终态已拿到，不再需要它。
-    dev.wifi_req_pwd = ""
-    dev.wifi_result_at = utcnow()
-    db.commit()
-
-    # reason 只进日志、**不进库也不回给 APP**：它是固件内部错误码/英文，
-    # 家属看到"ESP_ERR_WIFI_NOT_CONNECT"没有任何可行动的信息；真正给家属看的
-    # 那句话由家属端按 state 派生（见 routers/devices._WIFI_MESSAGES）。
-    if not payload.ok:
-        log.warning("改 WiFi 失败已回滚：device=%s req_id=%s ssid=%s reason=%s",
-                    dev.id, dev.wifi_req_id, payload.ssid or "-",
-                    (payload.reason or "-")[:200])
-    else:
-        log.info("改 WiFi 已生效：device=%s req_id=%s ssid=%s",
-                 dev.id, dev.wifi_req_id, payload.ssid or "-")
+    _apply_wifi_result(dev, payload.ok, payload.ssid, payload.reason, db)
     return {"ok": True, "state": dev.wifi_state, "req_id": dev.wifi_req_id}
 
 

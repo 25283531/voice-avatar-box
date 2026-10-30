@@ -385,6 +385,72 @@ def run() -> None:
                   tok2)
     check("C10 别人的设备 POST wifi ⇒ 403", code == 403, f"http={code}")
 
+    # ---------------- C11 终态走**心跳体**（曾经永久丢失的那条路径） ----------------
+    #
+    # 为什么单独一条、且是全文件最重要的一条：C5/C9 走的是
+    # `POST /api/device/wifi-result`，而**固件实际走的是心跳体**
+    # （firmware/components/elder/src/sync.c 把 wifi_result 拼进 /sync 的 body，
+    # 拿到 200 就删掉本地结果）。2026-10-31 之前 `/sync` 从头到尾没读过
+    # request body ⇒ 固件以为送达、服务端什么都没收到：state 永远停在
+    # delivered、明文密码永久留库、APP 永远显示「正在切换」。
+    # 只测 /wifi-result 的 C5/C9 一直是绿的 —— 正是它们让这个缺陷活了下来。
+    code, body = req("POST", f"/api/devices/{pk}/wifi",
+                     {"ssid": "HeartbeatHome", "password": "hbpass1234"}, token=tok)
+    rid = (body or {}).get("req_id") if isinstance(body, dict) else None
+    check("C11 前置：再提交一次，拿到新的 req_id", code == 200 and rid is not None,
+          f"http={code} req_id={rid}")
+
+    code, sync1 = req("POST", "/api/device/sync", None, dtok)
+    wc = (sync1 or {}).get("wifi_change") if isinstance(sync1, dict) else None
+    check("C11 前置：这一轮心跳把指令下发出去",
+          code == 200 and isinstance(wc, dict) and wc.get("req_id") == rid,
+          f"http={code} wifi_change={wc}")
+    row8 = db_wifi(pk)
+    check("C11 前置：state=delivered 且密码在库",
+          row8.get("wifi_state") == "delivered"
+          and row8.get("wifi_req_pwd") == "hbpass1234", str(row8))
+
+    code, sync2 = req("POST", "/api/device/sync",
+                      {"wifi_result": {"req_id": rid, "ok": False,
+                                       "ssid": "HeartbeatHome",
+                                       "reason": "auth_or_not_found"}},
+                      dtok)
+    check("C11 心跳体带 wifi_result 时 /sync 仍返回 200", code == 200, f"http={code}")
+    row9 = db_wifi(pk)
+    check("C11 ★ 心跳体里的终态必须落库（state=rolled_back）",
+          row9.get("wifi_state") == "rolled_back", str(row9))
+    check("C11 ★ 心跳体回报也要清空明文密码（否则它永久留库）",
+          row9.get("wifi_req_pwd") == "", repr(row9.get("wifi_req_pwd")))
+    check("C11 心跳体回报也写 wifi_result_at", row9.get("wifi_result_at") is not None,
+          str(row9))
+    # 顺序判据：先收结果、再决定下发。反过来的话这一轮会既写 rolled_back
+    # 又把同一条指令再发一次，APP 那 5 秒一次的轮询能看到自相矛盾的中间态。
+    check("C11 ★ 收完结果后这一轮不得再下发同一条指令",
+          isinstance(sync2, dict) and (sync2 or {}).get("wifi_change") is None,
+          str((sync2 or {}).get("wifi_change")))
+
+    # 过期 req_id 走心跳体：只记日志、不改状态、不清密码。
+    # 先造一个新的 pending（密码重新入库），否则"密码没被清"是空断言 ——
+    # 上一步已经把它清成空串了，再断言等于断言 ""==""。
+    code, body = req("POST", f"/api/devices/{pk}/wifi",
+                     {"ssid": "ThirdHome", "password": "thirdpass99"}, token=tok)
+    rid2 = (body or {}).get("req_id") if isinstance(body, dict) else None
+    check("C11 前置：再提交一次（pending，密码重新入库）",
+          code == 200 and rid2 is not None, f"http={code} rid2={rid2}")
+
+    code, sync3 = req("POST", "/api/device/sync",
+                      {"wifi_result": {"req_id": rid, "ok": True,
+                                       "ssid": "HeartbeatHome", "reason": ""}},
+                      dtok)
+    row10 = db_wifi(pk)
+    # 这一轮**同时**做了两件事：丢弃过期回报、把 ThirdHome 下发出去。
+    # 所以终态是 delivered（而不是过期回报里的 applied）才算对。
+    check("C11 ★ 心跳体里的过期 req_id 不得改状态（不能把还没试过的请求判死）",
+          code == 200 and row10.get("wifi_state") == "delivered"
+          and row10.get("wifi_req_id") == rid2, f"http={code} {row10}")
+    check("C11 ★ 过期回报也不清当前请求的密码",
+          row10.get("wifi_req_pwd") == "thirdpass99", repr(row10.get("wifi_req_pwd")))
+
 
 def main() -> int:
     try:

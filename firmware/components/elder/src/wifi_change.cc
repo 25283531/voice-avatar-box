@@ -106,6 +106,7 @@
 #include "nvs.h"
 #include "nvs_flash.h"
 
+#include "elder_sync.h"        /* 收尾立刻催一次心跳：终态别等下一个 300 秒周期 */
 #include "elder_ui.h"          /* 播报：屏显 + 提示音 + TTS（hooks 由 main 注入） */
 #include "ssid_manager.h"
 #include "wifi_station.h"
@@ -618,6 +619,20 @@ static void trial_run(trial_arg_t *a)
 
     clear_pending();
     finish(a, ok, committed, reason);
+
+    /*
+     * 收尾立刻催一次心跳。
+     *
+     * 为什么需要：服务端只在**下发那一条指令的那一次**响应里把心跳周期提速到
+     * 15 秒（这是刻意的，永久提速会让全平台心跳量 ×20）。设备拿到指令 15 秒后
+     * 就会再同步一次，而那时改 WiFi 才刚播报完、还在试连 —— 那一轮响应把周期
+     * 恢复成 300 秒。于是终态要等到**下一次 300 秒周期**才回报，APP 会在设备
+     * 早就切完之后还显示「正在切换」好几分钟。
+     *
+     * 放在 `finish()` 之后：结果先落 NVS，这一轮心跳才带得上。
+     * 失败也无所谓 —— 网络可能还在重连，结果留在 NVS 里，下一轮周期照样带。
+     */
+    (void)elder_sync_request_now();
 }
 
 static void trial_task(void *arg)

@@ -299,9 +299,27 @@ class DeviceWifiResultIn(ORMBase):
     reason: str = ""
 
 
+class DeviceSyncIn(ORMBase):
+    """``POST /api/device/sync`` 的**可选**请求体。
+
+    ⚠️ 这个类存在的唯一理由是 ``wifi_result``：固件把「改 WiFi 终态」塞在心跳
+    请求体里一起发（断网时进 NVS 队列、联网后随下一轮心跳补发，见
+    ``firmware/components/elder/src/sync.c`` 拼 ``body`` 的那一段），而不是单独调
+    ``POST /api/device/wifi-result``。
+
+    ⚠️ **2026-10-31 之前这里是个真缺陷**：固件一直在发，而 ``/sync`` 从头到尾
+    没读过 request body（它只用 ``Request`` 拿 IP 判时区）。于是 200 返回、固件
+    认为送达并**删掉本地结果** ⇒ 改 WiFi 的终态永久丢失：APP 永远停在「正在
+    切换」，明文密码也一直留在库里。判据是 ``tools/smoke_wifi_change.py`` 的 C11
+    （走心跳带上结果的那条路径），**不是**只看 ``/wifi-result`` 的 C5/C9 ——
+    那两条一直是绿的，正是它们让这个缺陷活了整整一天。
+    """
+
+    wifi_result: DeviceWifiResultIn | None = None
+
+
 class DeviceWifiChangeOut(ORMBase):
     """随 ``POST /api/device/sync`` 下发给固件的改 WiFi 指令。
-
     ⚠️ 只在 ``wifi_state == "pending"`` 时出现，下发后服务端立刻把 state 置为
     ``delivered`` —— 所以**同一条指令不会下两次**（重复下发 = 设备反复试连、
     反复断网重连，老人家里会看到 WiFi 图标闪一整天）。

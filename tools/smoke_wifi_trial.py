@@ -206,9 +206,17 @@ def run() -> int:
         check("W9 ★ persist_pending() 里没有 pwd 这个变量（密码只活在 RAM）",
               re.search(r"\bpwd\b", pend) is None, "")
 
+    # ---- W10：收尾立刻催一次心跳 ----
+    # 不催的话终态要等下一个 300 秒周期才回报：APP 会在设备早就切完之后还显示
+    # 「正在切换」好几分钟。必须排在 finish() 之后（结果先落 NVS 才带得上）。
+    i_finish = pos(code, "finish(a, ok, committed, reason)")
+    i_sync = pos(code, "elder_sync_request_now()")
+    check("W10 ★ finish() 之后催一次心跳（终态别等下一个 300 秒周期）",
+          i_finish >= 0 and i_sync > i_finish, f"finish@{i_finish} sync@{i_sync}")
+
     # ---- 头文件与实现的一致性（防止只改一头）----
     hdr = HDR.read_text(encoding="utf-8") if HDR.exists() else ""
-    check("W10 头文件里不再宣称 pend_old_pwd 备份（文档不能描述旧机制）",
+    check("W11 头文件里不再宣称 pend_old_pwd 备份（文档不能描述旧机制）",
           "pend_old_pwd" not in hdr or "不再写" in hdr, "")
 
     print()
