@@ -58,7 +58,7 @@ def _get_deleted(db: Session, reminder_pk: int) -> models.Reminder:
     return r
 
 
-def client_via(request: Request) -> str:
+def client_via(request: Request | None) -> str:
     """客户端自报来源端。前端在请求头里带 ``X-Client: web|app``。
 
     为什么要客户端自报而不是服务端猜：网页端与 APP 端打的是同一套 API，
@@ -68,7 +68,18 @@ def client_via(request: Request) -> str:
 
     非法值一律回落 ``web``：这是个**展示**字段，不该因为它拼错就 400
     —— 那会让一次正常的删除失败。
+
+    ⚠️ ``request`` 可以是 ``None``（类型标注就是这么写的），**必须容忍**：
+    本仓有若干**进程内直调** router 函数的检查脚本（``tools/check_reminder_once.py``
+    就把 ``request`` 位置传 ``None``，因为它要测的是入参校验，不关心请求上下文）。
+    第一版这里直接写 ``request.headers.get(...)``，于是那些脚本一调就
+    ``AttributeError: 'NoneType' object has no attribute 'headers'`` ——
+    CI 的 ``server-ci`` 就是这么红的（本地 HTTP 冒烟永远发现不了，因为它
+    走的都是真实 Request）。``_reminder_tz()`` 早就用 ``if request is not None``
+    处理过同一个问题，这里照抄那个口径。
     """
+    if request is None:
+        return "web"
     raw = (request.headers.get("x-client") or "").strip().lower()
     return raw if raw in reminder_audit.VIA_VALUES else "web"
 
@@ -185,9 +196,10 @@ def create_reminder(device_pk: int, payload: ReminderIn, request: Request,
 
 
 @router.get("", response_model=list[ReminderOut])
-def list_reminders(device_pk: int | None = None, include_deleted: bool = False,
+def list_reminders(device_pk: int | None = None,
                    db: Session = Depends(get_db),
-                   user: models.User = Depends(get_current_user)):
+                   user: models.User = Depends(get_current_user),
+                   include_deleted: bool = False):
     """提醒列表。默认**只返回未删除的**。
 
     ``include_deleted=true`` 时把已删除的一并带出（``is_deleted=true``）：
