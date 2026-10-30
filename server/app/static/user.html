@@ -65,6 +65,9 @@
   .modal{background:#fff;border-radius:12px;padding:18px;width:100%;max-width:720px}
   .close{float:right;border:none;background:none;font-size:20px;cursor:pointer;color:var(--muted)}
   .empty{padding:20px;text-align:center;color:var(--muted)}
+  /* 操作历史里「删除」那一行：用户翻历史十有八九是找"我删过什么"，
+     一条红左边框比任何颜色标签都先被看见。 */
+  .audit-del{border-left:3px solid var(--bad);background:#fffafa}
   /* ---- 角色性格档位按钮组（与 /api/roles/traits 下发的 options 一一对应）---- */
   .bands{display:flex;gap:6px;flex-wrap:wrap}
   .bands button{font-size:12px;padding:5px 11px}
@@ -364,29 +367,84 @@
             <button class="primary" :disabled="!curDeviceId" @click="editReminder(null)">新增提醒</button>
           </div>
         </div>
-        <table v-if="reminders.length">
-          <thead><tr><th>标题</th><th>类型</th><th>时间</th><th>重复</th><th>确认</th><th>状态</th><th>操作</th></tr></thead>
-          <tbody>
-            <tr v-for="r in reminders" :key="r.id">
-              <td>
-                {{r.title}}
-                <div class="muted" style="font-size:12px" v-if="r.dose">剂量：{{r.dose}}</div>
-                <div class="muted" style="font-size:12px">下次：{{fmt(r.next_fire_at)}}</div>
-              </td>
-              <td>{{typeName(r.rtype)}}</td>
-              <td>{{(r.times_of_day||[]).join(' ')}}</td>
-              <td>{{kindName(r)}}</td>
-              <td>{{(r.confirm_methods||[]).join('/')||'—'}}</td>
-              <td><span class="tag" :class="r.enabled?'ok':''">{{r.enabled?'启用':'暂停'}}</span></td>
-              <td class="row">
-                <button @click="editReminder(r)">编辑</button>
-                <button @click="toggleReminder(r)">{{r.enabled?'暂停':'启用'}}</button>
-                <button class="danger" @click="removeReminder(r)">删除</button>
-              </td>
-            </tr>
-          </tbody>
-        </table>
-        <div v-else class="empty">该设备还没有提醒规则</div>
+        <!-- 视图切换：当前提醒 / 操作历史。
+             为什么要有「历史」而不是只留列表：提醒现在是**软删除**，删掉的规则
+             仍留在库里。用户的原话是「即便提醒删除了，用户也能看到历史上的
+             提醒操作记录」—— 不给入口，那条数据对用户就等于不存在。
+             用现有 button 样式做分段切换，不引入组件库。 -->
+        <div class="row" style="margin:0 0 10px;align-items:center">
+          <button :class="rView==='list'?'primary':''" @click="switchRView('list')">当前提醒</button>
+          <button :class="rView==='history'?'primary':''" @click="switchRView('history')">操作历史</button>
+          <span class="muted" style="font-size:12px">
+            删除的提醒不会丢，都会留在「操作历史」里，可以查、也可以恢复
+          </span>
+        </div>
+
+        <template v-if="rView==='list'">
+          <table v-if="reminders.length">
+            <thead><tr><th>标题</th><th>类型</th><th>时间</th><th>重复</th><th>确认</th><th>状态</th><th>操作</th></tr></thead>
+            <tbody>
+              <tr v-for="r in reminders" :key="r.id">
+                <td>
+                  {{r.title}}
+                  <div class="muted" style="font-size:12px" v-if="r.dose">剂量：{{r.dose}}</div>
+                  <div class="muted" style="font-size:12px">下次：{{fmt(r.next_fire_at)}}</div>
+                </td>
+                <td>{{typeName(r.rtype)}}</td>
+                <td>{{(r.times_of_day||[]).join(' ')}}</td>
+                <td>{{kindName(r)}}</td>
+                <td>{{(r.confirm_methods||[]).join('/')||'—'}}</td>
+                <td>
+                  <span class="tag" :class="r.enabled?'ok':''">{{r.enabled?'启用':'暂停'}}</span>
+                  <!-- 已删除的行仍然列出来（而不是直接消失）：让用户"看得见自己删过什么"，
+                       并且就地给一个恢复入口，不用先去历史里找。 -->
+                  <span class="tag bad" v-if="r.is_deleted">已删除</span>
+                </td>
+                <td class="row">
+                  <template v-if="r.is_deleted">
+                    <button class="primary" @click="restoreReminder(r)">恢复</button>
+                  </template>
+                  <template v-else>
+                    <button @click="editReminder(r)">编辑</button>
+                    <button @click="toggleReminder(r)">{{r.enabled?'暂停':'启用'}}</button>
+                    <button class="danger" @click="removeReminder(r)">删除</button>
+                  </template>
+                </td>
+              </tr>
+            </tbody>
+          </table>
+          <div v-else class="empty">该设备还没有提醒规则</div>
+        </template>
+
+        <!-- 操作历史：后端 /api/reminders/audits 的流水（create/update/delete/
+             restore/toggle/confirm）。动作名、操作人、摘要全部由后端给中文
+             （action_label / via_label / summary）—— 前端不再拼一遍，
+             否则两处的措辞迟早不一致，而用户只会觉得"同一次操作有两个说法"。 -->
+        <template v-else>
+          <table v-if="rAudits.length">
+            <thead><tr><th>时间</th><th>动作</th><th>提醒</th><th>操作人</th><th>摘要</th><th>操作</th></tr></thead>
+            <tbody>
+              <tr v-for="a in rAudits" :key="a.id" :class="a.action==='delete'?'audit-del':''">
+                <td class="muted" style="white-space:nowrap">{{fmt(a.created_at)}}</td>
+                <td><span class="tag" :class="auditTone(a)">{{a.action_label||a.action}}</span></td>
+                <td>{{a.title||'—'}}</td>
+                <td>{{auditActor(a)}}</td>
+                <td class="muted">{{a.summary}}</td>
+                <td>
+                  <button v-if="a.can_restore" class="primary"
+                          @click="restoreFromAudit(a)">恢复</button>
+                  <span v-else class="muted">—</span>
+                </td>
+              </tr>
+            </tbody>
+          </table>
+          <div v-else class="empty">暂无操作记录</div>
+          <div class="row" style="justify-content:center;margin-top:10px" v-if="rAuditHasMore">
+            <button :disabled="rAuditLoading" @click="loadMoreAudits">
+              {{rAuditLoading?'加载中…':'加载更多'}}
+            </button>
+          </div>
+        </template>
       </div>
 
       <div class="card" v-if="curDeviceId">
@@ -1069,6 +1127,11 @@ createApp({
       // 提醒
       curDeviceId: null, reminders: [], events: [],
       rBox: null, rForm: null, timesText:'', weekText:'', monthText:'',
+      // 提醒操作历史（GET /api/reminders/audits）。提醒是**软删除**，删掉的规则
+      // 仍在库里，这个视图就是"删掉的提醒去哪了"的答案。
+      //   rView          'list' = 当前提醒 / 'history' = 操作历史
+      //   rAuditHasMore  后端没给 total，只能按"这一页是否装满"推断还有没有下一页
+      rView: 'list', rAudits: [], rAuditHasMore: false, rAuditLoading: false,
       // 记忆
       memories: [], tone: null, personaPrompt: '',
       // 形象
@@ -1124,7 +1187,11 @@ createApp({
     async api(path, opt){
       const res = await fetch(path, Object.assign({
         headers: Object.assign(
-          {'Content-Type':'application/json'},
+          // X-Client: 后端用它区分「网页」与「手机 APP」（提醒操作历史里会记
+          // 一条 via=web/app）。放在这个公共封装里而不是每个调用点 ——
+          // 漏一个调用点，那次操作就会被记成"来源未知"，而那种缺口在流水里
+          // 看起来跟"用户从别处操作"一模一样，事后无法分辨。
+          {'Content-Type':'application/json', 'X-Client':'web'},
           this.token ? {Authorization:'Bearer '+this.token} : {}
         )
       }, opt || {}));
@@ -1169,7 +1236,8 @@ createApp({
       this.busy = true; this.err = '';
       try{
         const r = await fetch('/api/auth/login', {
-          method:'POST', headers:{'Content-Type':'application/json'},
+          method:'POST',
+          headers:{'Content-Type':'application/json', 'X-Client':'web'},
           body: JSON.stringify({username: username, password: password})
         });
         const d = await r.json();
@@ -1285,7 +1353,7 @@ createApp({
     // 注意：supportEmail 保持空串时，模板里 v-if="supportEmail" 为假 ⇒ 不渲染 mailto。
     async loadSupportEmail(){
       try{
-        const r = await fetch('/api/support-contact');
+        const r = await fetch('/api/support-contact', {headers:{'X-Client':'web'}});
         if (!r.ok) return;
         const d = await r.json();
         if (d && typeof d.email === 'string' && d.email.trim()){
@@ -1323,11 +1391,66 @@ createApp({
     async loadReminders(){
       if (!this.curDeviceId) return;
       try{
-        const r = await this.api('/api/reminders?device_pk='+this.curDeviceId);
+        // include_deleted=1：已删除的提醒**仍要列出来**（带「已删除」标签 + 恢复按钮）。
+        // 不传的话它们会凭空消失，用户会以为"数据丢了"，而不是"我删了、还能恢复"。
+        const r = await this.api('/api/reminders?device_pk='+this.curDeviceId+'&include_deleted=1');
         if (r) this.reminders = r;
         const e = await this.api('/api/devices/'+this.curDeviceId+'/events?limit=50');
         if (e) this.events = e;
       }catch(e){ this.err = '提醒加载失败：' + e.message; }
+    },
+    // 切「当前提醒 / 操作历史」。进历史才拉流水（重页按需加载，与其它 tab 一致）。
+    switchRView(v){
+      this.rView = v;
+      if (v === 'history') this.loadAudits(true);
+    },
+    // 操作历史。reset=true 从头拉（首次进入 / 恢复后刷新），false 是「加载更多」。
+    async loadAudits(reset){
+      if (!this.curDeviceId) return;
+      this.rAuditLoading = true;
+      try{
+        const offset = reset ? 0 : this.rAudits.length;
+        const list = await this.api('/api/reminders/audits?device_pk=' + this.curDeviceId
+                                    + '&limit=100&offset=' + offset);
+        const arr = list || [];
+        this.rAudits = reset ? arr : this.rAudits.concat(arr);
+        // 后端没给总数：这一页装满 100 条就认为可能还有下一页。
+        // 少给一次"加载更多"按钮，好过给一个点了没反应的按钮。
+        this.rAuditHasMore = arr.length >= 100;
+      }catch(e){
+        this.err = '操作历史加载失败：' + e.message;
+        this.rAuditHasMore = false;
+      }finally{ this.rAuditLoading = false; }
+    },
+    loadMoreAudits(){ this.loadAudits(false); },
+    // 操作人：actor_name 为空时退回 via_label（例如「手机 APP」）。
+    // 两个都空才显示破折号 —— 绝不显示空白格，那看起来像"系统干的"。
+    auditActor(a){
+      if (!a) return '—';
+      return a.actor_name || a.via_label || a.via || '—';
+    },
+    // 动作配色：删除必须最扎眼（用户来历史里就是找它），恢复用绿色（做对了事）。
+    auditTone(a){
+      const act = a && a.action;
+      if (act === 'delete') return 'bad';
+      if (act === 'restore') return 'ok';
+      if (act === 'create' || act === 'update') return '';
+      return 'warn';
+    },
+    async restoreReminder(r){
+      if (!r || !r.id) return;
+      try{
+        await this.api('/api/reminders/'+r.id+'/restore', {method:'POST'});
+        this.flash = '已恢复提醒「' + (r.title || '') + '」';
+        await this.loadReminders();
+        // 历史视图若正开着，流水里也要出现这条 restore —— 否则用户刚恢复，
+        // 回头一看历史里没有"恢复"记录，会怀疑到底成没成。
+        if (this.rView === 'history') await this.loadAudits(true);
+      }catch(e){ this.err = '恢复失败：' + e.message; }
+    },
+    // 历史行上的恢复：那里只有 reminder_id + 当时的标题快照，拼成 restoreReminder 认识的形状。
+    restoreFromAudit(a){
+      return this.restoreReminder({id: a.reminder_id, title: a.title});
     },
     blankReminder(){
       return { title:'', speak_text:'', rtype:0, schedule_kind:1,
@@ -1366,10 +1489,13 @@ createApp({
       }catch(e){ this.err = e.message; }
     },
     async removeReminder(r){
-      if (!confirm('删除提醒「'+r.title+'」？')) return;
+      // 文案直接回应"删了还能不能找回来"：这是用户的原始诉求，也是软删除
+      // 唯一需要用户知道的事。只写"确定删除？"会让人以为不可逆而不敢删。
+      if (!confirm('删除提醒「'+r.title+'」？\n删除后仍可在「操作历史」里查到，并可恢复。')) return;
       try{
         await this.api('/api/reminders/'+r.id, {method:'DELETE'});
         await this.loadReminders();
+        if (this.rView === 'history') await this.loadAudits(true);
       }catch(e){ this.err = e.message; }
     },
 
@@ -1775,11 +1901,20 @@ createApp({
     methodName(m){ return ['—','语音确认','按键','手机端','自动','语音+按键确认'][m] || '—'; }
   },
   watch:{
-    curDeviceId(){ this.loadReminders(); },
+    curDeviceId(){
+      // 换设备时历史必须清空重拉：留着上一台设备的流水，用户会以为
+      // 「这台设备也有过这些操作」。列表本来就按 device_pk 过滤，历史同理。
+      this.rAudits = []; this.rAuditHasMore = false;
+      this.loadReminders();
+      if (this.rView === 'history') this.loadAudits(true);
+    },
     tab(t){
       // 各页按需加载：登录时只拉设备/形象/角色三个概览页，
       // 重页（提醒/记忆/用量）进 tab 才拉，失败只红当前页的错误条，不白屏。
-      if (t === 'reminders') this.loadReminders();
+      if (t === 'reminders'){
+        this.loadReminders();
+        if (this.rView === 'history') this.loadAudits(true);
+      }
       if (t === 'memory') this.loadMemory();
       if (t === 'usage') this.loadUsage();
       if (t === 'stats'){ if (!this.statsDeviceId && this.devices.length) this.statsDeviceId = this.devices[0].id; this.loadStats(); this.loadHome(); }

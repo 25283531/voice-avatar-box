@@ -97,7 +97,15 @@ export function elderRequestRaw<T = any>(
 ): Promise<ElderRawResult<T>> {
   const { method = 'GET', data, auth = true, timeout = 10000, header: extra } = options
 
-  const header: Record<string, string> = { 'Content-Type': 'application/json' }
+  // X-Client 告诉服务端这次操作来自「手机 APP」还是「网页」。
+  // 提醒的操作历史（/api/reminders/audits）会把它记成 via=app/web，
+  // 家属看流水时才能分清"我在 APP 上删的"和"我爸在网页上删的"。
+  // 放在这个唯一出口而不是每个调用点：漏一个调用点，那次操作就会记成
+  // 来源未知，而那种缺口在流水里看起来跟"从别处操作"一模一样。
+  const header: Record<string, string> = {
+    'Content-Type': 'application/json',
+    'X-Client': 'app',
+  }
   if (auth === 'optional') {
     const token = getElderToken()
     if (token) header.Authorization = `Bearer ${token}`

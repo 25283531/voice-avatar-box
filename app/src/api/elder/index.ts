@@ -57,6 +57,45 @@ export interface Reminder {
   confirm_methods: string[]
   enabled: boolean
   next_fire_at: string | null
+  /* ---- 软删除（2026-10 起）：删掉的提醒仍在库里，可查、可恢复 ---- */
+  deleted_at: string | null
+  deleted_by: number | null
+  /** 从哪个入口删的：web / app / voice / admin / device */
+  deleted_via: string
+  is_deleted: boolean
+}
+
+/**
+ * 一条提醒操作流水（GET /api/reminders/audits）。
+ *
+ * ⚠️ action_label / via_label / summary **都是服务端算好的中文**，直接显示，
+ * 前端不要再拼一遍：两处各写一套措辞，同一次操作就会出现两种说法，
+ * 用户只会觉得"这系统自己都说不清"。
+ */
+export interface ReminderAudit {
+  id: number
+  reminder_id: number
+  device_id: number
+  /** create / update / delete / restore / toggle_on / toggle_off / confirm */
+  action: string
+  /** 中文动作名，直接显示 */
+  action_label: string
+  /** user / voice / device / system */
+  actor_type: string
+  /** 冗余显示名，**可能为空串**（此时退回 via_label） */
+  actor_name: string
+  /** web / app / voice / admin / device */
+  via: string
+  /** 中文来源名，直接显示（如「手机 APP」） */
+  via_label: string
+  /** 当时的提醒标题快照（提醒被删后仍可显示） */
+  title: string
+  /** 一句中文描述，直接显示 */
+  summary: string
+  /** ISO 时间，**带时区偏移** */
+  created_at: string
+  /** 该提醒当前是否处于已删除状态（true 才给「恢复」按钮） */
+  can_restore: boolean
 }
 
 export interface ReminderEvent {
@@ -181,8 +220,43 @@ export function deviceEvents(devicePk: number, limit = 50) {
 }
 
 // ============================================================ 提醒
-export function listReminders(devicePk: number) {
-  return elderGet<Reminder[]>('/api/reminders', { device_pk: devicePk })
+/**
+ * 列出某台设备的提醒。
+ *
+ * includeDeleted=true 时**连已删除的一起返回**（每条带 is_deleted / deleted_at），
+ * 供「历史」视图与「已删除」灰标使用；默认只给未删除的（编辑/调度用）。
+ */
+export function listReminders(devicePk: number, opts?: { includeDeleted?: boolean }) {
+  return elderGet<Reminder[]>('/api/reminders', {
+    device_pk: devicePk,
+    include_deleted: opts?.includeDeleted ? 1 : undefined,
+  })
+}
+
+/**
+ * 恢复一条被删除的提醒（软删除的反向操作）。
+ * 恢复后设备下次心跳会重新拿到它 —— 与新建一样有最多 5 分钟同步时延。
+ */
+export function restoreReminder(reminderPk: number) {
+  return elderPost<Reminder>(`/api/reminders/${reminderPk}/restore`, {})
+}
+
+/**
+ * 提醒操作流水（谁、什么时候、干了什么）。按时间倒序。
+ *
+ * 这是「提醒删了也要能查到历史」的落点：提醒本身是软删除，
+ * 而每一次增删改都会在这里留一条。
+ */
+export function listReminderAudits(
+  devicePk: number,
+  opts?: { limit?: number, offset?: number, reminderId?: number },
+) {
+  return elderGet<ReminderAudit[]>('/api/reminders/audits', {
+    device_pk: devicePk,
+    limit: opts?.limit ?? 100,
+    offset: opts?.offset ?? 0,
+    reminder_id: opts?.reminderId,
+  })
 }
 
 export function createReminder(devicePk: number, data: Partial<Reminder>) {
