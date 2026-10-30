@@ -2622,9 +2622,14 @@ docker compose -f docker-compose.yml -f docker-compose.mysql.yml exec -T elder-d
 - MySQL：每天 `mysqldump` 一次，异地留存。
 - 升级版本前**务必**先备份：表结构靠 `create_all` 自动建，**没有 Alembic，升级没有回滚脚本**。
 - 新增列由 `server/app/schema_patch.py` 的 `ensure_missing_columns()` 在启动时**幂等**补齐。
-  当前 `NEW_COLUMNS` 登记了 **26 列**（SQLite 类型 / MySQL 类型），分布在 5 张表上：
-  `users` 1 列、`devices` 1 列、`ai_providers` 20 列、`avatars` 3 列、
-  `agent_persona_profiles` 1 列。其中最关键的几条：
+
+<!-- NEW_COLUMNS:STATS:BEGIN（本块由 tools/doc_new_columns.py 生成，勿手改）-->
+当前 `NEW_COLUMNS` 登记了 **37 列**，分布在 **8 张表**上：`users` 1 列、`reminders` 4 列、`reminder_events` 1 列、`devices` 4 列、`ai_providers` 20 列、`avatars` 3 列、`agent_persona_profiles` 1 列、`activation_codes` 3 列。
+
+> 这段是**生成内容**：数字以 `server/app/schema_patch.py` 为准。改了 `NEW_COLUMNS` 就跑 `python tools/doc_new_columns.py --fix`，`server-ci` 会跑 `--check` 拦住忘改的情况。
+<!-- NEW_COLUMNS:STATS:END -->
+
+  其中最关键的几条：
 
   | 表 | 列 | SQLite | MySQL |
   | --- | --- | --- | --- |

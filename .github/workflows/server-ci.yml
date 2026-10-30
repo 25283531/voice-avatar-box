@@ -116,6 +116,15 @@ jobs:
       - name: 运行库默认路径解析冒烟（含双库冲突 / 0 字节 / 不落回仓库树）
         run: python tools/run_smoke.py logs/smoke_smoke_db_path.log python tools/smoke_db_path.py
 
+      # docs/DEPLOY.md §8.3 曾把 `NEW_COLUMNS` 的规模写死成「26 列 / 5 张表」，
+      # 而 2026-10-30 加完提醒软删除三列后实际是「37 列 / 8 张表」。
+      # §8.3 是升级前核对的唯一依据 —— 按它核对会得出「还缺 11 列」，
+      # 于是很可能有人去手工 ALTER 补一批**早就存在**的列（轻则白折腾，重则补错类型）。
+      # 数字会继续变（每加一个模型字段都要登记一行），所以不能靠人记得改：
+      # 这段统计改成**生成块**，本步做逐字比对，不一致就红并给出 --fix 命令。
+      - name: 文档与代码一致性（NEW_COLUMNS 统计块）
+        run: python tools/doc_new_columns.py --check
+
       # 提醒提示音乐是**固化进固件的资源**（assets/common/reminder_chime.ogg，
       # 由 tools/make_reminder_chime.py 生成）。它被删/换坏/忘接进 OnPlayTone 时，
       # 运行时**零报错**：提醒照样到点、屏照样变、回执照样回，只是没有声音。
