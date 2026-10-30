@@ -119,7 +119,12 @@ def _tick(session: Session) -> None:
     ).all()
     for ev in overdue:
         rule = session.get(Reminder, ev.reminder_id)
-        if not rule or not rule.require_confirm:
+        # 软删除（2026-10-30）：已删除的规则**不许**再升级。
+        # 删除时只清了 PENDING 实例，已经 FIRED 的那条还留着（那是"那天响过"
+        # 的历史事实）；但它的升级链（红灯常亮 + 通知子女）必须停 —— 否则
+        # 家属删掉提醒后还会收到"老人没吃药"的告警，去问老人却发现提醒早就
+        # 删了。`is_alive()` 是 models.Reminder 上与 Avatar 同风格的判据。
+        if not rule or not rule.is_alive() or not rule.require_confirm:
             continue
         # due_at 存的是**规则所在时区**的裸钟点（跨时区之后不再是"服务端钟点"），
         # 直接和 now（aware）比较会抛 TypeError，而且就算补了 TZ 也只有北京规则

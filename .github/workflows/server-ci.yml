@@ -271,6 +271,18 @@ jobs:
       # 设备断网时在本地建提醒、恢复后补报，这条链路错了老人会重复吃药。
       - name: 断网自建提醒上报冒烟（鉴权 / 幂等 / sync 可见）
         run: python tools/run_smoke.py logs/smoke_smoke_local_reminders.log python tools/smoke_local_reminders.py 8123
+      # 提醒软删除 + 操作审计（端口 8137）：用户要「删了也能在 APP / 网页端
+      # 看到历史」，所以删除改成软删除 + 只追加的审计表。
+      #
+      # 软删除真正的风险不是"看不到历史"，而是**删了还在响**：reminders 的行
+      # 还在，任何一处读查询漏了 `deleted_at IS NULL`，那条提醒就会继续排期、
+      # 继续随心跳下发、继续在老人家里播报 —— 服药提醒重复播报 = 让老人重复
+      # 吃药。这条路径**不报错、日志里不显形**，只有断言能抓：F1/F2 直接数
+      # 库里的 PENDING 实例与心跳下发列表；H6/H7 钉「已删规则的回执不能补建
+      # 事件行」，D4 钉「软删同时置 enabled=0」（第二道防线：让按 enabled 过滤的
+      # 查询与 deleted_at 互为备份，且不留"已删除但仍启用"的矛盾数据）。
+      - name: 提醒软删除与操作审计冒烟
+        run: python tools/run_smoke.py logs/smoke_smoke_reminder_audit.log python tools/smoke_reminder_audit.py 8137
       # hw_model 截断护栏（端口 8126）：SQLite 不强制列宽，`hw[:64]` 是唯一
       # 护栏。脚本自带**变异自检**（把 [:64] 改成 [:200] 必须变红），所以它
       # 不只是"跑通了"，还证明了自己的断言有鉴别力。

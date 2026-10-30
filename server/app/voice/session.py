@@ -402,7 +402,11 @@ def _pending_reminder_label(device_pk: int) -> str:
                 .join(_m.ReminderEvent,
                       _m.ReminderEvent.reminder_id == _m.Reminder.id)
                 .where(_m.ReminderEvent.device_id == device_pk,
-                       _m.ReminderEvent.state == int(_m.EventState.FIRED))
+                       _m.ReminderEvent.state == int(_m.EventState.FIRED),
+                       # 软删除（2026-10-30）：已删除的提醒不该再被当成
+                       # 「屏幕上正挂着的那条」。否则老人删掉提醒后，模型仍
+                       # 会对着一条不存在的提醒说"您先把药吃了再确认"。
+                       _m.Reminder.deleted_at.is_(None))
                 .order_by(_m.ReminderEvent.due_at.desc())
                 .limit(1)
             ).first()

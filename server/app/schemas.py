@@ -943,6 +943,54 @@ class ReminderOut(ReminderIn):
     created_at: datetime
     updated_at: datetime
     next_fire_at: datetime | None = None
+    # ---- 软删除（2026-10-30）----
+    # ⚠️ 这四个字段**只能加在 ReminderOut，绝不能加进 ReminderIn**：
+    # ``ReminderIn.model_dump()`` 会被 router 直接展开成
+    # ``models.Reminder(**dump)``，而 ``is_deleted`` 根本不是数据库列 ——
+    # 落进 **dump 就会在创建提醒时抛 ``TypeError: 'is_deleted' is an invalid
+    # keyword argument``（每个新建提醒的请求都 500）。
+    # ``deleted_*`` 是真实列，技术上可以进 ReminderIn，但那样客户端就能
+    # 通过 POST/PATCH 自己伪造"删除"—— 删除只该走 DELETE 接口。
+    deleted_at: datetime | None = None
+    deleted_by: int | None = None
+    deleted_via: str = ""
+    #: 已删除标记（前端加「已删除」标签用）。由 router 从 deleted_at 推导，
+    #: **不是列** —— 派生值存列就多了一份会漂移的真源。
+    is_deleted: bool = False
+
+
+class ReminderAuditOut(ORMBase):
+    """一条提醒操作流水（GET /api/reminders/audits 的元素）。
+
+    为什么继承 ``ORMBase`` 而不是裸 ``BaseModel``
+    --------------------------------------------
+    任务书写的是 ``BaseModel``，但裸 BaseModel **不会**给 naive datetime
+    补偏移：SQLite 读回来的 ``created_at`` 是 naive UTC，直接序列化会输出
+    ``2026-10-30T12:00:00``（无偏移），前端当本地时间显示就整体差 8 小时。
+    本仓库已有唯一约定：``ORMBase`` 的 ``field_serializer("*")`` 负责补偏移
+    （``due_at`` 等墙上时间走白名单、其余按 UTC）—— 照抄 EventOut 的做法，
+    就是让 created_at 走「非白名单 = 补 UTC」那条分支。
+    """
+
+    id: int
+    reminder_id: int
+    device_id: int
+    action: str
+    #: 中文标签：新增/修改/删除/恢复/暂停/确认（映射表在 app.reminder_audit）
+    action_label: str = ""
+    actor_type: str = ""
+    actor_name: str = ""
+    via: str = ""
+    #: 中文标签：网页/手机 APP/语音/管理后台/设备
+    via_label: str = ""
+    title: str = ""
+    summary: str = ""
+    #: 带时区偏移（见类注释）
+    created_at: datetime
+    #: 该条流水对应的提醒**当前**是否处于已删除状态（前端据此决定显不显示
+    #: 「恢复」按钮）。注意它是"现在"的状态，不是"当时"的状态 —— 一条
+    #: delete 流水在恢复之后会变成 False，这是有意的：按钮要能反映现状。
+    can_restore: bool = False
 
 
 class EventOut(ORMBase):

@@ -589,10 +589,37 @@ class Reminder(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
 
+    # ---- 软删除（2026-10-30）----
+    # 用户要求「即便提醒删除了，也要能看到历史操作记录」，所以删除**不再物理删行**。
+    #
+    # ⚠️ 代价必须写在这里，因为它是**安全级**的：
+    # 每一个读 Reminder 的地方都必须自己加 ``deleted_at IS NULL``，
+    # SQLAlchemy 的 ``db.get()`` / ``select()`` **不会**自动加这个条件。
+    # 漏一处 = "删了还在响"（服药提醒已删却继续播报 = 让老人重复服药）。
+    # 已确认的全部读点见 routers/reminders.py、routers/device_api.py、
+    # routers/home.py、voice/tools.py、schedule.materialize_events。
+    deleted_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True)
+    # 谁删的 / 从哪个端删的（web / app / voice / admin / device）。
+    # 冗余在行上是为了「恢复」时能说清上次是谁删的，审计流水另有完整记录。
+    deleted_by: Mapped[int | None] = mapped_column(
+        ForeignKey("users.id"), nullable=True)
+    deleted_via: Mapped[str] = mapped_column(
+        String(16), default="", server_default="")
+
     device: Mapped["Device"] = relationship(back_populates="reminders")
     events: Mapped[list["ReminderEvent"]] = relationship(
         back_populates="reminder", cascade="all, delete-orphan"
     )
+
+    def is_alive(self) -> bool:
+        """未软删。与 ``Avatar.is_alive`` 同风格：读路径先判这个。
+
+        ⚠️ 这只是**兜底**，不是过滤机制 —— 查询必须自己在 WHERE 里加条件，
+        否则 ``list_reminders`` 之类仍会把已删行捞出来（拿到之后再 is_alive()
+        过滤，等于把「删了还在响」的风险留给每一个调用方）。
+        """
+        return self.deleted_at is None
 
 
 class EventState(IntEnum):
@@ -638,6 +665,56 @@ class ReminderEvent(Base):
     note: Mapped[str] = mapped_column(String(255), default="")
 
     reminder: Mapped["Reminder"] = relationship(back_populates="events")
+
+
+class ReminderAudit(Base):
+    """提醒操作审计流水。
+
+    为什么单独一张表，而不是靠 reminders 行上的时间戳
+    ----------------------------------------------
+    用户要的是"历史上做过哪些操作"，不是"最后一次什么时候改的"。
+    一条提醒会被反复暂停/恢复/改名，行上的 updated_at 只能留下最后一次；
+    而"谁在什么时候删了哪条"恰恰是最需要追溯的（家属之间互相覆盖、
+    老人误删）。所以按**事件**记录，一条操作一行，只追加不修改。
+
+    ⚠️ ``reminder_id`` 允许指向**已软删除**的提醒（reminders 行还在），
+    所以这里的外键是安全的。但**不要**依赖 JOIN 取标题 —— 提醒可能被改名，
+    历史流水必须显示**当时**的标题，故冗余 ``title`` 快照列。
+
+    ``before_json`` / ``after_json`` 用 Text 存 JSON 字符串（不是 JSON 列）：
+    SQLite 与 MySQL 对 JSON 列的默认值/比较行为不一致，而这两列只用来
+    "给人看改了什么"，不需要在库里查询，用文本最省事也最可移植。
+    """
+
+    __tablename__ = "reminder_audits"
+    __table_args__ = (
+        Index("ix_audit_device_created", "device_id", "created_at"),
+        Index("ix_audit_reminder", "reminder_id", "created_at"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    device_id: Mapped[int] = mapped_column(ForeignKey("devices.id"), index=True)
+    reminder_id: Mapped[int] = mapped_column(ForeignKey("reminders.id"), index=True)
+
+    # create / update / delete / restore / toggle_on / toggle_off / confirm
+    action: Mapped[str] = mapped_column(String(16))
+    # user（家属在网页或 APP 点的）/ voice（老人对设备说话）/ device（设备回执）/ system
+    actor_type: Mapped[str] = mapped_column(String(16), default="user")
+    actor_id: Mapped[int | None] = mapped_column(ForeignKey("users.id"), nullable=True)
+    # 冗余显示名：用户可能改名或被删，流水要能还原"当时是谁"
+    actor_name: Mapped[str] = mapped_column(String(64), default="")
+    # web / app / voice / admin / device
+    via: Mapped[str] = mapped_column(String(16), default="web")
+
+    title: Mapped[str] = mapped_column(String(128), default="")
+    # 一句人类可读的话，前端直接显示，不让前端再拼一遍（第二份真源）
+    summary: Mapped[str] = mapped_column(String(255), default="")
+
+    before_json: Mapped[str] = mapped_column(Text, default="")
+    after_json: Mapped[str] = mapped_column(Text, default="")
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, index=True)
 
 
 # ================================================================ 交互日志

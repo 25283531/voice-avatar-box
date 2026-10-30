@@ -150,6 +150,12 @@ def delete_device(device_pk: int, db: Session = Depends(get_db),
     # （models.py:145-147 / :505-507）。手写一遍会与 cascade 形成**两份真源**，
     # 且 `synchronize_session` 语义不同（D45 §5 那个 naive/aware 的坑就在这条路上）。
     #
+    # ⚠️ ``ReminderAudit`` **必须手删**（2026-10-30 加）：它与 ``Interaction``
+    # 同病 —— 只有外键、没有 relationship / cascade。不删就是孤儿行，而
+    # ``devices.id`` 无 AUTOINCREMENT ⇒ pk 一复用，上一家的「谁删了哪条提醒」
+    # 就挂到新设备名下，新家属会看到别人家的提醒标题。这比数据脏更严重：
+    # 那是**跨家庭的信息泄露**。
+    #
     # ⚠️ 属性必须在 `db.delete(dev)` **之前**读出来：删完这行是 detached 的，
     # 再读 `dev.id` / `dev.owner_id` 会抛 ObjectDeletedError，审计日志直接丢。
     pk = int(dev.id)
@@ -160,6 +166,9 @@ def delete_device(device_pk: int, db: Session = Depends(get_db),
     ).rowcount or 0
     n_cu = db.execute(
         delete(models.ChatUsage).where(models.ChatUsage.device_id == pk)
+    ).rowcount or 0
+    n_ra = db.execute(
+        delete(models.ReminderAudit).where(models.ReminderAudit.device_id == pk)
     ).rowcount or 0
     db.delete(dev)
     db.commit()
@@ -178,8 +187,8 @@ def delete_device(device_pk: int, db: Session = Depends(get_db),
     # （口径见 tools/qa3_log_privacy.py —— 日志会进 CI artifact 与被拷走的
     # 容器日志，业务内容一旦进去就收不回来）。
     log.warning("DELETE-DEVICE device_pk=%s mac=%s 原归属用户=%s 操作人=%s(id=%s) "
-                "删除行数: interactions=%d chat_usage=%d",
-                pk, mac, old_owner, user.username, user.id, n_ia, n_cu)
+                "删除行数: interactions=%d chat_usage=%d reminder_audits=%d",
+                pk, mac, old_owner, user.username, user.id, n_ia, n_cu, n_ra)
 
 @router.post("/{device_pk}/unbind", status_code=status.HTTP_204_NO_CONTENT)
 def admin_unbind_device(device_pk: int, db: Session = Depends(get_db),

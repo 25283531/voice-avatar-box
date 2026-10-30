@@ -333,6 +333,17 @@ NEW_COLUMNS: Final[list[tuple[str, str, str, str]]] = [
     ("activation_codes", "attempts", "INTEGER DEFAULT 0", "INT NOT NULL DEFAULT 0"),
     ("activation_codes", "max_attempts", "INTEGER DEFAULT 5", "INT NOT NULL DEFAULT 5"),
     ("activation_codes", "used_at", "DATETIME", "DATETIME NULL"),
+    # ---- reminders：软删除（2026-10-30）----
+    # 用户要求「即便提醒删除了，也能看到历史操作记录」，删除改为软删（行留在库里）。
+    # 三列都**必须带默认值**：老库补列后既有行读出 NULL / ''，语义正是
+    # 「未删除」，不需要任何回填 —— 这也让升级本身不会改变任何一条提醒的行为。
+    #
+    # ⚠️ 补列只是"行还在"，真正防止「删了还在响」的是**每个读点自己加
+    #    deleted_at IS NULL**（见 models.Reminder 的注释与 smoke_reminder_audit）。
+    #    这条注释在这里再写一遍，是因为"加个列就完事了"是最容易犯的误解。
+    ("reminders", "deleted_at", "DATETIME", "DATETIME NULL"),
+    ("reminders", "deleted_by", "INTEGER", "INT NULL"),
+    ("reminders", "deleted_via", "VARCHAR(16) DEFAULT ''", "VARCHAR(16) DEFAULT ''"),
 ]
 
 # 本轮新增的索引。create_all 只为**新**库建索引，老库升级上来不会有，

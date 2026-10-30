@@ -249,7 +249,11 @@ def materialize_events(db: Session, device_pk: int, since: datetime | None = Non
 
     rules = (
         db.query(Reminder)
-        .filter(Reminder.device_id == device_pk, Reminder.enabled.is_(True))
+        .filter(Reminder.device_id == device_pk, Reminder.enabled.is_(True),
+                # 软删除（2026-10-30）：已删除的规则**不许**再排期。
+                # 这是"删了还在响"最根本的一道闸 —— 只要这里漏了，删除接口
+                # 之后的任何一次心跳都会把实例重新排出来并下发给设备。
+                Reminder.deleted_at.is_(None))
         .all()
     )
     created = 0
@@ -275,3 +279,28 @@ def materialize_events(db: Session, device_pk: int, since: datetime | None = Non
     if created:
         db.commit()
     return created
+
+
+def clear_pending_events(db: Session, reminder_pk: int) -> int:
+    """删掉某条提醒**尚未触发**的排期实例，返回删除条数（不 commit）。
+
+    三个调用点都必须用它，别各写一遍：删除提醒（web/app）、语音删除、
+    修改规则（重排前清空）。漏一处的后果不是"统计不准"，而是：
+
+    1. ``reminder_events`` 上有 ``UniqueConstraint(reminder_id, due_at)``，
+       残留的 PENDING 会占住唯一键 —— 以后「恢复」时 ``materialize_events``
+       插不进去，表现为"恢复了但永远不响"；
+    2. ``/api/device/sync`` 会把 PENDING 实例下发给设备 ⇒ **删了还在响**。
+       服药提醒重复播报 = 让老人重复服药，这是安全级问题。
+
+    只删 PENDING：已触发/已确认的实例是**历史事实**，删了家属就再也看不到
+    "那天到底吃没吃药"。
+    """
+    from .models import EventState, ReminderEvent
+
+    pending = db.query(ReminderEvent).filter(
+        ReminderEvent.reminder_id == reminder_pk,
+        ReminderEvent.state == int(EventState.PENDING)).all()
+    for e in pending:
+        db.delete(e)
+    return len(pending)

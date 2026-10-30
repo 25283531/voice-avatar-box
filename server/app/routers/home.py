@@ -77,6 +77,10 @@ def _medicine_today(db: Session, device_ids: list[int]) -> MedicineTodayOut:
                 models.Reminder.device_id.in_(device_ids),
                 models.Reminder.rtype == int(ReminderType.MEDICINE),
                 models.Reminder.enabled.is_(True),
+                # 软删除（2026-10-30）：已删除的服药规则不该再计入"今天该吃
+                # 几次"。漏了它 ⇒ 家属删掉一条提醒后，首页永远显示"还有 1 次
+                # 没吃"，而这个数字是家属判断老人有没有漏药的唯一依据。
+                models.Reminder.deleted_at.is_(None),
             )
         ).all()
         for r in rules:
@@ -100,6 +104,11 @@ def _medicine_today(db: Session, device_ids: list[int]) -> MedicineTodayOut:
             .where(
                 models.ReminderEvent.device_id.in_(device_ids),
                 models.Reminder.rtype == int(ReminderType.MEDICINE),
+                # 软删除（2026-10-30）：与上面规则查询同口径。这里的 join
+                # 原本只是为了拿 rtype，但已删除规则的实例会污染 rule_zone
+                # 之外的统计口径（虽然下面有 `rid not in rule_zone` 兜着，
+                # 那是"碰巧没算错"，不是"保证算对"）。
+                models.Reminder.deleted_at.is_(None),
                 models.ReminderEvent.due_at >= now_wall - timedelta(days=2),
                 models.ReminderEvent.due_at < now_wall + timedelta(days=2),
             )

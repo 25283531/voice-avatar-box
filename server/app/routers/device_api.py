@@ -16,6 +16,7 @@ from sqlalchemy.orm import Session
 
 from .. import models
 from .. import geo
+from .. import reminder_audit
 from ..config import (
     PUBLIC_BASE_URL,
     SCHEDULE_AHEAD_HOURS,
@@ -183,7 +184,12 @@ def sync(request: Request, fw_version: str = "", hw_model: str = "",
 
     rules = db.scalars(
         select(models.Reminder).where(models.Reminder.device_id == dev.id,
-                                      models.Reminder.enabled.is_(True))
+                                      models.Reminder.enabled.is_(True),
+                                      # 软删除（2026-10-30）：已删除的规则**绝不能**
+                                      # 下发。这是「删了还在响」最直接的入口 ——
+                                      # 设备按这份列表在本地排期，下发一次它就
+                                      # 天天响，服务端这边看起来"已经删了"。
+                                      models.Reminder.deleted_at.is_(None))
     ).all()
     now = local_now()
 
@@ -318,13 +324,16 @@ def sync(request: Request, fw_version: str = "", hw_model: str = "",
     )
 
 
-@router.post("/events", response_model=EventOut)
+@router.post("/events", response_model=EventOut | dict[str, Any])
 def report_event(payload: EventReportIn, db: Session = Depends(get_db),
                  dev: models.Device = Depends(get_current_device)):
     """设备回传一次提醒的触发 / 确认 / 超时结果。
 
     若该实例服务端未预排（设备离线期间自行排的），这里按
     (reminder_id, due_at) 补建，保证对账不丢。
+
+    规则已被软删除时**整条回执丢弃**，返回 ``{"ok": true,
+    "ignored": "reminder_deleted"}``（见下方注释）。
 
     ⚠️ ``due_at`` 在这里是**设备本地钟点**（固件 ``sync.c`` 用
     ``elder_time_iso_local`` 按自己的 TZ 格式化，不带偏移）。它与
@@ -333,7 +342,23 @@ def report_event(payload: EventReportIn, db: Session = Depends(get_db),
     自己的时区，属于单独的固件改动；在那之前，这里的行为与改造前完全一致
     （存量设备全部在北京时间下，条件成立）。
     """
+    # 软删除（2026-10-30）：这里**故意用 db.get 而不是带 ``deleted_at IS NULL``
+    # 的 select** —— "已删除"与"从不存在"必须分开处理，混成一个 None 就分不出来：
+    #   * 已删除 ⇒ 静默忽略（见下面 return）；
+    #   * 从不存在 ⇒ 保持旧行为，照常补建实例（设备断网时自建的提醒，服务端
+    #     可能压根没这条规则，靠补建对账不丢）。
+    # 后续只用到它的 ``tz`` 与 ``deleted_at``，不需要排期字段，所以不过滤。
     rule = db.get(models.Reminder, payload.reminder_id)
+    if rule is not None and rule.deleted_at is not None:
+        # 设备断网期间的回执会进 NVS 队列，联网后 flush_queue() 补发；这期间
+        # 规则被软删了。若照旧补建 ReminderEvent，家属就会在历史里看到
+        # 「删掉的提醒还显示吃过药」—— 一条假记录，比丢一条回执严重得多。
+        #
+        # ⚠️ 不能抛 4xx：固件把非 2xx 当失败留在队列里重试，会形成死循环
+        # （每条回执每次心跳都重发，永不收敛）。返回 200 + 明确标记。
+        log.info("丢弃已删除提醒的回执：device=%s reminder=%s due_at=%s state=%s",
+                 dev.id, payload.reminder_id, payload.due_at, payload.state)
+        return {"ok": True, "ignored": "reminder_deleted"}
     ev = db.scalar(
         select(ReminderEvent).where(
             ReminderEvent.reminder_id == payload.reminder_id,
@@ -354,6 +379,10 @@ def report_event(payload: EventReportIn, db: Session = Depends(get_db),
     if ev.device_id != dev.id:
         ev.device_id = dev.id
 
+    # 审计要的是"**第一次**变成已确认"这个事件：设备对同一条实例会报两次
+    # （先语音、后按键），两次都记的话家属会看到两条「确认提醒」，
+    # 而实际只吃了一次药。
+    prev_state = ev.state
     ev.state = payload.state
     # 语音确认 = 半置信，按键确认 = 全置信（2026-10-27 用户定义）。
     # 同一条提醒实例设备会报两次：先 method=VOICE（老人说「我吃过了」），
@@ -381,6 +410,18 @@ def report_event(payload: EventReportIn, db: Session = Depends(get_db),
         ev.note = payload.note
     if payload.state == int(EventState.MISSED):
         ev.escalated = True
+    # 设备确认 = 一条审计流水（actor_type=device）。只在**首次**确认时记，
+    # 理由见上面 prev_state 的注释。已删除的提醒不记：它的行还在，但
+    # 家属已经从列表里删掉了，再往流水里塞"确认"只会让人以为删错了。
+    if (payload.state == int(EventState.CONFIRMED)
+            and prev_state != int(EventState.CONFIRMED)
+            and rule is not None):
+        reminder_audit.log(
+            db, reminder=rule, action="confirm", actor_type="device",
+            actor_name=(dev.name or "设备")[:64], via="device",
+            after={"event_id": int(ev.id) if ev.id else None,
+                   "due_at": ev.due_at, "confirm_method": _method},
+        )
     db.commit()
     db.refresh(ev)
     return ev
@@ -422,17 +463,36 @@ def report_local_reminders(
                         "按每天落库", item.client_key)
             kind = int(models.ScheduleKind.DAILY)
 
-        existing = db.scalar(
-            select(models.Reminder).where(
-                models.Reminder.device_id == dev.id,
-                models.Reminder.title == item.title,
-                models.Reminder.times_of_day == item.times_of_day,
-                models.Reminder.rtype == item.rtype,
-                models.Reminder.schedule_kind == kind,
-            )
+        # 幂等去重（设备在响应丢失时会重发同一批）。
+        #
+        # ⚠️ 软删除（2026-10-30）让这里多了一个必须明确的分支：
+        #   * **只按活着的行去重**（``deleted_at IS NULL``）—— 已删的提醒
+        #     不该再被当成"已经建过了"；
+        #   * 但若命中的是一条**已删除**的行，必须**ack 它的 id 且不新建**
+        #     （见下面第二个查询）。否则设备补报一次，就等于把用户刚删掉的
+        #     提醒**复活成一条新行**，服务端还会为它 materialize 出 PENDING
+        #     实例、随心跳下发 —— 那正是"删了还在响"。
+        #     而 ack 一个已删除的 id 是安全的：``/sync`` 的规则列表已经过滤
+        #     掉它，设备下次心跳就会把本地这条清掉（自愈，且不会新建实例）。
+        _dedupe = (
+            models.Reminder.device_id == dev.id,
+            models.Reminder.title == item.title,
+            models.Reminder.times_of_day == item.times_of_day,
+            models.Reminder.rtype == item.rtype,
+            models.Reminder.schedule_kind == kind,
         )
+        existing = db.scalar(
+            select(models.Reminder).where(*_dedupe, models.Reminder.deleted_at.is_(None)))
         if existing is not None:
             acks.append({"client_key": item.client_key, "reminder_id": existing.id})
+            continue
+        gone = db.scalar(
+            select(models.Reminder).where(*_dedupe,
+                                          models.Reminder.deleted_at.is_not(None)))
+        if gone is not None:
+            log.info("设备补报的本地提醒 %s 与服务端已删除的 #%s 相同，只 ack 不新建"
+                     "（新建等于复活已删提醒）", item.client_key, gone.id)
+            acks.append({"client_key": item.client_key, "reminder_id": gone.id})
             continue
 
         row = models.Reminder(

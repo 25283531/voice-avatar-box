@@ -91,12 +91,22 @@ def overview(device_pk: int, days: int = Query(7, ge=1, le=60),
     total_7d = sum(p.total for p in series)
 
     # --- 提醒对账 ---
+    # 软删除（2026-10-30）：待处理数**必须**排除已删除的提醒。
+    # 删除只清了 PENDING 实例，已经 FIRED 的那条还留着（"那天确实响过"），
+    # 不过滤的话家属会看到一个永远清不掉的「待处理 1 条」——而列表里根本
+    # 没有这条提醒可处理，是个死胡同。
     pending = db.scalar(
-        select(func.count(models.ReminderEvent.id)).where(
+        select(func.count(models.ReminderEvent.id))
+        .join(models.Reminder, models.Reminder.id == models.ReminderEvent.reminder_id)
+        .where(
             models.ReminderEvent.device_id == device_pk,
             models.ReminderEvent.state.in_([int(EventState.PENDING), int(EventState.FIRED)]),
+            models.Reminder.deleted_at.is_(None),
         )
     ) or 0
+    # ⚠️ ``missed_today`` **刻意不过滤**已删除的提醒：它是"今天真的错过了一次"
+    # 的历史事实，删掉提醒不该把已经发生过的漏服从统计里抹掉 —— 那等于
+    # 让家属永远发现不了"老爷子删了提醒、也真的漏了药"。
     missed_today = db.scalar(
         select(func.count(models.ReminderEvent.id)).where(
             models.ReminderEvent.device_id == device_pk,

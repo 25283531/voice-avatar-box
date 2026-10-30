@@ -1,27 +1,94 @@
-"""提醒规则 CRUD + 排期实例 + 设备回执。"""
+"""提醒规则 CRUD + 排期实例 + 设备回执。
+
+⚠️ 软删除（2026-10-30）之后，**每一个读 Reminder 的查询都必须自己加
+``deleted_at IS NULL``** —— SQLAlchemy 不会自动加。本文件统一走
+:func:`_get_alive` / ``_alive_filter()``，不要在别处再手写一遍
+（漏一处 = "删了还在响"，见 models.Reminder 的注释）。
+"""
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from .. import geo, models
+from .. import geo, models, reminder_audit
 from ..db import get_db
 from ..deps import get_current_user, require_device_owner
 from ..models import EventState
-from ..schedule import (TZ_MARGIN, event_due_utc, event_zone, materialize_events,
-                        next_occurrence, occurrences_on, reminder_zone)
-from ..schemas import EventOut, ReminderIn, ReminderOut
+from ..schedule import (TZ_MARGIN, clear_pending_events, event_due_utc,
+                        event_zone, materialize_events, next_occurrence,
+                        occurrences_on, reminder_zone)
+from ..schemas import EventOut, ReminderAuditOut, ReminderIn, ReminderOut
 
 router = APIRouter(prefix="/api/reminders", tags=["reminders"])
+
+
+# ---------------------------------------------------------------- 软删除
+def _alive_filter():
+    """「未删除」的 SQL 条件。**所有**读 Reminder 的查询都要带上它。"""
+    return models.Reminder.deleted_at.is_(None)
+
+
+def _get_alive(db: Session, reminder_pk: int) -> models.Reminder:
+    """按 id 取一条**未删除**的提醒；不存在或已删都按"不存在"处理（404）。
+
+    为什么统一用带 where 的 select 而不是 ``db.get()``
+    ------------------------------------------------
+    ``db.get()`` 只能按主键取，加不了条件；先 get 再判 ``is_alive()`` 的写法
+    每处都要记得判，漏一处就是「已删除的提醒还能被 PATCH / 还能被确认」。
+    而且它把"已删"与"不存在"分成两条代码路径，容易一边 404、一边 403
+    （后者会泄露"这个 id 曾经存在"）。
+    """
+    r = db.scalar(select(models.Reminder).where(
+        models.Reminder.id == reminder_pk, _alive_filter()))
+    if r is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "提醒不存在")
+    return r
+
+
+def _get_deleted(db: Session, reminder_pk: int) -> models.Reminder:
+    """按 id 取一条**已删除**的提醒（只有 restore 用）。"""
+    r = db.scalar(select(models.Reminder).where(
+        models.Reminder.id == reminder_pk,
+        models.Reminder.deleted_at.is_not(None)))
+    if r is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "没有找到已删除的提醒")
+    return r
+
+
+def client_via(request: Request) -> str:
+    """客户端自报来源端。前端在请求头里带 ``X-Client: web|app``。
+
+    为什么要客户端自报而不是服务端猜：网页端与 APP 端打的是同一套 API，
+    User-Agent 里既有浏览器也有 WebView，靠 UA 判端必然误判（APP 内嵌页
+    与浏览器页面 UA 几乎一样）。而"从哪个端删的"是家属之间互相追责时
+    最有用的一列，宁可让前端显式声明。
+
+    非法值一律回落 ``web``：这是个**展示**字段，不该因为它拼错就 400
+    —— 那会让一次正常的删除失败。
+    """
+    raw = (request.headers.get("x-client") or "").strip().lower()
+    return raw if raw in reminder_audit.VIA_VALUES else "web"
 
 
 def _with_next(db: Session, r: models.Reminder) -> ReminderOut:
     out = ReminderOut.model_validate(r)
     out.next_fire_at = next_occurrence(r)
+    # is_deleted 是派生值（不是列）：统一在这里推导，避免每个接口各算一遍。
+    out.is_deleted = r.deleted_at is not None
     return out
+
+
+def _clear_pending_events(db: Session, reminder_pk: int) -> int:
+    """删掉这条提醒**尚未触发**的排期实例（实现见 ``schedule.clear_pending_events``）。
+
+    为什么实现在 schedule 而不是这里：语音链路（``voice/tools.py``）的
+    「语音删除提醒」也要做同一件事，而 voice 模块不该 import routers
+    （分层反了，且会引入一串无关的 FastAPI 依赖）。
+    """
+    return clear_pending_events(db, reminder_pk)
 
 
 def _reminder_tz(request, dev: models.Device, explicit: str = "") -> str:
@@ -104,6 +171,12 @@ def create_reminder(device_pk: int, payload: ReminderIn, request: Request,
     data["tz"] = _reminder_tz(request, dev, data.get("tz", ""))
     r = models.Reminder(device_id=device_pk, creator_id=user.id, **data)
     db.add(r)
+    # flush 而不是 commit：审计行要 reminder_id，而流水必须与业务变更
+    # **同一个事务**提交（分开提交就可能出现"提醒建了、流水丢了"）。
+    db.flush()
+    reminder_audit.log(db, reminder=r, action="create", actor=user,
+                       via=client_via(request),
+                       after=reminder_audit.snapshot(r))
     db.commit()
     db.refresh(r)
     # 立即为该规则排期，保证设备下次心跳就能拉到
@@ -112,9 +185,18 @@ def create_reminder(device_pk: int, payload: ReminderIn, request: Request,
 
 
 @router.get("", response_model=list[ReminderOut])
-def list_reminders(device_pk: int | None = None, db: Session = Depends(get_db),
+def list_reminders(device_pk: int | None = None, include_deleted: bool = False,
+                   db: Session = Depends(get_db),
                    user: models.User = Depends(get_current_user)):
+    """提醒列表。默认**只返回未删除的**。
+
+    ``include_deleted=true`` 时把已删除的一并带出（``is_deleted=true``）：
+    这是用户要的「删了也能看到历史」在列表侧的落点，家属可以据此发现
+    "老爷子把降压药提醒删了"并一键恢复。
+    """
     q = select(models.Reminder)
+    if not include_deleted:
+        q = q.where(_alive_filter())
     if device_pk is not None:
         require_device_owner(device_pk, user, db)
         q = q.where(models.Reminder.device_id == device_pk)
@@ -153,12 +235,53 @@ def upcoming(device_pk: int, hours: int = 24, db: Session = Depends(get_db),
     return keep
 
 
+@router.get("/audits", response_model=list[ReminderAuditOut])
+def list_audits(device_pk: int,
+                reminder_id: int | None = None,
+                limit: int = Query(100, ge=1, le=500),
+                offset: int = Query(0, ge=0),
+                db: Session = Depends(get_db),
+                user: models.User = Depends(get_current_user)):
+    """某台设备的提醒操作流水（新→旧）。
+
+    ⚠️ **路由顺序**：本函数必须定义在 ``/{reminder_pk}`` **之前**。
+    FastAPI 按声明顺序匹配，放后面时 ``GET /api/reminders/audits`` 会先命中
+    ``/{reminder_pk}``，把 ``"audits"`` 当成 int 解析 → 422，且报错信息
+    （"value is not a valid integer"）完全指不到真正的原因。
+    ``/upcoming`` 也是同样的道理，所以两者都放在前面。
+
+    ``can_restore`` 是**当前**状态：同一条 delete 流水在恢复之后会变成 false
+    （按钮要反映现状，而不是"当时能不能恢复"）。
+    """
+    require_device_owner(device_pk, user, db)
+    q = select(models.ReminderAudit).where(
+        models.ReminderAudit.device_id == device_pk)
+    if reminder_id is not None:
+        q = q.where(models.ReminderAudit.reminder_id == reminder_id)
+    rows = db.scalars(
+        q.order_by(models.ReminderAudit.created_at.desc(),
+                   models.ReminderAudit.id.desc())
+        .limit(limit).offset(offset)
+    ).all()
+    if not rows:
+        return []
+
+    # 一次查询算出"这些流水涉及的提醒里，哪些现在是已删除状态"。
+    # 逐行查会变成 N+1（一页 100 条 = 100 次查询）。
+    ids = {int(r.reminder_id) for r in rows}
+    deleted_ids = set(db.scalars(
+        select(models.Reminder.id).where(
+            models.Reminder.id.in_(ids),
+            models.Reminder.deleted_at.is_not(None))
+    ).all())
+    return [reminder_audit.to_out(r, can_restore=int(r.reminder_id) in deleted_ids)
+            for r in rows]
+
+
 @router.get("/{reminder_pk}", response_model=ReminderOut)
 def get_reminder(reminder_pk: int, db: Session = Depends(get_db),
                  user: models.User = Depends(get_current_user)):
-    r = db.get(models.Reminder, reminder_pk)
-    if not r:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "提醒不存在")
+    r = _get_alive(db, reminder_pk)
     require_device_owner(r.device_id, user, db)
     return _with_next(db, r)
 
@@ -167,14 +290,15 @@ def get_reminder(reminder_pk: int, db: Session = Depends(get_db),
 def update_reminder(reminder_pk: int, payload: ReminderIn, request: Request,
                     db: Session = Depends(get_db),
                     user: models.User = Depends(get_current_user)):
-    r = db.get(models.Reminder, reminder_pk)
-    if not r:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "提醒不存在")
+    r = _get_alive(db, reminder_pk)
     require_device_owner(r.device_id, user, db)
     # 与 create 同一条约束：把一条规则改成「一次性」却不给日期，等于让它
     # 永远不触发（见 _reject_once_without_date 的说明）。
     _reject_once_without_date(payload)
 
+    # 快照必须在**改动之前**取：改完之后再 snapshot 拿到的是新值，
+    # before/after 会变成两份一样的 JSON（流水看起来"什么都没改"）。
+    before = reminder_audit.snapshot(r)
     data = payload.model_dump()
     # 未显式给 tz 时**保留原值**，不重新判定：一条规则建好之后的时区不该
     # 因为"家属这次在另一个国家改了个标题"而漂移 —— 那会把老人已经习惯的
@@ -187,46 +311,117 @@ def update_reminder(reminder_pk: int, payload: ReminderIn, request: Request,
     # 于是"最后修改时间"稳定地比真实时间晚 8 小时 —— 属于本轮要消灭的
     # 「几个节点时区不统一」的一部分。
     r.updated_at = models.utcnow()
+    # 与业务变更同一个事务（见 reminder_audit 模块头部）。
+    reminder_audit.log(db, reminder=r, action="update", actor=user,
+                       via=client_via(request),
+                       before=before, after=reminder_audit.snapshot(r))
     db.commit()
     db.refresh(r)
 
     # 规则变了，清掉尚未发生的排期实例，按新规则重排
-    pending = db.scalars(
-        select(models.ReminderEvent).where(
-            models.ReminderEvent.reminder_id == r.id,
-            models.ReminderEvent.state == int(EventState.PENDING),
-        )
-    ).all()
-    for e in pending:
-        db.delete(e)
+    _clear_pending_events(db, r.id)
     db.commit()
     materialize_events(db, r.device_id)
     return _with_next(db, r)
 
 
 @router.post("/{reminder_pk}/toggle", response_model=ReminderOut)
-def toggle_reminder(reminder_pk: int, db: Session = Depends(get_db),
+def toggle_reminder(reminder_pk: int, request: Request,
+                    db: Session = Depends(get_db),
                     user: models.User = Depends(get_current_user)):
     """暂停 / 恢复（老人住院、外出时常用）。"""
-    r = db.get(models.Reminder, reminder_pk)
-    if not r:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "提醒不存在")
+    r = _get_alive(db, reminder_pk)
     require_device_owner(r.device_id, user, db)
+    was_enabled = bool(r.enabled)
     r.enabled = not r.enabled
+    reminder_audit.log(
+        db, reminder=r,
+        action="toggle_on" if r.enabled else "toggle_off",
+        actor=user, via=client_via(request),
+        before={"enabled": was_enabled}, after={"enabled": bool(r.enabled)},
+    )
     db.commit()
     db.refresh(r)
     return _with_next(db, r)
 
 
 @router.delete("/{reminder_pk}", status_code=status.HTTP_204_NO_CONTENT)
-def delete_reminder(reminder_pk: int, db: Session = Depends(get_db),
+def delete_reminder(reminder_pk: int, request: Request,
+                    db: Session = Depends(get_db),
                     user: models.User = Depends(get_current_user)):
-    r = db.get(models.Reminder, reminder_pk)
-    if not r:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "提醒不存在")
+    """软删除：行留在库里（家属要看历史），但对外表现成"不存在"。
+
+    幂等口径：对已删除的再删一次返回 **404** —— 因为 ``_get_alive`` 已经
+    把它当成不存在了。这比返回 204 更好：前端拿到 404 会刷新列表，
+    而不是以为自己又删了一遍。
+
+    ⚠️ 软删除**必须同时置 ``enabled = False``**，但**不要**把它理解成"老固件
+    的兜底" —— 这个说法一度写在这里，是错的，2026-10-30 已更正：
+
+    下发查询是 ``Reminder.enabled.is_(True)``，所以「置 ``enabled=False``」和
+    「查询时过滤 ``deleted_at``」对**下发 payload 的效果完全相同**，都只是让
+    这条规则从数组里消失。而老固件 ``sync.c`` 的 ``do_sync()`` 短路条件是
+    **数组为空**（``count > 0`` 才整表替换）：
+
+      * 还有别的启用规则 → 数组非空 → 老固件整表替换 → 被删那条消失 ✅
+      * **删掉的是最后一条** → 数组为空 → 老固件短路、保留本地旧表 → 继续
+        每天响 ❌
+
+    第二种情况下服务端**无论怎么改都救不了**，只能等设备 OTA 到含 ``a407119``
+    的固件（那一版把判据从"解析出几条"改成 ``cJSON_IsArray``，空数组也整表
+    替换）。别以为置了 false 就万事大吉。
+
+    那为什么还要置 false —— **第二道防线**，两个理由：
+      ① ``schedule.materialize_events`` 等查询按 ``enabled`` 过滤，与
+         ``deleted_at`` 互为备份，以后谁改错一个，另一个还挡得住；
+      ② 一条已删除的提醒本来就不该是"启用"状态，留 ``True`` 是自相矛盾的
+         数据，读库的人会困惑。
+    """
+    r = _get_alive(db, reminder_pk)
     require_device_owner(r.device_id, user, db)
-    db.delete(r)
+    # 快照必须在**改任何字段之前**取：before_json 要保留删除前的 enabled
+    # 原值，restore 靠它还原（先置 false 再取快照 ⇒ 恢复后永远是暂停态）。
+    before = reminder_audit.snapshot(r)
+    r.deleted_at = models.utcnow()
+    r.deleted_by = user.id
+    r.deleted_via = client_via(request)
+    r.enabled = False            # 第二道防线，**不是**老固件兜底，理由见 docstring
+    reminder_audit.log(db, reminder=r, action="delete", actor=user,
+                       via=r.deleted_via, before=before)
+    # 必须与软删**同一个事务**：如果先提交删除再清实例，中途失败就会留下
+    # "提醒已删、实例还在"的状态 ⇒ 设备继续按 PENDING 播报（删了还在响）。
+    _clear_pending_events(db, r.id)
     db.commit()
+
+
+@router.post("/{reminder_pk}/restore", response_model=ReminderOut)
+def restore_reminder(reminder_pk: int, request: Request,
+                     db: Session = Depends(get_db),
+                     user: models.User = Depends(get_current_user)):
+    """把一条软删除的提醒恢复（家属发现"老爷子把降压药提醒删了"时用）。
+
+    ``enabled`` 还原成**删除前**的值（读最近一条 delete 流水的 before_json）：
+    删除时把 enabled 置了 false（第二道防线，见 ``delete_reminder``），无条件
+    恢复成 True 会把「先暂停、再删除」的意图弄丢
+    （见 ``reminder_audit.enabled_before_delete``）。
+    """
+    r = _get_deleted(db, reminder_pk)
+    require_device_owner(r.device_id, user, db)
+    prev_enabled = reminder_audit.enabled_before_delete(db, r.id)
+    r.enabled = True if prev_enabled is None else prev_enabled
+    r.deleted_at = None
+    r.deleted_by = None
+    r.deleted_via = ""
+    r.updated_at = models.utcnow()
+    reminder_audit.log(db, reminder=r, action="restore", actor=user,
+                       via=client_via(request),
+                       before={"enabled": False},
+                       after=reminder_audit.snapshot(r))
+    db.commit()
+    db.refresh(r)
+    # 重新排期：删除时把 PENDING 实例清光了，不重排的话这条规则"活着但不响"。
+    materialize_events(db, r.device_id)
+    return _with_next(db, r)
 
 
 def _get_or_create_event(db: Session, r: models.Reminder, due: datetime) -> models.ReminderEvent:
@@ -260,7 +455,8 @@ def _get_or_create_event(db: Session, r: models.Reminder, due: datetime) -> mode
 
 
 @router.post("/{reminder_pk}/confirm", response_model=EventOut)
-def confirm_now(reminder_pk: int, db: Session = Depends(get_db),
+def confirm_now(reminder_pk: int, request: Request,
+                db: Session = Depends(get_db),
                 user: models.User = Depends(get_current_user)):
     """子女在 APP 上代老人确认当前待办（ConfirmMethod.APP）。
 
@@ -280,9 +476,7 @@ def confirm_now(reminder_pk: int, db: Session = Depends(get_db),
     """
     from ..models import ConfirmMethod
 
-    r = db.get(models.Reminder, reminder_pk)
-    if not r:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "提醒不存在")
+    r = _get_alive(db, reminder_pk)
     require_device_owner(r.device_id, user, db)
 
     # 「当天」与「到点」都必须在规则的时区里判：拿北京时间的 now 去比一条
@@ -327,6 +521,10 @@ def confirm_now(reminder_pk: int, db: Session = Depends(get_db),
     # due_at 是纽约钟点、confirmed_at 是北京钟点，页面上会显示"确认时间晚 12 小时"。
     ev.confirmed_at = datetime.now(event_zone(ev))
     ev.note = "子女端代确认"
+    reminder_audit.log(db, reminder=r, action="confirm", actor=user,
+                       via=client_via(request),
+                       after={"event_id": int(ev.id) if ev.id else None,
+                              "due_at": ev.due_at, "state": int(ev.state)})
     db.commit()
     db.refresh(ev)
     return ev

@@ -51,8 +51,12 @@ from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from typing import Any
 
+from sqlalchemy import select
+
 from .. import models
-from ..schedule import ScheduleKind, local_now, materialize_events, next_occurrence
+from .. import reminder_audit
+from ..schedule import (ScheduleKind, clear_pending_events, local_now,
+                        materialize_events, next_occurrence)
 
 log = logging.getLogger(__name__)
 
@@ -741,6 +745,11 @@ _PLACEHOLDER_TITLE_RE = re.compile(
 )
 
 
+#: 语音链路的审计 actor 显示名。老人没有账号（设备语音不走登录态），
+#: 所以 ``actor_id`` 恒为 None，用这个名字说明"是老人自己说的"。
+_VOICE_ACTOR = "老人（语音）"
+
+
 def _is_placeholder_title(title: str) -> bool:
     """标题是不是「提醒 / 事项」这类占位词（= 模型没听清内容就拿分类词凑数）。"""
     t = _normalize(title)
@@ -752,8 +761,13 @@ def _is_placeholder_title(title: str) -> bool:
 
 
 def _find_reminders(db: Any, device_pk: int, keyword: str) -> list[models.Reminder]:
+    # 软删除（2026-10-30）：已删除的提醒对老人来说"不存在"。
+    # 漏了这个过滤 ⇒ 老人说「删掉吃药提醒」时，_resolve_one 可能选中一条
+    # 早已删除的行，回一句"已删除「吃药」"（他其实没删成任何东西），
+    # 或者更糟：把一条已删的重新暂停/恢复，让它在设备上又活过来。
     rows = list(db.query(models.Reminder)
-                .filter(models.Reminder.device_id == device_pk)
+                .filter(models.Reminder.device_id == device_pk,
+                        models.Reminder.deleted_at.is_(None))
                 .order_by(models.Reminder.id.desc()).all())
     if not keyword:
         return rows
@@ -1223,6 +1237,11 @@ def _create_reminder(db: Any, device_pk: int, args: dict[str, Any]) -> dict[str,
         enabled=True,
     )
     db.add(r)
+    # flush 拿 id，然后与业务变更**同一个事务**写审计（见 reminder_audit 模块）。
+    db.flush()
+    reminder_audit.log(db, reminder=r, action="create", actor_type="voice",
+                       actor_name=_VOICE_ACTOR, via="voice",
+                       after=reminder_audit.snapshot(r))
     db.commit()
     db.refresh(r)
     # 立即排期，保证设备下次心跳就能拉到（与 routers/reminders.create 同口径）
@@ -1253,8 +1272,11 @@ def _create_reminder(db: Any, device_pk: int, args: dict[str, Any]) -> dict[str,
 
 
 def _list_reminders(db: Any, device_pk: int) -> dict[str, Any]:
+    # 软删除（2026-10-30）：列给老人听的只能是"还活着"的提醒，
+    # 否则他会听到一条已经删掉的服药时间并按它吃药。
     rows = list(db.query(models.Reminder)
-                .filter(models.Reminder.device_id == device_pk)
+                .filter(models.Reminder.device_id == device_pk,
+                        models.Reminder.deleted_at.is_(None))
                 .order_by(models.Reminder.id.desc()).limit(20).all())
     if not rows:
         return {"ok": True, "count": 0, "reminders": [],
@@ -1275,7 +1297,12 @@ def _resolve_one(db: Any, device_pk: int, args: dict[str, Any],
     keyword = str(args.get("title") or "").strip()
     if rid:
         try:
-            r = db.get(models.Reminder, int(rid))
+            # 软删除（2026-10-30）：用带 where 的 select 而不是 db.get()。
+            # db.get() 拿不到 deleted_at 条件，会把已删的提醒当成活的，
+            # 于是「删掉八点的药」可能删到一条早就删过的行。
+            r = db.scalar(select(models.Reminder).where(
+                models.Reminder.id == int(rid),
+                models.Reminder.deleted_at.is_(None)))
         except (TypeError, ValueError):
             r = None
         if r is None or int(r.device_id) != int(device_pk):
@@ -1302,7 +1329,23 @@ def _delete_reminder(db: Any, device_pk: int, args: dict[str, Any]) -> dict[str,
     if err:
         return err
     title = r.title
-    db.delete(r)
+    # 软删除（2026-10-30）：与 web/app 的 DELETE 同口径 —— 行留在库里（家属
+    # 要能看到"是老人自己删的"），对外表现为不存在。
+    before = reminder_audit.snapshot(r)
+    r.deleted_at = models.utcnow()
+    r.deleted_by = None          # 老人没有账号，删除人是"语音"，由流水记录
+    r.deleted_via = "voice"
+    # 与 web/app 的 DELETE 同口径：enabled 一并置 false 是**第二道防线**
+    # （materialize_events 等查询按 enabled 过滤，与 deleted_at 互为备份），
+    # **不是**老固件兜底 —— 下发 payload 本来就看 enabled，置 false 与过滤
+    # deleted_at 对设备是同一个效果；老固件在"数组为空"时仍会保留本地旧表。
+    # 完整说明见 routers/reminders.delete_reminder。
+    r.enabled = False
+    reminder_audit.log(db, reminder=r, action="delete", actor_type="voice",
+                       actor_name=_VOICE_ACTOR, via="voice", before=before)
+    # 必须与软删同一个事务：否则会留下"已删但 PENDING 还在"的状态，
+    # 设备按实例继续播报 ⇒ 删了还在响。
+    clear_pending_events(db, r.id)
     db.commit()
     return {"ok": True, "deleted": title,
             "message": f"已删除「{title}」，请用一句话告知老人"}
@@ -1313,7 +1356,14 @@ def _toggle_reminder(db: Any, device_pk: int, args: dict[str, Any]) -> dict[str,
     if err:
         return err
     want = args.get("enabled")
+    was_enabled = bool(r.enabled)
     r.enabled = (bool(want) if isinstance(want, bool) else not r.enabled)
+    reminder_audit.log(
+        db, reminder=r,
+        action="toggle_on" if r.enabled else "toggle_off",
+        actor_type="voice", actor_name=_VOICE_ACTOR, via="voice",
+        before={"enabled": was_enabled}, after={"enabled": bool(r.enabled)},
+    )
     db.commit()
     db.refresh(r)
     nxt = next_occurrence(r)
