@@ -5,6 +5,7 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <sys/time.h>
+#include <time.h>
 
 #include "cJSON.h"
 #include "esp_chip_info.h"
@@ -814,13 +815,48 @@ esp_err_t elder_sync_enqueue_event(uint32_t server_id, time_t due_at,
     return ESP_OK;
 }
 
+/* 回执定位实例用的 due_at —— **绝不能退回 time(NULL)**。
+ *
+ * 服务端按 (reminder_id, due_at) 定位"哪一天的这一次提醒"（device_api.py
+ * 的 _apply_* 按这两个字段找事件，找不到就 db.add 新建）。所以 due 一旦
+ * 变成"上报那一刻"，服务端必然找不到原实例，只能新建一条假实例。
+ *
+ * 旧代码就是 `if (due == 0) due = time(NULL);`（R2，2026-10-31 用户实报）。
+ * 现场库里留下的证据：id=109 due_at=20:58:58、id=110 due_at=20:59:09，
+ * due_at 与 confirmed_at 逐秒相同；而真正该被确认的 08:00 那两行永远
+ * 等不到确认 ⇒ 设备红灯一直闪，依从率统计把一次服药算成三次。
+ *
+ * 正确兜底：用条目自己的 hour/minute 拼"今天该提醒的时刻"。回执只可能
+ * 针对**已经触发过**的实例，所以算出来的时刻若落在将来，就往前退一天
+ * （23:55 的提醒跨零点才确认，属于这种情况）。 */
+static time_t due_of_item(const elder_rmd_item_t *it)
+{
+    if (it->fired_due_at > 0) return (time_t)it->fired_due_at;
+
+    time_t now = time(NULL);
+    struct tm tmv;
+    localtime_r(&now, &tmv);
+    tmv.tm_hour  = it->hour;
+    tmv.tm_min   = it->minute;
+    tmv.tm_sec   = 0;
+    tmv.tm_isdst = -1;
+    time_t cand = mktime(&tmv);
+    if (cand > now) {
+        tmv.tm_mday -= 1;
+        tmv.tm_isdst = -1;
+        cand = mktime(&tmv);
+    }
+    ESP_LOGW(TAG, "提醒 rid=%lu 的 fired_due_at 丢失，按计划时刻兜底：due=%ld 现在=%ld",
+             (unsigned long)it->server_id, (long)cand, (long)now);
+    return cand;
+}
+
 void elder_sync_on_reminder_state(const elder_rmd_item_t *item, elder_rmd_state_t st)
 {
     if (!item) return;
 
     uint32_t sid = item->server_id;
-    time_t due = (time_t)item->fired_due_at;
-    if (due == 0) due = time(NULL);
+    time_t due = due_of_item(item);
 
     switch (st) {
     case ELDER_RMD_PENDING:

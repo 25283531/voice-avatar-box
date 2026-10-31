@@ -845,6 +845,9 @@ typedef struct {
     uint8_t          old_state[ELDER_REMINDER_MAX];
     bool             old_fired[ELDER_REMINDER_MAX];
     int64_t          old_deadline[ELDER_REMINDER_MAX];
+    int64_t          old_due[ELDER_REMINDER_MAX];
+    int64_t          old_pending[ELDER_REMINDER_MAX];
+    int64_t          old_half[ELDER_REMINDER_MAX];
 } rmd_merge_scratch_t;
 
 esp_err_t elder_reminder_replace_all(const elder_rmd_item_t *items,
@@ -869,6 +872,9 @@ esp_err_t elder_reminder_replace_all(const elder_rmd_item_t *items,
     uint8_t *old_state = sc->old_state;
     bool    *old_fired = sc->old_fired;
     int64_t *old_deadline = sc->old_deadline;
+    int64_t *old_due = sc->old_due;
+    int64_t *old_pending = sc->old_pending;
+    int64_t *old_half = sc->old_half;
 
     /* ---- 1. 快照旧表与运行态 ---- */
     uint8_t old_n = g.table.count > ELDER_REMINDER_MAX ? ELDER_REMINDER_MAX : g.table.count;
@@ -879,6 +885,13 @@ esp_err_t elder_reminder_replace_all(const elder_rmd_item_t *items,
     memcpy(old_state, g.state, sizeof(sc->old_state));
     memcpy(old_fired, g.fired_today, sizeof(sc->old_fired));
     memcpy(old_deadline, g.confirm_deadline_us, sizeof(sc->old_deadline));
+    /* fired_due_at 是"本次实例的到期时刻"，回执靠它定位服务端那一行。
+     * 它住在 items[] 里，而下面第 4 步要 memset 整张表 —— 不单独快照就会
+     * 跟着一起归零（R2，2026-10-31 用户实报后修）。 */
+    memset(old_due, 0, sizeof(sc->old_due));
+    for (uint8_t i = 0; i < old_n; i++) old_due[i] = g.table.items[i].fired_due_at;
+    memcpy(old_pending, g.pending_since_us, sizeof(sc->old_pending));
+    memcpy(old_half, g.half_since_us, sizeof(sc->old_half));
 
     /* ---- 2. 挑出「设备本地自建」（server_id==0）条目 —— 后端同步绝不能抹掉它们 ----
      * 这是本函数存在的理由：断网时老人亲手建的服药提醒只存在于设备 NVS，
@@ -999,20 +1012,45 @@ esp_err_t elder_reminder_replace_all(const elder_rmd_item_t *items,
         }
         if (old_idx >= 0) {
             claimed |= (1u << old_idx);   /* 这条旧条目已被认领，后面的条目不许再认 */
-            /* 沿用旧表同一条的运行态，避免同步打断老人当天的进度 */
+            /* 沿用旧表同一条的运行态，避免同步打断老人当天的进度。
+             *
+             * ⚠️ 这里继承的字段必须**覆盖整个"本次实例"的上下文**，
+             * 漏一个就会让一次普通的心跳同步把老人当天的进度打断。
+             * 2026-10-31 的 R2 就是漏了 fired_due_at 造成的：
+             *   08:00 的服药提醒响过、正等确认 → 子女端改了别的提醒，
+             *   触发一次 replace_all → fired_due_at 归零 → 老人/子女
+             *   确认时 sync 层拿 0 兜底成"现在" → 服务端按 (rid, due)
+             *   找不到 08:00 那行，add 出一条 due_at == 确认时刻的假实例。
+             *   08:00 那行永远等不到确认 ⇒ 红灯一直闪，依从率全失真。 */
             g.state[i] = old_state[old_idx];
             g.fired_today[i] = old_fired[old_idx];
             g.confirm_deadline_us[i] = old_deadline[old_idx];
+            g.table.items[i].fired_due_at = old_due[old_idx];
+            /* 两个计时基准同样是"本次实例"的一部分：
+             *   pending_since_us —— 15 分钟升级计时的起点。丢了就退回
+             *     `(now_min - due) >= 15` 的兜底，晚开机/同步一次就立刻
+             *     判 ESCALATED 上报 MISSED，子女端收到假"漏服"告警。
+             *   half_since_us —— 半置信复核窗口的起点。丢了会退回更早的
+             *     pending_since_us ⇒ 窗口立刻到期 ⇒ 语音确认被冲成
+             *     HALF_EXPIRED，老人刚说过的"吃过了"白说。 */
+            g.pending_since_us[i] = old_pending[old_idx];
+            g.half_since_us[i] = old_half[old_idx];
         } else {
             g.state[i] = ELDER_RMD_IDLE;
             g.fired_today[i] = false;
             g.confirm_deadline_us[i] = 0;
+            g.table.items[i].fired_due_at = 0;
+            g.pending_since_us[i] = 0;
+            g.half_since_us[i] = 0;
         }
     }
     for (uint8_t i = n; i < ELDER_REMINDER_MAX; i++) {
         g.state[i] = ELDER_RMD_IDLE;
         g.fired_today[i] = false;
         g.confirm_deadline_us[i] = 0;
+        g.table.items[i].fired_due_at = 0;
+        g.pending_since_us[i] = 0;
+        g.half_since_us[i] = 0;
     }
 
     /* ---- 5. 位图按新状态重算 ---- */

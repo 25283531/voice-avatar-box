@@ -859,6 +859,160 @@ def main() -> int:
           ("⚠️ " + "；".join(_c14_bad[:5])) if _c14_bad else _c14_info,
           fatal=True)
 
+    # --------- C15 提醒回执的 due_at 必须指向「本次实例」（R2）
+    # 2026-10-31 用户实报：8 点的服药提醒，20:49 子女端在 APP 上点了代确认，
+    # 设备红灯一直闪。库里同一件事裂成三行：
+    #     id=107/108 due_at=08:27:11   ← 真正触发过的那两次，永远等不到确认
+    #     id=109     due_at=20:58:58   ← due_at 与 confirmed_at 逐秒相同
+    #     id=110     due_at=20:59:09
+    # 服务端按 (reminder_id, due_at) 定位实例（device_api.py 找不到就 db.add
+    # 新建），due_at 一旦变成"上报那一刻"就等于换了一个实例 ⇒ 原实例永远不
+    # 确认 + 凭空多一条假记录，依从率把一次服药算成三次。
+    # 两个口子，缺一不可：
+    #   ① reminder.c 的 replace_all 用 memset 整表重建，却只继承 state /
+    #      fired_today / confirm_deadline_us —— fired_due_at 跟着被清零。
+    #      于是**一次普通心跳同步**就能把"8 点那一次"打成 0。
+    #   ② sync.c 的 on_reminder_state 拿 0 兜底成 time(NULL)。
+    # 都是"编译全绿、单测全绿，只有真实数据量 + 真实跨天才会暴露"的形态，
+    # 所以必须在编译前按代码位拦住。
+    _c15_rmd = ROOT / "firmware" / "components" / "elder" / "src" / "reminder.c"
+    _c15_sync = ROOT / "firmware" / "components" / "elder" / "src" / "sync.c"
+
+    def _strip_comments(s: str) -> str:
+        """把注释换成等长空白（保留换行与偏移）。
+
+        为什么必须先剥注释：本项的断言是"某处不许出现 time(NULL)"，而
+        **解释为什么不许出现的那段注释里就写着 time(NULL)** —— 不剥注释
+        等于让防回归注释自己踩红（这是本仓库反复踩过的坑）。
+        字符串字面量要整体跳过，否则 `"//"` 会被当成行注释起点。
+        """
+        out: list[str] = []
+        i, n = 0, len(s)
+        while i < n:
+            c = s[i]
+            if c == "/" and i + 1 < n and s[i + 1] == "*":
+                j = s.find("*/", i + 2)
+                j = n if j < 0 else j + 2
+                out.append(re.sub(r"[^\n]", " ", s[i:j]))
+                i = j
+            elif c == "/" and i + 1 < n and s[i + 1] == "/":
+                j = s.find("\n", i)
+                j = n if j < 0 else j
+                out.append(" " * (j - i))
+                i = j
+            elif c in "\"'":
+                q, j = c, i + 1
+                while j < n:
+                    if s[j] == "\\":
+                        j += 2
+                        continue
+                    if s[j] == q:
+                        j += 1
+                        break
+                    j += 1
+                out.append(s[i:j])
+                i = j
+            else:
+                out.append(c)
+                i += 1
+        return "".join(out)
+
+    def _func_body(code: str, name: str) -> str | None:
+        """按花括号配平切出函数体（含外层大括号）。取不到返回 None。
+
+        为什么不用"整文件子串匹配"：`fired_due_at = old_due[` 这种判据一旦
+        放宽到全文件，别处（例如某次实验代码、某个无关函数）出现一次就能
+        让断言假绿。要防的是"这一条继承没写"，不是"文件里提过这个名字"。
+        """
+        m = re.search(r"\b" + re.escape(name) + r"\s*\(", code)
+        if not m:
+            return None
+        i = code.find("{", m.end())
+        if i < 0:
+            return None
+        depth = 0
+        for j in range(i, len(code)):
+            if code[j] == "{":
+                depth += 1
+            elif code[j] == "}":
+                depth -= 1
+                if depth == 0:
+                    return code[i:j + 1]
+        return None
+
+    if not _c15_rmd.is_file() or not _c15_sync.is_file():
+        check("C15 提醒回执 due_at 指向本次实例", SKIP,
+              "reminder.c / sync.c 不存在，本项无判据可查")
+    else:
+        _rmd_code = _strip_comments(
+            _c15_rmd.read_text(encoding="utf-8", errors="replace"))
+        _sync_code = _strip_comments(
+            _c15_sync.read_text(encoding="utf-8", errors="replace"))
+        _c15_bad: list[str] = []
+
+        _ra = _func_body(_rmd_code, "elder_reminder_replace_all")
+        if _ra is None:
+            _c15_bad.append("取不到 elder_reminder_replace_all() 的函数体")
+        else:
+            _m_wipe = re.search(r"memset\s*\(\s*g\s*\.\s*table\s*\.\s*items", _ra)
+            _m_snap = re.search(
+                r"old_due\s*\[[^\]]*\]\s*=\s*g\s*\.\s*table\s*\.\s*items\s*"
+                r"\[[^\]]*\]\s*\.\s*fired_due_at", _ra)
+            _m_inherit = re.search(r"fired_due_at\s*=\s*old_due\s*\[", _ra)
+            if _m_wipe is None:
+                # 整表重建的写法变了，判据本身失效 —— 显式报出来让人复核，
+                # 绝不"取不到就 SKIP"（那等于让断言永远不执行）。
+                _c15_bad.append(
+                    "replace_all 里找不到整表重建（memset(g.table.items)）—— "
+                    "实现已变，本判据失效，请人工复核运行态继承")
+            else:
+                if _m_snap is None:
+                    _c15_bad.append(
+                        "replace_all 没有快照 fired_due_at（old_due[i] = "
+                        "g.table.items[i].fired_due_at）")
+                elif _m_snap.start() > _m_wipe.start():
+                    _c15_bad.append(
+                        "fired_due_at 的快照写在 memset 之后 —— 快照到的是空表")
+                if _m_inherit is None:
+                    _c15_bad.append(
+                        "replace_all 的运行态继承里没有 fired_due_at"
+                        "（一次心跳同步就把本次实例的到期时刻清零）")
+
+        _on = _func_body(_sync_code, "elder_sync_on_reminder_state")
+        if _on is None:
+            _c15_bad.append("取不到 elder_sync_on_reminder_state() 的函数体")
+        else:
+            _n_now = len(re.findall(r"\btime\s*\(\s*NULL\s*\)", _on))
+            if _n_now:
+                _c15_bad.append(
+                    f"on_reminder_state 里仍有 {_n_now} 处 time(NULL) 兜底 "
+                    "—— 回执会被挂到上报那一刻，服务端据此新建假实例")
+            if "due_of_item(" not in _on:
+                _c15_bad.append(
+                    "on_reminder_state 没走 due_of_item() 取到期时刻")
+
+        _doi = _func_body(_sync_code, "due_of_item")
+        if _doi is None:
+            _c15_bad.append("缺 due_of_item()：due_at 的兜底没有单点实现")
+        else:
+            if "tm_hour" not in _doi or "tm_min" not in _doi:
+                _c15_bad.append(
+                    "due_of_item() 的兜底没用条目自己的 hour/minute 拼计划时刻")
+            if "mktime" not in _doi:
+                _c15_bad.append(
+                    "due_of_item() 没用 mktime 把计划时刻转成绝对时间")
+
+        check("C15 提醒回执的 due_at 必须指向「本次实例」（R2）",
+              not _c15_bad,
+              ("⚠️ " + "；".join(_c15_bad[:5]) +
+               "。服务端按 (reminder_id, due_at) 定位实例，due_at 一变就等于"
+               "换了一条记录：原实例永远等不到确认（红灯一直闪），同时凭空"
+               "多出一条 due_at == confirmed_at 的假记录，依从率把一次服药"
+               "算成三次。") if _c15_bad else
+              "replace_all 在整表重建前快照并继承了 fired_due_at；"
+              "sync 层用 due_of_item() 按计划时刻兜底，无 time(NULL)",
+              fatal=True)
+
     # ------------------------------------------------------ 汇总
     failed = [r for r in results if not r[1] and r[3]]
     warned = [r for r in results if not r[1] and not r[3]]
