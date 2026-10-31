@@ -176,6 +176,9 @@ PATCH_REGISTRY: Final[dict[str, str]] = {
         "（修P0：kind 为空的用户角色曾被每次启动刷成 preset）",
     "persona_agent_key_v1":
         "回填 agent_persona_profiles.agent_key 并合并重复的 L1 全局画像行",
+    "persona_l0_stats_v1":
+        "把各角色行里已有的语气统计一次性归并进 L0(agent_id IS NULL) 行，"
+        "并把角色行统计清零（统计从此跨角色累积，不再按角色分裂）",
     "device_token_epoch_unbound_v1":
         "把部署前就已解绑的 devices.token_epoch 抬到 1"
         "（否则这批设备原主人的旧 device_token 在解绑后仍然有效）",
@@ -1107,9 +1110,218 @@ def dedupe_persona_globals() -> int:
     return removed
 
 
+def merge_persona_stats_to_l0() -> int:
+    """把各角色行里已有的语气统计**一次性**归并进 L0（``agent_id IS NULL``）行。
+
+    背景
+    ----
+    统计字段原先写在"当前角色那一行"，家属换角色（``agent_id`` 8 -> 1）后
+    统计就分裂成多份、各自从零开始。写入路径已改为固定写 L0
+    （``memory.persona.observe_reply`` -> ``_stats_profile``），但**老库里已经
+    分裂出去的历史统计**必须搬一次，否则换过角色的老人会直接"丢历史"。
+
+    归并算法（哪些能相加、哪些要加权，逐项说明）
+    ------------------------------------------
+    1. ``replies_count`` / ``positive_count`` / ``negative_count``：**相加**。
+       每次 ``observe_reply`` 只落在**一行**里，所以各行之和就是真实总数 ——
+       在这里相加**不会**重复计数（重复只可能发生在"归并跑第二次"，
+       由下面两层幂等挡住）。
+    2. ``avg_reply_len`` 按 ``positive_count`` 加权平均；``avg_user_len`` 按
+       ``replies_count`` 加权平均；``humor_score`` 按 ``positive_count`` 加权平均。
+       权重全为 0 时退化为算术平均（与 :func:`dedupe_persona_globals` 同口径）。
+    3. ``address_counts`` / ``catchphrases``：逐项相加再取前 N（8 / 20，与
+       写入侧上限一致）；``address`` 取合并后计数最高的那个。
+    4. ``speed``：取第一个非空且不是 ``normal`` 的值 —— ``normal`` 是列默认值，
+       不代表观测结论；都取不到才回落 ``normal``。
+    5. **``manual`` 不上移**：manual 是"家属对这个角色的交代"，属于 L2 语义，
+       搬进 L0 会让某一个角色的交代污染全局。L0 行只保留它自己原有的 manual。
+
+    幂等（两层，缺一不可）
+    --------------------
+    * **结构幂等**：归并完把角色行的统计列**清零**（数据是"搬走"不是"复制"），
+      所以即使本函数被重复执行，``sum(角色行) + L0`` 也不会翻倍；
+    * **标记幂等**：登记进 :data:`PATCH_REGISTRY` + ``patch_meta``，第二次启动
+      直接返回 0（符合模块顶部铁律：启动时改业务数据必须只执行一次）。
+
+    只处理"角色行真的带统计"的用户：没有统计的用户不会被凭空造出一行 L0 画像
+    （否则每个建过 manual 的用户都会多一行全零行，读侧还得判空）。
+
+    :return: 实际归并过的用户数。
+    """
+    patch_id = "persona_l0_stats_v1"
+    insp = inspect(engine)
+    if "agent_persona_profiles" not in set(insp.get_table_names()):
+        # 全新库：create_all 会按新模型建表，没有历史统计要搬。
+        return 0
+    cols = {c["name"] for c in insp.get_columns("agent_persona_profiles")}
+    required = {
+        "user_id", "agent_id", "agent_key", "replies_count", "positive_count",
+        "negative_count", "avg_reply_len", "avg_user_len", "humor_score",
+        "address", "address_counts", "speed", "catchphrases", "manual",
+        "created_at", "updated_at",
+    }
+    if not required <= cols:
+        # 补列还没跑（理论上 run_all 保证先补列）。本轮跳过、**不登记**，
+        # 下次启动会重试 —— 宁可重跑，不可漏跑。
+        log.warning("agent_persona_profiles 缺列 %s，跳过 L0 统计归并（下次启动重试）",
+                    sorted(required - cols))
+        return 0
+
+    import json as _json
+
+    def _num(row: dict[str, Any], key: str) -> float:
+        v = row.get(key)
+        try:
+            return float(v) if v is not None else 0.0
+        except (TypeError, ValueError):
+            return 0.0
+
+    def _as_dict(raw: Any) -> dict[str, Any]:
+        """计数字典列的统一读取（两种方言、两种驱动返回形态都要吃下）。"""
+        if not raw:
+            return {}
+        if isinstance(raw, dict):
+            return dict(raw)
+        try:
+            parsed = _json.loads(raw)
+        except (ValueError, TypeError):
+            return {}
+        return dict(parsed) if isinstance(parsed, dict) else {}
+
+    def _has_stats(row: dict[str, Any]) -> bool:
+        if any(_num(row, k) != 0.0 for k in (
+                "replies_count", "positive_count", "negative_count",
+                "avg_reply_len", "avg_user_len", "humor_score")):
+            return True
+        if str(row.get("address") or "").strip():
+            return True
+        return bool(_as_dict(row.get("address_counts"))) or \
+            bool(_as_dict(row.get("catchphrases")))
+
+    merged_users = 0
+    meta_ready = _patch_meta_ready(insp)
+    with engine.begin() as conn:
+        if meta_ready and _is_applied(conn, patch_id):
+            # 「只执行一次」那层防线。结构幂等已经保证重复执行不会翻倍，
+            # 但按模块顶部铁律，启动时改业务数据必须靠标记位收口。
+            return 0
+
+        rows = conn.execute(text(
+            "SELECT id, user_id, agent_id, replies_count, positive_count, "
+            "negative_count, avg_reply_len, avg_user_len, humor_score, address, "
+            "address_counts, speed, catchphrases, manual "
+            "FROM agent_persona_profiles")).mappings().all()
+        by_user: dict[int, list[dict[str, Any]]] = {}
+        for r in rows:
+            by_user.setdefault(int(r["user_id"]), []).append(dict(r))
+
+        for uid, group in by_user.items():
+            l0_rows = [r for r in group if r["agent_id"] is None]
+            role_rows = [r for r in group if r["agent_id"] is not None]
+            if not any(_has_stats(r) for r in role_rows):
+                continue
+            sources = l0_rows + role_rows
+
+            rc = int(sum(_num(r, "replies_count") for r in sources))
+            pc = int(sum(_num(r, "positive_count") for r in sources))
+            nc = int(sum(_num(r, "negative_count") for r in sources))
+
+            def _wavg(key: str, weight_key: str) -> float:
+                """按 weight_key 加权平均；权重全为 0 时退化为算术平均。"""
+                tw = sum(max(0.0, _num(r, weight_key)) for r in sources)
+                if tw <= 0:
+                    vals = [_num(r, key) for r in sources]
+                    return round(sum(vals) / len(vals), 3) if vals else 0.0
+                acc = sum(_num(r, key) * max(0.0, _num(r, weight_key))
+                          for r in sources)
+                return round(acc / tw, 3)
+
+            arl = _wavg("avg_reply_len", "positive_count")
+            aul = _wavg("avg_user_len", "replies_count")
+            hs = _wavg("humor_score", "positive_count")
+
+            ac: dict[str, int] = {}
+            cp: dict[str, int] = {}
+            for r in sources:
+                for key, bucket in (("address_counts", ac), ("catchphrases", cp)):
+                    for k, v in _as_dict(r.get(key)).items():
+                        try:
+                            bucket[str(k)] = bucket.get(str(k), 0) + int(v)
+                        except (TypeError, ValueError):
+                            bucket[str(k)] = bucket.get(str(k), 0) + 1
+            ac = dict(sorted(ac.items(), key=lambda kv: -kv[1])[:8])
+            cp = dict(sorted(cp.items(), key=lambda kv: -kv[1])[:20])
+
+            address = (max(ac.items(), key=lambda kv: kv[1])[0] if ac else
+                       next((str(r["address"]) for r in sources
+                             if str(r.get("address") or "").strip()), ""))
+            speed = next((str(r["speed"]) for r in sources
+                          if str(r.get("speed") or "").strip() not in ("", "normal")),
+                         "")
+            if not speed:
+                speed = next((str(r["speed"]) for r in sources
+                              if str(r.get("speed") or "").strip()), "normal")
+
+            values = {
+                "rc": rc, "pc": pc, "nc": nc, "arl": arl, "aul": aul, "hs": hs,
+                "addr": address or "", "speed": speed or "normal",
+                "ac": _json.dumps(ac, ensure_ascii=False),
+                "cp": _json.dumps(cp, ensure_ascii=False),
+            }
+
+            if l0_rows:
+                base_id = int(l0_rows[0]["id"])
+                conn.execute(text(
+                    "UPDATE agent_persona_profiles SET "
+                    "replies_count = :rc, positive_count = :pc, "
+                    "negative_count = :nc, avg_reply_len = :arl, "
+                    "avg_user_len = :aul, humor_score = :hs, address = :addr, "
+                    "speed = :speed, address_counts = :ac, catchphrases = :cp "
+                    "WHERE id = :id"), {**values, "id": base_id})
+                # 理论上 dedupe_persona_globals 已经保证 L0 只有一行；
+                # 若本函数被单独调用（QA 脚本）仍有重复，这里顺手收口，
+                # 否则会留下多行 L0 让读侧取值不确定。
+                for extra in l0_rows[1:]:
+                    conn.execute(text(
+                        "DELETE FROM agent_persona_profiles WHERE id = :id"),
+                        {"id": int(extra["id"])})
+            else:
+                now = datetime.now(timezone.utc)
+                conn.execute(text(
+                    "INSERT INTO agent_persona_profiles "
+                    "(user_id, agent_id, agent_key, replies_count, positive_count, "
+                    " negative_count, avg_reply_len, avg_user_len, humor_score, "
+                    " address, address_counts, speed, catchphrases, manual, "
+                    " created_at, updated_at) "
+                    "VALUES (:uid, NULL, 0, :rc, :pc, :nc, :arl, :aul, :hs, "
+                    " :addr, :ac, :speed, :cp, '{}', :now, :now)"),
+                    {**values, "uid": uid, "now": now})
+
+            # 统计"搬走"：角色行清零。**不动 manual**（L2 的交代留在原行），
+            # 也不动 speed（它是 manual 的镜像列，清零会让"家属设的语速"丢失）。
+            conn.execute(text(
+                "UPDATE agent_persona_profiles SET "
+                "replies_count = 0, positive_count = 0, negative_count = 0, "
+                "avg_reply_len = 0, avg_user_len = 0, humor_score = 0, "
+                "address = '', address_counts = '{}', catchphrases = '{}' "
+                "WHERE user_id = :uid AND agent_id IS NOT NULL"), {"uid": uid})
+            merged_users += 1
+
+        if meta_ready:
+            # 登记与 UPDATE 在**同一个事务**里：中途抛异常则一起回滚，
+            # 不会留下「标记写了但数据没改」的静默漏跑。
+            _mark_applied(conn, patch_id)
+
+    if merged_users:
+        log.warning("L0 统计归并：%d 个用户的角色级统计已搬进 L0（agent_id IS NULL）",
+                    merged_users)
+    return merged_users
+
+
 def _quote_table(name: str) -> str:
     """按当前方言引用表名：SQLite 用双引号，MySQL 用反引号。"""
     return f'"{name}"' if _is_sqlite() else f"`{name}`"
+
 
 
 def drop_membership_tables() -> int:
@@ -1299,6 +1511,8 @@ def run_all() -> dict[str, int]:
       4. MAC 归一化 —— 与代次回填互不依赖，但**必须在建索引之前**：
          索引本身不挑数据，可 `_find_device` 能否用上索引取决于存量是否已归一；
       5. 去重 + 回填 agent_key —— 必须在建唯一索引前完成，否则索引直接失败；
+      5b. L0 统计归并 —— 必须在去重之后（要求 L0 只有一行），把老库里按角色
+         分裂的统计搬进 L0 并清零角色行（只跑一次）；
       6. 建索引 —— 最后一步，依赖前几步的列与数据。
 
     删表（:func:`drop_membership_tables`）**与上面四步互不依赖**，放在最前面：
@@ -1320,6 +1534,10 @@ def run_all() -> dict[str, int]:
     # `mac_variants` 的双写法兜底让功能不依赖它，但**索引生效**依赖它。
     macs = normalize_device_macs()
     deduped = dedupe_persona_globals()
+    # L0 统计归并：必须在 dedupe 之后（要求 L0 只有一行），且必须在补列之后
+    # （依赖 agent_key 存在）。它把老库里按角色分裂的统计搬进 L0 并清零角色行，
+    # 之后写入端固定写 L0，统计才真正"跨角色累积"。
+    persona_merged = merge_persona_stats_to_l0()
     indexed = ensure_missing_indexes()
     return {
         "membership_tables_dropped": dropped,
@@ -1329,5 +1547,6 @@ def run_all() -> dict[str, int]:
         "reminder_once_fixed": once_fixed,
         "device_macs_normalized": macs,
         "persona_globals_deduped": deduped,
+        "persona_stats_merged": persona_merged,
         "indexes_created": indexed,
     }

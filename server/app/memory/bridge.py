@@ -141,7 +141,13 @@ def remember_after_reply(
     try:
         memorize_background(db_factory, user_id, agent_id, turns,
                             session_id=session_id, client=client,
-                            device_id=device_id)
+                            device_id=device_id,
+                            # signal / prev_bot_text 必须一起带下去：
+                            # 语气画像在 memorize 里更新，而判"这一轮算不算
+                            # 正例"要用到调用方检测到的打断/重问信号。
+                            # 只传给 record_feedback 不传给 memorize，
+                            # 等于信号进了审计、没进画像。
+                            signal=signal, prev_bot_text=prev_bot_text)
     except Exception as exc:  # noqa: BLE001
         log.warning("启动后台记忆写入失败：%s: %s", type(exc).__name__, exc)
 

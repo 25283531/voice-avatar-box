@@ -31,6 +31,7 @@ debug 日志并忽略（不返回响应，行为与未发送完全相同）。�
 from __future__ import annotations
 
 import asyncio
+import difflib
 import json
 import logging
 import re
@@ -60,6 +61,7 @@ from .prompts import (
     EMPTY_UTTERANCE_REPLY,
     LLM_NOT_CONFIGURED_MESSAGE,
     TOOL_LOOP_FALLBACK,
+    build_system_prompt,
     now_context,
 )
 from .tools import TOOL_DEFS, clock_mentions, execute_tool
@@ -120,6 +122,29 @@ _PAUSE_MARGIN_MS: Final[int] = 500          # 自适应阈值的固定余量
 # 自己的声音当成打断，那比不能打断糟得多。
 _BARGE_GRACE_SEC: Final[float] = 2.0        # 开播后 2s 内不判打断
                                               # （AEC 残余 + 唤醒词尾巴）
+
+# ---- 反馈信号识别（2026-10-31）----
+# 打断是"老人不满意/没说到点上"的**强**信号；重复提问是"上一句没说清"的
+# 弱信号。两者都必须落进人格演化，否则画像里永远只有正例（生产库实测
+# 21 正例 / 0 反例，是自我强化而不是越用越懂老人）。
+_RETRY_LOOKBACK: Final[int] = 3        # 与最近几轮 user 文本比对
+_RETRY_SIMILARITY: Final[float] = 0.8  # 归一化后的字符级相似度阈值
+#: 两句长度比的下限。为什么需要它：``SequenceMatcher`` 对"短句是长句子串"
+#: 给分很高（「今天天气怎么样」vs「今天天气怎么样啊孩子」= 0.82），而那
+#: 多半是**接着说**而不是重问。误判成 retry 的代价不只是统计脏了 ——
+#: judge_feedback 会真的写进一对正/反例（"说成B比A更容易被接受"），
+#: 那条假偏好会一直留在 APP 的偏好列表里。真正逐字重复的两句长度比接近 1。
+_RETRY_MIN_LEN_RATIO: Final[float] = 0.85
+
+
+def _norm_utterance(text: str) -> str:
+    """归一化一句话再比相似度：只留字/词，去标点、空白、语气符号。
+
+    不归一化的话「明天早上八点吃药。」与「明天早上八点吃药」相似度不到
+    0.9 —— 老人复述时标点几乎必然不一样，而我们要判的是"是不是同一件事"。
+    """
+    return re.sub(r"[\W_]+", "", str(text or ""))
+
 
 # ---- 送 ASR 前裁掉头尾静音（P1：首句响应时间，2026-10-21）----
 # 实测（生产主机容器内 → 宿主 FunASR 8082）：ASR 延迟 ≈ 280ms 基座
@@ -638,6 +663,12 @@ class VoiceSession:
         # 打断标志。asyncio 单线程事件循环里 bool 读写是原子的，
         # 不需要锁；但所有 await 点都要重新读它（见 _speak_reply 的循环）。
         self._abort: bool = False
+
+        # 本轮是不是被**老人抢话**打断的（2026-10-31）。
+        # 与 ``_abort`` 分开的理由：``_abort`` 还会被"连接断开"置位
+        # （run() 的 finally），那种情况不是反馈信号，记成"老人纠正"
+        # 就是往画像里灌假数据。只有真正的人声打断才置这一位。
+        self._turn_barged_in: bool = False
 
         # 当前这一轮对话的 task。**必须与收包主循环解耦**，否则播报期间
         # 读不到上行消息、abort 失效（见 run() 里的注释）。
@@ -1177,6 +1208,9 @@ class VoiceSession:
         #    把**还没走下 socket** 的队列帧全部作废 —— 只置 _abort 的话
         #    老人还会听到已经排队的十几帧（"喊停了还在说"）。
         self._abort = True
+        # 记下"这一轮是被抢话掐断的"：反馈沉淀要靠它判 correction
+        # （见 _feedback_signal）。断开连接也会置 _abort，但不会置这一位。
+        self._turn_barged_in = True
         speaker = self._speaker
         if speaker is not None:
             speaker._pacer.reset()
@@ -1466,6 +1500,11 @@ class VoiceSession:
         reason = obj.get("reason", "")
         log.info("[%s] abort（reason=%s）", self.session_id, reason)
         self._abort = True
+        # 设备侧 abort 是**老人自己**按停/喊唤醒词（固件在播报期检测到
+        # 唤醒词就发它）。语义与全双工打断相同：这一轮没被接受。
+        # 若它发生在没有轮次在跑的空档，下一次 _run_turn 开头会清掉，
+        # 不会污染下一轮。
+        self._turn_barged_in = True
         # 打断只影响"正在播的音频"，不影响已经结束的 ASR/LLM：
         # 那两个已经拿到结果，重来一次只是多花一次 token。
         self._frames.clear()
@@ -1818,6 +1857,9 @@ class VoiceSession:
         # 每轮重置"待机复核"状态（见 __init__ 里这两个字段的说明）。
         self._dismiss_candidate = ""
         self._standby_requested = False
+        # 打断标记同理：上一轮被抢话不代表这一轮也被抢话。置位只有两处
+        # （_trigger_barge_in / _on_abort），消费在 _feedback_signal。
+        self._turn_barged_in = False
         # 提醒确认状态同理：上一轮命中过"喝完了"不代表这一轮也算。
         self._confirm_candidate = False
         self._pending_reminder = ""
@@ -1990,20 +2032,43 @@ class VoiceSession:
             return utterance
 
         # ---- 记忆 + 人格召回
+        #
+        # 2026-10-31：这里原来只拼 ``BASE_VOICE_PROMPT + recall_for_reply()``
+        # ⇒ 家属在 APP 里建的角色（名字/交代/性格）一句也到不了老人耳朵里
+        # —— ``PromptCompiler`` 只被 APP 预览接口调用过，语音链路一次都没调。
+        # 现在交给 ``build_system_prompt``：它用编译器产出的身份段**替换**掉
+        # BASE 里硬编码的「你是小智」，再拼上说话要求与记忆；没有角色时原样
+        # 回退到 ``BASE_VOICE_PROMPT + memory_ctx``（与接入前同一份文案，
+        # 唯一差别是「当前时间」那一行现在排在末尾 —— 位置变了，内容没变）。
+        #
+        # 为什么要和召回放在**同一个线程池任务**里：两者都要一个 DB 会话，
+        # 分两次 run_in_threadpool 就多一次线程切换 + 多一个会话；
+        # 而 memory_ctx 又正是 prompt 的输入，分开拿反而多一层拼装。
         def _recall() -> str:
             with SessionLocal() as db:
-                return memory_bridge.recall_for_reply(
-                    db, self.dev.owner_id, self.dev.agent_id, utterance,
-                    session_id=self.session_id)
+                try:
+                    ctx = memory_bridge.recall_for_reply(
+                        db, self.dev.owner_id, self.dev.agent_id, utterance,
+                        session_id=self.session_id)
+                except Exception as exc:  # noqa: BLE001  记忆是增益
+                    log.warning("[%s] 记忆召回失败，按无记忆回答：%s: %s",
+                                self.session_id, type(exc).__name__, exc)
+                    ctx = ""
+                # examples_prompt 传空串：偏好示例已由 recall_for_reply
+                # （内部 build_persona_prompt）注入在 ctx 里，再传一次就是
+                # 同一段话在 prompt 里出现两遍（白烧 token + 诱导复读）。
+                return build_system_prompt(
+                    db, self.dev.owner_id, self.dev.agent_id,
+                    memory_ctx=ctx, examples_prompt="")
 
         try:
-            memory_ctx = await run_in_threadpool(_recall)
-        except Exception as exc:  # noqa: BLE001
-            log.warning("[%s] 记忆召回失败，按无记忆回答：%s: %s",
+            system = await run_in_threadpool(_recall)
+        except Exception as exc:  # noqa: BLE001  连兜底都失败就退回基础口令
+            log.warning("[%s] 组装口令失败，用基础口令回答：%s: %s",
                         self.session_id, type(exc).__name__, exc)
-            memory_ctx = ""
+            system = BASE_VOICE_PROMPT
 
-        system = BASE_VOICE_PROMPT + "\n\n" + now_context()
+        system = system + "\n\n" + now_context()
         # ---- F3：说话人身份注入 system（仅该说话人在本会话首次出现时）
         # 与 user 消息的 JSON 包装是同一思路的两半：system 给"他是谁、
         # 该怎么介绍他"（description 在这里才派上用场），JSON 让模型自然
@@ -2016,8 +2081,8 @@ class VoiceSession:
             if desc:
                 line += desc
             system = system + "\n\n" + line
-        if memory_ctx:
-            system = system + "\n\n" + memory_ctx
+        # ⚠️ 这里**不再**追加 memory_ctx：语气画像/正反例/事实记忆已经由
+        # build_system_prompt 拼进 system 了。再拼一次就是同一段话出现两遍。
         # ---- 待机意图复核提示（只在命中弱判据的那一轮注入）----
         if self._dismiss_candidate:
             system = system + "\n\n" + _STANDBY_VERIFY_HINT
@@ -2151,6 +2216,15 @@ class VoiceSession:
                 # 否则 _finalize 的兜底会在他抢话之后把设备送进待机。
                 self._dismiss_candidate = ""
                 await speaker.finish()
+                # ⚠️ 打断是**最强的负反馈**，而这条 return 原来把它整个吞掉了：
+                # _record_usage（记忆沉淀 + 反馈）在下面，走不到 ⇒ 老人每次
+                # 抢话都白抢，人格演化永远收不到反例。
+                # 这里补一次，信号由 _feedback_signal 给（抢话 ⇒ correction）；
+                # 断开连接导致的 abort 不带 correction，只把老人这句话记下来。
+                await self._sediment_feedback(
+                    utterance, "",
+                    signal=self._feedback_signal(utterance),
+                    prev_bot_text=self._last_bot_text())
                 return utterance
             log.warning("[%s] LLM 返回空文本", self.session_id)
             await speaker.close()
@@ -2179,6 +2253,12 @@ class VoiceSession:
             # 历史里也换成兜底话术：把规划语留在上下文里，模型下一轮会照着学。
             reply = UNSPEAKABLE_REPLY_FALLBACK
 
+        # ---- 反馈信号：必须在追加历史**之前**算 ----
+        # 重复提问的对照是"之前那几轮"，本轮一旦进了 _history，任何一句话
+        # 都和自己 100% 相似 ⇒ 每轮都会被判成 retry。
+        prev_bot_text = self._last_bot_text()
+        signal = self._feedback_signal(utterance)
+
         # 会话内历史：**只在本轮成功拿到回复后**才追加。失败轮不进历史，
         # 否则下一轮的上下文里会有一条没有回复的 user 消息，
         # 模型会以为用户的话被忽略了。工具轮的中间文本不进历史 ——
@@ -2188,7 +2268,8 @@ class VoiceSession:
 
         # ---- 埋点 + 记忆沉淀（都不阻塞播报）
         await self._record_usage(results, utterance, reply, started, t_asr, t_llm,
-                                 tool_trace, timing=timing, speaker=speaker)
+                                 tool_trace, timing=timing, speaker=speaker,
+                                 signal=signal, prev_bot_text=prev_bot_text)
 
         # ---- 收尾播报：流式过程中已播的句子不管，这里发 tts stop
         #    （或空回复的 start/stop 配对，设备靠它回落 idle）。
@@ -2459,11 +2540,92 @@ class VoiceSession:
 
 
     # ================================================================ 埋点
+    # ---------------------------------------------------------------- 反馈
+    def _last_bot_text(self) -> str:
+        """上一轮机器人说过的话（会话内历史里最后一条 assistant）。
+
+        ``judge_feedback`` 判 retry 时需要它（"换说法后被接受"要成对比较），
+        不传的话 retry 一律被判无效 —— 信号传了也等于没传。
+        """
+        for item in reversed(self._history):
+            if item.get("role") == "assistant":
+                return str(item.get("content") or "")
+        return ""
+
+    def _is_repeated_question(self, utterance: str) -> bool:
+        """本轮是不是在重复最近几轮问过的同一件事（字符级相似度 > 0.8）。
+
+        为什么用 ``difflib`` 而不是向量：这里要判的是"几乎同一句话"，
+        字符级序列匹配对老人这种**逐字重复**的提问最准，而且零依赖、零
+        网络往返 —— 它在每一轮对话的关键路径上，不能引入任何 IO。
+
+        ASR 会把同一句话识别成略有差异的版本（"几点了"/"几点了？"），
+        所以先归一化（去标点空白）再比。
+        """
+        cur = _norm_utterance(utterance)
+        if not cur:
+            return False
+        prevs = [str(i.get("content") or "") for i in self._history
+                 if i.get("role") == "user"][-_RETRY_LOOKBACK:]
+        for prev in prevs:
+            other = _norm_utterance(prev)
+            if not other:
+                continue
+            short, long_ = sorted((len(cur), len(other)))
+            if long_ and short / long_ < _RETRY_MIN_LEN_RATIO:
+                # 长度差太多 ⇒ 是接着往下说，不是重问（见常量注释）
+                continue
+            if difflib.SequenceMatcher(None, cur, other).ratio() >= _RETRY_SIMILARITY:
+                return True
+        return False
+
+    def _feedback_signal(self, utterance: str) -> str:
+        """本轮该记哪种反馈信号（空串 = 交给 ``judge_feedback`` 自动识别）。
+
+        优先级：抢话打断 > 重复提问。两者同时成立时记打断 —— 打断是老人
+        主动做出的动作，比"又问了同样的话"更明确。
+        """
+        if self._turn_barged_in:
+            return _m.PersonaSignal.CORRECTION
+        if self._is_repeated_question(utterance):
+            return _m.PersonaSignal.RETRY
+        return ""
+
+    async def _sediment_feedback(self, utterance: str, reply: str, *,
+                                 signal: str = "",
+                                 prev_bot_text: str = "") -> None:
+        """把这一轮的反馈 + 事实记忆交给记忆模块（异步、失败自吞）。
+
+        抽成方法是为了**打断路径也能调**：打断轮没有完整回复、不走
+        ``_record_usage``，而它恰恰是最该被学到的那一轮。
+        """
+        turns = [{"role": "user", "content": utterance}]
+        if reply:
+            # 打断轮没有完整回复：不写空的 assistant 行（``as_turns`` 虽然
+            # 也会滤掉空内容，但下游不该看到一条"机器人什么都没说"的轮次）。
+            turns.append({"role": "assistant", "content": reply})
+        try:
+            memory_bridge.remember_after_reply(
+                SessionLocal, self.dev.owner_id, self.dev.agent_id, turns,
+                session_id=self.session_id,
+                user_text=utterance, bot_text=reply,
+                prev_bot_text=prev_bot_text, signal=signal,
+                # 用量归属：记忆抽取（light）与向量化（embed）两条流水要靠它
+                # 才能被用户端按设备过滤看到 —— 后台线程里 contextvars 不传播，
+                # 必须显式传。
+                device_id=self.dev.id,
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("[%s] 记忆沉淀启动失败：%s: %s", self.session_id,
+                        type(exc).__name__, exc)
+
     async def _record_usage(self, results: list[Any], utterance: str, reply: str,
                             started: float, t_asr: int, t_llm: int,
                             tool_trace: list[dict[str, Any]] | None = None,
                             *, timing: dict[str, Any] | None = None,
-                            speaker: _ReplySpeaker | None = None) -> None:
+                            speaker: _ReplySpeaker | None = None,
+                            signal: str = "",
+                            prev_bot_text: str = "") -> None:
         """记账：token 用量 + 陪聊时长 + Interaction + 记忆沉淀。
 
         工具循环下**每轮 LLM 调用各记一行** model_usage（token 是每轮真实
@@ -2625,22 +2787,15 @@ class VoiceSession:
             log.warning("[%s] 埋点写入失败（不影响本轮对话）：%s: %s",
                         self.session_id, type(exc).__name__, exc)
 
-        # 记忆沉淀：异步、异常自吞，绝不阻塞也不能让本轮失败
-        try:
-            memory_bridge.remember_after_reply(
-                SessionLocal, self.dev.owner_id, self.dev.agent_id,
-                [{"role": "user", "content": utterance},
-                 {"role": "assistant", "content": reply}],
-                session_id=self.session_id,
-                user_text=utterance, bot_text=reply,
-                # 用量归属：记忆抽取（light）与向量化（embed）两条流水要靠它
-                # 才能被用户端按设备过滤看到 —— 后台线程里 contextvars 不传播，
-                # 必须显式传。
-                device_id=self.dev.id,
-            )
-        except Exception as exc:  # noqa: BLE001
-            log.warning("[%s] 记忆沉淀启动失败：%s: %s", self.session_id,
-                        type(exc).__name__, exc)
+        # 记忆沉淀：异步、异常自吞，绝不阻塞也不能让本轮失败。
+        # signal / prev_bot_text 由 _run_turn 在追加历史**之前**算好传进来：
+        #   * signal=correction ⇒ 老人抢话打断（走 judge_feedback 的纠正闸门）；
+        #   * signal=retry      ⇒ 老人在重复问同一件事（需要 prev_bot_text 成对）；
+        #   * 空串              ⇒ 交给 judge_feedback 自己识别。
+        # 之前这里两个都不传，等于每轮都只有"机器人的原话"这一个输入，
+        # 判定结果恒为无效 —— 反馈闭环是断的。
+        await self._sediment_feedback(utterance, reply, signal=signal,
+                                      prev_bot_text=prev_bot_text)
 
     async def _record_turn(self, utterance: str, reply: str, started: float,
                            t_asr: int, t_llm: int, t_tts: int,

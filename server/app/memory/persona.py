@@ -48,7 +48,7 @@ from collections import Counter
 from dataclasses import dataclass, field
 from typing import Any, Iterable, Sequence
 
-from sqlalchemy import select
+from sqlalchemy import delete, func, select
 
 from .. import models
 from .textutil import normalize, sanitize_for_prompt
@@ -323,6 +323,25 @@ def _get_profile(db, user_id: int, agent_id: int | None, create: bool = True):
     return row
 
 
+def _stats_profile(db, user_id: int, create: bool = True):
+    """取 **L0 统计行**：``agent_id IS NULL`` 那一行。
+
+    为什么统计必须固定在 L0
+    ----------------------
+    「越用越懂老人」这件事说的是**这位老人本人**怎么说话，不是"这位老人
+    对着小智这个角色怎么说话"。换角色（``agent_id`` 从 8 换成 1）只是换了个
+    外壳，统计值不该跟着从零开始 —— 否则每次换角色都是一次"重新认识"。
+
+    所以统计字段（replies_count / avg_* / humor_score / address* /
+    catchphrases / speed）**只读写这一行**；``manual`` 仍按 L1/L2 分层
+    （见 :func:`_get_profile` 与 :func:`tone_profile`）。
+
+    这与 :func:`copy_l2_manual`（派生角色只复制 manual、不复制统计）是同一个
+    设计意图的另一半：统计跟着人走，manual 跟着角色走。
+    """
+    return _get_profile(db, user_id, None, create=create)
+
+
 #: 口头禅候选里不许出现的字。中文口头禅是"短语"，不是"含虚词的片段"——
 #: 统计出来的"喝水的""是十二"就是没做这一步的产物（2026-10-29 家属端
 #: 语气画像里真的显示了这两个词）。
@@ -353,13 +372,31 @@ def _catchphrases(text: str) -> list[str]:
 
 
 def observe_reply(db, user_id: int, agent_id: int | None, bot_text: str,
-                  user_text: str = "", positive: bool = True) -> None:
+                  user_text: str = "", positive: bool = True,
+                  *, neutral: bool = False) -> None:
     """把一次「机器人说话 + 用户反应」累积进语气画像（增量，不做全量重算）。
 
     只统计**被认可**的回复来定"该怎么说话"：被否掉的说法会进反例池，
     但不该参与"平均句长"这类正向统计，否则画像会被自己犯过的错带偏。
+
+    ``neutral=True`` 是**第三档**：既不记正例也不记反例，只更新"老人说了
+    多少轮、平均说多长"这两项。
+
+    为什么需要这一档（2026-10-31 加）：把 ``positive=True`` 那个常量换成
+    ``judge_feedback`` 之后暴露了新问题 —— 那个判据在**没有显式信号**时
+    返回 ``valid=False``，而绝大多数正常轮次都属于"没识别出明确反馈"。
+    如果 ``valid=False`` 就整个跳过本函数，``replies_count`` / ``avg_user_len``
+    会永远停在旧值，新用户恒为 0，编译器里「老人平均说 X 字」那段永远不出现。
+    这等于把"100% 假正例"修成了"完全不统计"，同样是错的。
+    正/负例统计要严，轮次统计要全 —— 所以拆成三档。
+
+    ⚠️ ``agent_id`` **保留在签名里只为兼容调用方**（``memory.service.memorize``
+    会传当前设备挂的角色），统计**不再按它分桶**：写入固定落到 L0
+    （``agent_id IS NULL``）那一行。这是本轮的核心改动 —— 以前写"当前角色
+    那一行"，于是家属换个角色，统计就分裂成两份，各自从零开始。
+    角色之间的差异只应该体现在 ``manual`` 上（家属对这个角色的交代）。
     """
-    prof = _get_profile(db, user_id, agent_id)
+    prof = _stats_profile(db, user_id)
     bot = (bot_text or "").strip()
     if user_text:
         n = prof.replies_count + 1
@@ -367,6 +404,9 @@ def observe_reply(db, user_id: int, agent_id: int | None, bot_text: str,
         prof.replies_count = n
 
     if not bot:
+        return
+    if neutral:
+        # 轮次与平均句长已在上面无条件累积；这里只跳过"被认可/被否掉"的统计。
         return
     if positive:
         prof.positive_count += 1
@@ -403,17 +443,26 @@ def tone_profile(db, user_id: int, agent_id: int | None) -> dict[str, Any]:
 
     返回的 dict 直接给接口用：**数值给 APP 做滑块，描述给家属读**。
     人工覆盖（manual）优先级最高 —— 自动演化永远是增益，不能压过人的判断。
+
+    ⚠️ 两层来源是**分开取的**（2026-10-31）：
+      * 统计值**永远读 L0**（``agent_id IS NULL``）—— 跨角色累积，换角色不清零；
+      * manual **按传入的 agent_id 分层** —— ``agent_id`` 给定时读该角色的 L2，
+        否则读 L1。
+    返回值结构保持不变（调用方很多），只是 ``stats`` 的来源从"当前角色行"
+    换成了 L0 行。
     """
-    prof = _get_profile(db, user_id, agent_id, create=False)
+    stats_prof = _stats_profile(db, user_id, create=False)
+    manual_prof = (stats_prof if agent_id is None
+                   else _get_profile(db, user_id, agent_id, create=False))
     stats = {
-        "replies_count": int(prof.replies_count or 0) if prof else 0,
-        "positive_count": int(prof.positive_count or 0) if prof else 0,
-        "negative_count": int(prof.negative_count or 0) if prof else 0,
-        "avg_reply_len": float(prof.avg_reply_len or 0.0) if prof else 0.0,
-        "avg_user_len": float(prof.avg_user_len or 0.0) if prof else 0.0,
-        "humor_score": float(prof.humor_score or 0.0) if prof else 0.0,
-        "address": (prof.address or "") if prof else "",
-        "speed": (prof.speed or "normal") if prof else "normal",
+        "replies_count": int(stats_prof.replies_count or 0) if stats_prof else 0,
+        "positive_count": int(stats_prof.positive_count or 0) if stats_prof else 0,
+        "negative_count": int(stats_prof.negative_count or 0) if stats_prof else 0,
+        "avg_reply_len": float(stats_prof.avg_reply_len or 0.0) if stats_prof else 0.0,
+        "avg_user_len": float(stats_prof.avg_user_len or 0.0) if stats_prof else 0.0,
+        "humor_score": float(stats_prof.humor_score or 0.0) if stats_prof else 0.0,
+        "address": (stats_prof.address or "") if stats_prof else "",
+        "speed": (stats_prof.speed or "normal") if stats_prof else "normal",
         # 口头禅要**跨多轮**重复才算数：一次回复内部重复两遍多半是"好的好的"
         # 这种口误，累计到 3 轮还在说才是习惯。低于门槛的一律不显示 ——
         # 画像里写一句假口头禅，比空着更伤信任。
@@ -422,10 +471,10 @@ def tone_profile(db, user_id: int, agent_id: int | None) -> dict[str, Any]:
         # 攒的（"喝水的""是十二"就是那批），只改写入侧的话它们会一直显示到
         # 自然衰减为止。
         "catchphrases": [p for p, c in sorted(
-            (prof.catchphrases or {}).items(), key=lambda kv: -kv[1]
-        ) if int(c) >= 3 and not (set(p) & _CATCH_STOP)][:8] if prof else [],
+            (stats_prof.catchphrases or {}).items(), key=lambda kv: -kv[1]
+        ) if int(c) >= 3 and not (set(p) & _CATCH_STOP)][:8] if stats_prof else [],
     }
-    manual = dict(prof.manual or {}) if prof else {}
+    manual = dict(manual_prof.manual or {}) if manual_prof else {}
 
     # 自动推语速：句长是最稳的代理指标（说短句 = 要听清 = 放慢）
     auto_speed = "slow" if 0 < stats["avg_reply_len"] <= 18 else (
@@ -650,9 +699,19 @@ def merge_profiles(db, user_id: int, agent_id: int | None) -> dict[str, Any]:
     优先级 **L2 > L1**：越具体的越贴近当下这个角色的实际用法。
     traits 声明不参与这个函数（由 persona.compiler.ProfileMerger 统一处理优先级链
     L2.manual > L1 统计 > 声明），这里只负责把两层 DB 数据取出来。
+
+    ⚠️ 统计只有一份（2026-10-31 起）
+    ------------------------------
+    ``tone_profile`` 的 stats 现在恒读 L0（``agent_id IS NULL``），所以 L1 与 L2
+    拿到的是**同一份跨角色统计**。L2 那一层因此只剩 ``manual`` 有意义 ——
+    这里把它的 ``stats`` 置空，让"L2 只贡献 manual"这件事在数据结构上成立
+    （``ProfileMerger`` 的 s2 于是恒为空，自动回落到 s1 的 L0 统计）。
+    返回结构不变：仍然是 ``{"l1": ..., "l2": ...}``。
     """
     l1 = tone_profile(db, user_id, None)
     l2 = tone_profile(db, user_id, agent_id) if agent_id is not None else None
+    if l2 is not None:
+        l2 = {**l2, "stats": {}}
     return {"l1": l1, "l2": l2}
 
 
@@ -674,3 +733,100 @@ def copy_l2_manual(db, user_id: int, from_agent_id: int | None,
         dst.manual = manual
         if isinstance(manual.get("speed"), str):
             dst.speed = manual["speed"]
+
+
+# ---------------------------------------------------------------- 显式重置
+def reset_persona(db, user_id: int, agent_id: int | None = None) -> dict[str, Any]:
+    """家属**显式**清空画像（不可逆，调用方必须先拿到 ``confirm=true``）。
+
+    两个范围（语义完全不同，不要合并成一个"清空"）
+    --------------------------------------------
+    * ``agent_id is None`` —— **换了一位老人**：清 L0 统计 + 该用户全部
+      manual + 整个偏好示例池（含各角色级的）。
+    * ``agent_id`` 指定 —— **这个角色重来**：只清该角色的 L2 manual 与
+      该角色自己的示例。L0 统计（老人本人的说话习惯）与其它角色的示例不动。
+
+    为什么必须存在（伦理，不是功能）
+    ------------------------------
+    老人身故 / 换人后，新家庭不该继承上一位老人的语气画像与正反例 ——
+    那不是"数据"，那是"另一个人的说话方式"。而解绑设备只清归属
+    （``routers/devices.unbind_device``）、删角色只解绑设备
+    （``routers/roles.delete_role``）：**换硬件不等于换人**，所以那两条路径里
+    **刻意不**顺手调本函数。只有家属显式点这个动作才清。
+
+    ⚠️ **审计一律保留**（``AgentPersonaAudit``）：合规与可追溯优先于"清干净"。
+    重置本身也写一条 ``signal=reset`` 的审计（范围 + 条数），否则历史审计会
+    凭空断档 —— 家属/运营看到的是"学过的东西消失了，但没人知道为什么"。
+
+    ⚠️ 示例池是**硬删**而不是像 :func:`delete_example` 那样软作废：
+    软作废的行仍留在表里、仍会出现在示例列表里，对"换了一位老人"这个场景
+    等于把上一位老人的原话继续展示给新家庭看。留痕由审计承担（审计自己存了
+    user_text / bot_text 的副本），所以删示例不会让"曾经学过什么"不可追溯。
+
+    :return: 被清掉的条数（给审计与前端提示用），形如
+        ``{"scope": "l0"|"l2", "profiles_cleared": 3, "examples_cleared": 12,
+        "audits_kept": 170, "audit_id": 171}``
+    """
+    scope = "l0" if agent_id is None else "l2"
+
+    if agent_id is None:
+        # 换人：画像行（统计 + manual）整行删掉。统计行会在下一次
+        # observe_reply 时按需重建，所以不需要保留一个"全零"的空壳。
+        prof_res = db.execute(delete(models.AgentPersonaProfile).where(
+            models.AgentPersonaProfile.user_id == user_id))
+        profiles_cleared = int(prof_res.rowcount or 0)
+        ex_res = db.execute(delete(models.AgentPreferenceExample).where(
+            models.AgentPreferenceExample.user_id == user_id))
+        examples_cleared = int(ex_res.rowcount or 0)
+        scope_text = "该用户的 L0 统计与全部 manual、整个偏好示例池"
+        audit_count_q = (select(func.count())
+                         .select_from(models.AgentPersonaAudit)
+                         .where(models.AgentPersonaAudit.user_id == user_id))
+    else:
+        # 这个角色重来：只清该角色的 manual 与示例，不碰 L0 统计。
+        row = _get_profile(db, user_id, agent_id, create=False)
+        if row is None:
+            profiles_cleared = 0
+        else:
+            row.manual = {}
+            # speed 是 manual 的镜像列（update_manual 会同步写），
+            # 一并复位，否则"清掉 manual 后语速还停在 slow"。
+            row.speed = "normal"
+            profiles_cleared = 1
+        ex_res = db.execute(delete(models.AgentPreferenceExample).where(
+            models.AgentPreferenceExample.user_id == user_id,
+            models.AgentPreferenceExample.agent_id == agent_id))
+        examples_cleared = int(ex_res.rowcount or 0)
+        scope_text = f"角色 id={agent_id} 的 L2 manual 与该角色的偏好示例"
+        audit_count_q = (select(func.count())
+                         .select_from(models.AgentPersonaAudit)
+                         .where(models.AgentPersonaAudit.user_id == user_id)
+                         .where(models.AgentPersonaAudit.agent_id == agent_id))
+
+    audits_kept = int(db.scalar(audit_count_q) or 0)
+
+    audit = models.AgentPersonaAudit(
+        user_id=user_id,
+        agent_id=agent_id,
+        signal=models.PersonaSignal.RESET,
+        # 不写 user_text / bot_text：重置不是一次对话，没有语料可记。
+        inferred=(f"家属显式重置{scope_text}：清除画像 {profiles_cleared} 行、"
+                  f"示例 {examples_cleared} 条；审计保留 {audits_kept} 条"),
+        valid=True,
+        reason="显式重置（不可逆操作，必须 confirm=true）",
+        created_at=models.utcnow(),
+    )
+    db.add(audit)
+    db.flush()
+
+    log.warning("人格画像显式重置：user=%s agent=%s 清画像 %d 行 / 示例 %d 条",
+                user_id, agent_id, profiles_cleared, examples_cleared)
+    return {
+        "scope": scope,
+        "user_id": user_id,
+        "agent_id": agent_id,
+        "profiles_cleared": profiles_cleared,
+        "examples_cleared": examples_cleared,
+        "audits_kept": audits_kept,
+        "audit_id": audit.id,
+    }

@@ -466,10 +466,74 @@ def _get_or_create_event(db: Session, r: models.Reminder, due: datetime) -> mode
     return ev
 
 
+def _parse_due_param(raw: str | None, reminder: models.Reminder) -> datetime | None:
+    """把前端带回来的 ``due_at`` 解析成「规则时区的 aware 时刻」。
+
+    ⚠️ 必须是 **aware**：``ReminderEvent.due_at`` 列是
+    ``DateTime(timezone=True)``，而 ``occurrences_on()`` 返回的也是带
+    ``reminder_zone()`` 的 aware 时刻。第一版这里把 tzinfo 抹掉返回 naive，
+    结果 ``_same_instant()`` 里 aware 减 naive 抛 ``TypeError`` 被吞成
+    ``False`` ⇒「实例还没排出、现场补一条」那段分支变成**死代码**
+    （2026-10-31 独立验证时发现：传一个当天服药点、但库里还没有实例的时刻，
+    得到 404 而不是补建）。
+
+    前端拿到的是服务端序列化出来的 due_at，正常情况下带偏移；万一没带，
+    按"规则时区的墙上时间"补上 —— **不能当成 UTC**，否则跨时区规则会
+    整体错开一个时区偏移，"永远找不到对应实例"。
+
+    解析失败一律当"没传"处理：前端参数写错不该让代确认直接 500，
+    退回启发式至少还能确认一次。
+    """
+    if not raw:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(raw).strip())
+    except (TypeError, ValueError):
+        return None
+    zone = reminder_zone(reminder)
+    return dt.replace(tzinfo=zone) if dt.tzinfo is None else dt.astimezone(zone)
+
+
+def _same_instant(a: datetime, b: datetime, tol: float = 60.0) -> bool:
+    """两个时刻是不是「同一次」（±60 秒容差）。
+
+    用容差而不是等值：唯一键是秒级的，但前端往返一趟 ISO 序列化后
+    微秒位可能对不齐，等值比较会静默找不到，表现成"点了没反应"。
+
+    对 aware/naive 混用做兜底（都按墙上时间比）——这类混用一旦抛
+    ``TypeError`` 被吞掉，表现就是"分支永远进不去"，极难查。
+    """
+    if a is None or b is None:
+        return False
+    if (a.tzinfo is None) != (b.tzinfo is None):
+        a = a.replace(tzinfo=None)
+        b = b.replace(tzinfo=None)
+    try:
+        return abs((a - b).total_seconds()) <= tol
+    except TypeError:
+        return False
+
+
+def _event_at(db: Session, r: models.Reminder, target: datetime):
+    """按 (reminder_id, due_at) 精确定位一条实例；找不到返回 None。"""
+    return db.scalar(
+        select(models.ReminderEvent)
+        .where(models.ReminderEvent.reminder_id == r.id,
+               models.ReminderEvent.due_at >= target - timedelta(seconds=60),
+               models.ReminderEvent.due_at <= target + timedelta(seconds=60))
+        .order_by(models.ReminderEvent.due_at)
+        .limit(1)
+    )
+
+
 @router.post("/{reminder_pk}/confirm", response_model=EventOut)
 def confirm_now(reminder_pk: int, request: Request,
                 db: Session = Depends(get_db),
-                user: models.User = Depends(get_current_user)):
+                user: models.User = Depends(get_current_user),
+                due_at: str | None = Query(
+                    default=None,
+                    description="要确认的那一次的到期时刻（ISO 8601）。"
+                                "不传则按启发式挑一次，见函数注释。")):
     """子女在 APP 上代老人确认当前待办（ConfirmMethod.APP）。
 
     实例表没预排到当天早些时候的服药点时，这里按规则**现场补一条**再确认，
@@ -496,7 +560,36 @@ def confirm_now(reminder_pk: int, request: Request,
     now = datetime.now(reminder_zone(r))
     today_dues = occurrences_on(r, now.date())
     ev = None
-    if today_dues:
+
+    # ---- 精确到「某一次」（2026-10-31 用户实报后加）----
+    #
+    # 现场：一条「降压药」规则有 08:00 和 20:00 两个服药点，老人早上那次没吃。
+    # 子女在手机端看到「08:00 待确认」，点代确认 —— 结果下面那套启发式会
+    # 优先挑"当天已到点的最晚一次"，也就是 20:00 那次，把还没到的晚上那次
+    # 确认掉了，而真正没吃的早上那次仍然挂着。子女端看到的确认时间对不上，
+    # 依从率也是假的。
+    #
+    # 所以前端现在会把列表里那一行的 due_at 原样带回来，这里按
+    # (reminder_id, due_at) 精确定位。**不传就退回原来的启发式**，
+    # 保证老的调用方（含进程内直调的脚本）行为不变。
+    target = _parse_due_param(due_at, r)
+    if target is not None:
+        ev = _event_at(db, r, target)
+        if ev is not None:
+            if ev.state in (int(EventState.CONFIRMED), int(EventState.SKIPPED)):
+                raise HTTPException(
+                    status.HTTP_409_CONFLICT,
+                    f"这一次（{ev.due_at:%m-%d %H:%M}）已经处理过了")
+        else:
+            # 实例还没排出来（排期只覆盖未来 36 小时），但确实是今天的服药点
+            # ⇒ 现场补一条，与下面的启发式分支同源。
+            hit = next((ts for ts in today_dues if _same_instant(ts, target)), None)
+            if hit is None:
+                raise HTTPException(status.HTTP_404_NOT_FOUND,
+                                    "没有找到对应的提醒实例")
+            ev = _get_or_create_event(db, r, hit)
+
+    if ev is None and today_dues:
         past = [ts for ts in today_dues if ts <= now]
         # 已到点的按倒序（最近一次优先），未到点的按正序（最早一次优先）
         for due in past[::-1] + [ts for ts in today_dues if ts > now]:

@@ -17,22 +17,42 @@
 记忆召回的合并文本）。这里不重复那部分 —— 两处各写一份人格描述，
 将来必然漂移，而漂移的表现是"文本端改了人格、语音端没改"，
 且没有任何断言能抓到（断言只能看到"回复非空"）。
+
+2026-10-31：角色人格接进语音链路
+-------------------------------
+家属在 APP 里建的角色（名字 / 家属交代 / traits）由
+`persona.compiler.PromptCompiler` 编译成 system prompt，入口是
+:func:`build_system_prompt`。**它替换掉本文件的身份段，而不是拼在后面**：
+编译器会输出「你的名字是X…你的任务是陪伴一位老人」，与 BASE 里硬编码的
+「你是「小智」」直接冲突 —— 两段并存时模型会自称两个名字。
+
+所以 BASE 被拆成两段常量（``VOICE_IDENTITY_PROMPT`` + ``VOICE_STYLE_PROMPT``），
+``BASE_VOICE_PROMPT`` 仍是两者的拼接结果、语义不变（``tools/llm_bench.py``
+与 ``tools/llm_probe.py`` 仍直接引用它）。有角色时用「编译器身份段 +
+VOICE_STYLE_PROMPT」，没有角色时原样用 ``BASE_VOICE_PROMPT`` ——
+一份文案两处引用会漂移，所以拼接只在这里做一次。
 """
 from __future__ import annotations
 
+import logging
 from datetime import datetime
 from typing import Final
 
-#: 语音会话的基础 system prompt。拼接顺序：
-#: BASE_VOICE_PROMPT + recall_for_reply() 的返回值（人格 + 记忆）。
+log = logging.getLogger("elder.voice.prompts")
+
+#: 身份段：**只有这一句**。有角色时它会被 ``PromptCompiler`` 产出的身份段
+#: 整段替换（见 :func:`build_system_prompt`），没角色时才用。
+VOICE_IDENTITY_PROMPT: Final[str] = (
+    "你是「小智」，一位陪伴老年人的语音助手，通过音箱和老人说话。")
+
+#: 说话要求 / 表情 / 提醒 / 工具 各段。**与身份无关**，所以有角色时原样保留：
+#: 角色换了，音箱上的规矩不换。
 #:
 #: ⚠️ 2026-10-17：加入「提醒工具」一小节。刻意压到 6 行以内 —— 这段每轮
 #: 对话都会随 messages 发一遍，提示词本身也是 token 成本；写成长作文的
 #: 代价是每轮多花 token、且老人场景下模型更容易被带偏去"解释工具"而不是
 #: "好好说话"。
-BASE_VOICE_PROMPT: Final[str] = """你是「小智」，一位陪伴老年人的语音助手，通过音箱和老人说话。
-
-说话的要求：
+VOICE_STYLE_PROMPT: Final[str] = """说话的要求：
 - 每次只说一两句话，简短、清楚、口语化，像跟家里长辈聊天。
 - 不用书面语，不罗列条目，不用"首先/其次/最后"，不说"作为一个AI"。
 - 老人听力可能不好，所以句子要短，重要的信息慢慢说、说清楚。
@@ -86,6 +106,12 @@ BASE_VOICE_PROMPT: Final[str] = """你是「小智」，一位陪伴老年人的
   不要先报一句"我这就去查"，再报结果。
 - 想不清楚要说什么时，宁可只说一句短话，也不要把思考过程念出来。"""
 
+#: 语音会话的基础 system prompt（无角色 / 角色取不到时的回退值）。
+#:
+#: ⚠️ 不要在这里另写一份说话要求：它必须是上面两段的拼接，否则
+#: "改了 VOICE_STYLE_PROMPT 但回退路径没变"这类漂移没有任何断言能抓到。
+BASE_VOICE_PROMPT: Final[str] = VOICE_IDENTITY_PROMPT + "\n\n" + VOICE_STYLE_PROMPT
+
 #: 语音识别结果为空时念给老人的话。
 #: 刻意**不调 LLM**（见 session.py 第 3 步）：ASR 都没认出东西，
 #: 让大模型"根据空文本编一句"只会产出更空的客套，且白白花一次配额与 token。
@@ -134,3 +160,64 @@ def now_context(now: datetime | None = None) -> str:
     return (f"现在是 {now.year}年{now.month}月{now.day}日 "
             f"星期{weekday} {now.hour:02d}:{now.minute:02d}。\n"
             "老人问几点、今天几号、星期几，直接按这一行回答，不要推算、不要猜。")
+
+
+def build_system_prompt(db, user_id: int, agent_id: int | None,
+                        memory_ctx: str = "", examples_prompt: str = "") -> str:
+    """组装语音链路这一轮的 system prompt（角色人格 + 说话要求 + 记忆）。
+
+    三段拼法，顺序不是随意的
+    ------------------------
+    ① **编译器产出**（身份 / 任务 / 性格 / 家属交代 / 红线）：由
+       ``persona.loader.load_agent_persona`` 取 spec + 画像，再交给
+       ``PromptCompiler.compile``。它**替换**掉 ``VOICE_IDENTITY_PROMPT``，
+       不与之并存 —— 两份身份同时出现时模型会自称两个名字。
+    ② ``VOICE_STYLE_PROMPT``：说话要求 / 表情 / 提醒工具。与身份无关，
+       换角色也照旧（音箱上的规矩不跟着角色走）。
+    ③ ``memory_ctx``：``recall_for_reply`` 的返回值（语气画像 + 正反例 +
+       事实记忆）。**原样追加，不经过编译器的 memory 段**，理由见下。
+
+    ``memory_ctx`` 为什么**不**传给 ``compile(memory_ctx=...)``
+    ----------------------------------------------------------
+    ``_section_memory`` 会过 ``sanitize_for_prompt``：它把换行压成空格、
+    再截到 1500 字。而 ``recall_for_reply`` 返回的是**已经逐条清洗过**的
+    多段结构（【这位老人习惯的说话方式】+ 正反例 + 【你已经知道这些】），
+    压成一行会让模型读不出分条；更糟的是 1500 字上限会把排在后面的
+    **事实记忆整段截掉**（画像段本身就常有几百字），表现为"记忆明明召回了、
+    模型却说不知道" —— 一个不会报错、只会静默变笨的故障。
+
+    ``examples_prompt`` 默认空串：偏好示例已经由 ``recall_for_reply``
+    （内部 ``build_persona_prompt``）注入在 ``memory_ctx`` 里，再传一次就是
+    同一段话在 prompt 里出现两遍 —— 白烧 token，还会让模型照着复读。
+
+    ``spec is None``（未绑角色 / 角色取不到 / 数据非法）时**原样回退**到
+    ``BASE_VOICE_PROMPT + memory_ctx`` —— 文案与接入人格之前完全一致，
+    只是不再有编译器那几段。
+    """
+    fallback = BASE_VOICE_PROMPT + (("\n\n" + memory_ctx) if memory_ctx else "")
+    try:
+        # 延迟导入：无人格路径（未绑角色）完全不必付 persona 包的导入成本，
+        # 也避免 voice 包在 import 阶段就与 persona/memory 绑死。
+        from ..persona import guardrails
+        from ..persona.compiler import PromptCompiler
+        from ..persona.loader import load_agent_persona
+
+        spec, profile = load_agent_persona(db, user_id, agent_id)
+        if spec is None:
+            return fallback
+
+        compiled = PromptCompiler().compile(spec, profile, "", examples_prompt)
+        # 红线要在**末尾**（LLM 对末尾注意力更高，compiler 的设计前提）。
+        # 说话要求插在红线之前，不能把红线挤到中间去。
+        tail = guardrails.render_tail(
+            guardrails.regenerate_locked(spec.guardrails_hard))
+        body = compiled
+        if tail and body.endswith(tail):
+            body = body[:-len(tail)].rstrip()
+        else:  # 理论上不会发生（compile 恒以尾段收尾）；兜底不拆红线
+            tail = ""
+        return "\n\n".join(p for p in (body, VOICE_STYLE_PROMPT, memory_ctx, tail) if p)
+    except Exception as exc:  # noqa: BLE001  人格是增益，失败绝不能让对话失败
+        log.warning("角色口令编译失败，回退基础口令：%s: %s",
+                    type(exc).__name__, exc)
+        return fallback

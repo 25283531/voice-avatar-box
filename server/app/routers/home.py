@@ -42,12 +42,37 @@ from ..schedule import event_instant, local_now, occurrences_on, reminder_zone
 from ..schemas import (
     HomeDeviceOut,
     HomeSummaryOut,
+    MedicineTodayItemOut,
     MedicineTodayOut,
 )
 
 log = logging.getLogger("elder.home")
 
 router = APIRouter(prefix="/api/home", tags=["home"])
+
+
+# ---------------------------------------------------------------- 文案映射
+# 枚举值 → 中文。放在服务端而不是让前端各自硬编码：APP（uni-app）、
+# 手机网页（user.html）两套 UI 都在展示同一批实例，文案写两份必然漂移，
+# 而漂移的那一份会让家属看到"同一次吃药，两个页面说法不一样"。
+_STATE_TEXT = {
+    int(models.EventState.PENDING): "未响铃",
+    int(models.EventState.FIRED): "待确认",
+    int(models.EventState.CONFIRMED): "已确认",
+    # 超时未确认对家属来说仍然是"还没确认"，与 FIRED 同一个动作诉求
+    # （去点「代确认」），所以文案统一成「待确认」，不用「超时」吓人。
+    int(models.EventState.MISSED): "待确认",
+    int(models.EventState.SKIPPED): "已跳过",
+}
+
+_CONFIRM_TEXT = {
+    int(models.ConfirmMethod.NONE): "—",
+    int(models.ConfirmMethod.VOICE): "语音确认",
+    int(models.ConfirmMethod.BUTTON): "按键确认",
+    int(models.ConfirmMethod.APP): "子女代确认",
+    int(models.ConfirmMethod.AUTO): "自动确认",
+    int(models.ConfirmMethod.VOICE_AND_BUTTON): "语音+按键确认",
+}
 
 
 # ---------------------------------------------------------------- 服药统计
@@ -69,8 +94,13 @@ def _medicine_today(db: Session, device_ids: list[int]) -> MedicineTodayOut:
 
     try:
         # 1) 按规则实时推算当天应触发的服药时间点，默认都是「待服药」
-        #    （reminder_id, "HH:MM"）-> 状态
-        slots: dict[tuple[int, str], int] = {}
+        #    (reminder_id, "HH:MM") -> 这一格的明细
+        #
+        #    槽里存**整条明细**而不是只存 state：家属端要显示药品名与确认方式，
+        #    光有 state 拼不出来。title 直接取自上面这次规则查询（Reminder 行
+        #    本来就在手上），**不要**逐槽 db.get(Reminder, rid) —— 老人一天 3~5
+        #    条规则、多条设备合并时那就是标准的 N+1。
+        slots: dict[tuple[int, str], dict] = {}
         rule_zone: dict[int, object] = {}
         rules = db.scalars(
             select(models.Reminder).where(
@@ -83,12 +113,22 @@ def _medicine_today(db: Session, device_ids: list[int]) -> MedicineTodayOut:
                 models.Reminder.deleted_at.is_(None),
             )
         ).all()
+        by_id = {r.id: r for r in rules}
         for r in rules:
             zone = reminder_zone(r)
             rule_zone[r.id] = zone
             today = datetime.now(zone).date()
             for ts in occurrences_on(r, today):
-                slots[(r.id, ts.strftime("%H:%M"))] = int(models.EventState.PENDING)
+                slots[(r.id, ts.strftime("%H:%M"))] = {
+                    "reminder_id": r.id,
+                    "title": r.title or "",
+                    # 规则时区的**裸钟点**，与实例表 due_at 同口径（见下面第 2 条）
+                    "due_at": ts.replace(tzinfo=None),
+                    "tz": r.tz or "",
+                    "state": int(models.EventState.PENDING),
+                    "confirm_method": int(models.ConfirmMethod.NONE),
+                    "confirmed_at": None,
+                }
 
         # 2) 用实例表覆盖真实状态。为什么按 (提醒, HH:MM) 对齐而不是按完整时间：
         #    SQLite 不保留 tzinfo，due_at 读回来是"规则时区的裸钟点"，而
@@ -120,19 +160,59 @@ def _medicine_today(db: Session, device_ids: list[int]) -> MedicineTodayOut:
             zone = rule_zone[rid]
             if event_instant(ev.due_at).astimezone(zone).date() != datetime.now(zone).date():
                 continue
-            slots[(rid, ev.due_at.strftime("%H:%M"))] = int(ev.state)
+            key = (rid, ev.due_at.strftime("%H:%M"))
+            slot = slots.get(key)
+            if slot is None:
+                # 规则的时间点被改过（实例是旧时刻），或规则今天已不再触发这一次。
+                # **仍然要保留这条实例**：它代表"老人今天确实吃过这一次"，
+                # 丢掉就等于把已确认的记录从页面上抹掉。
+                rule = by_id.get(rid)
+                slots[key] = {
+                    "reminder_id": rid,
+                    "title": (rule.title if rule is not None else "") or "",
+                    "due_at": ev.due_at,
+                    "tz": ev.tz or "",
+                    "state": int(ev.state),
+                    "confirm_method": int(ev.confirm_method or 0),
+                    "confirmed_at": ev.confirmed_at,
+                }
+                continue
+            slot["due_at"] = ev.due_at
+            slot["tz"] = ev.tz or slot["tz"]
+            slot["state"] = int(ev.state)
+            slot["confirm_method"] = int(ev.confirm_method or 0)
+            slot["confirmed_at"] = ev.confirmed_at
 
-        confirmed = sum(1 for s in slots.values() if s == int(models.EventState.CONFIRMED))
+        confirmed = sum(1 for s in slots.values()
+                        if s["state"] == int(models.EventState.CONFIRMED))
         # 主动跳过（SKIPPED）不算待服药：家属明确点了「这次不吃了」
         pending_slots = sorted(
             hhmm for (_, hhmm), s in slots.items()
-            if s not in (int(models.EventState.CONFIRMED), int(models.EventState.SKIPPED))
+            if s["state"] not in (int(models.EventState.CONFIRMED), int(models.EventState.SKIPPED))
         )
+        items = [
+            MedicineTodayItemOut(
+                reminder_id=s["reminder_id"],
+                title=s["title"],
+                due_at=s["due_at"],
+                tz=s["tz"],
+                state=s["state"],
+                state_text=_STATE_TEXT.get(s["state"], ""),
+                confirm_method=s["confirm_method"],
+                confirm_method_text=_CONFIRM_TEXT.get(s["confirm_method"], ""),
+                confirmed_at=s["confirmed_at"],
+            )
+            for s in slots.values()
+        ]
+        # 按**绝对时刻**排序：混时区时按裸钟点排会把纽约的 08:00 排到北京的
+        # 09:00 前面。event_instant 是全仓唯一做这个换算的地方。
+        items.sort(key=lambda it: event_instant(it.due_at, it.tz))
         return MedicineTodayOut(
             pending_count=len(pending_slots),
             pending_times=pending_slots,
             confirmed_count=confirmed,
             total_count=len(slots),
+            items=items,
         )
     except Exception as exc:  # noqa: BLE001  统计失败不应拖垮整个首页
         log.warning("服药统计失败，降级为 0: %s", exc)

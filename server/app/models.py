@@ -1238,6 +1238,11 @@ class PersonaSignal:
     POSITIVE = "positive"      # 积极反馈：笑了、接梗、继续聊
     NEGATIVE = "negative"      # 消极反馈：打断、重复提问、"算了"
     MANUAL = "manual"          # 家属手动添加（人工纠偏，与自动演化并列）
+    # 家属**显式重置**画像（换了一位老人 / 这个角色重来）。
+    # 它不是学习信号，而是"清空动作"的留痕：重置会删掉统计、manual 与示例池，
+    # 但审计一律保留 —— 所以必须有一条记录说明"这些学习是被谁、在什么时候、
+    # 以什么范围清掉的"，否则历史审计会凭空断档。
+    RESET = "reset"
 
     TEXTS = {
         CORRECTION: "明确纠正",
@@ -1245,8 +1250,11 @@ class PersonaSignal:
         POSITIVE: "积极反馈",
         NEGATIVE: "消极反馈",
         MANUAL: "家属手动添加",
+        RESET: "显式重置",
     }
 
+    # 学习信号的枚举（不含 RESET：重置不是"机器人学到了什么"，
+    # 它只写审计、不产出示例，所以不参与"学习信号"这一组）。
     LIST = (CORRECTION, RETRY, POSITIVE, NEGATIVE, MANUAL)
 
 
@@ -1309,6 +1317,22 @@ class AgentPersonaProfile(Base):
 
     一个 (user_id, agent_id) 只有一行；统计用增量更新（EMA），
     不做全量重算 —— 老人一天聊几十轮，全量扫历史不划算。
+
+    ⚠️ **统计与 manual 不是同一层的语义**（2026-10-31 明确）
+    -------------------------------------------------------
+    ``replies_count`` / ``positive_count`` / ``negative_count`` /
+    ``avg_reply_len`` / ``avg_user_len`` / ``humor_score`` / ``speed`` /
+    ``address`` / ``address_counts`` / ``catchphrases`` 这些**统计出来的**
+    字段，语义是「这位老人本人怎么说话」，与"挂在哪个角色上"无关 ——
+    家属换一个角色，机器人不该从零开始重新认识老人。
+    所以它们**只读写 ``agent_id IS NULL`` 那一行**（L0，见
+    ``memory.persona._stats_profile``），角色行不再累积统计。
+
+    ``manual``（家属手填的交代）仍然是分层的：L2（角色级）> L1（全局），
+    因为"对这个角色说话轻一点"本来就是角色特有的意图。
+
+    这与 ``memory.persona.copy_l2_manual``（派生角色只复制 manual、不复制统计）
+    是同一个设计意图：统计跟着人走，manual 跟着角色走。
 
     ⚠️ ``agent_key`` 是为修一个**已存在的唯一性漏洞**加的：
     ``UniqueConstraint("user_id", "agent_id")`` 在 SQLite 与 MySQL 下都**不约束

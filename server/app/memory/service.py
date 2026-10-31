@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import logging
+import re
 import threading
 from datetime import datetime
 from typing import Any, Sequence
@@ -24,7 +25,7 @@ from .. import config, models
 from .client import ModelClient, get_default_client
 from .extract import (Fact, as_turns, dedup_key_of, extract_facts,
                       is_duplicate)
-from .persona import observe_reply
+from .persona import judge_feedback, observe_reply
 from .retrieve import MemoryHit, search as _search
 from .store import NewFact, SqliteMemoryStore, invalidate
 from .textutil import fingerprint, sanitize_for_prompt
@@ -34,6 +35,16 @@ log = logging.getLogger("elder.memory.service")
 # 单条记忆进入 prompt 的长度上限。与 schema 的 content 上限（1000/4000）
 # 独立：清洗会去掉换行等结构，这里再兜一道，防止多条长记忆把 prompt 撑爆。
 PROMPT_CONTENT_MAX = 500
+
+#: 「这句话有没有实质内容」的判据 —— 与 persona.judge_feedback 的第一道闸门
+#: 保持同一口径（去掉非字词与数字后 < 4 字算太短）。放在这里是因为
+#: 语气画像要用它区分「判不出正负」和「压根没说话」：
+#: 前者仍应计入轮次统计，后者不该。
+_SUBSTANTIVE_RE = re.compile(r"[\W\d_]+")
+
+
+def _substantive(text: str) -> bool:
+    return len(_SUBSTANTIVE_RE.sub("", text or "")) >= 4
 
 
 def _commit(db: Session, user_id: int, agent_id: int | None) -> None:
@@ -91,6 +102,8 @@ def memorize(
     commit: bool = True,
     observe: bool = True,
     device_id: int | None = None,
+    signal: str = "",
+    prev_bot_text: str = "",
 ) -> list[int]:
     """把一轮对话沉淀成长期记忆，返回新写入的记忆 id 列表。
 
@@ -200,7 +213,19 @@ def memorize(
         ))
     db.flush()
 
-    # 5) 语气画像：把这一轮机器人的说法计入"被接受"的统计
+    # 5) 语气画像：**先判定这一轮是不是有效信号，再决定要不要统计**
+    #
+    # 原实现写死 ``positive=True``：只要机器人说过话就算"被接受"。生产库实测
+    # replies_count=21 / positive_count=21（100% 正例、0 反例）—— 那不是
+    # "越用越懂老人"，是**自我强化**：机器人把自己说过的每句话都当成正确答案
+    # 反喂回画像，越跑越自信，而老人的真实反应一次都没进来过。
+    #
+    # 现在过 ``judge_feedback`` 的闸门（与 record_feedback 同一套判据）：
+    #   * 判定无效（太短 / 纯语气词 / 玩梗 / 没识别出信号）⇒ **不统计**，
+    #     否则这些无意义轮次会稀释均值；
+    #   * positive ⇒ 计入正例；correction / negative ⇒ 计入反例；
+    #   * retry（老人在重问）⇒ **两边都不计**：它说明"上一句没说清"，但这
+    #     一句也还没被接受，算正算负都是猜。
     if observe:
         last_bot = next((t.content for t in reversed(turns)
                          if (t.role or "").lower() == "assistant"), "")
@@ -208,7 +233,34 @@ def memorize(
                           if (t.role or "").lower() == "user"), "")
         if last_bot:
             try:
-                observe_reply(db, user_id, agent_id, last_bot, last_user, positive=True)
+                sig = models.PersonaSignal
+                # ``signal`` 由语音链路给出（打断→correction、重问→negative…）。
+                # 不传它的话这里只剩"自动识别显式否定"一条路，而正常轮次一律
+                # 判不出信号 —— 语音链路辛苦检测到的打断/重问就全丢了。
+                judgement = judge_feedback(last_user, bot_text=last_bot,
+                                           prev_bot_text=prev_bot_text,
+                                           hint=signal)
+                if not judgement.valid:
+                    # 判不出正负 ≠ 这一轮不存在。老人说了几句、平均多长，
+                    # 是**客观事实**，必须继续累积（neutral 档只跳过正/负统计）。
+                    # 但"嗯/啊/哦"这类太短的句子连平均句长都不该拉低。
+                    if _substantive(last_user):
+                        observe_reply(db, user_id, agent_id, last_bot, last_user,
+                                      neutral=True)
+                    else:
+                        log.info("语气画像：本轮太短（%s），连轮次也不计",
+                                 judgement.reason)
+                elif judgement.signal in (sig.CORRECTION, sig.NEGATIVE):
+                    observe_reply(db, user_id, agent_id, last_bot, last_user,
+                                  positive=False)
+                elif judgement.signal == sig.POSITIVE:
+                    observe_reply(db, user_id, agent_id, last_bot, last_user,
+                                  positive=True)
+                else:
+                    # retry 等：说明上一句没说清，但这一句也还没被接受，
+                    # 算正算负都是猜 —— 只记轮次。
+                    observe_reply(db, user_id, agent_id, last_bot, last_user,
+                                  neutral=True)
             except Exception as exc:  # noqa: BLE001  画像统计失败不影响记忆写入
                 log.warning("语气画像更新失败：%s", exc)
 
@@ -224,7 +276,9 @@ def memorize(
 def memorize_background(db_factory, user_id: int, agent_id: int | None,
                         conversation: Sequence[Any], *, session_id: str = "",
                         client: ModelClient | None = None,
-                        device_id: int | None = None) -> threading.Thread | None:
+                        device_id: int | None = None,
+                        signal: str = "",
+                        prev_bot_text: str = "") -> threading.Thread | None:
     """后台线程里跑 memorize（不阻塞本次对话响应）。
 
     ``db_factory`` 传 ``app.db.SessionLocal``：新线程必须用自己的会话，
@@ -242,7 +296,8 @@ def memorize_background(db_factory, user_id: int, agent_id: int | None,
         db = db_factory()
         try:
             memorize(db, user_id, agent_id, conversation, session_id=session_id,
-                     client=client, commit=True, device_id=device_id)
+                     client=client, commit=True, device_id=device_id,
+                     signal=signal, prev_bot_text=prev_bot_text)
         except Exception as exc:  # noqa: BLE001  后台任务绝不能把进程带崩
             log.warning("后台记忆提取失败：%s: %s", type(exc).__name__, exc)
         finally:

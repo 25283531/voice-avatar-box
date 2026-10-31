@@ -562,12 +562,27 @@ def bind_device(request: Request, payload: BindIn, db: Session = Depends(get_db)
 @router.get("/{device_pk}/events", response_model=list[EventOut])
 def device_events(device_pk: int, limit: int = 100, db: Session = Depends(get_db),
                   user: models.User = Depends(get_current_user)):
-    """查看该设备的提醒回执（是否按时确认）。"""
+    """查看该设备的提醒回执（是否按时确认）。
+
+    join ``Reminder.title`` 一起返回：只给 due_at + state 的话，家属看到
+    「08:00 已确认」仍然不知道是哪一种药 —— 而「最近回执」这张表存在的
+    唯一目的就是回答"这一次吃的是什么、怎么确认的"。
+
+    用 outerjoin 而不是 join：规则被软删除后实例仍在（那是历史事实），
+    inner join 会让这些回执整行消失，表现是"删了一条提醒，之前的记录也没了"。
+    """
     require_device_owner(device_pk, user, db)
-    rows = db.scalars(
-        select(models.ReminderEvent)
+    rows = db.execute(
+        select(models.ReminderEvent, models.Reminder.title)
+        .outerjoin(models.Reminder,
+                   models.Reminder.id == models.ReminderEvent.reminder_id)
         .where(models.ReminderEvent.device_id == device_pk)
         .order_by(models.ReminderEvent.due_at.desc())
         .limit(limit)
     ).all()
-    return list(rows)
+    out: list[EventOut] = []
+    for ev, title in rows:
+        item = EventOut.model_validate(ev)
+        item.reminder_title = title or ""
+        out.append(item)
+    return out

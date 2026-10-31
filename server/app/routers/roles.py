@@ -30,13 +30,15 @@ import logging
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
+from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from .. import models
 from ..db import get_db
 from ..deps import get_current_admin, get_current_user, require_role
-from ..memory.persona import build_persona_prompt, copy_l2_manual, merge_profiles
+from ..memory.persona import (build_persona_prompt, copy_l2_manual, merge_profiles,
+                              reset_persona)
 from ..persona import admin_audit, catalog, guardrails
 from ..persona import spec as spec_mod
 from ..persona.compiler import ProfileMerger, PromptCompiler, effective_traits
@@ -695,6 +697,66 @@ def restore_role(role_pk: int, payload: RoleRestoreIn, db: Session = Depends(get
     db.refresh(row)
     log.info("用户 id=%s 把角色 id=%s 还原为预设（母版 id=%s）", user.id, row.id, parent.id)
     return _role_out(db, row)
+
+
+# ================================================================ 人格画像：显式重置
+class PersonaResetIn(BaseModel):
+    """显式重置画像的入参。
+
+    ``confirm`` 必须是 true —— 这个动作不可逆（清统计 / manual / 示例池），
+    默认 false 让"手滑调用"直接 400，而不是悄悄清掉一位老人的画像。
+    """
+
+    user_id: int | None = None    # None = 当前登录用户
+    agent_id: int | None = None   # None = L0（换了一位老人）；指定 = 该角色重来
+    confirm: bool = False
+
+
+@router.post("/persona/reset")
+def reset_persona_profile(payload: PersonaResetIn, db: Session = Depends(get_db),
+                          user: models.User = Depends(get_current_user)):
+    """**显式**重置语气画像（换了一位老人 / 这个角色重来）。
+
+    ⚠️ 路径为什么是 ``/api/roles/persona/reset`` 而不是 ``/api/persona/reset``：
+    ``main.py`` 只 include 已登记的 router，而本轮改动范围不含 ``main.py``；
+    新建 ``routers/persona.py`` 也不会被注册 —— 那会静默 404，比路径难看更糟。
+    所以挂在角色接口下：画像本来就是"角色 ↔ 老人"的交叉数据。
+
+    语义（细节见 ``memory.persona.reset_persona``）：
+      * ``agent_id=None`` -> 清 L0 统计 + 全部 manual + 整个示例池（换人）；
+      * ``agent_id`` 指定 -> 只清该角色的 L2 manual 与它的示例（角色重来）；
+      * ``AgentPersonaAudit`` **一律保留**，并额外写一条 ``signal=reset`` 的审计。
+
+    权限：只能重置**自己**的画像；管理员可指定 ``user_id`` 重置他人。
+    ``agent_id`` 给定时还要过 ``require_role``（越权一律 404，与本文件其它接口
+    同口径）—— 但用的是**读**权限：平台预设角色人人都能用，家属给自己正在用的
+    预设角色"重来"一次是完全正常的诉求，用写权限会把预设角色挡在外面。
+
+    ⚠️ 这里**不**解绑设备、**不**改任何角色字段：重置的只是"机器人学到的
+    说话方式"。解绑可能只是换硬件，不等于换人（见 devices.unbind_device）。
+    """
+    if not payload.confirm:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            "重置不可逆，请显式传 confirm=true")
+
+    target_id = int(payload.user_id) if payload.user_id is not None else int(user.id)
+    if target_id != int(user.id) and not user.is_admin:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "只能重置自己的画像")
+    target = db.get(models.User, target_id)
+    if target is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "用户不存在")
+
+    if payload.agent_id is not None:
+        # 用**被重置者**的身份判可见性：管理员替别人重置时，判的是"那个人
+        # 能不能看到这个角色"，而不是管理员自己。
+        require_role(db, int(payload.agent_id), target, allow_archived=True)
+
+    result = reset_persona(db, target_id, payload.agent_id)
+    db.commit()
+    log.warning("用户 id=%s 显式重置人格画像（user_id=%s agent_id=%s）：%s",
+                user.id, target_id, payload.agent_id, result)
+    return result
 
 
 @router.post("/{role_pk}/archive")

@@ -46,6 +46,7 @@ from ..schemas import (
     LocalReminderIn,
     LocalReminderReportOut,
     ProviderSafeOut,
+    RemoteConfirmOut,
     ReminderOut,
 )
 
@@ -279,6 +280,41 @@ def sync(request: Request, fw_version: str = "", hw_model: str = "",
     # 混时区时（一条北京规则 + 一条纽约规则）顺序会错。
     upcoming.sort(key=event_due_utc)
 
+    # ---- 子女代确认下发（remote_confirms，2026-10-31）----
+    #
+    # 家属在手机端点了「代确认」，服务端只写库：设备那边什么都不知道，
+    # 于是灯继续闪、屏幕继续显示"该吃药了"，直到老人自己去按一次 ——
+    # 家属以为已经处理完了，实际设备还在催。这个数组就是那条缺失的下行链路。
+    #
+    # 为什么**不做 ack**：设备侧对已 DONE 的实例是幂等的（本地已是 DONE 就
+    # 跳过），同一批记录每次心跳重复带几条完全安全；而加 ack 等于多一个
+    # "设备没回 ack ⇒ 服务端永远重发 / 或提前停发"的失败点，收益为零。
+    #
+    # 窗口：近 24 小时。粗筛按 due_at ±TZ_MARGIN 放宽（due_at 是规则时区的
+    # 裸钟点，见模块头），再用 event_due_utc 换算成绝对时刻精确过滤 ——
+    # 与上面 upcoming 同一套写法，不另发明一种。
+    #
+    # ⚠️ 传给 RemoteConfirmOut 的必须是 **event_due_utc()** 的结果（绝对时刻），
+    # 不能直接给 e.due_at：固件拿它和本地的 fired_due_at（epoch）做 ±60 秒比对，
+    # 给裸钟点会整体差一个时区（见 schemas.RemoteConfirmOut 的类注释）。
+    cutoff = now - timedelta(hours=24)
+    rc_rows = db.scalars(
+        select(ReminderEvent)
+        .where(ReminderEvent.device_id == dev.id,
+               ReminderEvent.state == int(EventState.CONFIRMED),
+               ReminderEvent.confirm_method == int(ConfirmMethod.APP),
+               ReminderEvent.due_at >= wall - timedelta(hours=24) - TZ_MARGIN,
+               ReminderEvent.due_at <= wall + TZ_MARGIN)
+        .order_by(ReminderEvent.due_at.desc())
+        .limit(50)
+    ).all()
+    remote_confirms = [
+        RemoteConfirmOut(reminder_id=e.reminder_id, due_at=event_due_utc(e),
+                         confirm_method=int(e.confirm_method or 0))
+        for e in rc_rows
+        if cutoff <= event_due_utc(e) <= now
+    ]
+
     avatar = db.get(models.Avatar, dev.avatar_id) if dev.avatar_id else None
     # ⚠️⚠️ 下面这条查询是本项目最敏感的一行，**绝对不要**加 owner 或 record_type 条件。
     #
@@ -369,6 +405,7 @@ def sync(request: Request, fw_version: str = "", hw_model: str = "",
         tz_offset_minutes=tz_offset,
         wifi_change=wifi_change,
         sync_interval_sec=sync_interval,
+        remote_confirms=remote_confirms,
     )
 
 

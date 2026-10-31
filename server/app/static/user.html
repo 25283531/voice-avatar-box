@@ -50,6 +50,9 @@
   .tag.ok{background:#e8f7ee;color:var(--ok)}
   .tag.bad{background:#fdeaea;color:var(--bad)}
   .tag.warn{background:#fdf3e3;color:var(--warn)}
+  /* 「子女代确认」用蓝色单独一类：它不是设备上的确认，也不是语音那种半置信，
+     需要一眼和「按键」「语音」区分开（三种方式三种颜色，见 methodClass）。 */
+  .tag.info{background:#e8f0fe;color:#1a56db}
   .kpi{background:var(--brand-soft);border-radius:var(--radius);padding:12px}
   .kpi .n{font-size:24px;font-weight:700;color:var(--brand);line-height:1.2}
   .kpi .l{font-size:12px;color:var(--muted)}
@@ -453,12 +456,15 @@
       <div class="card" v-if="curDeviceId">
         <h2>最近回执</h2>
         <table v-if="events.length">
-          <thead><tr><th>应触发</th><th>状态</th><th>确认方式</th><th>确认时间</th><th>备注</th></tr></thead>
+          <thead><tr><th>应触发</th><th>提醒内容</th><th>状态</th><th>确认方式</th><th>确认时间</th><th>备注</th></tr></thead>
           <tbody>
             <tr v-for="e in events" :key="e.id">
               <td>{{fmt(e.due_at)}}</td>
+              <!-- reminder_title 由 GET /api/devices/{pk}/events join Reminder.title 填上。
+                   没有它，这张表只能说「08:00 已确认」，看不出是哪一种药。 -->
+              <td>{{e.reminder_title || '—'}}</td>
               <td><span class="tag" :class="stateClass(e.state)">{{stateName(e.state)}}</span></td>
-              <td>{{methodName(e.confirm_method)}}</td>
+              <td><span class="tag" :class="methodClass(e.confirm_method)">{{methodName(e.confirm_method)}}</span></td>
               <td>{{fmt(e.confirmed_at)}}</td>
               <td class="muted">{{e.note}}</td>
             </tr>
@@ -959,6 +965,51 @@
               ? '（' + home.medicine_today.pending_times.join(' ') + '）' : ''}}</div></div>
         </div>
 
+        <!-- A. 今日待确认：逐条列出「哪一次、什么药、还没确认」，并给一个
+             代确认入口（POST /api/reminders/{id}/confirm，见 reminders.confirm_now）。
+             只靠上面的计数，家属看到"还有 1 次没吃"仍然不知道该催哪一次。 -->
+        <h2 style="font-size:14px;margin-top:4px">今日待确认</h2>
+        <table v-if="pendingItems.length" id="pendTable">
+          <thead><tr><th>时间</th><th>提醒内容</th><th>状态</th><th>操作</th></tr></thead>
+          <tbody>
+            <tr v-for="it in pendingItems" :key="'p' + it.reminder_id + '@' + it.due_at">
+              <td style="white-space:nowrap">{{fmtHM(it.due_at)}}</td>
+              <td>{{it.title || '—'}}</td>
+              <td><span class="tag" :class="stateClass(it.state)">{{it.state_text || stateName(it.state)}}</span></td>
+              <td>
+                <!-- state===0 是「还没到点」。给药都不该给代确认按钮：
+                     08:00 的药在 06:00 就被家属点掉，等于替老人谎报服药，
+                     而且这条会从待确认里消失，真到点没人再提醒。 -->
+                <button v-if="it.state !== 0" class="primary"
+                        :disabled="confirmingKey===keyOf(it)"
+                        @click="confirmForElder(it)">
+                  {{confirmingKey===keyOf(it) ? '提交中…' : '代确认'}}
+                </button>
+                <span v-else class="muted">未到时间</span>
+              </td>
+            </tr>
+          </tbody>
+        </table>
+        <div v-else class="empty">今天没有待确认的提醒</div>
+
+        <!-- B. 今日已确认：老人自己按的、说的，还是子女代确认的，一眼分得清。
+             confirm_method_text 由服务端给（/api/home/summary 的 items），
+             颜色由 methodClass 按 ConfirmMethod 区分。 -->
+        <h2 style="font-size:14px;margin-top:16px">今日已确认</h2>
+        <table v-if="confirmedItems.length" id="doneTable">
+          <thead><tr><th>时间</th><th>提醒内容</th><th>确认方式</th><th>确认时间</th></tr></thead>
+          <tbody>
+            <tr v-for="it in confirmedItems" :key="'d' + it.reminder_id + '@' + it.due_at">
+              <td style="white-space:nowrap">{{fmtHM(it.due_at)}}</td>
+              <td>{{it.title || '—'}}</td>
+              <td><span class="tag" :class="methodClass(it.confirm_method)">{{it.confirm_method_text || methodName(it.confirm_method)}}</span></td>
+              <td class="muted">{{fmt(it.confirmed_at)}}</td>
+            </tr>
+          </tbody>
+        </table>
+        <div v-else class="empty">今天还没有已确认的提醒</div>
+
+        <h2 style="font-size:14px;margin-top:16px">设备状态</h2>
         <table v-if="(home.devices||[]).length">
           <thead><tr><th>设备</th><th>状态</th><th>IP</th><th>固件</th><th>角色</th><th>形象</th><th>最后上线</th></tr></thead>
           <tbody>
@@ -1156,6 +1207,9 @@ createApp({
       usageSummary: null, usageRows: [], usageFilter: '',
       // 交互统计（GET /api/stats/overview?device_pk=&days=）+ 首页聚合（GET /api/home/summary）
       stats: null, statsDeviceId: null, statsDays: 7, home: null,
+      // 正在提交「代确认」的那条提醒 id：只用来禁用按钮，防止连点重复提交。
+      // 代确认是 POST，api() 对 POST 不重试，但用户连点仍会发两次。
+      confirmingKey: null,
       // 工单
       tickets: [], tkMsg: '',
       tkForm: { email:'', title:'', content:'', category:'other', device_id:'' },
@@ -1192,6 +1246,20 @@ createApp({
       return '当前语音服务：' + (o.vendor_label || o.vendor || '未配置')
            + '；共 ' + n + ' 个可选音色，默认「' + this.voiceLabel(o.default_voice) + '」。'
            + '留空表示跟随形象 / 系统默认。';
+    },
+    // 「今日待确认」：当天还没确认的明细（0 未响铃 / 1 已响铃 / 3 超时未确认）。
+    // 服务端 items 里 state 是 EventState 枚举值；这里按"还没确认"筛，
+    // 而不是按 state!==2 —— 因为「已跳过」(4) 也不该出现在待确认里。
+    pendingItems(){
+      const mt = (this.home && this.home.medicine_today) || {};
+      return (mt.items || []).filter(
+        it => it.state === 0 || it.state === 1 || it.state === 3);
+    },
+    // 「今日已确认」：state === 2（CONFIRMED）。确认方式直接用服务端给的
+    // confirm_method_text，前端不再翻译一遍枚举，避免两边文案漂移。
+    confirmedItems(){
+      const mt = (this.home && this.home.medicine_today) || {};
+      return (mt.items || []).filter(it => it.state === 2);
     }
   },
   methods:{
@@ -1859,6 +1927,48 @@ createApp({
         this.home = await this.api('/api/home/summary');
       }catch(e){ this.err = '今日概况加载失败：' + e.message; }
     },
+    // 时间点单独格式化：这张表已经按"今天"分组，日期是冗余信息，只留 HH:MM。
+    // 不能用 fmt() —— 那会输出 "2026-10-31 08:00"，一行挤两遍日期。
+    fmtHM(v){
+      if (!v) return '—';
+      const d = new Date(v);
+      if (isNaN(d.getTime())) return String(v);
+      const p = n => String(n).padStart(2,'0');
+      return p(d.getHours()) + ':' + p(d.getMinutes());
+    },
+    // 子女代老人确认（POST /api/reminders/{reminder_pk}/confirm）。
+    //
+    // 为什么按 reminder_id 调而不是按实例 id：后端这个接口的入参是**规则** id，
+    // 由 confirm_now 自己挑"当天已到点的最晚一次"，所以这里传 it.reminder_id。
+    // ⚠️ 副作用：同一条规则当天有两个待确认时间点时，后端会确认较晚的那一次，
+    // 可能与用户点的行不一致（见交付报告里的"需复核"项）。
+    //
+    // 一行待确认的唯一标识。**不能只用 reminder_id**：同一条规则一天可能有
+    // 08:00 和 20:00 两个服药点（server_id 相同、due_at 不同），只按
+    // reminder_id 做 key 会让两行同时显示"提交中…"，也会让确认请求分不清
+    // 该确认哪一次。
+    keyOf(it){
+      return (it && (it.reminder_id + '@' + it.due_at)) || '';
+    },
+    // 确认框文案带上提醒标题：老人一天多条服药规则时，"确认已经吃了吗"
+    // 这种没有主语的问句等于没问。
+    async confirmForElder(it){
+      const title = (it.title || '这条提醒') + '（' + this.fmtHM(it.due_at) + '）';
+      if (!confirm('确认老人已经完成「' + title + '」？')) return;
+      this.err = '';
+      this.confirmingKey = this.keyOf(it);
+      try{
+        // ⚠️ due_at 必须带上：服务端 confirm_now 不传它会按"当天已到点的
+        // 最晚一次"猜，于是点 08:00 那行可能把 20:00 那次确认掉，真正
+        // 没吃的早上那次仍然挂着（2026-10-31 用户实报）。
+        await this.api('/api/reminders/' + it.reminder_id + '/confirm'
+                       + '?due_at=' + encodeURIComponent(it.due_at), {method:'POST'});
+        this.setFlash('已代确认「' + title + '」');
+        // 必须重拉：确认后这条要从「待确认」挪到「已确认」，还要更新顶部计数。
+        await this.loadHome();
+      }catch(e){ this.err = '代确认失败：' + e.message; }
+      finally{ this.confirmingKey = null; }
+    },
     statsBarHeight(n){
       const arr = (this.stats && this.stats.series) ? this.stats.series : [];
       const max = Math.max(1, ...arr.map(s => s.total || 0));
@@ -1969,7 +2079,18 @@ createApp({
     /* 2026-10-27 两档置信度：语音确认=半置信（还要按键复核），
        语音+按键=全置信。5 是 ConfirmMethod.VOICE_AND_BUTTON，
        由服务端把同一条的 VOICE 与 BUTTON 两次回执合并得到。 */
-    methodName(m){ return ['—','语音确认','按键','手机端','自动','语音+按键确认'][m] || '—'; }
+    methodName(m){ return ['—','语音确认','按键','手机端','自动','语音+按键确认'][m] || '—'; },
+    /* 确认方式的颜色档位（与 methodName 配套，只决定 tag 颜色）：
+         按键(2) / 语音+按键(5) = 全置信 → 绿 ok
+         语音(1)              = 半置信 → 黄 warn
+         子女代确认(3)        = 人工介入，单独一类 → 蓝 info
+         自动(4) / 无(0)      = 灰（不加类） */
+    methodClass(m){
+      if (m === 2 || m === 5) return 'ok';
+      if (m === 1) return 'warn';
+      if (m === 3) return 'info';
+      return '';
+    }
   },
   watch:{
     curDeviceId(){

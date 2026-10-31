@@ -964,6 +964,39 @@ class HomeDeviceOut(ORMBase):
     avatar_name: str | None = None
 
 
+class MedicineTodayItemOut(ORMBase):
+    """当天**某一个服药时间点**的明细（家属端要能分清"是哪种药没吃"）。
+
+    为什么必须逐条返回、而不是只给 ``pending_times`` 的 "HH:MM"：
+    家属看到"还有 1 次没吃"时，下一步一定是问"哪一次、什么药"。只有钟点
+    没有药品名时，这个问题只能靠人去对规则列表，而老人一天往往有 3~5 条
+    规则 —— 对不上就等于没告诉。
+
+    ``state`` / ``confirm_method`` 直接透传 :class:`EventState` /
+    :class:`ConfirmMethod` 的枚举值，同时给一份 ``*_text``：前端做颜色/图标
+    要的是枚举值，直接展示要的是中文，两边都不该各自硬编码一份文案。
+
+    ⚠️ ``tz`` 不是给前端看的，是 :class:`ORMBase` 的序列化器要读它来给
+    ``due_at`` / ``confirmed_at`` 补**正确**的偏移（见 ORMBase 的注释）。
+    缺了它这两个字段会一律被标成 ``config.TZ`` —— 美西家庭的 08:00 会被
+    标成北京时间 08:00，错 12 小时且不报错。
+    """
+
+    reminder_id: int
+    #: 规则标题（药品名 / 日程名）。规则被删后仍保留实例，标题会是空串。
+    title: str = ""
+    due_at: datetime
+    #: 这一实例的钟点基准（IANA 名），见类注释
+    tz: str = ""
+    #: EventState：0 待触发 / 1 已响铃 / 2 已确认 / 3 超时未确认 / 4 已跳过
+    state: int
+    state_text: str = ""
+    #: ConfirmMethod：0 无 / 1 语音 / 2 按键 / 3 手机端 / 4 自动 / 5 语音+按键
+    confirm_method: int = 0
+    confirm_method_text: str = ""
+    confirmed_at: datetime | None = None
+
+
 class MedicineTodayOut(ORMBase):
     """当天服药概览（服务端时区 TZ 的自然日）。"""
 
@@ -973,6 +1006,10 @@ class MedicineTodayOut(ORMBase):
     pending_times: list[str] = Field(default_factory=list)
     confirmed_count: int = 0
     total_count: int = 0
+    #: 当天逐条明细（**同时包含待确认与已确认**，按 due_at 升序）。
+    #: 与上面三个计数字段并存而不是替代它们：老前端只读计数，删字段会让
+    #: 它们整块变空；新前端读 items 拿药品名与确认方式。
+    items: list[MedicineTodayItemOut] = Field(default_factory=list)
 
 
 class HomeSummaryOut(ORMBase):
@@ -1127,6 +1164,9 @@ class EventOut(ORMBase):
     fired_count: int
     escalated: bool
     note: str
+    #: 该实例所属提醒的标题（药品名 / 日程名）。默认空串：老调用方不认这个键
+    #: 也不受影响；``routers.devices.device_events`` 会 join Reminder 填上。
+    reminder_title: str = ""
 
 
 class EventReportIn(ORMBase):
@@ -1249,6 +1289,39 @@ class DeviceQuotaOut(ORMBase):
 
 
 # ============================================================ 设备同步
+class RemoteConfirmOut(BaseModel):
+    """一条「子女在手机端代确认」的记录，随心跳下发给设备。
+
+    为什么需要它：家属在手机端点了「代确认」，服务端只写库（``state`` /
+    ``confirm_method`` / ``confirmed_at``），而设备那边什么都没收到 ——
+    于是灯一直闪、屏幕还停在"该吃药了"，直到老人自己去按一次。设备侧拿到
+    这个数组后把对应实例标成本地 DONE，症状才消失。
+
+    ⚠️ **刻意继承 ``BaseModel`` 而不是 :class:`ORMBase`**：ORMBase 会给
+    naive datetime 补时区标记，而这里要的根本不是字符串（见下面的序列化器）。
+
+    ⚠️⚠️ **``due_at`` 在 JSON 里是 unix 秒（整数），不是 ISO 字符串。**
+    固件侧 ``firmware/components/elder/src/sync.c`` 的 ``apply_remote_confirms``
+    用 ``cJSON_IsNumber(jdue)`` 判定这条记录是否可用，非数字直接计入 bad 并
+    丢弃 —— 发 ISO 字符串的话整个功能**一条都落不下去，而且服务端 200、
+    固件只打一条 WARN**，是最难查的那种静默失效。固件同时用 ``fired_due_at``
+    （本地 epoch）与它做 ±60 秒比对，所以这里必须是**绝对时刻**的 epoch，
+    不是"规则时区的墙上钟点"。
+    因此：入参传 ``schedule.event_due_utc(ev)``（aware UTC），由下面的
+    ``field_serializer`` 转成 ``int(dt.timestamp())``。
+    """
+
+    reminder_id: int
+    due_at: datetime
+    #: ConfirmMethod.APP（3）。透传而不是写死，将来出现"远程跳过"也能复用。
+    confirm_method: int
+
+    @field_serializer("due_at")
+    def _due_at_epoch(self, v: datetime) -> int:
+        """datetime → unix 秒。契约见类注释（固件只认数字）。"""
+        return int(v.timestamp())
+
+
 class DeviceSyncOut(ORMBase):
     """设备心跳拉取的完整配置快照（含当日陪聊配额，见规划文档 7.3）。"""
     server_time: datetime
@@ -1291,6 +1364,10 @@ class DeviceSyncOut(ORMBase):
     # 若把它做成必填，老固件之外的所有既有调用方都会在反序列化时炸。
     # 与 quota / tts_voice 同例：新增字段一律带默认值。
     wifi_change: DeviceWifiChangeOut | None = None
+    #: 近 24 小时内「子女在手机端代确认」的实例（2026-10-31）。
+    #: **必须是带默认空列表的顶层数组**：老固件按 key 取值，不认识就忽略，
+    #: 不需要动协议版本；写成必填会让所有既有调用方反序列化失败。
+    remote_confirms: list[RemoteConfirmOut] = Field(default_factory=list)
 
 
 # ============================================================ 陪聊时长上报
