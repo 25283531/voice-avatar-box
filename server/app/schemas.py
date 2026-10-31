@@ -995,6 +995,16 @@ class MedicineTodayItemOut(ORMBase):
     confirm_method: int = 0
     confirm_method_text: str = ""
     confirmed_at: datetime | None = None
+    #: 这条属于哪台设备（2026-10-31 加）。
+    #:
+    #: 为什么必须带：``_medicine_today`` 是**多台设备合并成一份**统计的，而
+    #: 一个家庭可能既有客厅那台也有卧室那台。合并之后家属看到"08:00 降压药
+    #: 待确认"，根本不知道要去哪台设备前提醒老人 —— 更糟的是点了「代确认」
+    #: 也说不清确认的是哪一台。
+    #: ``device_name`` 是快照（设备改名后历史条目仍显示当时的名字），
+    #: 与 ``HomeDeviceOut.name`` 同源。
+    device_id: int = 0
+    device_name: str = ""
 
 
 class MedicineTodayOut(ORMBase):

@@ -954,15 +954,28 @@
 
       <div class="card" v-if="home">
         <h2>今日概况</h2>
+        <!-- 多设备筛选（2026-10-31）：服务端把该家属名下所有设备的服药统计
+             合并成一份返回，家里既有客厅那台又有卧室那台时，家属看到
+             「08:00 降压药待确认」根本不知道去哪台设备前提醒老人。
+             只有一台设备时不显示这个选择器（没有可选的东西，白占地方）。 -->
+        <div v-if="(home.devices||[]).length > 1" style="margin-bottom:10px">
+          <label class="muted" style="margin-right:6px">设备</label>
+          <select v-model.number="medDeviceFilter" id="medDevSel">
+            <option :value="0">全部设备（{{(home.devices||[]).length}} 台）</option>
+            <option v-for="dv in home.devices" :key="'opt'+dv.id" :value="dv.id">
+              {{dv.name || ('设备 ' + dv.id)}}{{dv.online ? '' : '（离线）'}}
+            </option>
+          </select>
+        </div>
         <div class="grid g3" style="margin-bottom:12px">
-          <div class="kpi"><div class="n">{{home.medicine_today.total_count}}</div><div class="l">今日服药总次数</div></div>
-          <div class="kpi"><div class="n" style="color:var(--ok)">{{home.medicine_today.confirmed_count}}</div>
+          <div class="kpi"><div class="n">{{medItems.length}}</div><div class="l">今日服药总次数</div></div>
+          <div class="kpi"><div class="n" style="color:var(--ok)">{{medConfirmedCount}}</div>
             <div class="l">已确认</div></div>
           <div class="kpi">
-            <div class="n" :style="{color:home.medicine_today.pending_count?'var(--warn)':'var(--text)'}">
-              {{home.medicine_today.pending_count}}</div>
-            <div class="l">待服药{{(home.medicine_today.pending_times||[]).length
-              ? '（' + home.medicine_today.pending_times.join(' ') + '）' : ''}}</div></div>
+            <div class="n" :style="{color:medPendingCount?'var(--warn)':'var(--text)'}">
+              {{medPendingCount}}</div>
+            <div class="l">待服药{{medPendingTimes.length
+              ? '（' + medPendingTimes.join(' ') + '）' : ''}}</div></div>
         </div>
 
         <!-- A. 今日待确认：逐条列出「哪一次、什么药、还没确认」，并给一个
@@ -970,10 +983,11 @@
              只靠上面的计数，家属看到"还有 1 次没吃"仍然不知道该催哪一次。 -->
         <h2 style="font-size:14px;margin-top:4px">今日待确认</h2>
         <table v-if="pendingItems.length" id="pendTable">
-          <thead><tr><th>时间</th><th>提醒内容</th><th>状态</th><th>操作</th></tr></thead>
+          <thead><tr><th>时间</th><th v-if="showDeviceCol">设备</th><th>提醒内容</th><th>状态</th><th>操作</th></tr></thead>
           <tbody>
             <tr v-for="it in pendingItems" :key="'p' + it.reminder_id + '@' + it.due_at">
               <td style="white-space:nowrap">{{fmtHM(it.due_at)}}</td>
+              <td v-if="showDeviceCol">{{it.device_name || ('设备 ' + it.device_id)}}</td>
               <td>{{it.title || '—'}}</td>
               <td><span class="tag" :class="stateClass(it.state)">{{it.state_text || stateName(it.state)}}</span></td>
               <td>
@@ -997,10 +1011,11 @@
              颜色由 methodClass 按 ConfirmMethod 区分。 -->
         <h2 style="font-size:14px;margin-top:16px">今日已确认</h2>
         <table v-if="confirmedItems.length" id="doneTable">
-          <thead><tr><th>时间</th><th>提醒内容</th><th>确认方式</th><th>确认时间</th></tr></thead>
+          <thead><tr><th>时间</th><th v-if="showDeviceCol">设备</th><th>提醒内容</th><th>确认方式</th><th>确认时间</th></tr></thead>
           <tbody>
             <tr v-for="it in confirmedItems" :key="'d' + it.reminder_id + '@' + it.due_at">
               <td style="white-space:nowrap">{{fmtHM(it.due_at)}}</td>
+              <td v-if="showDeviceCol">{{it.device_name || ('设备 ' + it.device_id)}}</td>
               <td>{{it.title || '—'}}</td>
               <td><span class="tag" :class="methodClass(it.confirm_method)">{{it.confirm_method_text || methodName(it.confirm_method)}}</span></td>
               <td class="muted">{{fmt(it.confirmed_at)}}</td>
@@ -1210,6 +1225,8 @@ createApp({
       // 正在提交「代确认」的那条提醒 id：只用来禁用按钮，防止连点重复提交。
       // 代确认是 POST，api() 对 POST 不重试，但用户连点仍会发两次。
       confirmingKey: null,
+      // 今日概况的设备筛选：0 = 全部。见 medItems / showDeviceCol 的注释。
+      medDeviceFilter: 0,
       // 工单
       tickets: [], tkMsg: '',
       tkForm: { email:'', title:'', content:'', category:'other', device_id:'' },
@@ -1248,18 +1265,41 @@ createApp({
            + '留空表示跟随形象 / 系统默认。';
     },
     // 「今日待确认」：当天还没确认的明细（0 未响铃 / 1 已响铃 / 3 超时未确认）。
-    // 服务端 items 里 state 是 EventState 枚举值；这里按"还没确认"筛，
-    // 而不是按 state!==2 —— 因为「已跳过」(4) 也不该出现在待确认里。
-    pendingItems(){
+    // 当前筛选的设备（0 = 全部）。服务端把该家属名下所有设备的服药统计
+    // 合并成一份返回，这里只在展示层过滤，不改后端口径。
+    medItems(){
       const mt = (this.home && this.home.medicine_today) || {};
-      return (mt.items || []).filter(
-        it => it.state === 0 || it.state === 1 || it.state === 3);
+      const all = mt.items || [];
+      if (!this.medDeviceFilter) return all;
+      return all.filter(it => it.device_id === this.medDeviceFilter);
+    },
+    // 只有「全部设备 + 确实有多台」时才显示设备列 —— 已经筛成单台了，
+    // 每一行都印同一个设备名纯属噪音。
+    showDeviceCol(){
+      return !this.medDeviceFilter && ((this.home && this.home.devices) || []).length > 1;
+    },
+    // 三个 KPI 从 items 现算，**不用**服务端的 total_count/confirmed_count/
+    // pending_count：那三个数是全设备的。一旦按设备筛选，直接用就会出现
+    // 「待服药 1」但下面表里一条都没有 —— 家属会以为页面坏了。
+    medConfirmedCount(){
+      return this.medItems.filter(it => it.state === 2).length;
+    },
+    medPendingCount(){
+      return this.medItems.filter(it => this.isPendingState(it.state)).length;
+    },
+    medPendingTimes(){
+      return this.medItems.filter(it => this.isPendingState(it.state))
+        .map(it => this.fmtHM(it.due_at));
+    },
+    // 「还没确认」= 0 未响铃 / 1 已响铃 / 3 超时未确认。
+    // 不能写成 state !== 2：那样「已跳过」(4) 也会混进待确认里。
+    pendingItems(){
+      return this.medItems.filter(it => this.isPendingState(it.state));
     },
     // 「今日已确认」：state === 2（CONFIRMED）。确认方式直接用服务端给的
     // confirm_method_text，前端不再翻译一遍枚举，避免两边文案漂移。
     confirmedItems(){
-      const mt = (this.home && this.home.medicine_today) || {};
-      return (mt.items || []).filter(it => it.state === 2);
+      return this.medItems.filter(it => it.state === 2);
     }
   },
   methods:{
@@ -1936,12 +1976,15 @@ createApp({
       const p = n => String(n).padStart(2,'0');
       return p(d.getHours()) + ':' + p(d.getMinutes());
     },
+    // 「还没确认」= 0 待触发 / 1 已响铃 / 3 超时未确认。
+    // 不能写成 state !== 2：那样「已跳过」(4) 会被算进待确认里，
+    // 顶部「待确认 N 项」凭空多出一截，家属会去催一件老人本来就不用做的事。
+    isPendingState(st){ return st === 0 || st === 1 || st === 3; },
     // 子女代老人确认（POST /api/reminders/{reminder_pk}/confirm）。
     //
-    // 为什么按 reminder_id 调而不是按实例 id：后端这个接口的入参是**规则** id，
-    // 由 confirm_now 自己挑"当天已到点的最晚一次"，所以这里传 it.reminder_id。
-    // ⚠️ 副作用：同一条规则当天有两个待确认时间点时，后端会确认较晚的那一次，
-    // 可能与用户点的行不一致（见交付报告里的"需复核"项）。
+    // 为什么按 reminder_id 调而不是按实例 id：后端这个接口的入参是**规则** id。
+    // 只传 reminder_id 时后端按"当天已到点的最晚一次"猜（启发式，会点错行），
+    // 所以必须再带上 due_at 精确到那一次（见 confirmForElder 里的注释）。
     //
     // 一行待确认的唯一标识。**不能只用 reminder_id**：同一条规则一天可能有
     // 08:00 和 20:00 两个服药点（server_id 相同、due_at 不同），只按

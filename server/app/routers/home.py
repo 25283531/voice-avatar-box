@@ -76,7 +76,8 @@ _CONFIRM_TEXT = {
 
 
 # ---------------------------------------------------------------- 服药统计
-def _medicine_today(db: Session, device_ids: list[int]) -> MedicineTodayOut:
+def _medicine_today(db: Session, device_ids: list[int],
+                    device_names: dict[int, str] | None = None) -> MedicineTodayOut:
     """统计当天服药情况。
 
     ⚠️ 「当天」是**每条规则自己时区**的自然日（2026-10-21 跨时区改造）。
@@ -91,6 +92,10 @@ def _medicine_today(db: Session, device_ids: list[int]) -> MedicineTodayOut:
     empty = MedicineTodayOut()
     if not device_ids:
         return empty
+    # 设备名快照。为什么不在这里现查：调用方 home_summary 本来就已经把
+    # Device 全查出来了，再查一遍纯属浪费；而且这里只拿到 id 列表，
+    # 现查就是一次额外往返。
+    names = device_names or {}
 
     try:
         # 1) 按规则实时推算当天应触发的服药时间点，默认都是「待服药」
@@ -128,6 +133,8 @@ def _medicine_today(db: Session, device_ids: list[int]) -> MedicineTodayOut:
                     "state": int(models.EventState.PENDING),
                     "confirm_method": int(models.ConfirmMethod.NONE),
                     "confirmed_at": None,
+                    "device_id": r.device_id,
+                    "device_name": names.get(r.device_id, ""),
                 }
 
         # 2) 用实例表覆盖真实状态。为什么按 (提醒, HH:MM) 对齐而不是按完整时间：
@@ -175,6 +182,8 @@ def _medicine_today(db: Session, device_ids: list[int]) -> MedicineTodayOut:
                     "state": int(ev.state),
                     "confirm_method": int(ev.confirm_method or 0),
                     "confirmed_at": ev.confirmed_at,
+                    "device_id": ev.device_id,
+                    "device_name": names.get(ev.device_id, ""),
                 }
                 continue
             slot["due_at"] = ev.due_at
@@ -201,6 +210,8 @@ def _medicine_today(db: Session, device_ids: list[int]) -> MedicineTodayOut:
                 confirm_method=s["confirm_method"],
                 confirm_method_text=_CONFIRM_TEXT.get(s["confirm_method"], ""),
                 confirmed_at=s["confirmed_at"],
+                device_id=s["device_id"],
+                device_name=s["device_name"],
             )
             for s in slots.values()
         ]
@@ -257,5 +268,6 @@ def home_summary(db: Session = Depends(get_db),
 
     return HomeSummaryOut(
         devices=items,
-        medicine_today=_medicine_today(db, [d.id for d in devices]),
+        medicine_today=_medicine_today(db, [d.id for d in devices],
+                                       {d.id: d.name for d in devices}),
     )
