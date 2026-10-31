@@ -275,8 +275,19 @@ export function deleteReminder(reminderPk: number) {
   return elderDelete(`/api/reminders/${reminderPk}`)
 }
 
-export function confirmReminder(reminderPk: number) {
-  return elderPost<ReminderEvent>(`/api/reminders/${reminderPk}/confirm`, {})
+/**
+ * 子女代老人确认某一次提醒（POST /api/reminders/{reminder_pk}/confirm）。
+ *
+ * ⚠️ `dueAt` 必须传：服务端 `confirm_now` 不传它时会按「当天已到点的
+ * **最晚一次**」猜 —— 一条 08:00 + 20:00 的规则，点 08:00 那行会把 20:00
+ * 那次确认掉，早上真正没吃的那次仍然挂着（2026-10-31 用户实报）。
+ * 传了就精确到那一次，传错/查无此实例返回 404，已确认过返回 409。
+ *
+ * `elderPost` 不支持 query，所以这里自己拼。
+ */
+export function confirmReminder(reminderPk: number, dueAt?: string) {
+  const qs = dueAt ? `?due_at=${encodeURIComponent(dueAt)}` : ''
+  return elderPost<ReminderEvent>(`/api/reminders/${reminderPk}/confirm${qs}`, {})
 }
 
 export function upcomingEvents(devicePk: number, hours = 24) {
@@ -660,6 +671,35 @@ export function mySupportTickets(limit = 50) {
 }
 
 // ============================================================ 首页聚合
+/**
+ * 当天**某一个服药时间点**的明细（`GET /api/home/summary` 的
+ * `medicine_today.items[]`）。
+ *
+ * 为什么要有它：只给 `pending_count` / `pending_times` 时，家属看到
+ * 「还有 1 次没吃」根本不知道是哪一种药、去哪台设备前提醒老人。
+ *
+ * `state` / `confirm_method` 是枚举值（要上色、要做判断），
+ * `*_text` 是服务端给的中文（要直接展示）—— 两边都不该各自硬编码一份。
+ */
+export interface MedicineTodayItem {
+  reminder_id: number
+  /** 药品名 / 提醒标题 */
+  title: string
+  /** ISO 时间，**带时区偏移**（服务端 ORMBase 按 tz 补的） */
+  due_at: string
+  tz: string
+  /** 0 未响铃 / 1 待确认 / 2 已确认 / 3 超时未确认 / 4 已跳过 */
+  state: number
+  state_text: string
+  /** 0 — / 1 语音 / 2 按键 / 3 子女代确认 / 4 自动 / 5 语音+按键 */
+  confirm_method: number
+  confirm_method_text: string
+  confirmed_at: string | null
+  /** 这一格属于哪台设备（多设备家庭必须分清） */
+  device_id: number
+  device_name: string
+}
+
 export interface HomeSummary {
   devices: {
     id: number
@@ -677,6 +717,13 @@ export interface HomeSummary {
     pending_times: string[]
     confirmed_count: number
     total_count: number
+    /**
+     * 当天逐条明细（待确认 + 已确认都在这一个数组里，按绝对时刻升序）。
+     *
+     * ⚠️ 服务端加这个字段之前的老版本不会返回它，所以用到时一律
+     * `items || []`，别直接 `.length`。
+     */
+    items?: MedicineTodayItem[]
   }
 }
 
