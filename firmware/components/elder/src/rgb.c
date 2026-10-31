@@ -194,6 +194,16 @@ static struct {
     bool                  btn_pending;    /* 存在待确认提醒（吸引注意态的真源） */
     bool                  btn_resolved;   /* 本轮按下已经出过结果，别再重复反馈 */
     uint32_t              btn_phase_ms;   /* 呼吸/渐变的相位起点（墙上时钟） */
+    /* 橙色呼吸（BTN_ATTRACT）的**起点**，只用于 R4 的 2 小时上限。
+     *
+     * 为什么不复用 btn_phase_ms：它在 GRADIENT→ATTRACT（按钮松手）和
+     * FLASH 结束（rgb.c 的 btn_step 里）都会被重置成"现在"，拿它计时
+     * 会让 2 小时窗口在老人每按一次键之后重新开始 —— 而"待确认"这件事
+     * 本身没变，灯就又闪起来了，等于没有上限。
+     *
+     * 语义：btn_pending 由假变真的那一刻记一次（见 elder_rgb_button_pending），
+     * 由真变假时清零；呼吸超时后**只熄灭灯珠，不动 btn_pending**（见 btn_step）。 */
+    uint32_t              btn_attract_start_ms;
     uint32_t              btn_flash_start_ms;  /* 闪烁起点（**渲染时钟**） */
     uint32_t              btn_flash_color;
     uint8_t               btn_flash_times;
@@ -542,6 +552,26 @@ static uint32_t btn_step(uint32_t t_ms)
 
     switch (g.btn_mode) {
     case BTN_ATTRACT: {
+        /* R4（2026-10-31）：橙色呼吸也要有 2 小时上限，和红色 nag 对齐。
+         *
+         * 现场：老人 8 点没确认，中午 12 点屏幕自己黑了（见 R3），只剩 #1
+         * 还在无限呼吸 —— 从早到晚一直亮着，夜里也亮，老人以为是设备坏了。
+         *
+         * ⚠️ 三条不能动的地方（都是踩过的坑）：
+         *   ① 超时只 return 0（这颗灯珠灭），**绝不改 btn_mode**。
+         *      改成 BTN_OFF 会让 btn_pending 与 btn_mode 不一致；而且下一次
+         *      elder_rgb_button_pending(true) 会因为 `g.btn_pending == pending`
+         *      早退（那边比较的是"值变没变"，不是"灯亮没亮"），
+         *      结果永远点不亮 —— 灯彻底死了。
+         *   ② 计时基准用 btn_attract_start_ms，不用 btn_phase_ms：后者在
+         *      松手回 ATTRACT、FLASH 结束时都会重置，计时会被反复归零。
+         *   ③ 不要顺手禁掉 elder_rgb_button_press：老人按 #1 仍然要走渐变
+         *      确认，那是唯一能把这条提醒清掉的动作，跟"还闪不闪"无关。
+         *
+         * 用有符号差值比较，兼容 now_ms() 的 32 位回绕。 */
+        if ((int32_t)(t_ms - g.btn_attract_start_ms) >= (int32_t)ELDER_NAG_TOTAL_MS) {
+            return 0u;
+        }
         uint32_t half  = ELDER_RGB_BTN_BREATH_MS / 2u;
         uint32_t phase = (t_ms - g.btn_phase_ms) % ELDER_RGB_BTN_BREATH_MS;
         uint32_t lvl = (phase < half) ? (phase * 255u / half)
@@ -948,6 +978,17 @@ void elder_rgb_button_pending(bool pending)
         return;
     }
     g.btn_pending = pending;
+    /* R4：呼吸计时只认 btn_pending 的**边沿**，不认 btn_mode 的迁移。
+     *
+     * 为什么放在这里而不是下面"OFF→ATTRACT"那个分支里：btn_pending 变真时
+     * 老人可能正按着（BTN_GRADIENT）或正在放结果（BTN_FLASH），那时不会进
+     * ATTRACT，但"待确认"的计时已经该开始了；等渐变/闪烁结束再进 ATTRACT 时
+     * 起点仍是这次边沿，不会被悄悄顺延 2 小时。 */
+    if (pending) {
+        g.btn_attract_start_ms = t_ms;
+    } else {
+        g.btn_attract_start_ms = 0u;
+    }
     /* 只在"熄灭 ↔ 吸引注意"之间切；正在按住或正在放结果时不打断 */
     if (g.btn_mode == BTN_OFF && pending) {
         g.btn_mode = BTN_ATTRACT;

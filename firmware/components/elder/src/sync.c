@@ -108,6 +108,10 @@ typedef struct {
 /* "服务端没下发时区"的告警只打一次（见 do_sync 第 0 步）。 */
 static bool s_tz_warned;
 
+/* "remote_confirms 解析不了"的告警只打一次（见 apply_remote_confirms）。
+ * 心跳每 5 分钟一轮，服务端数据问题不会自己好，重复打只会把串口日志冲掉。 */
+static bool s_rc_warned;
+
 /* 与 reminder.c 中同款的自实现 CRC32（避免引入额外组件） */
 static uint32_t crc32_simple(const void *data, size_t len)
 {
@@ -1153,6 +1157,66 @@ typedef struct {
     elder_rmd_when_t when[ELDER_REMINDER_MAX];
 } sync_rmd_buf_t;
 
+/* ---- 服务端代确认（R1，2026-10-31）----
+ *
+ * 子女在手机端点了「代确认」，服务端在 /api/device/sync 的响应里多带一个
+ * 顶层数组（老固件不认识这个 key 会自动忽略，所以不需要动协议版本）：
+ *   "remote_confirms": [{"reminder_id": 12, "due_at": 1730428800,
+ *                        "confirm_method": 3}]
+ *
+ * 时机：**必须在 replace_all 成功之后**。replace_all 会重排 items[] 下标、
+ * 继承/清零 fired_due_at 与 state[]；在它之前确认，等于对着一张马上要被换掉
+ * 的表做匹配 —— 轻则找不到，重则确认到另一条提醒上（服药场景是事故）。
+ *
+ * 失败策略：这是**可选字段**，任何解析问题都只告警、绝不让整轮 sync 失败。
+ * 走到这里时提醒表已经装好了，为一个附加字段回滚，会把刚同步到的规则又打回去。
+ */
+static void apply_remote_confirms(cJSON *root)
+{
+    cJSON *arr = cJSON_GetObjectItem(root, "remote_confirms");
+    if (!arr) return;                     /* 老服务端：没有这个键，静默跳过 */
+    if (!cJSON_IsArray(arr)) {
+        if (!s_rc_warned) {
+            s_rc_warned = true;
+            ESP_LOGW(TAG, "remote_confirms 不是数组（类型不对），本次忽略；"
+                          "同类问题后续不再重复告警");
+        }
+        return;
+    }
+
+    int applied = 0;
+    int skipped = 0;
+    int bad = 0;
+    cJSON *it = NULL;
+    cJSON_ArrayForEach(it, arr) {
+        cJSON *jrid  = cJSON_GetObjectItem(it, "reminder_id");
+        cJSON *jdue  = cJSON_GetObjectItem(it, "due_at");
+        cJSON *jmeth = cJSON_GetObjectItem(it, "confirm_method");
+        /* reminder_id / due_at 缺一个就没法定位实例 —— 这两条是**必需**字段。
+         * confirm_method 缺失时按 APP 处理（这个字段的语义就是"手机端点的"）。 */
+        if (!cJSON_IsNumber(jrid) || !cJSON_IsNumber(jdue)) {
+            bad++;
+            continue;
+        }
+        uint8_t method = cJSON_IsNumber(jmeth) ? (uint8_t)jmeth->valueint
+                                               : (uint8_t)ELDER_CFM_APP;
+        esp_err_t rc = elder_reminder_confirm_remote(
+            (uint32_t)jrid->valuedouble,
+            (time_t)(int64_t)jdue->valuedouble,
+            method);
+        if (rc == ESP_OK) applied++;
+        else              skipped++;
+    }
+    if (bad && !s_rc_warned) {
+        s_rc_warned = true;
+        ESP_LOGW(TAG, "remote_confirms 有 %d 条缺 reminder_id/due_at，已跳过；"
+                      "同类问题后续不再重复告警", bad);
+    }
+    if (applied || skipped) {
+        ESP_LOGI(TAG, "远程代确认：%d 条已置为已完成，%d 条跳过", applied, skipped);
+    }
+}
+
 static esp_err_t do_sync(void)
 {
     static char *resp = NULL;
@@ -1258,6 +1322,9 @@ static esp_err_t do_sync(void)
      * 这两块与 reminder.c 里 rmd_merge_scratch_t 是同一类问题，一起搬到堆。 */
     sync_rmd_buf_t *rb = heap_caps_malloc(sizeof(*rb), MALLOC_CAP_8BIT);
     uint8_t count = 0;
+    /* replace_all 是否真的装成功了 —— 只有装成功才对账 remote_confirms
+     * （见下面 3.5 的注释：表没换，按 (server_id, due_at) 匹配就可能是旧表）。 */
+    bool table_ok = false;
     if (!rb) {
         /* 拿不到就**不动本地表**：本地提醒照常响，5 分钟后再试。 */
         ESP_LOGW(TAG, "解析提醒表时内存不足（需 %u 字节），本轮跳过提醒同步",
@@ -1287,13 +1354,29 @@ static esp_err_t do_sync(void)
         cJSON *jrem = cJSON_GetObjectItem(root, "reminders");
         if (cJSON_IsArray(jrem)) {
             parse_reminders(jrem, rb->items, rb->when, &count);
-            elder_reminder_replace_all(rb->items, rb->when, count);
+            /* ⚠️ replace_all 的返回值里**混着落盘结果**（函数末尾
+             * `return elder_reminder_flush()`）。NVS 满时它返回错误，但表其实
+             * 已经装进 RAM 了 —— 若只认 ESP_OK，NVS 一满，子女的手机端代确认
+             * 就永久落不下来。只有这两个错误才代表"根本没装"：
+             *   ESP_ERR_INVALID_SIZE（count 超上限，开头就返回）
+             *   ESP_ERR_NO_MEM（快照区拿不到，什么都没动） */
+            esp_err_t rrc = elder_reminder_replace_all(rb->items, rb->when, count);
+            table_ok = (rrc != ESP_ERR_NO_MEM && rrc != ESP_ERR_INVALID_SIZE);
         } else {
             ESP_LOGW(TAG, "响应里没有 reminders 数组（老服务端或字段缺失），"
                           "本轮不动本地提醒表");
         }
         heap_caps_free(rb);
     }
+
+    /* 3.5) 服务端代确认（R1，2026-10-31）：子女在手机端点了「代确认」。
+     *
+     * **必须放在 replace_all 成功之后**：表刚换完，(server_id, due_at) 才
+     * 对应得上本地的新下标与 fired_due_at。放在前面就是拿旧表去匹配。
+     * replace_all 失败（堆不足等）时整段跳过 —— 表都没换，这一轮的
+     * "已完成"落不到正确的实例上，下一轮心跳会重新带过来，不必抢这一轮。
+     * 解析问题只告警，不影响本轮其它字段（见 apply_remote_confirms）。 */
+    if (table_ok) apply_remote_confirms(root);
 
     /* 4) 心跳周期以服务端下发为准 */
     cJSON *iv = cJSON_GetObjectItem(root, "sync_interval_sec");

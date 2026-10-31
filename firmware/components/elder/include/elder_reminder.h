@@ -299,6 +299,31 @@ esp_err_t elder_reminder_confirm_ex(uint8_t id, uint8_t confirm_method);
 uint8_t elder_reminder_last_confirm_method(void);
 
 /**
+ * @brief 服务端代确认（子女在手机端点了「代确认」）落到设备。
+ *
+ * 与 elder_reminder_confirm_ex 的区别：那个用本地下标，这个是按
+ * (server_id, due_at) 定向 —— 服务端只知道这两个。
+ *
+ * 校验（缺一条都会造成误确认，见 reminder.c 里的逐条注释）：
+ *   - server_id == 0 → ESP_ERR_INVALID_ARG（本地自建条目服务端不知道）
+ *   - 找不到 server_id → ESP_ERR_NOT_FOUND
+ *   - |fired_due_at - due_at| >= 60s → 跳过（同一条提醒每天都会响，
+ *     8:00 的代确认不能把 20:00 那条也确认掉）
+ *   - 已是 DONE → ESP_OK（幂等：服务端每次心跳都会带，不能重复回执）
+ *
+ * ⚠️ 一个 reminder_id 在本地可能对应**多条** item（sync.c 把 times_of_day
+ *    展开成多条，8:00/20:00 共用同一个 server_id），所以内部会先按
+ *    elder_reminder_find_by_server_id() 确认存在，再在同一 server_id 的所有
+ *    条目里按 due_at 挑出真正那一条。
+ *
+ * @param server_id      服务端的 reminder_id
+ * @param due_at         本次实例的到期时刻（unix 秒）
+ * @param confirm_method 确认方式；只接受 ELDER_CFM_APP(3)，别的值按 APP 记
+ */
+esp_err_t elder_reminder_confirm_remote(uint32_t server_id, time_t due_at,
+                                        uint8_t confirm_method);
+
+/**
  * @brief 打开确认窗口（按键长按后由 input 事件驱动）
  */
 void elder_reminder_arm_confirm(uint8_t id);
@@ -307,6 +332,18 @@ void elder_reminder_arm_confirm(uint8_t id);
  * @brief 当前是否有「服药未完成」——决定红灯是否长亮
  */
 bool elder_reminder_has_pending_medicine(void);
+
+/**
+ * @brief 当前是否有「等着老人确认」的提醒（**任意类型**，不限服药）。
+ *
+ * 判据：enabled 且 state ∈ {PENDING, CONFIRM_WIN, ESCALATED, HALF_CONFIRMED}，
+ * 与 #1 按键指示灯的"吸引注意"态完全同源（reminder.c 的 has_pending_confirm）。
+ *
+ * 为什么必须公开（2026-10-31 R3）：屏幕的 4 小时收屏原先只看 elder_ui 自己
+ * 的计时，于是会出现「灯在闪、屏幕已回待机」—— 老人 8 点没确认，中午 12 点
+ * 屏幕自己黑了。收屏判据必须问引擎，不能各记一套。
+ */
+bool elder_reminder_has_pending_confirm(void);
 
 /**
  * @brief 当前**正在响铃**的提醒下标（语音/按键确认的优选目标）；没有则 -1。

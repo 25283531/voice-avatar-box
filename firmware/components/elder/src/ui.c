@@ -1,4 +1,8 @@
 #include "elder_ui.h"
+/* R3（2026-10-31）：4 小时到点要不要收屏，必须问提醒引擎"还有没有待确认项"。
+ * 屏幕原先只看自己记的 4 小时计时，于是出现「灯还在闪、屏幕已经回到待机熊猫」
+ * —— 老人 8 点没确认，中午 12 点屏幕自己黑了，只剩 #1 在呼吸。 */
+#include "elder_reminder.h"
 
 #include <string.h>
 
@@ -130,11 +134,26 @@ void elder_ui_tick(void)
      *
      * 放在这里而不是让上层计时：tick 由 sync 任务循环驱动（离线时也能跑），
      * 是组件里唯一"一定会被周期性调用"的地方。精度只到一次 sync 周期
-     * （秒级到分钟级），对"4 小时的屏显"完全够用 —— 不值得为它再起一个任务。 */
+     * （秒级到分钟级），对"4 小时的屏显"完全够用 —— 不值得为它再起一个任务。
+     *
+     * R3（2026-10-31 用户实报「灯在闪、屏幕是待机熊猫」）：4 小时是**上限**，
+     * 不是"到点必收"。收屏前必须确认引擎里已经没有待确认项 ——
+     * 屏幕和 #1 呼吸灯/红色 nag 必须同源，否则老人看到的是
+     * 「屏上什么都没有，只有一颗灯在闪」，根本不知道该干什么。
+     *
+     * 有 pending 时**续一个 4 小时窗口**而不是每个 tick 都判一次：tick 是
+     * 秒级调用，不续期就会每秒进来一次、每秒打一行日志。真正收屏的时机由
+     * 确认动作（DONE → OnReminder → hide）负责，这里只是兜底。 */
     if (g.reminder_showing && g.reminder_expire_us &&
             esp_timer_get_time() >= g.reminder_expire_us) {
-        ESP_LOGI(TAG, "全屏提醒已满 4 小时，自动收掉");
-        elder_ui_hide_reminder();
+        if (elder_reminder_has_pending_confirm()) {
+            g.reminder_expire_us = esp_timer_get_time() + ELDER_UI_REMINDER_HOLD_US;
+            ESP_LOGW(TAG, "全屏提醒已满 4 小时，但引擎仍有待确认项 ⇒ 继续显示"
+                          "（与呼吸灯/闪灯保持同源）");
+        } else {
+            ESP_LOGI(TAG, "全屏提醒已满 4 小时且无待确认项，自动收掉");
+            elder_ui_hide_reminder();
+        }
     }
 
     if (!g.expire_us) return;

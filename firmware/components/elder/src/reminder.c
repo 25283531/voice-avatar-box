@@ -18,6 +18,7 @@
 #include "freertos/task.h"
 
 #include <string.h>
+#include <stdio.h>     /* snprintf：R3 的反向对账要重建全屏文案 */
 #include <time.h>
 
 static const char *TAG = "elder.reminder";
@@ -81,6 +82,9 @@ static struct {
     bool              fired_today[ELDER_REMINDER_MAX];
     bool              dirty;
     int64_t           last_flush_us;
+    /* R3：上一次"屏幕漏显示了、由引擎补推全屏提醒"的时刻（见 tick 末尾）。
+     * 只用于限频 —— tick 每秒一次，不限频就会每秒重推一次 UI。 */
+    int64_t           last_reshow_us;
     uint8_t           last_confirm_method;
     TaskHandle_t      task;
 } g;
@@ -595,6 +599,49 @@ static void tick(void)
     /* NVS 去抖：脏数据最多 30s 落一次盘，降低 Flash 磨损 */
     if (g.dirty && (now_us() - g.last_flush_us) > 30LL * 1000 * 1000) {
         elder_reminder_flush();
+    }
+
+    /* ---- 反向对账：引擎有待确认项，屏幕却不在了 ⇒ 重新推一次（R3）----
+     *
+     * 2026-10-31 用户实报「灯在闪、屏幕是待机熊猫」：屏幕原先只有自己记的
+     * 4 小时计时，到点无条件收屏；而 #1 呼吸灯/红色 nag 看的是
+     * has_pending_confirm()。两套判据各走各的，就出现了"中午 12 点屏幕黑了，
+     * 只剩一颗灯在闪"。ui.c 那边已经改成"4 小时且无 pending 才收"，
+     * 这里再补一层兜底：只要引擎里还有待确认项，屏幕就必须有字。
+     *
+     * ⚠️ 三条约束：
+     *   ① **只在 has_pending_confirm() 为真时重显** —— 老人刚确认完、
+     *      DONE 回调正在收屏，此刻 pending 已经是假，不会和"收屏"打架。
+     *   ② 限频 ≥5 秒：tick 每秒跑一次，UI 钩子未注入（无屏板）或别处立刻
+     *      又收掉时，不限频会每秒重推一次、把日志刷满。
+     *   ③ 文案取 fired_due_at 最大那条（elder_reminder_first_ringing()），
+     *      与 elder_bridge.cc 的 FirstUndoneReminder() 同一取法 —— 否则会
+     *      出现"屏上写着 A、按键确认的是 B"。
+     *
+     * ⚠️ 文案必须与 elder_bridge.cc 的 OnReminder(PENDING) 保持一致
+     *    （「该吃…了」/「…时间到了」+「长按按钮 3 秒确认」）。改一处就要改两处，
+     *    否则重显出来的句子和第一次响铃时不一样，老人会以为是另一条提醒。 */
+    if (has_pending_confirm() && !elder_ui_reminder_showing()) {
+        if (g.last_reshow_us == 0 ||
+            (now_us() - g.last_reshow_us) >= 5LL * 1000 * 1000) {
+            int idx = elder_reminder_first_ringing();
+            if (idx >= 0 && idx < ELDER_REMINDER_MAX) {
+                char text[96];
+                char screen_text[160];
+                const elder_rmd_item_t *it = &g.table.items[idx];
+                if (it->type == ELDER_RMD_TYPE_MEDICINE) {
+                    snprintf(text, sizeof(text), "该吃%s了", it->label);
+                } else {
+                    snprintf(text, sizeof(text), "%s时间到了", it->label);
+                }
+                snprintf(screen_text, sizeof(screen_text),
+                         "%s\n\n长按按钮 3 秒确认", text);
+                elder_ui_show_reminder(screen_text);
+                g.last_reshow_us = now_us();
+                ESP_LOGW(TAG, "引擎还有待确认项但屏幕没在显示 ⇒ 重新推全屏提醒: %s",
+                         it->label);
+            }
+        }
     }
 }
 
@@ -1181,12 +1228,104 @@ uint8_t elder_reminder_last_confirm_method(void)
     return g.last_confirm_method;
 }
 
+/* 服务端代确认（子女在手机端点了「代确认」）落到设备。
+ *
+ * 与 elder_reminder_confirm_ex 的区别：那个用本地下标，这个是按
+ * (server_id, due_at) 定向 —— 服务端只知道这两个。
+ *
+ * 四道校验一条都不能少，每条都对应一种"确认到错的那条"：
+ *   ① server_id == 0：本地自建条目服务端不知道，传 0 进来只可能是调用方
+ *      解析出了空值，拿它去匹配会命中第一条本地条目。
+ *   ② 找不到：服务端已经删了/还没下发这条，本地没有对应实例，静默跳过。
+ *   ③ 到期时刻必须对得上（<60 秒）：同一条提醒**每天**都会响，服务端只认
+ *      (reminder_id, due_at) 这个实例。不比 due 的话，8:00 的代确认会把
+ *      20:00 那条也标成已完成 —— 老人晚上的药就此"被吃过"。
+ *   ④ 已是 DONE 直接返回 OK：服务端每次心跳都会带一遍（直到它自己也确认
+ *      收下），不幂等就会重复回执、重复打日志、重复写 NVS。
+ *
+ * ⚠️ 执行时必须记成 ELDER_CFM_APP：server/app/routers/device_api.py 会拿
+ *    设备上报的 method **覆盖**库里的值。这里若按 VOICE/BUTTON 记，
+ *    「手机端代确认」在子女端就会显示成"按键确认"——记录是假的，
+ *    而且会顺带把 DONE 变成半置信的 HALF_CONFIRMED（见 confirm_ex）。 */
+esp_err_t elder_reminder_confirm_remote(uint32_t server_id, time_t due_at,
+                                        uint8_t confirm_method)
+{
+    if (server_id == 0) return ESP_ERR_INVALID_ARG;
+
+    int idx = elder_reminder_find_by_server_id(server_id);
+    if (idx < 0) {
+        ESP_LOGW(TAG, "远程确认：本地没有 server_id=%lu 的提醒，跳过",
+                 (unsigned long)server_id);
+        return ESP_ERR_NOT_FOUND;
+    }
+
+    /* ⚠️ 同一个 server_id 可能对应**多条** item，不能直接拿下标就用：
+     * sync.c 的 parse_reminders() 会把一条规则的 times_of_day 展开成多条
+     * （「8:00 吃药 / 20:00 吃药」共用同一个 reminder_id）。而
+     * elder_reminder_find_by_server_id() 只返回**第一条**，拿它去比 20:00 的
+     * due_at 必然对不上 ⇒ 20:00 那条的代确认永远落不下去，子女端点了没反应。
+     * 所以在同一 server_id 的所有条目里按到期时刻再挑一次。 */
+    int match = -1;
+    for (int i = 0; i < g.table.count && i < ELDER_REMINDER_MAX; i++) {
+        if (g.table.items[i].server_id != server_id) continue;
+        int64_t d = g.table.items[i].fired_due_at - (int64_t)due_at;
+        if (d < 0) d = -d;
+        if (g.table.items[i].fired_due_at != 0 && d < 60) { match = i; break; }
+    }
+    if (match < 0) {
+        /* local_due == 0 = 这条今天在本地还没触发（fired_due_at 只在 tick
+         * 触发时写），此时无从判断是不是同一个实例，只能跳过。
+         * 宁可这次不确认，也不能把别的时段那条确认掉。
+         *
+         * ⚠️ 这里按 `(int)` 打，不用 %ld/%lld：本工程
+         * CONFIG_LIBC_NEWLIB_NANO_FORMAT=y，nano-printf 不支持 64 位长度
+         * 修饰符，真机打出来是字面量（见 net.c / sync.c 的同类注释）。
+         * epoch 秒到 2038 年前都装得进 int。 */
+        ESP_LOGW(TAG, "远程确认：到期时刻对不上（服务端 due=%d，本地该 id 下"
+                      "没有同一实例），跳过 server_id=%lu",
+                 (int)due_at, (unsigned long)server_id);
+        return ESP_ERR_NOT_FOUND;
+    }
+    idx = match;
+
+    uint8_t st = g.state[idx];
+    if (st == ELDER_RMD_DONE) {
+        /* 幂等：心跳每次都带，重复确认什么都不做（也不重复回执）。 */
+        return ESP_OK;
+    }
+    if (st != ELDER_RMD_PENDING && st != ELDER_RMD_CONFIRM_WIN &&
+        st != ELDER_RMD_ESCALATED && st != ELDER_RMD_HALF_CONFIRMED) {
+        /* IDLE / SKIPPED / HALF_EXPIRED：这一轮已经作废或还没开始，
+         * 没有"待确认"可言，改了反而会凭空造出一条已完成记录。 */
+        ESP_LOGW(TAG, "远程确认：server_id=%lu 当前状态 %u 不是待确认，跳过",
+                 (unsigned long)server_id, (unsigned)st);
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    /* 只接受 APP。上层若传了别的值（历史调用/笔误），一律按 APP 记并告警 ——
+     * 这个入口的语义就是"子女在手机端点的"，记错方式比不记更糟。 */
+    if (confirm_method != ELDER_CFM_APP) {
+        ESP_LOGW(TAG, "远程确认：method=%u 不是 APP(3)，按 APP 记录",
+                 (unsigned)confirm_method);
+        confirm_method = ELDER_CFM_APP;
+    }
+
+    /* 复用现有状态机，不重写：DONE + 位图 + 回调 + 落盘都在 confirm_ex 里。 */
+    return elder_reminder_confirm_ex((uint8_t)idx, confirm_method);
+}
+
 void elder_reminder_arm_confirm(uint8_t id)
 {
     if (id >= g.table.count) return;
     if (g.state[id] != ELDER_RMD_PENDING && g.state[id] != ELDER_RMD_ESCALATED) return;
     set_state(id, ELDER_RMD_CONFIRM_WIN);
     g.confirm_deadline_us[id] = now_us() + 30LL * 1000 * 1000;
+}
+
+/* 公开包装：屏幕的 4 小时收屏（ui.c）要用同一套判据，见 elder_reminder.h。 */
+bool elder_reminder_has_pending_confirm(void)
+{
+    return has_pending_confirm();
 }
 
 bool elder_reminder_has_pending_medicine(void)
