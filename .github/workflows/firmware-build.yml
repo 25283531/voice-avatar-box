@@ -762,6 +762,12 @@ jobs:
           cp -v build/merged-flash.bin \
                "$GITHUB_WORKSPACE/out/elder-firmware-esp32s3-merged-flash.bin"
           cp -v build/flasher_args.json                "$GITHUB_WORKSPACE/out/" 2>/dev/null || true
+          # 链接映射表：串口崩溃只有一串裸地址（`Backtrace: 0x4205d86a:0x3fcdbda0 ...`），
+          # 没有 .map 就只能靠猜是哪个函数崩的。
+          # 2026-11-04 就吃过这个亏：AGC 和 NS 同一次提交里上线，设备唤醒必重启，
+          # 手里只有地址、没有符号表 ⇒ 只能"猜"是 NS 空指针，猜错就要再让用户重启一次。
+          # .map 只有几 MB，随 artifact 下发，下次崩溃 5 分钟就能定位到函数。
+          cp -v build/xiaozhi.map                      "$GITHUB_WORKSPACE/out/" 2>/dev/null || true
           # 应用镜像文件名随工程名变化，统一抓取。
           # ⚠️ 必须排除 merged-flash.bin：它就在 build/ 根下，不排除会被再拷一份，
           #    artifact 里于是出现两个 12.4MB 的同内容大文件（其中一个还叫模糊的名字），
