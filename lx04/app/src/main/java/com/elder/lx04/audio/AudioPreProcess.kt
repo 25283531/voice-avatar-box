@@ -3,31 +3,46 @@ package com.elder.lx04.audio
 /**
  * 录音前处理：直流阻断 → 高通 → 噪声底跟踪 → 自动增益 → 语音活动判定。
  *
- * ## 为什么要自己写，而不是直接开系统的 NS/AGC
+ * ## 2026-11-04 实机更正（这条结论推翻过之前的判断，留痕）
  *
- * LX04 原厂的小爱唤醒（`MiVpmService`）走的也是 **AOSP 的音频预处理**，
- * 也就是 `/vendor/lib/soundfx/libaudiopreprocessing.so` 里的 WebRTC
- * AEC / NS / AGC 三件套 —— 这台机器上并没有小米自己另写的降噪库。
+ * 之前从 `dumpsys media.audio_flinger` 里看到
  *
- * 但实测（2026-11-04，设备 10.0.1.184）发现：
- *
- *     $ dumpsys media.audio_flinger | head
  *     XML effect configuration failed to load.
- *     ...
- *     Input thread 0xb0183d40, name AudioIn_1E, tid 488, type 3 (RECORD):
- *     Active Client Session S  Flags  Format  Chn mask  SRate
- *     0 Effect Chains            ← 一条效果链都没有
+ *     Input thread AudioIn_1E ... 0 Effect Chains
  *
- * 也就是说**效果配置没加载成功**，录音会话上挂不到任何效果链。
- * `NoiseSuppressor.create()` / `AutomaticGainControl.create()` 在这种机器上
- * 会返回 null（框架拿不到效果句柄）。所以：
+ * 就判定"平台效果挂不上，必须纯软件兜底"。**这个判断是错的** ——
+ * `AudioIn_1E` 是 `MiVpmService`（小爱唤醒）的线程，那 0 条链是**它的**，
+ * 不是我们的。
  *
- *   1. [AudioCapture] 仍然**先尝试**挂平台效果 —— 挂上就白赚，零 CPU；
- *   2. 挂不上就由本类兜底，纯 Kotlin 自己算。
+ * 我们自己的录音会开一条**独立的** input thread。实测（设备 10.0.1.184，
+ * 录 5 秒时抓 `dumpsys`）：
  *
- * 两条路的开关状态会在日志里打出来，装机时一眼能看出走的是哪条。
+ *     Input thread AudioIn_3E, tid 3989, type 3 (RECORD):
+ *       Audio source: 6 (voice recognition)
+ *       Input device: 0x80000004 (AUDIO_DEVICE_IN_BUILTIN_MIC)
+ *       Active Client Session 89
+ *       1 Effect Chains
+ *         3 effects for session 89
+ *           Effect ID 83: Noise Suppression  (AOSP)
+ *           Effect ID 91: Acoustic Echo Canceler
+ *           Effect ID 9x: Automatic Gain Control
  *
- * ## 每一级在解决什么（都是实机听感问题，不是教科书凑数）
+ * 也就是说 **NS / AEC / AGC 三件套是真挂上并且真在跑的**。
+ * `NoiseSuppressor.create()` 返回非 null 是可信的，不是空壳。
+ *
+ * ## 所以增益不能无条件做
+ *
+ * 平台 AGC 已经在我们前面动过增益了。如果软件再叠一层最高 8 倍的放大，
+ * 轻则"抽气"，重则直接削顶失真 —— 而且是在平台 AGC 已经把弱音提上来的
+ * 基础上再提，噪声会被放大到 ASR 无法忍受。
+ *
+ * 因此 [softwareAgc] 是一个**开关**：
+ *   · 平台 AGC 挂上了  → 关掉软件增益，本类只做噪声底跟踪 + VAD
+ *   · 平台 AGC 挂不上  → 打开软件增益兜底
+ *
+ * 开关由 [AudioCapture] 在挂效果之后设置，日志里会打清楚走的是哪条。
+ *
+ * ## 每一级在解决什么
  *
  * 1. **直流阻断**：MTK 的 ADC 有几十个 LSB 的直流偏置。不除掉的话
  *    下面算 RMS 会被这个恒定分量抬高，VAD 就永远判"有声音"。
@@ -40,22 +55,21 @@ package com.elder.lx04.audio
  *    （安静时立刻降下来，变吵时慢慢升上去），这样老人一开口，
  *    噪声底还停在安静时的值，信噪比才算得准。
  *
- * 4. **自动增益**：老人对着音箱说话，距离从 30cm 到 3m 都有可能，
- *    音量能差 20dB。目标是把语音段拉到 -26dBFS 附近。
+ * 4. **自动增益**（见上，可能被关掉）：老人对着音箱说话，距离从 30cm
+ *    到 3m 都有可能，音量能差 20dB。目标是把语音段拉到 -26dBFS 附近。
  *    **只对语音帧提增益**，静音帧不动 —— 否则安静时会去放大底噪，
  *    服务端 ASR 听到的是一片嘶嘶声，识别率反而更低。
  *    增益变化做平滑（每帧最多变 1.5dB），突变会产生"抽气"声。
  *
  * 5. **VAD**：能量判据 + 滞回。用于两件事：判断"说完了没有"（自动结束
  *    一轮聆听），以及给增益决定"这一帧要不要提"。
+ *    **平台效果不提供 VAD**，所以这一级无论走哪条路都必须自己算。
  *
- * ## 不做的事
+ * ## 关于回声消除
  *
- * **不做回声消除**。AEC 需要参考信号（正在播放的 TTS 音频），
- * 我们的播放和录音在同一个进程里，理论上能拿到，但要做到不跑偏
- * 得对齐延迟、估计声学路径 —— 那是几百行的自适应滤波器。
- * 现阶段用**半双工**回避：说话时不播放，播放时不录音。
- * 这也是对讲机时代的成熟做法，老人不会觉得别扭。
+ * 平台 AEC 已经挂上了，但**不要指望它能救半双工**：AEC 的效果取决于
+ * 参考信号与声学路径的对齐，设备外放音量大的时候残留回声仍然会进 ASR。
+ * 所以上层仍然是半双工（说话不播、播不说话），AEC 只是多一层保险。
  */
 class AudioPreProcess(
     /** 采样率，必须与采集一致（16kHz）。 */
@@ -81,6 +95,15 @@ class AudioPreProcess(
 
     /** 连续静音帧数 —— 用来判断"说完了"。 */
     private var silentFrames = 0
+
+    /**
+     * 是否启用**软件**增益。
+     *
+     * 默认 true（最坏情况的兜底）。[AudioCapture] 挂完平台效果后会按
+     * 实际情况改写：平台 AGC 挂上了就设 false，避免两层 AGC 叠加。
+     */
+    @Volatile
+    var softwareAgc: Boolean = true
 
     /** 高通系数：一阶高通，截止 120Hz。 */
     private val hpAlpha = run {
@@ -133,8 +156,8 @@ class AudioPreProcess(
 
         if (speaking) silentFrames = 0 else silentFrames++
 
-        // ---- 5. 自动增益（只对语音帧） ----
-        if (speaking && rms > 1f) {
+        // ---- 5. 自动增益（只对语音帧，且仅当平台 AGC 没挂上时） ----
+        if (softwareAgc && speaking && rms > 1f) {
             // 目标 -26dBFS ≈ 32767 * 10^(-26/20) ≈ 1640
             val target = 1640f
             val want = (target / rms).coerceIn(1f, MAX_GAIN)

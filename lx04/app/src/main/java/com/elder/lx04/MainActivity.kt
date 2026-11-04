@@ -576,6 +576,153 @@ class MainActivity : Activity() {
         }
     }
 
+    /**
+     * 扬声器 → 麦克风 **回环自检**。
+     *
+     * ## 解决什么问题
+     *
+     * [runMicTest] 只能证明"能读到数据"。但实测稳态 rms 只有 6~12，
+     * 而峰值出现在开录的头 0.5 秒（7056）—— 这有两种完全不同的解释：
+     *
+     *   a) 房间真的安静，那点峰值是麦克风上电的爆音；
+     *   b) 平台的 NS（Noise Suppression）把一切非人声都压掉了。
+     *
+     * 两者对产品的影响天差地别：a 正常，b 意味着老人说话也可能被压没。
+     * 光看数字分不出来，**必须制造一个已知的声音**去听。
+     *
+     * ## 怎么造声音
+     *
+     * 用设备自己的扬声器放 1kHz 正弦（幅度 8000 ≈ -12dBFS），
+     * 同时用麦克风录。音箱的喇叭和麦克风在同一个腔体里，
+     * 耦合足够强，一定能收到。
+     *
+     * ⚠️ 这次**刻意不挂平台效果**（`enablePlatformEffects = false`）：
+     *    平台 AEC 的参考信号正是我们正在播的内容，它会把这段声音
+     *    当成回声消掉 —— 挂着 AEC 测回环，等于自己把答案抹掉。
+     *
+     * ## 怎么读结果
+     *
+     * ```
+     * 静默段 rms ≈ 10   放音段 rms ≈ 几千     → 通路完好，之前是 a)
+     * 静默段 rms ≈ 10   放音段 rms ≈ 10       → 麦克风通路有问题
+     * 放音段 rms 有明显抬升但很小（<100）      → 通路通但衰减严重
+     * ```
+     *
+     * 用法：`adb shell am broadcast -a com.elder.lx04.DEBUG --es cmd tone_test`
+     */
+    private fun runToneTest() {
+        if (sending) {
+            Log.w(TAG, "tone_test 忽略 —— 正在对话中")
+            return
+        }
+        screen.setHint("回环自检：先静音 1 秒，再放音 1.5 秒…")
+
+        // ⚠️ 不能用 `@Volatile var`：Kotlin 的 @Volatile 只作用于属性（有 backing
+        //    field 的），局部变量上写它会直接编译报错。这里跨线程读，用原子量。
+        val playing = java.util.concurrent.atomic.AtomicBoolean(false)
+        var peakQuiet = 0f
+        var peakTone = 0f
+        var framesQuiet = 0
+        var framesTone = 0
+
+        val cap = AudioCapture(
+            onFrame = { _, info ->
+                if (playing.get()) {
+                    framesTone++
+                    if (info.rms > peakTone) peakTone = info.rms
+                } else {
+                    framesQuiet++
+                    if (info.rms > peakQuiet) peakQuiet = info.rms
+                }
+            },
+            enablePlatformEffects = false
+        )
+
+        if (!cap.start()) {
+            screen.setHint("回环自检失败：麦克风打不开")
+            return
+        }
+
+        scope.launch {
+            // ---- 1. 静音段基线 1 秒 ----
+            delay(1_000)
+            val quietBaseline = peakQuiet
+
+            // ---- 2. 放 1.5 秒 1kHz 正弦，同时录 ----
+            val tone = buildTone(SAMPLE_RATE_OUT, ms = 1_500, freqHz = 1000.0, amp = 8000)
+            val track = createTrack(SAMPLE_RATE_OUT)
+            if (track == null) {
+                cap.stop()
+                screen.setHint("回环自检失败：AudioTrack 打不开")
+                return@launch
+            }
+
+            playing.set(true)
+            withContext(Dispatchers.IO) {
+                runCatching {
+                    track.play()
+                    track.write(tone, 0, tone.size)
+                    // 等缓冲放完，否则立刻 release 会截断
+                    Thread.sleep(300)
+                }
+            }
+            playing.set(false)
+            runCatching { track.stop() }
+            runCatching { track.release() }
+
+            // ---- 3. 再静音 0.5 秒收尾 ----
+            delay(500)
+            cap.stop()
+
+            val verdict = when {
+                framesQuiet == 0 || framesTone == 0 ->
+                    "没读到帧（静音段 $framesQuiet / 放音段 $framesTone）"
+                peakTone < quietBaseline * 2 ->
+                    "麦克风收不到扬声器 —— 通路有问题（静默峰值 ${f(quietBaseline)}，" +
+                        "放音峰值 ${f(peakTone)}）"
+                else -> "通路完好：静默峰值 ${f(quietBaseline)} → 放音峰值 ${f(peakTone)}" +
+                    "（提升 ${"%.1f".format(peakTone / maxOf(quietBaseline, 1f))} 倍）"
+            }
+            Log.i(TAG, "tone_test 结果：$verdict")
+            screen.setHint("回环：$verdict")
+        }
+    }
+
+    /** 生成一段正弦 PCM16。 */
+    private fun buildTone(sampleRate: Int, ms: Int, freqHz: Double, amp: Int): ShortArray {
+        val n = sampleRate * ms / 1000
+        val out = ShortArray(n)
+        val w = 2.0 * Math.PI * freqHz / sampleRate
+        for (i in 0 until n) {
+            out[i] = (Math.sin(w * i) * amp).toInt().toShort()
+        }
+        return out
+    }
+
+    /** 建一个 24kHz 单声道流式 AudioTrack（与 TTS 播放同参数）。 */
+    private fun createTrack(sampleRate: Int): android.media.AudioTrack? {
+        val minBuf = android.media.AudioTrack.getMinBufferSize(
+            sampleRate,
+            android.media.AudioFormat.CHANNEL_OUT_MONO,
+            android.media.AudioFormat.ENCODING_PCM_16BIT
+        )
+        if (minBuf <= 0) return null
+        val t = runCatching {
+            @Suppress("DEPRECATION")
+            android.media.AudioTrack(
+                android.media.AudioManager.STREAM_MUSIC,
+                sampleRate,
+                android.media.AudioFormat.CHANNEL_OUT_MONO,
+                android.media.AudioFormat.ENCODING_PCM_16BIT,
+                maxOf(minBuf, sampleRate), // 1 秒缓冲，够放 1.5 秒的余量
+                android.media.AudioTrack.MODE_STREAM
+            )
+        }.getOrNull()
+        return t?.takeIf { it.state == android.media.AudioTrack.STATE_INITIALIZED }
+    }
+
+    private fun f(v: Float): String = "%.0f".format(v)
+
     // ------------------------------------------------------------------ 调试入口
 
     private val debugReceiver = object : BroadcastReceiver() {
@@ -595,6 +742,7 @@ class MainActivity : Activity() {
             "talk" -> beginListening()
             "stop_talk" -> endListening()
             "mic_test" -> runMicTest()
+            "tone_test" -> runToneTest()
 
             "med_pending" -> {
                 onReminderPending(true)
@@ -687,5 +835,13 @@ class MainActivity : Activity() {
          * ASR 两半都识别不出来）；太长则每轮都要多等一截，交互变迟钝。
          */
         const val SILENCE_STOP_MS = 1200L
+
+        /**
+         * 下行播放采样率（自检用）。
+         *
+         * 正常对话里这个值由服务端 hello 下发（`opus.init(sampleRate)`），
+         * 不能写死；这里只是回环自检没有服务端可问，用一个与 TTS 同参数的默认值。
+         */
+        private const val SAMPLE_RATE_OUT = 24_000
     }
 }

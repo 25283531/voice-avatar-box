@@ -26,23 +26,50 @@ import kotlin.concurrent.thread
  * 老人对着音箱说话，距离从半米到三米，原始信号的信噪比会差很多。
  * 用和小爱同一个音频源，至少起点是一样的。
  *
- * ## 平台效果：先试，试不到就自己算
+ * ## 平台效果：实测**挂得上**，而且真的在跑
  *
  * `NoiseSuppressor` / `AutomaticGainControl` / `AcousticEchoCanceler`
  * 都是对 `AudioRecord` 的 session 挂 `libaudiopreprocessing.so` 里的效果。
- * 但这台机器实测 **效果配置加载失败**（`XML effect configuration failed
- * to load.`，录音线程 0 Effect Chains），`create()` 很可能返回 null。
  *
- * 所以这里的设计是：
- *   1. 逐个尝试挂载，**挂上几个算几个**，日志里打清楚；
- *   2. 无论挂没挂上，[AudioPreProcess] 都会跑（软件兜底）。
+ * 2026-11-04 实机验证（录音进行中抓 `dumpsys media.audio_flinger`）：
  *
- * 为什么不"挂了平台效果就不跑软件链"：两条链的语义不一样 ——
- * 平台效果是 NS/AGC，而软件链还负责 **VAD**（判断说完了没有）和
- * 噪声底估计，这些是平台效果不提供的。软件链的 AGC 在信噪比已经
- * 很好的时候会自动停手（`gain` 停在 1.0 附近），不会叠加放大。
+ *     Input thread AudioIn_3E, tid 3989, type 3 (RECORD):
+ *       Audio source: 6 (voice recognition)
+ *       Active Client Session 89
+ *       1 Effect Chains
+ *         3 effects for session 89
+ *           Effect ID 83: Noise Suppression
+ *           Effect ID 91: Acoustic Echo Canceler
+ *           Effect ID 9x: Automatic Gain Control
+ *
+ * 三条全在，`create()` 返回的对象是实的。
+ *
+ * ⚠️ 之前一度判断"效果配置加载失败、挂不上"，那是因为看错了线程：
+ *    `AudioIn_1E` 是 `MiVpmService`（小爱唤醒）的线程，它的 0 条链
+ *    跟我们无关。我们自己会开一条**独立的** `AudioIn_3E`。
+ *
+ * ## 软件链仍然要跑，但增益不重复做
+ *
+ * 平台效果提供 NS / AEC / AGC，**但不提供 VAD**，也不给我们噪声底估计。
+ * 所以 [AudioPreProcess] 无论如何都要跑 —— 它是"说完了没有"的唯一判据。
+ *
+ * 唯一要避免的是**两层 AGC 叠加**：平台 AGC 已经动过增益了，
+ * 软件再放大最高 8 倍会削顶失真。所以挂上平台 AGC 时
+ * 把 [AudioPreProcess.softwareAgc] 关掉，只保留噪声底 + VAD。
  */
 class AudioCapture(
+    /**
+     * 是否挂平台 NS/AEC/AGC。
+     *
+     * 正常对话一律 true。只有**自检**时才传 false —— 因为 AEC 会把
+     * 我们自己扬声器的声音当成回声消掉，回环测试就测不出东西了。
+     *
+     * ⚠️ 这个参数刻意放在 lambda **前面**：Kotlin 的尾随 lambda 语法
+     *    只认最后一个参数，如果 lambda 不在最后，`AudioCapture { ... }`
+     *    这种写法就编译不过。放前面还能用默认值，调用处照样只写 lambda。
+     */
+    private val enablePlatformEffects: Boolean = true,
+
     /** 每 60ms 回调一次。回调在**采集线程**上执行，不要在里面做重活。 */
     private val onFrame: (pcm: ShortArray, info: AudioPreProcess.Frame) -> Unit
 ) {
@@ -103,7 +130,10 @@ class AudioCapture(
             return false
         }
 
-        attachEffects(rec.audioSessionId)
+        if (enablePlatformEffects) attachEffects(rec.audioSessionId) else {
+            pre.softwareAgc = true
+            Log.i(TAG, "平台效果：本次**刻意不挂**（自检模式，避免 AEC 消掉回环）")
+        }
 
         record = rec
         pre.reset()
@@ -154,7 +184,7 @@ class AudioCapture(
         }
     }
 
-    /** 挂平台效果。挂不上是**正常情况**（本机效果配置加载失败），只记日志。 */
+    /** 挂平台效果。挂不上的情况仍要能跑（只记日志，不阻断）。 */
     private fun attachEffects(sessionId: Int) {
         noiseSuppressor = runCatching { NoiseSuppressor.create(sessionId) }.getOrNull()
             ?.also { it.enabled = true }
@@ -163,10 +193,15 @@ class AudioCapture(
         echoCancel = runCatching { AcousticEchoCanceler.create(sessionId) }.getOrNull()
             ?.also { it.enabled = true }
 
+        // ⚠️ 平台 AGC 挂上了就关掉软件增益 —— 两层 AGC 叠加会削顶失真。
+        //    注意这里用 autoGain != null 判断，而不是"create 没抛异常"：
+        //    create 返回 null 才是"这台机器没有 AGC"，实测本机是非 null。
+        pre.softwareAgc = autoGain == null
+
         Log.i(
             TAG,
             "平台效果：NS=${noiseSuppressor != null} AGC=${autoGain != null} " +
-                "AEC=${echoCancel != null}（全 false 属正常，走软件前处理兜底）"
+                "AEC=${echoCancel != null} → 软件增益${if (pre.softwareAgc) "开启（兜底）" else "关闭（避免与平台 AGC 叠加）"}"
         )
     }
 
