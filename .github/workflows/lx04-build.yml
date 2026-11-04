@@ -81,7 +81,12 @@ jobs:
         # ⚠️ 灯效与按键的时序逻辑是移植里最容易出错的部分 ——
         # 固件上这些判定被反复修过四轮（10-20 / 10-28 / 11-03 / 11-04），
         # 每次都是踩坑改出来的。测试锁住它们，移植才不会把语义改漂。
-        run: ./gradlew --no-daemon testReleaseUnitTest
+        run: |
+          # gradlew 是在 Windows 上入的库，git 曾把可执行位记成 644，
+          # 导致 CI 里 `./gradlew` 直接 exit 126 (Permission denied)。
+          # 已在仓库里改成 100755，这里再兜一次底，换环境也不会再挂。
+          chmod +x gradlew
+          ./gradlew --no-daemon testReleaseUnitTest
 
       - name: 构建 APK
         working-directory: lx04
