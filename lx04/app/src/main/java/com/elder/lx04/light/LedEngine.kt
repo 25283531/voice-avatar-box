@@ -1,6 +1,5 @@
 package com.elder.lx04.light
 
-import android.graphics.Color
 // LedConfigItem 是 object Led 的**内部类**，不是顶层类型。
 // Kotlin 不会因为同包就自动可见嵌套类，必须显式 import。
 import com.elder.lx04.light.Led.LedConfigItem
@@ -275,10 +274,12 @@ class LedEngine {
      * 按下（不管当时有没有可确认的提醒；没有就保持熄灭）。
      *
      * 与固件 `elder_rgb_button_press` 一致。
+     *
+     * @param t 按下时刻（默认取 [clock]）；单测传入显式时间戳以锁死时序
      */
     @Synchronized
-    fun buttonPress() {
-        button.press(now())
+    fun buttonPress(t: Long = now()) {
+        button.press(t)
     }
 
     /**
@@ -293,14 +294,14 @@ class LedEngine {
      * 300ms 之后的松手照样粉红闪 5 次。
      */
     @Synchronized
-    fun buttonRelease() {
-        button.release(now())
+    fun buttonRelease(t: Long = now()) {
+        button.release(t)
     }
 
     /** 确认完成 ⇒ 天蓝 #00BFFF 全亮闪 3 次。 */
     @Synchronized
-    fun buttonConfirmed() {
-        button.confirmed()
+    fun buttonConfirmed(t: Long = now()) {
+        button.confirmed(t)
     }
 
     /**
@@ -312,8 +313,8 @@ class LedEngine {
      * 追问路径同样达标，所以必须闪天蓝，不能退回橙色呼吸让老人看不到回执。
      */
     @Synchronized
-    fun buttonAcknowledged() {
-        button.acknowledged()
+    fun buttonAcknowledged(t: Long = now()) {
+        button.acknowledged(t)
     }
 
     /** 是否存在待确认的提醒 ⇒ 橙色呼吸 / 熄灭。 */
@@ -331,13 +332,11 @@ class LedEngine {
      */
     @Synchronized
     fun render(t: Long): BandRender {
-        // 1) 清理过期请求
-        slots.removeAll { it.expiresAt != 0L && t >= it.expiresAt }
-
-        // 2) 决定"对话/提醒灯带"（左带）显示什么
+        // 1) 决定"对话/提醒灯带"（左带）显示什么
+        //    （过期请求的清理在 resolveLeftBand 里做，测试走同一路径）
         val left = resolveLeftBand(t)
 
-        // 3) 决定"按键指示灯"（右带）显示什么
+        // 2) 决定"按键指示灯"（右带）显示什么
         val right = button.render(t)
 
         return BandRender(left = left, right = right)
@@ -357,6 +356,11 @@ class LedEngine {
      * 优先级：ALARM > MED_PENDING > REMINDER > EMOTION > IDLE
      */
     private fun resolveLeftBand(t: Long): BandRender.Band {
+        // 0) 清理过期请求。
+        //    放在这里而不是只放在 render() 里：resolveLeftForTest() 也走这条路，
+        //    否则"服药完成 60 秒后回落"这类 TTL 用例在测试里永远看不到回落。
+        slots.removeAll { it.expiresAt != 0L && t >= it.expiresAt }
+
         // 事件灯不受「状态灯开关」影响 —— 判据是优先级，不是名单。
         // （状态灯可以关，但提醒/服药这类事件必须还能亮，否则老人就漏了提醒。）
         val event = slots.filter { it.prio.value >= Led.Priority.REMINDER.value }
@@ -547,14 +551,27 @@ class LedEngine {
      * 没有灯珠的非线性衰减，但**仍按感知亮度口径**处理 ——
      * 这样同一个 `level` 在两个平台上的观感一致，灯效配置表才能原样复用。
      */
+    /**
+     * 按感知亮度缩放颜色。
+     *
+     * ⚠️ **刻意不用 `android.graphics.Color`**。
+     *
+     * 这是灯效语义的核心计算，必须能在 JVM 单元测试里跑。而 `android.graphics.Color`
+     * 在单元测试里是 stub：AGP 的 mockable android.jar 把方法体换成返回默认值，
+     * `Color.red(...)` 恒为 0 —— 于是 `applyLevel` 把任何颜色都算成 0，
+     * 所有"天蓝闪 3 次"这类断言全部失败（run 41845796959，14 个测试挂在这）。
+     *
+     * ARGB 拆解本来就是纯位运算，没有理由依赖框架类。这里自己拆，
+     * 行为与 `Color.argb` 完全一致，但在 JVM 上可测、也更快。
+     */
     private fun applyLevel(color: Int, level: Int): Int {
         if (color == 0) return color
-        val f = (level.coerceIn(0, 255)) / 255f
-        val a = Color.alpha(color)
-        val r = (Color.red(color) * f).toInt().coerceIn(0, 255)
-        val g = (Color.green(color) * f).toInt().coerceIn(0, 255)
-        val b = (Color.blue(color) * f).toInt().coerceIn(0, 255)
-        return Color.argb(a, r, g, b)
+        val f = level.coerceIn(0, 255) / 255f
+        val a = (color ushr 24) and 0xFF
+        val r = (((color shr 16) and 0xFF) * f).toInt().coerceIn(0, 255)
+        val g = (((color shr 8) and 0xFF) * f).toInt().coerceIn(0, 255)
+        val b = ((color and 0xFF) * f).toInt().coerceIn(0, 255)
+        return (a shl 24) or (r shl 16) or (g shl 8) or b
     }
 
     private fun applyStateConfig(id: Int) {
@@ -588,11 +605,53 @@ class LedEngine {
     /** 伪随机色相（星光/流星用）。 */
     private fun pseudoRandomHue(seed: Long): Int {
         val x = seed * 2862933555777941757L + 3037000493L
-        val hue = ((x ushr 33) % 360L).toInt()
-        return Color.HSVToColor(floatArrayOf(hue.toFloat(), 0.85f, 1f))
+        val hue = ((x ushr 33) % 360L).toFloat()
+        // 同 applyLevel：不用 Color.HSVToColor —— 它在 JVM 单测里是 stub，
+        // 恒返回 0，星光就永远算成黑色，测试与真机行为不一致。
+        return hsvToArgb(hue, 0.85f, 1f)
     }
 
-    private fun now(): Long = android.os.SystemClock.elapsedRealtime()
+    /**
+     * HSV → ARGB（纯 Kotlin 实现，不依赖 `android.graphics.Color`）。
+     *
+     * @param hDeg 色相 0~360（度）
+     * @param s    饱和度 0~1
+     * @param v    明度 0~1
+     * @return 不透明 ARGB（alpha = 255，与 `Color.HSVToColor` 一致）
+     */
+    private fun hsvToArgb(hDeg: Float, s: Float, v: Float): Int {
+        val h = (((hDeg % 360f) + 360f) % 360f) / 60f
+        val c = v * s
+        val x = c * (1f - kotlin.math.abs(h % 2f - 1f))
+        val m = v - c
+        val rgb = when {
+            h < 1f -> Triple(c, x, 0f)
+            h < 2f -> Triple(x, c, 0f)
+            h < 3f -> Triple(0f, c, x)
+            h < 4f -> Triple(0f, x, c)
+            h < 5f -> Triple(x, 0f, c)
+            else   -> Triple(c, 0f, x)
+        }
+        val r = ((rgb.first + m) * 255f).toInt().coerceIn(0, 255)
+        val g = ((rgb.second + m) * 255f).toInt().coerceIn(0, 255)
+        val b = ((rgb.third + m) * 255f).toInt().coerceIn(0, 255)
+        return (0xFF shl 24) or (r shl 16) or (g shl 8) or b
+    }
+
+    /**
+     * 时间源。
+     *
+     * 生产环境用单调时钟 `SystemClock.elapsedRealtime()`；单元测试把它换成
+     * 手动推进的假时钟，才能精确断言"按住 1.5 秒""闪 3 次共 1800ms"这类时序。
+     *
+     * 为什么必须可注入：`SystemClock` 在 JVM 单测里是 AGP 的 stub，**恒返回 0**。
+     * 那样 `buttonPress()` 记下的按下时刻就是 0，而 0 在旧实现里正是"没在按"
+     * 的哨兵值 —— 所有按键用例都静默退化成"没按下过"，时序断言全部失败
+     * （run 41845796959 里 14 个失败的大头）。
+     */
+    internal var clock: () -> Long = { android.os.SystemClock.elapsedRealtime() }
+
+    private fun now(): Long = clock()
 
     // ------------------------------------------------------------------ 内部类
 
@@ -617,8 +676,14 @@ class LedEngine {
         /** 有待确认的提醒 ⇒ 橙色呼吸 / 熄灭。 */
         var pending: Boolean = false
 
-        /** 按下的时刻；0 = 没在按 */
-        private var pressAt: Long = 0L
+        /**
+         * 按下的时刻；`null` = 没在按。
+         *
+         * ⚠️ **不要用 0 当哨兵**：`elapsedRealtime()` 开机瞬间就是 0，
+         * 假时钟的起点也是 0。用 0 表示"没在按"会让"t=0 按下"永远无效 ——
+         * 表现为单测里按键相关用例全部静默失败，且很难看出原因。
+         */
+        private var pressAt: Long? = null
 
         /** 本轮是否已经出过结果（confirmed / 已闪烁） */
         private var resolved: Boolean = false
@@ -641,18 +706,18 @@ class LedEngine {
         /**
          * 松开。
          *
-         * ⚠️ **无论走哪个分支，都必须把 `pressAt` 清零** ——
-         * 否则灯会一直停在"按住渐变"状态（pressAt != 0 时 render 永远画渐变），
+         * ⚠️ **无论走哪个分支，都必须把 `pressAt` 置回 null** ——
+         * 否则灯会一直停在"按住渐变"状态（pressAt 非 null 时 render 永远画渐变），
          * 表现为色带卡在天青色上不熄。老年人看着就是"灯坏了"。
          *
          * 所以这里统一在 finally 语义上清 pressAt，判定结果只影响"闪什么"。
          */
         fun release(t: Long) {
-            if (pressAt == 0L) return
-            if (resolved) { pressAt = 0L; return }
+            val down = pressAt ?: return
+            pressAt = null
+            if (resolved) return
 
-            val held = t - pressAt
-            pressAt = 0L
+            val held = t - down
             resolved = true
 
             if (held >= CONFIRM_HOLD_MS) {
@@ -670,26 +735,28 @@ class LedEngine {
             flashAt = t
         }
 
-        fun confirmed() {
+        fun confirmed(t: Long) {
             resolved = true
-            pressAt = 0L
+            pressAt = null
             flashColor = Led.Color.BUTTON_OK
             flashLeft = OK_FLASH_TIMES
-            flashAt = now()
+            flashAt = t
         }
 
-        fun acknowledged() = confirmed()
+        fun acknowledged(t: Long) = confirmed(t)
 
         fun render(t: Long): BandRender.Band {
             // ④ 结果闪烁优先
             if (flashLeft > 0) {
-                // 每次闪 300ms，间隔 300ms
-                val since = t - flashAt
-                val slot = since / 300L
-                if (slot >= flashLeft) {
+                // 一次闪 = 300ms 亮 + 300ms 灭 = 两个 300ms 半格。
+                // ⚠️ 计数单位必须是「半格」：`flashLeft` 数的是**次数**，
+                //    直接拿次数跟半格序号比，会把 3 次闪压缩成 2 次、900ms 就收尾
+                //    —— 老人看到的是"闪了两下"，与约定的"闪三下"不符。
+                val half = (t - flashAt) / 300L
+                if (half >= flashLeft * 2L) {
                     flashLeft = 0
                 } else {
-                    val on = (since % 600L) < 300L
+                    val on = half % 2L == 0L
                     return BandRender.Band.Solid(
                         color = applyLevel(flashColor, Led.Level.FULL),
                         alpha = if (on) 255 else 0
@@ -698,8 +765,13 @@ class LedEngine {
             }
 
             // ③ 按住期间：天青由暗变亮（进度条）
-            if (pressAt != 0L) {
-                val held = t - pressAt
+            //
+            // ⚠️ 只有**有待确认提醒**时才画。没有可确认的东西却给"按到了"的
+            //    正反馈，等于告诉老人"办成了"而实际什么都没发生 ——
+            //    这是最坏的一类欺骗（见类注释 ① 的说明）。
+            val down = pressAt
+            if (pending && down != null) {
+                val held = t - down
                 val p = (held.toFloat() / CONFIRM_HOLD_MS).coerceIn(0f, 1f)
                 // 从 BUTTON_RAMP_MIN 线性升到 FULL
                 val level = (Led.Level.BUTTON_RAMP_MIN +
