@@ -563,7 +563,10 @@ class LedEngine {
         val eff = Led.LedEffect.of(item.effect) ?: return
         slots.removeAll { it.prio == Led.Priority.EMOTION }
         slots.add(
-            Slot(Led.Priority.EMOTION, eff, item.color, item.level, item.periodMs.toLong(), 0L)
+            // periodMs 是 Int（配置表里就是 Int）；不要 .toLong()，
+            // 否则 Slot 构造第 5 个参数类型不匹配。
+            // 需要 Long 的地方由 Slot.periodOrDefault() 负责转换。
+            Slot(Led.Priority.EMOTION, eff, item.color, item.level, item.periodMs, 0L)
         )
     }
 
