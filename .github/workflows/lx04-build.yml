@@ -127,28 +127,42 @@ jobs:
 
       - name: 校验产物
         run: |
-          set -e
+          # ⚠️ 必须开 pipefail：下面几处都要 `... | head`，
+          #    默认的管道退出码是最后一个命令的（head 永远 0），
+          #    于是校验命令本身失败也会被判成成功 —— 这就是"假绿灯"。
+          set -eo pipefail
+
           # 用通配而不是写死文件名：签名配置不同，产物名会在
           # app-release.apk / app-release-unsigned.apk 之间变。
           APK=$(ls lx04/app/build/outputs/apk/release/*.apk | head -1)
           echo "产物: $APK"
           test -f "$APK"
 
+          # ⚠️ build-tools 目录可能有多个版本（34/35/...），
+          #    `"$ANDROID_HOME"/build-tools/*/apksigner` 会被展开成多个路径，
+          #    结果第一个路径被当命令、第二个被当参数 —— apksigner 报
+          #    "Unsupported command: .../apksigner"，校验形同虚设。
+          #    这里显式选版本号最高的那个。
+          BT=$(ls -d "$ANDROID_HOME"/build-tools/*/ | sort -V | tail -1)
+          echo "build-tools: $BT"
+
           # ⚠️ 必须验签：未签名的包在 CI 里"构建成功"，装到音箱上却直接失败。
           #    这一步就是拦这种"绿灯但没用"的产物。
-          "$ANDROID_HOME"/build-tools/*/apksigner verify --print-certs "$APK" \
-            | head -5 || {
-              echo "!!! APK 未签名，装不进设备"; exit 1; }
+          echo "--- 签名 ---"
+          "${BT}apksigner" verify --print-certs "$APK" | head -5
 
           # ⚠️ 必须校验 ABI：LX04 是 32 位 armeabi-v7a 用户空间，
           # 混入 arm64 的 .so 会在设备上加载失败（UnsatisfiedLinkError）。
           echo "--- 产物里的 so 架构 ---"
           unzip -l "$APK" | grep -E "\.so$" || echo "(本次无 so)"
-          unzip -l "$APK" | grep -E "lib/arm64" && {
-            echo "!!! 产物里混进了 arm64 —— LX04 是 32 位，会加载失败"; exit 1; } || true
-          echo "--- manifest 里的 HOME 声明 ---"
+          if unzip -l "$APK" | grep -qE "lib/arm64"; then
+            echo "!!! 产物里混进了 arm64 —— LX04 是 32 位，会加载失败"
+            exit 1
+          fi
+
           # 开机直达依赖 HOME intent-filter，缺了等于功能没做
-          "$ANDROID_HOME"/build-tools/*/aapt2 dump xmltree "$APK" --file AndroidManifest.xml \
+          echo "--- manifest 里的 HOME 声明 ---"
+          "${BT}aapt2" dump xmltree "$APK" --file AndroidManifest.xml \
             | grep -iE "category|HOME" | head -20
 
       - name: 上传产物
