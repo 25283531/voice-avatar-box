@@ -67,7 +67,8 @@ from .prompts import (
     reminder_context,
 )
 from .tools import (TOOL_DEFS, clock_mentions, execute_tool,
-                    is_whole_event_yes, medicine_names, pending_medicine_events)
+                    is_all_medicines_yes, is_whole_event_yes, medicine_names,
+                    pending_medicine_events)
 
 log = logging.getLogger(__name__)
 
@@ -613,12 +614,23 @@ _PENDING_REMINDER_HINT: Final[str] = (
     "具体药名：服务端有一张专门的匹配表，你猜的药名很可能猜错。\n"
     "· 清单里**不止一条**、老人只说「吃了」「确认」却没说是哪一条 → **必须先问清"
     "是哪一种**，不许把几条一起确认，更不许只凭「吃了」两个字替他挑一条。\n"
-    "· 清单里**只有一条**、老人说「吃了 / 确认 / 都吃了」→ **直接调用"
-    "confirm_reminder，medicine 留空**，不要追问「是哪一味」。服务端会整条确认，"
-    "并在记录里注明「未逐味点名」。"
-    "反复追问是本功能最大的投诉点（2026-11-04）：设备长按 3 秒后问的就是一个是非"
-    "问句，老人答「确认」却听到「您吃的是降压药还是降脂药」，再答「确认」还是同一"
-    "句 —— 问三轮一次都没落库，屏幕和指示灯一直挂着。\n"
+    "· 清单里**只有一条**、那条只挂**一味药**（或没登记药名）→ 老人说「吃了 /"
+    "确认」就直接调用 confirm_reminder，medicine 留空，不要再追问。\n"
+    "· 清单里**只有一条**、但那条挂着**两味以上**、老人只说「确认 / 吃了」→"
+    " **必须问清是哪一味**（「您吃的是降压药还是降脂药？」）。**绝对不许**把"
+    "几味药一起确认 —— 「确认」是回答一个是非问，不是在说两味都吃了，他很可能"
+    "只吃了其中一味。替他报全部 = 编造依从记录，家属会看到假数据、漏服告警也"
+    "不会响。这是医疗安全底线，宁可多问一句。\n"
+    "· 老人**明确说了「都吃了 / 两样都吃了 / 全部吃了」**→ 带"
+    " medicine=\"都吃了\" 调用 confirm_reminder，服务端整条确认并留痕。"
+    "这是他自己对\"全部\"的断言，可以直接记。\n"
+    "⚠️ 上面那条「必须问清是哪一味」曾经把老人坑惨过（2026-11-04 三次投诉）："
+    "当时服务端**根本不知道屏上挂着提醒**（实例被判超时后从待确认集合里掉了），"
+    "再加上「确认」两个字会掉进药名匹配表拿到 matched=false ⇒ 问三轮一次都没"
+    "落库，屏幕和指示灯一直挂着。**那两个洞已经在服务端修掉了**（待确认判据改成"
+    "屏幕口径、「确认」不再进匹配表），所以现在问一句「您吃的是降压药还是降脂药」"
+    "老人答一个词就能落地。**不要**因为当年那个投诉再把多味药整条确认放回来 ——"
+    "那是拿医疗安全换少问一句话。\n"
     "· 工具返回 ambiguous（候选药名）→ 把候选药名一个一个念给他听，让他挑一个，"
     "再带他挑的那个词重新调用。\n"
     "· 工具返回 matched=false → 复述一遍候选药名再问一次；**最多再问两轮**，"
@@ -769,27 +781,24 @@ def _reminded_schedule_label(device_pk: int) -> str:
 
 
 def _fallback_confirm_verdict(device_pk: int,
-                              whole_yes: bool = False) -> tuple[bool, str]:
+                              all_medicines: bool = False) -> tuple[bool, str]:
     """服务端兜底确认（模型漏调 confirm_reminder）能否下发；返回 (可否, 跳过原因)。
 
     判据必须与 ``tools._confirm_reminder`` 的候选集**完全一致**：直接复用
     ``pending_medicine_events`` / ``medicine_names``，不另写一份 SQL。两套判据
     迟早漂移，漂移的症状是「兜底确认了一条工具根本不会确认的提醒」。
 
-    ``whole_yes``（2026-11-04 加）：老人说的是「确认 / 都吃了」这类不点名某一味
-    的短应答。为 True 时**允许唯一候选挂多味药**，与 ``_confirm_reminder`` 的
-    新口径保持一致（那边的长注释解释了为什么）。
+    ``all_medicines``（2026-11-04 加在末尾）：老人有没有**明确说「都吃了」**。
+    只有它为真时，才允许唯一候选挂多味药 —— 与 ``_confirm_reminder`` 同一个
+    口径。只说「确认 / 吃了」**不算**：那是回答一个是非问，不是在说两味都吃了。
 
-    为什么原先收紧到「恰好 1 条候选 + 该条只有 1 味药」（2026-11-03）：兜底下发
-    的是**空参数**设备确认 —— 设备挑的是"当前正在响铃的那条"，服务端无从核对。
-    多条候选时它可能确认错的那条。这一条**现在仍然成立，一个字没松**：多条候选
-    永远拒绝，因为那才是"确认错提醒"的真实风险。
-
-    多味药那条松了，理由是它已经不再是"确认错对象"，只剩"粒度"问题，而粒度
-    问题在固件侧早就用同一个取舍解决了（``elder_bridge.cc`` 的
-    ``!CanStartDialog()`` 兜底直接确认整条，注释：「信息缺失不能让老人确认
-    不了」）。服务端比设备更严 = 按键的可靠性取决于网络与设备状态，而用户的
-    要求是「按键一定能确认」。
+    为什么收紧到「恰好 1 条候选 + 该条只有 1 味药」（2026-11-03），以及为什么
+    多味药那条只在"明确说都吃了"时松（2026-11-04 用户裁定「医疗安全不容忽视」）：
+    兜底下发的是**空参数**设备确认 —— 设备挑的是"当前正在响铃的那条"，服务端
+    无从核对。多条候选时它可能确认错的那条，所以**多条永远拒绝**；单条但挂多味
+    药时，设备回执的 CONFIRMED 不带药名，``routers/device_api.report_event``
+    会整条置 CONFIRMED ⇒ 只吃了 1 味被记成 4 味全吃，依从率虚高、漏服告警失效。
+    这个风险**没有**因为用户催得急就消失，所以只留"老人本人说了都吃了"这一个口子。
     """
     try:
         with SessionLocal() as db:
@@ -800,9 +809,10 @@ def _fallback_confirm_verdict(device_pk: int,
                 return False, (f"有 {len(rows)} 条候选待确认，"
                                "设备无法确定老人说的是哪条")
             names = medicine_names(rows[0][1])
-            if len(names) > 1 and not whole_yes:
+            if len(names) > 1 and not all_medicines:
                 return False, (f"唯一候选挂着 {len(names)} 味药"
-                               f"（{'、'.join(names)}），且老人没说是哪一味")
+                               f"（{'、'.join(names)}），老人没说是哪一味"
+                               "（只说「确认」不等于「都吃了」）")
             return True, ""
     except Exception as exc:  # noqa: BLE001  查库失败就不兜底，绝不瞎确认
         return False, f"查询待确认提醒失败 {type(exc).__name__}: {exc}"
@@ -2823,16 +2833,17 @@ class VoiceSession:
         不满足就只打一条 log，交给模型按 ``_PENDING_REMINDER_HINT`` 的追问
         纪律继续问。
 
-        ``utterance``（2026-11-04 加在末尾）：用来判"这句是不是整条确认
-        （确认 / 都吃了）"。为真时允许唯一候选挂多味药 —— 与
-        ``_confirm_reminder`` 同一个口径，理由见那边的长注释。
+        ``utterance``（2026-11-04 加在末尾）：用来判"老人有没有明确说都吃了"。
+        只有明确说「都吃了 / 两样都吃了」时，才允许唯一候选挂多味药 —— 与
+        ``_confirm_reminder`` 同一个口径。只说「确认 / 吃了」**不算**
+        （医疗安全：那是回答一个是非问，不是在说两味都吃了）。
         """
         if not (self._pending_reminder and self._confirm_candidate):
             return
         if any(t.get("name") == "confirm_reminder" for t in tool_trace):
             return
         allowed, why = _fallback_confirm_verdict(
-            self.dev.id, whole_yes=is_whole_event_yes(utterance))
+            self.dev.id, all_medicines=is_all_medicines_yes(utterance))
         if not allowed:
             log.info("[%s] 兜底确认跳过：%s（交给模型按追问纪律继续问）",
                      self.session_id, why)

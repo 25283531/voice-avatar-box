@@ -490,11 +490,10 @@ def t_recent_confirm() -> None:
     finally:
         db.close()
 
-
 def t_whole_event_confirm() -> None:
-    """「确认」两个字必须能落库 —— 2026-11-04 用户第三次发火的根因。
+    """「确认」必须能落库，但**不许**替老人报"都吃了" —— 医疗安全底线。
 
-    现场（生产库 + 日志逐行核对）：
+    现场（2026-11-04 生产库 + 日志逐行核对）：
 
       ev=125 rmd=5「测试」 due=12:43 fired=16:19:26 state=3(MISSED)
               conf_at=None note='timeout' meds=['降压药','降脂药']
@@ -514,36 +513,60 @@ def t_whole_event_confirm() -> None:
          也返回空 ⇒ 设备问「您刚才已经服用过降压药了吗？」，老人答「确认」，
          服务端当成普通闲聊。
 
+    **但用户明确裁定（2026-11-04）：「第4条必须问清楚。医疗安全不容忽视。」**
+    所以「确认」只解决 B（让这句话被当成一次确认），**不**解决"哪几味"：
+    挂两味药时只答「确认」必须转追问，只有明确说「都吃了」才整条确认。
+
     这里钉死的判据（每条都要有负向对照，否则"放宽"会变成"什么都确认"）：
       1. MISSED 且屏幕窗口内 ⇒ 算待确认；超出 4 小时 ⇒ 不算；
-      2. 「确认 / 都吃了」⇒ 唯一候选整条确认，并**留痕**；
-      3. 多条候选 ⇒ 仍然拒绝（"确认错提醒"是真实风险，一个字不许松）；
-      4. 「好的 / 行 / 知道了 / 好像吃了」⇒ 一律不算确认。
+      2. 「确认」+ 挂两味药 ⇒ **need_detail**，库里 state 不变；
+      3. 「都吃了」+ 挂两味药 ⇒ 整条确认，并**留痕**；
+      4. 「确认」+ 只挂一味药 ⇒ 整条确认（没什么可问的）；
+      5. 多条候选 ⇒ 一律拒绝（"确认错提醒"是真实风险，一个字不许松）；
+      6. 「好的 / 行 / 知道了 / 好像吃了」⇒ 一律不算确认。
     """
-    print("\n[9] 「确认」整条确认 + MISSED 仍在屏幕窗口内（2026-11-04 根因）")
+    print("\n[9] 「确认」能落库 / 多味药必须问清 / MISSED 仍在屏幕窗口内")
     from datetime import timedelta
 
     from app import models
     from app.db import SessionLocal, init_db
     from app.schedule import local_now
     from app.voice.tools import (_CONFIRM_WINDOW_AFTER_MIN, _confirm_reminder,
-                                 is_whole_event_yes, medicine_names,
-                                 pending_medicine_events)
+                                 is_all_medicines_yes, is_whole_event_yes,
+                                 medicine_names, pending_medicine_events)
     from app.voice import session as vs
 
-    # ---- ① 措辞判据：正向 ----
+    # ---- ① 措辞判据：这是一次「确认」 ----
     for word in ("确认。", "确认", "对", "对的", "是的", "嗯", "没错", "吃了",
                  "吃过了", "都吃了", "全都吃了", "全部吃了", "两样都吃了",
                  "两种都吃了", "我已经全部吃过了"):
-        check(f"「{word}」判为整条确认", is_whole_event_yes(word) is True)
+        check(f"「{word}」判为确认措辞", is_whole_event_yes(word) is True)
 
-    # ---- ② 措辞判据：负向（放宽最容易在这里出事）----
+    # ---- ② 措辞判据：这是「都吃了」（比 ① 严，是它的真子集）----
+    for word in ("都吃了", "都吃过了", "全都吃了", "全部吃了", "两样都吃了",
+                 "两种都吃了", "两味都吃了", "一起吃了"):
+        check(f"「{word}」判为「都吃了」", is_all_medicines_yes(word) is True)
+
+    # ---- ③ 关键负向：「确认 / 吃了」**不是**「都吃了」----
+    # 这一组一旦变红，说明有人把两层判据合并了 —— 那就是替老人谎报服药。
+    for word in ("确认", "确认。", "确定", "对", "对的", "是的", "嗯", "没错",
+                 "吃了", "吃过了", "吃完了", "已经吃了", "喝过了"):
+        check(f"★「{word}」**不算**「都吃了」（不能整条确认多味药）",
+              is_all_medicines_yes(word) is False)
+
+    # ---- ④ 两层判据的包含关系必须是真子集 ----
+    from app.voice.tools import _ALL_MEDICINES_YES, _WHOLE_YES
+    check("★ _ALL_MEDICINES_YES 是 _WHOLE_YES 的真子集",
+          _ALL_MEDICINES_YES < _WHOLE_YES,
+          f"差集={_ALL_MEDICINES_YES - _WHOLE_YES}")
+
+    # ---- ⑤ 措辞判据：负向（放宽最容易在这里出事）----
     for word in ("好的", "行", "知道了", "好像吃了", "应该吃了吧", "还没吃",
                  "你确认一下", "我确认一下", "降压药吃了", "",
                  "我刚才吃完饭把降压药吃了还有那个降脂药也吃了"):
-        check(f"「{word}」不算整条确认", is_whole_event_yes(word) is False)
+        check(f"「{word}」不算确认措辞", is_whole_event_yes(word) is False)
 
-    # ---- ③ 屏幕窗口常量必须与固件同源 ----
+    # ---- ⑥ 屏幕窗口常量必须与固件同源 ----
     check("过期后窗口是 4 小时（= 固件 ui.c 的 ELDER_UI_REMINDER_HOLD_US）",
           _CONFIRM_WINDOW_AFTER_MIN == 240, f"{_CONFIRM_WINDOW_AFTER_MIN}")
 
@@ -572,12 +595,24 @@ def t_whole_event_confirm() -> None:
         db.add(rule)
         db.commit()
 
-        def add_ev(state: int, due_min_ago: int,
+        # 只挂一味药的规则，用来验「没什么可问的就直接确认」。
+        rule1 = models.Reminder(
+            device_id=pk, title="单味药",
+            rtype=int(models.ReminderType.MEDICINE),
+            require_confirm=True, enabled=True,
+            times_of_day='["12:44"]', weekdays="[]", month_days="[]",
+            medicines=[{"name": "阿司匹林", "dose": "1片"}],
+            tz="Asia/Shanghai", tz_offset_min=0,
+        )
+        db.add(rule1)
+        db.commit()
+
+        def add_ev(rule_obj, state: int, due_min_ago: int,
                    fired_min_ago: int | None = None,
                    note: str = "") -> int:
             now = local_now()
             ev = models.ReminderEvent(
-                reminder_id=rule.id, device_id=pk,
+                reminder_id=rule_obj.id, device_id=pk,
                 due_at=now - timedelta(minutes=due_min_ago),
                 fired_at=(None if fired_min_ago is None
                           else now - timedelta(minutes=fired_min_ago)),
@@ -588,78 +623,9 @@ def t_whole_event_confirm() -> None:
             db.commit()
             return int(ev.id)
 
-        # ---- ④ 核心：MISSED + 屏幕窗口内 ⇒ 仍是待确认候选 ----
-        ev_id = add_ev(models.EventState.MISSED, 60, 40)
-        rows = pending_medicine_events(db, pk)
-        check("★ MISSED 且 4 小时内 ⇒ 仍算待确认（这就是 ev=125 那条）",
-              [int(e.id) for e, _ in rows] == [ev_id],
-              f"rows={[(e.id, e.state) for e, _ in rows]}")
-        check("★ 待确认清单非空 ⇒ system 里会注入提醒（模型才知道要调工具）",
-              bool(vs._pending_reminder_label(pk)),
-              f"label={vs._pending_reminder_label(pk)!r}")
-        label = vs._pending_reminder_label(pk)
-        check("清单里两味药都列出来了（逐味列出，不是「两种药」）",
-              all(n in label for n in medicine_names(rule)), f"label={label!r}")
-
-        # ---- ⑤ 负向：超出 4 小时 ⇒ 屏幕早收了，不再算待确认 ----
-        db.query(models.ReminderEvent).delete()
-        db.commit()
-        add_ev(models.EventState.MISSED, 5 * 60, 5 * 60)
-        check("★ MISSED 且超出 4 小时 ⇒ 不算待确认（屏幕已经收了）",
-              pending_medicine_events(db, pk) == [])
-
-        # ---- ⑥ 负向：CONFIRMED / SKIPPED 永远不算待确认 ----
-        db.query(models.ReminderEvent).delete()
-        db.commit()
-        add_ev(models.EventState.CONFIRMED, 30, 30)
-        check("CONFIRMED 不算待确认",
-              pending_medicine_events(db, pk) == [])
-        db.query(models.ReminderEvent).delete()
-        db.commit()
-        add_ev(models.EventState.SKIPPED, 30, 30)
-        check("SKIPPED 不算待确认", pending_medicine_events(db, pk) == [])
-
-        # ---- ⑦ 兜底判据：多味药要「整条确认措辞」才放行 ----
-        db.query(models.ReminderEvent).delete()
-        db.commit()
-        add_ev(models.EventState.MISSED, 60, 40)
-        ok_plain, why_plain = vs._fallback_confirm_verdict(pk, whole_yes=False)
-        check("★ 多味药 + 没点名 ⇒ 兜底仍拒绝（不许替老人挑）",
-              ok_plain is False and "味药" in why_plain, f"why={why_plain!r}")
-        ok_yes, why_yes = vs._fallback_confirm_verdict(pk, whole_yes=True)
-        check("★ 多味药 + 「确认」整条确认措辞 ⇒ 兜底放行",
-              ok_yes is True, f"why={why_yes!r}")
-
-        # ---- ⑧ 多条候选 ⇒ 兜底一律拒绝（这一条一个字都不许松）----
-        rule2 = models.Reminder(
-            device_id=pk, title="第二条",
-            rtype=int(models.ReminderType.MEDICINE),
-            require_confirm=True, enabled=True,
-            times_of_day='["12:50"]', weekdays="[]", month_days="[]",
-            medicines=[{"name": "阿司匹林", "dose": "1片"}],
-            tz="Asia/Shanghai", tz_offset_min=0,
-        )
-        db.add(rule2)
-        db.commit()
-        ev2 = models.ReminderEvent(
-            reminder_id=rule2.id, device_id=pk,
-            due_at=local_now() - timedelta(minutes=50),
-            fired_at=local_now() - timedelta(minutes=45),
-            state=int(models.EventState.MISSED),
-            tz="Asia/Shanghai", tz_offset_min=0,
-        )
-        db.add(ev2)
-        db.commit()
-        ok_multi, why_multi = vs._fallback_confirm_verdict(pk, whole_yes=True)
-        check("★ 两条候选 + 整条确认措辞 ⇒ 兜底仍拒绝（确认错对象是真风险）",
-              ok_multi is False and "2 条" in why_multi, f"why={why_multi!r}")
-
-        # ---- ⑨ 工具路径：medicine="确认" ⇒ 整条确认并留痕 ----
-        db.query(models.ReminderEvent).delete()
-        db.query(models.Reminder).filter(
-            models.Reminder.id == rule2.id).delete()
-        db.commit()
-        ev_id = add_ev(models.EventState.MISSED, 60, 40, note="timeout")
+        def clear() -> None:
+            db.query(models.ReminderEvent).delete()
+            db.commit()
 
         calls: list[tuple] = []
 
@@ -669,8 +635,102 @@ def t_whole_event_confirm() -> None:
                     "result": {"content": [{"type": "text", "text": "true"}],
                                "isError": False}}
 
+        # ---- ⑦ 核心：MISSED + 屏幕窗口内 ⇒ 仍是待确认候选 ----
+        clear()
+        ev_id = add_ev(rule, models.EventState.MISSED, 60, 40)
+        rows = pending_medicine_events(db, pk)
+        check("★ MISSED 且 4 小时内 ⇒ 仍算待确认（这就是 ev=125 那条）",
+              [int(e.id) for e, _ in rows] == [ev_id],
+              f"rows={[(e.id, e.state) for e, _ in rows]}")
+        label = vs._pending_reminder_label(pk)
+        check("★ 待确认清单非空 ⇒ system 里会注入提醒（模型才知道要调工具）",
+              bool(label), f"label={label!r}")
+        check("清单里两味药都列出来了（逐味列出，不是「两种药」）",
+              all(n in label for n in medicine_names(rule)), f"label={label!r}")
+
+        # ---- ⑧ 负向：超出 4 小时 ⇒ 屏幕早收了，不再算待确认 ----
+        clear()
+        add_ev(rule, models.EventState.MISSED, 5 * 60, 5 * 60)
+        check("★ MISSED 且超出 4 小时 ⇒ 不算待确认（屏幕已经收了）",
+              pending_medicine_events(db, pk) == [])
+
+        # ---- ⑨ 负向：CONFIRMED / SKIPPED 永远不算待确认 ----
+        clear()
+        add_ev(rule, models.EventState.CONFIRMED, 30, 30)
+        check("CONFIRMED 不算待确认", pending_medicine_events(db, pk) == [])
+        clear()
+        add_ev(rule, models.EventState.SKIPPED, 30, 30)
+        check("SKIPPED 不算待确认", pending_medicine_events(db, pk) == [])
+
+        # ---- ⑩ 兜底判据：多味药只有「都吃了」才放行 ----
+        clear()
+        add_ev(rule, models.EventState.MISSED, 60, 40)
+        ok_plain, why_plain = vs._fallback_confirm_verdict(pk, all_medicines=False)
+        check("★ 多味药 + 只说「确认」⇒ 兜底拒绝（医疗安全：不许替老人报全部）",
+              ok_plain is False and "味药" in why_plain, f"why={why_plain!r}")
+        ok_yes, why_yes = vs._fallback_confirm_verdict(pk, all_medicines=True)
+        check("★ 多味药 + 明确「都吃了」⇒ 兜底放行", ok_yes is True,
+              f"why={why_yes!r}")
+
+        # ---- ⑪ 多条候选 ⇒ 兜底一律拒绝（这一条一个字都不许松）----
+        rule2 = models.Reminder(
+            device_id=pk, title="第二条",
+            rtype=int(models.ReminderType.MEDICINE),
+            require_confirm=True, enabled=True,
+            times_of_day='["12:50"]', weekdays="[]", month_days="[]",
+            medicines=[{"name": "二甲双胍", "dose": "0.5g"}],
+            tz="Asia/Shanghai", tz_offset_min=0,
+        )
+        db.add(rule2)
+        db.commit()
+        add_ev(rule2, models.EventState.MISSED, 50, 45)
+        ok_multi, why_multi = vs._fallback_confirm_verdict(pk, all_medicines=True)
+        check("★ 两条候选 + 「都吃了」⇒ 兜底仍拒绝（确认错对象是真风险）",
+              ok_multi is False and "2 条" in why_multi, f"why={why_multi!r}")
+        db.query(models.Reminder).filter(
+            models.Reminder.id == rule2.id).delete()
+        clear()
+
+        # ---- ⑫ 工具路径：「确认」+ 两味药 ⇒ **必须转追问**，不许落库 ----
+        ev_id = add_ev(rule, models.EventState.MISSED, 60, 40, note="timeout")
         r = _confirm_reminder(db, pk, fake_ok, {"medicine": "确认"})
-        check("★ medicine=「确认」⇒ 确认成功（不再答 matched=false）",
+        check("★ medicine=「确认」+ 两味药 ⇒ confirmed 不为 True",
+              r.get("confirmed") is not True, f"{r!r}")
+        check("★ 结果是 need_detail（让模型问是哪一味）",
+              r.get("need_detail") is True, f"{r!r}")
+        check("★ 候选药名原样回给模型（它才能念给老人听）",
+              set(r.get("candidates") or []) == {"降压药", "降脂药"}, f"{r!r}")
+        check("话术里点名了两味药、并要求问清",
+              "降压药" in str(r.get("message", ""))
+              and "降脂药" in str(r.get("message", "")),
+              f"{r.get('message')!r}")
+        check("★ 一个字都不许落库：库里的 state 仍是 MISSED",
+              int(db.get(models.ReminderEvent, ev_id).state)
+              == int(models.EventState.MISSED),
+              f"state={db.get(models.ReminderEvent, ev_id).state}")
+        check("★ 没确认就不许通知设备收屏（屏幕还得挂着让他回答）",
+              calls == [], f"calls={calls}")
+
+        # ---- ⑬ 「确认」+ 只挂一味药 ⇒ 直接确认（没什么可问的）----
+        clear()
+        ev1 = add_ev(rule1, models.EventState.MISSED, 60, 40)
+        r = _confirm_reminder(db, pk, fake_ok, {"medicine": "确认"})
+        check("★ 单味药 + 「确认」⇒ 直接确认", r.get("confirmed") is True, f"{r!r}")
+        db.expire_all()
+        check("单味药确认后 state 落 CONFIRMED",
+              int(db.get(models.ReminderEvent, ev1).state)
+              == int(models.EventState.CONFIRMED))
+        check("单味药不需要「整条确认」留痕（本来就只有一味）",
+              models.WHOLE_EVENT_CONFIRM_TAG
+              not in str(db.get(models.ReminderEvent, ev1).note or ""),
+              f"note={db.get(models.ReminderEvent, ev1).note!r}")
+
+        # ---- ⑭ 「都吃了」+ 两味药 ⇒ 整条确认并留痕 ----
+        clear()
+        calls.clear()
+        ev_id = add_ev(rule, models.EventState.MISSED, 60, 40, note="timeout")
+        r = _confirm_reminder(db, pk, fake_ok, {"medicine": "都吃了"})
+        check("★ medicine=「都吃了」+ 两味药 ⇒ 确认成功",
               r.get("confirmed") is True, f"{r!r}")
         db.expire_all()
         ev = db.get(models.ReminderEvent, ev_id)
@@ -681,19 +741,20 @@ def t_whole_event_confirm() -> None:
               set(ev.confirmed_medicines or []) == {"降压药", "降脂药"},
               f"{ev.confirmed_medicines!r}")
         check("★ note 里留痕「整条确认（未逐味点名）」—— 不许假装是逐味确认",
-              "整条确认" in str(ev.note or ""), f"note={ev.note!r}")
+              models.WHOLE_EVENT_CONFIRM_TAG in str(ev.note or ""),
+              f"note={ev.note!r}")
         check("★ 留痕**追加**而不是覆盖（timeout 是审计线索，抹掉就查不出"
               "这条曾经超时升级过）",
-              "timeout" in str(ev.note or "") and "整条确认" in str(ev.note or ""),
+              "timeout" in str(ev.note or "")
+              and models.WHOLE_EVENT_CONFIRM_TAG in str(ev.note or ""),
               f"note={ev.note!r}")
         check("确认后通知了设备收屏（server_id = reminders.id）",
               calls and calls[0][1] == {"server_id": int(rule.id)},
               f"calls={calls}")
 
-        # ---- ⑩ 负向：多味药 + 「好像吃了」⇒ 不许整条确认 ----
-        db.query(models.ReminderEvent).delete()
-        db.commit()
-        ev_id2 = add_ev(models.EventState.MISSED, 60, 40)
+        # ---- ⑮ 负向：多味药 + 「好像吃了」⇒ 不许整条确认 ----
+        clear()
+        ev_id2 = add_ev(rule, models.EventState.MISSED, 60, 40)
         r2 = _confirm_reminder(db, pk, fake_ok, {"medicine": "好像吃了"})
         check("★ 「好像吃了」不许整条确认", r2.get("confirmed") is not True,
               f"{r2!r}")
@@ -702,15 +763,21 @@ def t_whole_event_confirm() -> None:
               int(db.get(models.ReminderEvent, ev_id2).state)
               != int(models.EventState.CONFIRMED))
 
-        # ---- ⑪ 接线：_run_turn 的 _confirm_candidate 必须用上新判据 ----
+        # ---- ⑯ 接线：_run_turn / 兜底 必须用上新判据 ----
         src = inspect.getsource(vs.VoiceSession._run_turn)
         check("★ _run_turn 的确认判据用上了 is_whole_event_yes",
               "is_whole_event_yes(" in src, "判据没接上 ⇒ 「确认」永远不落库")
         src_fb = inspect.getsource(vs.VoiceSession._maybe_confirm_fallback)
-        check("★ 兜底确认把整轮原话传给了判据",
-              "is_whole_event_yes(utterance)" in src_fb)
+        check("★ 兜底确认用的是 is_all_medicines_yes（不是 is_whole_event_yes）",
+              "is_all_medicines_yes(utterance)" in src_fb
+              and "is_whole_event_yes(utterance)" not in src_fb,
+              "用错判据 ⇒ 「确认」也会整条确认多味药，医疗安全事故")
+        src_tool = inspect.getsource(_confirm_reminder)
+        check("★ 工具路径也要求 all_medicines 才整条确认",
+              "all_medicines" in src_tool
+              and "if len(names_here) <= 1 or all_medicines:" in src_tool)
 
-        # ---- ⑫ 设备回执不许抹掉留痕 / 不许把已确认翻回去 ----
+        # ---- ⑰ 设备回执不许抹掉留痕 / 不许把已确认翻回去 ----
         #
         # 固件每条 CONFIRMED 回执都带 note="confirmed"（sync.c），而
         # report_event 的 note 是**覆盖**语义 ⇒ 不挡的话上面刚写下的
@@ -720,17 +787,17 @@ def t_whole_event_confirm() -> None:
         from app.routers.device_api import report_event
         from app.schemas import EventReportIn
 
-        # 重新造一条"刚被整条确认过"的实例：上面 ⑩ 把事件表清空过，
-        # ``ev_id`` 会被 SQLite 重新分配给新行（自增列在空表上从 1 起），
-        # 直接复用会指到一条没有留痕的实例上 —— 那样断言红得毫无意义。
-        db.query(models.ReminderEvent).delete()
-        db.commit()
-        ev_id = add_ev(models.EventState.MISSED, 60, 40, note="timeout")
-        _confirm_reminder(db, pk, fake_ok, {"medicine": "确认"})
+        # 重新造一条"刚被整条确认过"的实例：上面清过表，``ev_id`` 会被
+        # SQLite 重新分配给新行（自增列在空表上从 1 起），直接复用会指到
+        # 一条没有留痕的实例上 —— 那样断言红得毫无意义。
+        clear()
+        ev_id = add_ev(rule, models.EventState.MISSED, 60, 40, note="timeout")
+        _confirm_reminder(db, pk, fake_ok, {"medicine": "都吃了"})
         db.expire_all()
         ev = db.get(models.ReminderEvent, ev_id)
         check("（前置）这条实例已带上留痕",
-              "整条确认" in str(ev.note or ""), f"note={ev.note!r}")
+              models.WHOLE_EVENT_CONFIRM_TAG in str(ev.note or ""),
+              f"note={ev.note!r}")
         due = ev.due_at
         report_event(EventReportIn(reminder_id=int(rule.id), due_at=due,
                                    state=int(models.EventState.CONFIRMED),
@@ -740,7 +807,8 @@ def t_whole_event_confirm() -> None:
         db.expire_all()
         ev = db.get(models.ReminderEvent, ev_id)
         check("★ 设备 CONFIRMED 回执的 note 不覆盖「整条确认」留痕",
-              "整条确认" in str(ev.note or ""), f"note={ev.note!r}")
+              models.WHOLE_EVENT_CONFIRM_TAG in str(ev.note or ""),
+              f"note={ev.note!r}")
 
         report_event(EventReportIn(reminder_id=int(rule.id), due_at=due,
                                    state=int(models.EventState.MISSED),
@@ -752,7 +820,8 @@ def t_whole_event_confirm() -> None:
               int(ev.state) == int(models.EventState.CONFIRMED),
               f"state={ev.state}")
         check("★ 被忽略的那条回执也不许改 note",
-              "整条确认" in str(ev.note or ""), f"note={ev.note!r}")
+              models.WHOLE_EVENT_CONFIRM_TAG in str(ev.note or ""),
+              f"note={ev.note!r}")
     finally:
         db.close()
 
