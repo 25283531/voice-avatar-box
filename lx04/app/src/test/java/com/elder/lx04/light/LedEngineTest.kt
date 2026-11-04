@@ -268,6 +268,51 @@ class LedEngineTest {
     // ------------------------------------------------------------ 对话四态
 
     @Test
+    fun `表情灯效不被待机默认值盖掉`() {
+        val f = Fixture()
+        f.e.defaultConfig()
+        // HAPPY 走"状态灯效表"里的同名项，落在 EMOTION 槽位上
+        f.e.setEmotion(Led.Emotion.HAPPY)
+
+        val band = f.at(1000L).left()
+        assertTrue(
+            "表情必须是常亮，不能被待机的闪烁星光顶掉 —— " +
+                "否则 setEmotion(HAPPY/SAD/ANGRY) 就是死代码，老人高兴难过时灯毫无变化",
+            band is BandRender.Band.Solid
+        )
+        val c = (band as BandRender.Band.Solid).color
+        val r = (c shr 16) and 0xFF
+        val g = (c shr 8) and 0xFF
+        val b = c and 0xFF
+        assertTrue("HAPPY 应是金色（R>G>B），实际 #%06X".format(c and 0xFFFFFF), r > g && g > b)
+    }
+
+    @Test
+    fun `确认成功正好闪3次`() {
+        val f = Fixture()
+        f.e.buttonPending(true)
+        f.e.buttonPress(0L)
+        f.e.buttonRelease(LedEngine.CONFIRM_HOLD_MS)
+        f.e.buttonConfirmed(LedEngine.CONFIRM_HOLD_MS)
+
+        val t0 = LedEngine.CONFIRM_HOLD_MS
+        var rises = 0
+        var prevOn = false
+        // 逐 10ms 采样，数"由灭到亮"的上升沿
+        for (t in t0..(t0 + 1800L) step 10L) {
+            val band = f.at(t).right()
+            val on = band is BandRender.Band.Solid && band.alpha == 255
+            if (on && !prevOn) rises++
+            prevOn = on
+        }
+        assertEquals(
+            "约定的「闪 3 次」必须真的是 3 次 —— 数错单位会变成 2 次，老人以为没按成",
+            3,
+            rises
+        )
+    }
+
+    @Test
     fun `对话四态互斥切换不残留`() {
         val f = Fixture()
         f.e.setUiState(Led.UiState.LISTENING)

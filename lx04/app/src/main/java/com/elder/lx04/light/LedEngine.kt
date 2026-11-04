@@ -379,13 +379,27 @@ class LedEngine {
         // 状态灯关 ⇒ 平时完全不发光
         if (!statusLightEnabled) return BandRender.Band.Off
 
-        // nag 节奏（提醒的红闪）
+        // nag 节奏（提醒的红闪）。顺序与固件一致：nag 压过普通灯效
+        // （rgb.c: `if (has_nag) c = nag_color; else if (fx) c = fx_pixel(...)`）。
         if (nagActive && nagInFlashWindow(t)) {
             return renderEffect(
                 Slot(Led.Priority.REMINDER, Led.LedEffect.BLINK_FAST,
                     Led.Color.REMINDER, Led.Level.FULL, 0, 0L),
                 t
             )
+        }
+
+        // 显式 EMOTION 槽位**优先于**四态的默认灯效。
+        //
+        // ⚠️ 这一段是固件语义的核心，缺了它 `setEmotion(HAPPY/SAD/ANGRY)` 就是死代码：
+        //    表情走 applyStateConfig() 往 EMOTION 槽位里写，而下面的 `when (uiState)`
+        //    不看槽位、只按 uiState 出默认灯效 ⇒ 老人高兴/难过/生气时灯毫无变化。
+        //    固件里根本没有这条"默认灯效"分支：`set_ui_state()` 自己就是往 EMOTION
+        //    槽位写一条请求（rgb.c: request_state_at(ELDER_RGB_PRIO_EMOTION, st)），
+        //    槽位是唯一真源。这里保留 when 分支只是为了让"没请求过任何灯效"时也有
+        //    合理的默认值（比如刚启动、配置还没下发）。
+        slots.firstOrNull { it.prio == Led.Priority.EMOTION }?.let {
+            return renderEffect(it, t)
         }
 
         // 对话四态
