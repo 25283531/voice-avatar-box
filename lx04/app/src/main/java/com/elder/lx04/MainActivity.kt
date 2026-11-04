@@ -509,6 +509,73 @@ class MainActivity : Activity() {
         }
     }
 
+    // ------------------------------------------------------------------ 麦克风自检
+
+    /**
+     * 麦克风自检 —— 不开 WebSocket，纯本地验证"能不能录到声音"。
+     *
+     * ## 为什么需要它
+     *
+     * LX04 上常驻着 `MiVpmService`（小爱唤醒，init 服务 `mivpm`），
+     * 它一直挂在 `AudioIn_1E` 上录音（`dumpsys media.audio_flinger` 里
+     * `Standby: no`）。我们的 AudioRecord 能不能和它**同时**打开，
+     * 取决于 MTK HAL 允不允许同源共享 —— 这是整条语音链路上
+     * 唯一一个"猜不出来、只能试"的点。
+     *
+     * 如果打不开，表现为 `AudioRecord` state 不是 INITIALIZED、
+     * 或 `startRecording` 后读回来的全是 0。这两种情况在这里都能看出来。
+     *
+     * ## 怎么读日志
+     *
+     * 每 10 帧（0.6 秒）打一行：
+     *   · `rms` 恒为 0        → 录到的是静音，麦克风没真给我们
+     *   · `rms` 有值但很小     → 通路通了，只是环境安静（正常）
+     *   · `floor` 跟着 `rms` 走 → 噪声底跟踪在工作
+     *   · `speech=true`        → VAD 判到人声（对着音箱说话时）
+     *
+     * 用法：`adb shell am broadcast -a com.elder.lx04.DEBUG --es cmd mic_test`
+     */
+    private fun runMicTest() {
+        if (sending) {
+            Log.w(TAG, "mic_test 忽略 —— 正在对话中")
+            return
+        }
+        screen.setHint("麦克风自检中（5 秒）…")
+        var frames = 0
+        var speechFrames = 0
+        var maxRms = 0f
+
+        val cap = AudioCapture { _, info ->
+            frames++
+            if (info.isSpeech) speechFrames++
+            if (info.rms > maxRms) maxRms = info.rms
+            if (frames % 10 == 0) {
+                Log.i(
+                    TAG,
+                    "mic[$frames] rms=${"%.0f".format(info.rms)} " +
+                        "floor=${"%.0f".format(info.noiseFloor)} " +
+                        "gain=${"%.2f".format(info.gain)} speech=${info.isSpeech}"
+                )
+            }
+        }
+        if (!cap.start()) {
+            Log.e(TAG, "mic_test: 采集启动失败 —— 麦克风被占用（多半是 MiVpmService）")
+            screen.setHint("麦克风打不开：被小爱占用")
+            return
+        }
+        scope.launch {
+            delay(5_000)
+            cap.stop()
+            val verdict = when {
+                frames == 0 -> "一帧都没读到 —— 采集链路断了"
+                maxRms < 1f -> "读到了 $frames 帧但全是 0 —— 麦克风没真给我们"
+                else -> "正常：$frames 帧，语音帧 $speechFrames，峰值 rms=${"%.0f".format(maxRms)}"
+            }
+            Log.i(TAG, "mic_test 结果：$verdict")
+            screen.setHint("自检：$verdict")
+        }
+    }
+
     // ------------------------------------------------------------------ 调试入口
 
     private val debugReceiver = object : BroadcastReceiver() {
@@ -527,6 +594,7 @@ class MainActivity : Activity() {
         when (cmd) {
             "talk" -> beginListening()
             "stop_talk" -> endListening()
+            "mic_test" -> runMicTest()
 
             "med_pending" -> {
                 onReminderPending(true)

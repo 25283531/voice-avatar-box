@@ -58,6 +58,17 @@ class MainScreen(private val context: Context) {
     private val userText: TextView
     private val deviceText: TextView
 
+    /**
+     * 底部状态提示（小字）。
+     *
+     * ⚠️ 它**不能**和激活页的说明文字共用同一个 TextView。
+     *    原先 `setHint()` 直接写 `activationHint`，而激活覆盖层在绑定成功后
+     *    会被隐藏 —— 于是"已连接"、"连不上服务器：xxx"、"麦克风打不开"
+     *    这些最需要看到的提示，全写进了一个看不见的 View 里。
+     *    调试时表现为"日志有、屏幕上什么都没有"。
+     */
+    private val statusText: TextView
+
     private val reminderOverlay: FrameLayout
     private val reminderEmoji: ImageView
     private val reminderTitle: TextView
@@ -127,8 +138,15 @@ class MainScreen(private val context: Context) {
             setPadding(0, dp(6), 0, 0)
             text = ""
         }
+        statusText = label(12f, COLOR_DIM).apply {
+            gravity = Gravity.CENTER
+            maxLines = 2
+            setPadding(0, dp(8), 0, 0)
+            text = ""
+        }
         subs.addView(userText)
         subs.addView(deviceText)
+        subs.addView(statusText)
 
         root.addView(
             subs,
@@ -282,9 +300,9 @@ class MainScreen(private val context: Context) {
         activationOverlay.visibility = View.GONE
     }
 
-    /** 底部提示一行小字（调试/状态用）。 */
+    /** 底部状态提示一行小字（连接状态 / 错误 / 自检结果）。 */
     fun setHint(text: String) {
-        activationHint.text = text
+        statusText.text = text
     }
 
     // ---------------------------------------------------------------- 工具
