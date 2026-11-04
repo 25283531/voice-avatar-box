@@ -1017,19 +1017,41 @@ void Application::SetDeviceState(DeviceState state) {
             if (!audio_service_.IsAudioProcessorRunning()) {
                 audio_service_.EnableVoiceProcessing(true);
             }
-            /* realtime 模式（设备 AEC 开）下，播报完回到 listening 时音频
-             * 处理器全程没停（speaking 分支特意不清它），原条件
-             * !IsAudioProcessorRunning() 恒假 ⇒ 不再向服务端发 listen
-             * start。而服务端一轮对话结束后会回到 idle、静音看门狗退出，
-             * 上行音频被静默丢弃 —— 两侧互相等成死锁：设备开着麦却听不到
-             * 唤醒词（listening 态关了 WakeNet），用户连喊多次毫无反应。
-             * 2026-10-20 实测一次 ASR 失败后设备聋了 164 秒。
-             * ⇒ realtime 模式每次进入 listening 都重新宣布一次。
-             * 服务端也有对应兜底（idle 态收到上行音频自动重新武装）。 */
-            if (!audio_service_.IsAudioProcessorRunning() ||
-                listening_mode_ == kListeningModeRealtime) {
+            /* ---- 每次真正转入 listening 都必须重新宣布（2026-11-04）----
+             *
+             * 用户实报：「语音播报了『您确认完成……』的完整语句后，屏幕显示
+             * 设备从待机转换为连接中，然后转换为聆听中，但是我说话他一直
+             * 识别不到，我说了十几次确认，他都听不到，状态灯也一直是聆听
+             * 状态的蓝色，很久很久。」
+             *
+             * 服务端侧证据：WebSocket 建立（语音会话开始）之后就**一条消息
+             * 都没有** —— 没有 listen start、没有音频帧、没有会话结束。
+             * 也就是说设备开着麦、显示聆听中、灯是蓝的，但服务端根本不知道
+             * 有人在听，上行音频全部落空。
+             *
+             * 根因是原来的条件：
+             *     if (!IsAudioProcessorRunning() || mode == Realtime)
+             * 只救了 realtime 一种模式（2026-10-20 那次聋 164 秒）。
+             * 而老人长按按键的追问路径走的是 **ManualStop**
+             * （见 StartListening()：SetListeningMode(kListeningModeManualStop)），
+             * 刚播完本地预录片段时音频处理器仍在跑 ⇒ 条件恒假 ⇒ 这条消息
+             * 不发。ManualStop 从来没被豁免过。
+             *
+             * 为什么改成"无条件发"是安全的：SetDeviceState() 对"状态没变"
+             * 直接 return，所以本分支只在**真正转入** listening 时执行一次，
+             * 不会把正在说的话清掉；服务端 _on_listen(start) 的重新武装也
+             * 正是我们要的语义。通道没开时发送没有意义，故加一道通道判据。
+             *
+             * ⚠️ 不要再把条件收窄回"只在 realtime 下发"—— 那等于把这个 bug
+             *    原样装回去，而且症状是"设备看起来在听、其实没在听"，最难查。 */
+            if (protocol_->IsAudioChannelOpened()) {
                 // Send the start listening command
                 protocol_->SendStartListening(listening_mode_);
+            } else {
+                /* 通道没开却进了 listening：这是个必须留痕的异常状态，
+                 * 否则又变成"屏幕上在听、服务端一无所知"的静默故障。 */
+                ESP_LOGE(TAG, "进入 listening 但音频通道未打开，listen start "
+                              "未发送（mode=%d）", (int)listening_mode_);
             }
             audio_service_.EnableWakeWordDetection(false);
             break;

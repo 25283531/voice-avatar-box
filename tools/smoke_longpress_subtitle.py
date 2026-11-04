@@ -45,6 +45,8 @@ RGB_C = ROOT / "firmware" / "components" / "elder" / "src" / "rgb.c"
 #: 按键消抖的真源（第 7 组：按下与松开的消抖阈值必须不同）
 INPUT_C = ROOT / "firmware" / "components" / "elder" / "src" / "input.c"
 BOARD_H = ROOT / "firmware" / "components" / "elder" / "include" / "elder_board.h"
+#: 设备状态机 / listen start 的真源（第 9 组）
+APP_CC = ROOT / "firmware" / "xiaozhi" / "main" / "application.cc"
 
 results: list[tuple[bool, str, str]] = []
 
@@ -638,6 +640,70 @@ def t8_longpress_always_lands() -> None:
           "没有理由 ⇒ 下次有人按 a334cca 的思路再删掉它")
 
 
+def t9_listen_start_always_sent() -> None:
+    """进入 listening 必须**一定**给服务端发 listen start（2026-11-04 用户实报）。
+
+    用户原话：「语音播报了『您确认完成……』的完整语句后，屏幕显示设备从待机
+    转换为连接中，然后转换为聆听中，但是我说话他一直识别不到，我说了十几次
+    确认，他都听不到，状态灯也一直是聆听状态的蓝色，很久很久。」
+
+    服务端证据：WebSocket 建立后**一条消息都没有** —— 没有 listen start、
+    没有音频帧、没有会话结束。设备在"假装聆听"。
+
+    根因：`SetDeviceState(kDeviceStateListening)` 里发 listen start 的条件是
+    `!IsAudioProcessorRunning() || listening_mode_ == kListeningModeRealtime`。
+    老人长按追问走的是 **ManualStop**（StartListening() 里写死），刚播完本地
+    预录片段时音频处理器仍在跑 ⇒ 条件恒假 ⇒ 不发。ManualStop 从来没被豁免。
+
+    这条判据守的是**行为契约**：不许再出现"只在某个 listening 模式下才宣布"。
+    """
+    print("\n── 9. 进入 listening 必须发 listen start（不许按模式收窄）──")
+    a = strip_comments(APP_CC.read_text(encoding="utf-8"))
+
+    # 9.1 找到 kDeviceStateListening 分支。
+    i_listen = a.find("case kDeviceStateListening:")
+    check(i_listen >= 0, "能定位 SetDeviceState 的 listening 分支",
+          "case 标签被改过？")
+    seg = a[i_listen: i_listen + 2600] if i_listen >= 0 else ""
+    i_send = seg.find("SendStartListening")
+    check(i_send >= 0, "listening 分支里调用了 SendStartListening",
+          "没有这条消息 ⇒ 服务端永远收不到上行音频，设备在假装聆听")
+
+    # 9.2 不许用 IsAudioProcessorRunning() / kListeningModeRealtime 收窄。
+    #     只查**紧邻的那一个 if 条件**：分支前面还有一段
+    #     `if (!IsAudioProcessorRunning()) EnableVoiceProcessing(true)`，
+    #     它是启动音频处理器用的，与 listen start 无关 —— 拿整段窗口匹配会
+    #     误伤（这条断言自己踩过一次假红）。
+    pre = seg[:i_send] if i_send >= 0 else ""
+    j = pre.rfind("if (")
+    cond = pre[j:j + 200] if j >= 0 else ""
+    check("IsAudioChannelOpened" in cond,
+          "SendStartListening 的紧邻判据是「通道是否打开」",
+          f"实际条件：{cond[:80]!r}")
+    check("IsAudioProcessorRunning" not in cond,
+          "SendStartListening **不被** IsAudioProcessorRunning() 收窄",
+          "音频处理器在跑时就不发 ⇒ ManualStop（长按追问）永远聋")
+    check("kListeningModeRealtime" not in cond,
+          "SendStartListening **不被** listening_mode 收窄",
+          "只豁免 realtime ⇒ ManualStop 落回同一个坑")
+
+    # 9.3 通道未打开时要留痕，不能静默。
+    after = seg[i_send: i_send + 900] if i_send >= 0 else ""
+    check("IsAudioChannelOpened" in seg,
+          "发之前判通道是否打开（IsAudioChannelOpened）",
+          "通道没开就发没有意义")
+    check("ESP_LOGE" in after,
+          "通道没开时留 ERROR（不静默）",
+          "静默 ⇒ 又是屏幕上在听、服务端一无所知")
+
+    # 9.4 文档锚点：StartListening 确实走 ManualStop（这正是旧条件漏掉它的原因）。
+    i_sl = a.find("void Application::StartListening()")
+    sl = _brace_body(a, i_sl) if i_sl >= 0 else ""
+    check("kListeningModeManualStop" in sl,
+          "StartListening() 走 ManualStop（旧条件漏掉它的原因，别被改掉）",
+          "改成 Realtime 会牵动 AEC 与播报打断，不能为了绕开判据而改它")
+
+
 def main() -> int:
     t1_clip_ids()
     t2_long_press_wiring()
@@ -647,6 +713,7 @@ def main() -> int:
     t6_actionable_gate()
     t7_press_debounce_and_listen_after_clip()
     t8_longpress_always_lands()
+    t9_listen_start_always_sent()
 
     passed = sum(1 for ok, _, _ in results if ok)
     failed = len(results) - passed
