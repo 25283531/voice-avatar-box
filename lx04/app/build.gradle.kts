@@ -1,5 +1,3 @@
-import org.jetbrains.kotlin.gradle.tasks.JvmTarget
-
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
@@ -64,7 +62,14 @@ android {
     }
 
     kotlinOptions {
-        jvmTarget = JvmTarget.JVM_1_8
+        // ⚠️ 这里必须是**字符串**，不能写成 JvmTarget.JVM_1_8。
+        //   Kotlin 1.9.x 的 `kotlinOptions.jvmTarget` 是 String 类型；
+        //   JvmTarget 枚举住在 org.jetbrains.kotlin.gradle.dsl 下（不是 tasks），
+        //   而且只在 `kotlin { compilerOptions { ... } }` 新 DSL 里才吃枚举。
+        //   之前误写 `org.jetbrains.kotlin.gradle.tasks.JvmTarget` →
+        //   `Unresolved reference: JvmTarget`，构建在第 1 行就挂（run 41842550769）。
+        //   且 jvmTarget 必须与上面 compileOptions 的 1.8 保持一致，否则 AGP 直接报错。
+        jvmTarget = "1.8"
     }
 
     packaging {
