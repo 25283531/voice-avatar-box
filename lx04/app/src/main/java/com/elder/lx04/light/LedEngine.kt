@@ -37,7 +37,20 @@ class LedEngine {
         val periodMs: Int,
         /** 到期时刻（elapsedRealtime 毫秒）；0 = 常驻直到被释放 */
         val expiresAt: Long
-    )
+    ) {
+        /**
+         * 取有效周期（ms），0/负数视为"用默认"。
+         *
+         * ⚠️ 统一返回 **Long**，不要在调用处写
+         * `periodMs.takeIf { it > 0 } ?: 2000L` ——
+         * 那是 `Int?` 与 `Long` 混用，Kotlin 会推断成
+         * `Comparable<CapturedType(*)> & Number` 这种交集类型，
+         * 后面 `t % period` 就找不到 operator（编译期报
+         * "'operator' modifier is required on 'mod'"）。
+         */
+        fun periodOrDefault(fallback: Int): Long =
+            (periodMs.takeIf { it > 0 } ?: fallback).toLong()
+    }
 
     /**
      * 当前所有生效的灯效请求。
@@ -164,7 +177,13 @@ class LedEngine {
 
     /** 取一份内置默认灯效表。 */
     @Synchronized
-    fun defaultConfig(): Array<LedConfigItem?> = arrayOf(
+    // ⚠️ 必须显式写 arrayOf<LedConfigItem?>(...)。
+    //   直接 arrayOf(...) 会推断成 Array<LedConfigItem>（非空），
+    //   与返回类型 Array<LedConfigItem?> 不兼容，编译期报
+    //   "Type mismatch: inferred type is Array<Led.LedConfigItem> but
+    //    Array<Led.LedConfigItem?> was expected"。
+    //   表里留 null 位是有意义的：某些状态 id 就是"不亮"。
+    fun defaultConfig(): Array<LedConfigItem?> = arrayOf<LedConfigItem?>(
         LedConfigItem(Led.LedEffect.TWINKLE.id, Led.Color.TWINKLE_RANDOM, Led.Level.IDLE_NEAR, 0),
         LedConfigItem(Led.LedEffect.SOLID.id, Led.Color.LISTENING, Led.Level.LISTENING, 0),
         LedConfigItem(Led.LedEffect.SOLID.id, Led.Color.SPEAKING, Led.Level.SPEAKING, 0),
@@ -419,8 +438,8 @@ class LedEngine {
             )
 
             Led.LedEffect.BREATH -> {
-                val phase = (t % (slot.periodMs.takeIf { it > 0 } ?: 2000L)).toFloat() /
-                    (slot.periodMs.takeIf { it > 0 } ?: 2000L).toFloat()
+                val period = slot.periodOrDefault(2000)
+                val phase = (t % period).toFloat() / period.toFloat()
                 val v = (0.5f + 0.5f * kotlin.math.sin(phase * 2 * Math.PI).toFloat())
                 BandRender.Band.Solid(
                     color = applyLevel(slot.color, slot.level),
@@ -459,7 +478,7 @@ class LedEngine {
 
             Led.LedEffect.METEOR -> {
                 // 一个亮头 + 拖尾，头部最亮、尾部线性衰减
-                val period = slot.periodMs.takeIf { it > 0 } ?: 1200L
+                val period = slot.periodOrDefault(1200)
                 val p = (t % period).toFloat() / period.toFloat()
                 val head = (p * SEGMENTS).toInt().coerceIn(0, SEGMENTS - 1)
                 val colors = buildList {
@@ -481,7 +500,7 @@ class LedEngine {
             }
 
             Led.LedEffect.FLOW -> {
-                val period = slot.periodMs.takeIf { it > 0 } ?: 2000L
+                val period = slot.periodOrDefault(2000)
                 val p = (t % period).toFloat() / period.toFloat()
                 val offset = (p * SEGMENTS).toInt()
                 val segs = mutableListOf<BandRender.Band.Segment>()
@@ -505,7 +524,7 @@ class LedEngine {
             }
 
             Led.LedEffect.CHASE -> {
-                val period = slot.periodMs.takeIf { it > 0 } ?: 1200L
+                val period = slot.periodOrDefault(1200)
                 val idx = ((t % period) / (period / SEGMENTS)).toInt().coerceIn(0, SEGMENTS - 1)
                 BandRender.Band.Segment(
                     index = idx,
