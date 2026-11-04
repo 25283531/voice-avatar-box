@@ -2,10 +2,12 @@ package com.elder.lx04
 
 import android.Manifest
 import android.app.Activity
+import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.PackageManager
-import android.media.AudioManager
+import android.os.BatteryManager
 import android.os.Bundle
 import android.os.SystemClock
 import android.util.Log
@@ -13,137 +15,147 @@ import android.view.KeyEvent
 import android.view.View
 import android.view.WindowManager
 import android.widget.FrameLayout
-import android.widget.TextView
+import com.elder.lx04.audio.AudioCapture
+import com.elder.lx04.audio.AudioPlayer
+import com.elder.lx04.audio.OpusCodec
 import com.elder.lx04.input.ConfirmKeyDetector
 import com.elder.lx04.input.TopKeys
 import com.elder.lx04.light.Led
 import com.elder.lx04.light.LedBandView
 import com.elder.lx04.light.LedEngine
+import com.elder.lx04.net.DeviceIdentity
+import com.elder.lx04.net.OtaClient
+import com.elder.lx04.net.VoiceClient
+import com.elder.lx04.ui.MainScreen
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 
 /**
- * LX04 设备端主界面。
+ * LX04 设备端主界面 —— 与服务端对接的完整客户端。
  *
- * ## 它要满足的四件事（用户 2026-11-04 的要求）
+ * ## 一屏之内要完成的事
  *
- * 1. **开机直接进入我们的项目，不进小爱桌面**
- *    · Manifest 里注册了 `MAIN + HOME + DEFAULT` ⇒ 可以被设为默认桌面
- *    · 部署脚本执行 `adb shell cmd package set-home-activity` 强制指定，跳过选择框
- *    · [BootReceiver] 兜底自启
+ * 1. **和服务端对接**：OTA 拿 token → WebSocket → 语音上行/下行
+ * 2. **界面与固件一致**：状态栏 / 表情 / 字幕 / 提醒页 / 激活页
+ * 3. **顶部三键**：音量± 保留，中间键 = 按住说话（也兼服药确认）
+ * 4. **两侧色带**：状态灯与事件灯搬到屏幕上（[LedEngine] 1:1 移植自固件）
  *
- * 2. **可以直接语音唤醒**
- *    · 自己用 `AudioRecord` 采集 + 自带唤醒词检测，**不依赖小爱的唤醒引擎**
- *      （小爱的唤醒是私有实现，拿不到事件也拿不到麦克风流）
+ * ## 一轮对话的完整时序（这是整份代码的主线）
  *
- * 3. **顶部三个按键**：音量± 保留原功能，中间键 = 服药确认键
- *    · 见 [dispatchKeyEvent]
+ * ```
+ * 按下中间键
+ *   → voice.listenStart()         服务端进入 listening，起静音看门狗
+ *   → capture.start()             AudioRecord 16k + 前处理（降噪/增益/VAD）
+ *   → opus.encode() 每 60ms 一帧 → WS 二进制帧（4 字节头 + Opus）
+ * 松手 / VAD 判到静音 1.2 秒
+ *   → voice.listenStop()          服务端开始 ASR → LLM → TTS
+ *   → capture.stop()
+ * 服务端回：
+ *   → {"type":"stt"}                          显示"老人说了什么"
+ *   → {"type":"tts","state":"sentence_start"} 显示字幕 + 表情切 happy
+ *   → 二进制 Opus 帧                          opus.decode() → AudioTrack
+ *   → {"type":"tts","state":"stop"}           回到待机
+ * ```
  *
- * 4. **事件灯 / 状态灯取消，改为屏幕两侧各 5mm 的色带**
- *    · [LedBandView] 画在内容两侧
- *    · 灯效语义 1:1 移植自 ESP32 固件（见 [LedEngine]）
+ * ## 为什么是"按一下说话"而不是一直听
  *
- * ## 全屏（很重要）
- *
- * 必须全屏且隐藏状态栏/导航栏 —— 否则两侧色带会被系统 UI 压住，
- * 或者系统强制显示状态栏导致布局被挤。
+ * 唤醒词（sherpa-onnx，已确认有 armeabi-v7a 的 .so）还没接。
+ * 在它接上之前，用中间键触发是最稳的 —— 而且对老人来说
+ * "按一下再说"比"记住一句唤醒词"更不容易失败。
+ * 唤醒词接上之后这条路径仍然保留：按键永远可用，不依赖模型。
  */
 class MainActivity : Activity() {
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
 
-    private lateinit var ledEngine: LedEngine
+    // ---- 界面与灯效 ----
+    private lateinit var screen: MainScreen
     private lateinit var bandView: LedBandView
-    private lateinit var subtitleView: TextView
-    private lateinit var statusView: TextView
+    private lateinit var ledEngine: LedEngine
+
+    // ---- 语音链路 ----
+    private var voice: VoiceClient? = null
+    private val opus = OpusCodec()
+    private var capture: AudioCapture? = null
+    private val player = AudioPlayer()
+
+    /** 正在把麦克风数据往上送。 */
+    @Volatile
+    private var sending = false
+
+    /** 连续静音帧数（60ms 一帧）。 */
+    @Volatile
+    private var silentFrames = 0
+
+    /** 正在播报（此时不开麦克风，半双工）。 */
+    @Volatile
+    private var speaking = false
 
     private val keyDetector = ConfirmKeyDetector()
 
-    /** 确认窗口的到期时刻（elapsedRealtime）；0 = 没有开着的窗口 */
+    /** 是否有待确认的提醒（由服务端事件驱动）。 */
+    @Volatile
+    private var hasPendingReminder = false
+
+    /** 确认窗口到期时刻（elapsedRealtime）；0 = 没有开着的窗口。 */
     private var confirmWindowUntil = 0L
 
-    /** 是否有待确认的提醒（由服务端事件驱动） */
-    private var hasPendingReminder = false
+    /** 是否已经绑定（OTA 拿到 websocket 段）。 */
+    @Volatile
+    private var bound = false
+
+    private var batteryPercent = 0
+    private var batteryCharging = false
+    private var wifiOk = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        // ⚠️ 必须全屏：色带是画在屏幕边缘的，系统 UI 会压住它
+        // ⚠️ 必须全屏：色带画在屏幕最边缘，系统 UI 会压住它
         window.addFlags(WindowManager.LayoutParams.FLAG_FULLSCREEN)
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         hideSystemUi()
 
+        // ⚠️ 顺序不能动：ledEngine 必须在 setContentView 之前建好。
+        //    buildRoot() 里那个 scope.launch 跑在 Dispatchers.Main.immediate 上，
+        //    也就是**当场同步执行**，第一句就是 ledEngine.render(now)。
+        //    如果还按"先 setContentView 再 new LedEngine"的顺序，
+        //    这里会抛 UninitializedPropertyAccessException，一开机就崩。
         ledEngine = LedEngine()
         ledEngine.defaultConfig()
-
-        setContentView(buildUi())
-
-        // 调试广播（默认不生效，见 DebugBridge）
-        runCatching {
-            registerReceiver(debugReceiver, android.content.IntentFilter(DebugBridge.ACTION))
-        }.onFailure { Log.w(TAG, "注册调试广播失败: ${it.message}") }
-
-        requestMicPermission()
-
-        // 启动时先亮一下"待命"色带，给老人一个"设备活着"的信号
         ledEngine.setUiState(Led.UiState.IDLE)
+
+        screen = MainScreen(this)
+        setContentView(buildRoot())
+
+        registerReceiver(batteryReceiver, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
+        registerReceiver(debugReceiver, IntentFilter(DebugBridge.ACTION))
+
+        startClock()
+        requestMicPermission()
     }
 
-    // ------------------------------------------------------------------ UI
+    // ------------------------------------------------------------------ 视图
 
-    private fun buildUi(): View {
+    private fun buildRoot(): View {
         val root = FrameLayout(this)
-
-        // 内容区（两侧留出色带空间）
-        //
-        // ⚠️ 每侧留 **1 个**色带宽度，不是 2 个。
-        // 色带是画在 root 的最上层（左 0~w，右 width-w~width），
-        // 内容区必须正好让开这两条，否则字幕/头像会压在色带下面。
-        val bandW = bandViewWidthPx()
-        val content = FrameLayout(this)
-        content.setPadding(bandW, 0, bandW, 0)
-
-        subtitleView = TextView(this).apply {
-            textSize = 30f
-            setTextColor(0xFFFFFFFF.toInt())
-            gravity = android.view.Gravity.CENTER
-            text = "小爱已就位"
-        }
-        content.addView(
-            subtitleView,
-            FrameLayout.LayoutParams(
-                FrameLayout.LayoutParams.MATCH_PARENT,
-                FrameLayout.LayoutParams.MATCH_PARENT
-            ).apply { gravity = android.view.Gravity.CENTER }
-        )
-
-        statusView = TextView(this).apply {
-            textSize = 16f
-            setTextColor(0xFF9AA0A6.toInt())
-            gravity = android.view.Gravity.CENTER
-            text = ""
-        }
-        content.addView(
-            statusView,
-            FrameLayout.LayoutParams(
-                FrameLayout.LayoutParams.MATCH_PARENT,
-                FrameLayout.LayoutParams.WRAP_CONTENT
-            ).apply { gravity = android.view.Gravity.BOTTOM }
-        )
-
         root.addView(
-            content,
+            screen.root,
             FrameLayout.LayoutParams(
                 FrameLayout.LayoutParams.MATCH_PARENT,
                 FrameLayout.LayoutParams.MATCH_PARENT
             )
         )
 
-        // 色带：左右各一条，叠在内容之上（内容已留出 padding，不会重叠）
+        // 色带叠在最上层（左右各 5mm）
         bandView = LedBandView(this)
         root.addView(
             bandView,
@@ -157,53 +169,216 @@ class MainActivity : Activity() {
         scope.launch {
             while (true) {
                 val now = SystemClock.elapsedRealtime()
-                // ⚠️ render() 必须**只调一次**：它内部会推进过期清理与状态机，
-                // 调两次会算出两套可能不一致的结果（第二套的时间基准更晚）。
+                // ⚠️ render() 只能调一次：它内部推进过期清理与状态机
                 val frame = ledEngine.render(now)
                 bandView.leftBand = frame.left
                 bandView.rightBand = frame.right
-                delay(33)   // ≈30fps，够用且省电（对齐固件 rgb_task 的节奏量级）
+                delay(33)   // ≈30fps，对齐固件 rgb_task 的节奏
             }
         }
-
         return root
     }
 
-    private fun bandViewWidthPx(): Int =
-        LedBandView.defaultBandWidthPx(this)
-
-    private fun hideSystemUi() {
-        @Suppress("DEPRECATION")
-        window.decorView.systemUiVisibility = (
-            View.SYSTEM_UI_FLAG_FULLSCREEN
-                or View.SYSTEM_UI_FLAG_HIDE_NAVIGATION
-                or View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
-                or View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN
-                or View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION
-                or View.SYSTEM_UI_FLAG_LAYOUT_STABLE
-            )
+    private fun startClock() {
+        scope.launch {
+            val fmt = SimpleDateFormat("HH:mm", Locale.CHINA)
+            while (true) {
+                screen.setClock(fmt.format(Date()))
+                screen.setStatus(wifiOk, batteryPercent, batteryCharging)
+                delay(10_000)
+            }
+        }
     }
 
-    override fun onWindowFocusChanged(hasFocus: Boolean) {
-        super.onWindowFocusChanged(hasFocus)
-        if (hasFocus) hideSystemUi()
+    private val batteryReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context, intent: Intent) {
+            val level = intent.getIntExtra(BatteryManager.EXTRA_LEVEL, -1)
+            val scale = intent.getIntExtra(BatteryManager.EXTRA_SCALE, 100)
+            if (level >= 0 && scale > 0) batteryPercent = level * 100 / scale
+            val st = intent.getIntExtra(BatteryManager.EXTRA_STATUS, -1)
+            batteryCharging = st == BatteryManager.BATTERY_STATUS_CHARGING ||
+                st == BatteryManager.BATTERY_STATUS_FULL
+            wifiOk = DeviceIdentity.wifiConnected(this@MainActivity)
+        }
+    }
+
+    // ------------------------------------------------------------------ 连接
+
+    /**
+     * OTA → WebSocket。
+     *
+     * 未绑定时不是错误：把激活码显示出来，每 5 秒重试一次 ——
+     * 家属在手机 App 里输完码，设备这边**自己**就接上了，不用重启。
+     */
+    private fun startConnect() {
+        val deviceId = DeviceIdentity.mac(this)
+        val clientId = DeviceIdentity.clientId(this)
+        val ota = OtaClient(SERVER_BASE_URL, deviceId, clientId)
+
+        scope.launch {
+            while (true) {
+                val result = withContext(Dispatchers.IO) { ota.check() }
+                when (result) {
+                    is OtaClient.Result.Bound -> {
+                        bound = true
+                        screen.hideActivation()
+                        screen.setHint("")
+                        connectWs(result.wsUrl, result.token, deviceId, clientId)
+                        return@launch
+                    }
+                    is OtaClient.Result.NeedActivation -> {
+                        bound = false
+                        setUiState("activating")
+                        screen.showActivation(result.code)
+                        delay(5_000)
+                    }
+                    is OtaClient.Result.Failed -> {
+                        bound = false
+                        setUiState("offline")
+                        screen.setHint("连不上服务器：${result.message}")
+                        delay(5_000)
+                    }
+                }
+            }
+        }
+    }
+
+    private fun connectWs(wsUrl: String, token: String, deviceId: String, clientId: String) {
+        val client = VoiceClient(object : VoiceClient.Listener {
+
+            override fun onConnected() {
+                runOnUiThread {
+                    setUiState("idle")
+                    screen.setHint("已连接")
+                }
+            }
+
+            override fun onDisconnected(reason: String) {
+                runOnUiThread {
+                    setUiState("offline")
+                    screen.setHint(reason)
+                }
+                // 断线自动重连：老人不会来点"重试"
+                scope.launch {
+                    delay(3_000)
+                    if (!isFinishing) startConnect()
+                }
+            }
+
+            override fun onHello(sampleRate: Int, frameMs: Int) {
+                // ⚠️ 采样率必须读 hello，不能写死 24k —— 服务端可用环境变量改
+                opus.init(sampleRate)
+                player.start(sampleRate)
+            }
+
+            override fun onStt(text: String) {
+                runOnUiThread { screen.setUserSaid(text) }
+            }
+
+            override fun onTtsState(state: String, text: String?) {
+                runOnUiThread {
+                    when (state) {
+                        "start" -> {
+                            speaking = true
+                            setUiState("speaking")
+                        }
+                        "sentence_start" -> {
+                            if (!text.isNullOrBlank()) screen.setDeviceSaid(text)
+                        }
+                        "stop" -> {
+                            speaking = false
+                            setUiState("idle")
+                        }
+                    }
+                }
+            }
+
+            override fun onEmotion(emotion: String) {
+                runOnUiThread {
+                    // 表情与灯效是两条独立通道（固件也是这么分的）：
+                    // 表情走 21 个词，灯效只认四态。
+                    screen.setEmoji(emotion)
+                }
+            }
+
+            override fun onAlert(message: String) {
+                runOnUiThread { screen.setHint(message) }
+            }
+
+            override fun onAudio(opusPacket: ByteArray) {
+                val pcm = ShortArray(opus.decodeFrameSamples)
+                val n = opus.decode(opusPacket, pcm)
+                if (n > 0) player.enqueue(pcm.copyOf(n))
+            }
+        })
+
+        if (client.connect(wsUrl, token, deviceId, clientId)) {
+            voice = client
+        } else {
+            screen.setHint("WebSocket 建立失败")
+        }
+    }
+
+    // ------------------------------------------------------------------ 一轮对话
+
+    /** 开始说话（按下中间键 / 调试命令触发）。 */
+    private fun beginListening() {
+        if (sending) return
+        if (!bound || voice?.isConnected != true) {
+            screen.setHint("还没连上服务器，稍等一下")
+            return
+        }
+        // 半双工：正在播报就先打断，否则麦克风会把 TTS 自己录进去
+        if (speaking) {
+            voice?.abort()
+            player.flush()
+            speaking = false
+        }
+
+        sending = true
+        silentFrames = 0
+        screen.setUserSaid("")
+        screen.setDeviceSaid("")
+        setUiState("listening")
+
+        voice?.listenStart()
+
+        val cap = AudioCapture { pcm, info ->
+            if (!sending) return@AudioCapture
+
+            // 上行编码（16k / 60ms / 960 采样）
+            val enc = opus.encode(pcm) ?: return@AudioCapture
+            voice?.sendAudio(enc)
+
+            // VAD 自动收尾：连续静音 1.2 秒算说完。
+            // 不"一静音就停"是因为老人说话中间会换气，
+            // 一停就掐断会把一句话切成两半，服务端 ASR 两半都识别不出来。
+            if (info.isSpeech) silentFrames = 0 else silentFrames++
+            if (silentFrames * AudioCapture.FRAME_MS >= SILENCE_STOP_MS) {
+                endListening()
+            }
+        }
+        capture = cap
+        if (!cap.start()) {
+            sending = false
+            setUiState("idle")
+            screen.setHint("麦克风打不开（可能被小爱占用）")
+        }
+    }
+
+    /** 说完了。 */
+    private fun endListening() {
+        if (!sending) return
+        sending = false
+        capture?.stop()
+        capture = null
+        voice?.listenStop()
+        setUiState("idle")
+        screen.setHint("")
     }
 
     // ------------------------------------------------------------------ 按键
 
-    /**
-     * 按键分发。
-     *
-     * ⚠️ 音量键**必须返回 false**（让系统继续处理），
-     * 否则音量就调不动了 —— 这正是用户要的"保留音量加减功能"。
-     *
-     * 中间键返回 true 吃掉事件，避免触发系统默认行为。
-     *
-     * ⚠️ 中间键的键值**已经不是 POWER 了**：实机验证后我们用 keylayout
-     * 把它重映射成了 `F1`（见 TopKeys.CONFIRM_KEY_CODES 与
-     * docs/lx04/实机验证结果.md）。所以这里"吃掉事件"更多是保险，
-     * 真正挡住熄屏/关机的是 keylayout 那一层 —— 应用层是拦不住 POWER 的。
-     */
     override fun dispatchKeyEvent(event: KeyEvent): Boolean {
         val now = SystemClock.elapsedRealtime()
 
@@ -218,8 +393,6 @@ class MainActivity : Activity() {
             return super.dispatchKeyEvent(event)
         }
 
-        // 实机排查时这条日志很关键：它能区分"按键根本没到应用"和
-        // "到了但判定/灯效不对" —— 两者修的地方完全不同。
         Log.i(
             TAG,
             "确认键 ${if (event.action == KeyEvent.ACTION_DOWN) "DOWN" else "UP"} " +
@@ -229,8 +402,9 @@ class MainActivity : Activity() {
         when (event.action) {
             KeyEvent.ACTION_DOWN -> {
                 if (keyDetector.onDown(now)) {
-                    // 新的按压开始 ⇒ 灯效开始渐变
                     ledEngine.buttonPress()
+                    // 按下即开始说话 —— 对老人来说"按住说话"最直觉
+                    beginListening()
                 }
                 return true
             }
@@ -238,90 +412,74 @@ class MainActivity : Activity() {
             KeyEvent.ACTION_UP -> {
                 when (keyDetector.onUp(now)) {
                     ConfirmKeyDetector.ReleaseResult.Confirmed -> {
-                        // ⚠️ 顺序要紧：**先 release 归位，再 confirmed 出结果**。
-                        // release() 负责清掉"按住中"的状态（pressAt）并标记本轮已判定；
-                        // confirmed() 负责出结果闪烁（天蓝闪 3 次）。
-                        // 少调 release() 的话，灯效引擎里 pressAt 残留，
-                        // 色带会卡在天青渐变态不熄 —— 老人看着就是"灯坏了"。
                         ledEngine.buttonRelease()
-                        // 长按达标 ⇒ 天蓝闪 3 次
                         ledEngine.buttonConfirmed()
                         onConfirmPressed()
                     }
-
-                    ConfirmKeyDetector.ReleaseResult.ReleasedEarly -> {
-                        // 中途松开 ⇒ 粉红闪 5 次
-                        ledEngine.buttonRelease()
-                    }
-
-                    ConfirmKeyDetector.ReleaseResult.Debounced -> {
-                        // 抖动：静默（固件的 300ms 兜底）
-                        ledEngine.buttonRelease()
-                    }
-
+                    ConfirmKeyDetector.ReleaseResult.ReleasedEarly,
+                    ConfirmKeyDetector.ReleaseResult.Debounced -> ledEngine.buttonRelease()
                     ConfirmKeyDetector.ReleaseResult.None -> Unit
                 }
+                endListening()
                 return true
             }
         }
         return super.dispatchKeyEvent(event)
     }
 
-    /**
-     * 长按拦截。
-     *
-     * 历史上这一段是**为了防关机**：中间键原本上报 `KEYCODE_POWER`，
-     * 系统长按 1 秒会弹关机菜单，老人按服药键就能把音箱关了。
-     *
-     * 现在中间键已被 keylayout 重映射为 `F1`（实机验证过，见
-     * docs/lx04/实机验证结果.md），长按 F1 本来就没有系统语义。
-     * 这里仍然拦一下，是为了兜住"keylayout 没刷成功"的退化情况 ——
-     * 那种情况下中间键还是 POWER，至少别让它弹关机菜单。
-     */
     override fun onKeyLongPress(keyCode: Int, event: KeyEvent): Boolean {
-        if (TopKeys.isConfirmKey(keyCode)) {
-            // 自己处理长按（进度条已由 ACTION_DOWN 起的计时驱动）
-            return true
-        }
+        if (TopKeys.isConfirmKey(keyCode)) return true
         return super.onKeyLongPress(keyCode, event)
     }
 
-    /**
-     * 长按达标的回调。
-     *
-     * 语义（固件 `elder_input.c`）：
-     *   · 提醒响铃期间长按 ≥3s ⇒ 直接确认「已服药」
-     *   · 不在响铃时 ⇒ 开一个 30 秒确认窗口，老人再短按一次确认
-     */
+    /** 长按达标（≥3 秒）—— 服药确认。 */
     private fun onConfirmPressed() {
         if (hasPendingReminder) {
-            // 有待确认提醒 ⇒ 直接确认
-            sendConfirmToServer()
+            confirmMedication()
         } else {
-            // 没有 ⇒ 开 30 秒窗口
             confirmWindowUntil = SystemClock.elapsedRealtime() + ConfirmKeyDetector.CONFIRM_WINDOW_MS
-            showStatus("已长按，请在 30 秒内再按一下确认")
         }
     }
 
-    /** 把「已服药」的确认事件发给服务端。 */
-    private fun sendConfirmToServer() {
-        // TODO(阶段1): 通过 WebSocket 发送确认帧
+    /** 把「已服药」的确认落地。 */
+    private fun confirmMedication() {
         hasPendingReminder = false
         ledEngine.medDone()
         ledEngine.buttonPending(false)
-        showStatus("已确认服药")
+        screen.hideReminder()
+        setUiState("confirmed")
+        scope.launch {
+            delay(2_000)
+            setUiState("idle")
+        }
+        // ⚠️ 服务端目前把"服药确认"建模成设备侧 MCP 工具回包
+        //    （session.py 的 call_device_tool）。我们还没实现设备工具通道，
+        //    所以这里**只做本地反馈**，不回假的"成功"给服务端 ——
+        //    回了假的，家属端会看到"已确认"而实际没记录，这是最坏的一类欺骗。
+        screen.setHint("已确认（服务端回写待接入）")
     }
 
-    /**
-     * 服务端下发提醒时调用。
-     */
+    /** 服务端下发提醒时调用。 */
     fun onReminderPending(pending: Boolean) {
         hasPendingReminder = pending
         ledEngine.buttonPending(pending)
-        if (pending) {
-            ledEngine.medPending()
+        if (pending) ledEngine.medPending()
+    }
+
+    // ------------------------------------------------------------------ 状态
+
+    /** 切界面状态。名字与固件 `elder_ui_state_t` 对齐。 */
+    private fun setUiState(state: String) {
+        screen.setEmoji(MainScreen.STATE_EMOJI[state] ?: "neutral")
+
+        // 灯效只认四态，与表情是两套独立枚举（固件也是分开的）
+        val ledState = when (state) {
+            "listening" -> Led.UiState.LISTENING
+            "speaking" -> Led.UiState.SPEAKING
+            "offline" -> Led.UiState.CONNECTING
+            else -> Led.UiState.IDLE
         }
+        ledEngine.setUiState(ledState)
     }
 
     // ------------------------------------------------------------------ 权限
@@ -330,13 +488,10 @@ class MainActivity : Activity() {
         if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) ==
             PackageManager.PERMISSION_GRANTED
         ) {
-            onMicPermissionGranted()
+            startConnect()
             return
         }
-        requestPermissions(
-            arrayOf(Manifest.permission.RECORD_AUDIO),
-            REQ_MIC
-        )
+        requestPermissions(arrayOf(Manifest.permission.RECORD_AUDIO), REQ_MIC)
     }
 
     override fun onRequestPermissionsResult(
@@ -346,50 +501,17 @@ class MainActivity : Activity() {
     ) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
         if (requestCode == REQ_MIC) {
-            if (grantResults.isNotEmpty() && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
-                onMicPermissionGranted()
-            } else {
-                // 没有麦克风权限就做不了唤醒 —— 必须让用户知道
-                showStatus("未授予麦克风权限，语音唤醒不可用")
+            if (grantResults.isEmpty() || grantResults[0] != PackageManager.PERMISSION_GRANTED) {
+                screen.setHint("没有麦克风权限，无法对话")
             }
+            // 没麦克风也把连接建起来 —— 至少能收到提醒、能显示字幕
+            startConnect()
         }
-    }
-
-    private fun onMicPermissionGranted() {
-        // TODO(阶段1): 启动 AudioRecord 采集 + 唤醒词检测 + WebSocket
-        showStatus("")
-    }
-
-    // ------------------------------------------------------------------ 其他
-
-    private fun showStatus(text: String) {
-        statusView.text = text
-    }
-
-    /** 设置字幕（服务端的 TTS / STT 文本）。 */
-    fun setSubtitle(text: String) {
-        subtitleView.text = text
-    }
-
-    /** 设置语音链路的 UI 态（对应固件的 `elder_rgb_set_ui_state`）。 */
-    fun setVoiceState(state: Led.UiState) {
-        ledEngine.setUiState(state)
-    }
-
-    override fun onDestroy() {
-        super.onDestroy()
-        runCatching { unregisterReceiver(debugReceiver) }
-        scope.cancel()
     }
 
     // ------------------------------------------------------------------ 调试入口
 
-    /**
-     * 调试广播（见 [DebugBridge]）。
-     *
-     * 默认不响应：只有 `settings put global elder_debug 1` 之后才生效。
-     */
-    private val debugReceiver = object : android.content.BroadcastReceiver() {
+    private val debugReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
             if (!DebugBridge.enabled(this@MainActivity)) {
                 Log.w(TAG, "调试命令被忽略 —— 先执行 settings put global elder_debug 1")
@@ -401,97 +523,101 @@ class MainActivity : Activity() {
         }
     }
 
-    /**
-     * 执行一条调试命令。
-     *
-     * 存在的理由：这些状态平时到不了 —— 服药提醒要等服务端下发，
-     * 「按住 3 秒」用 `input keyevent` 模拟不出来（它同一毫秒就发 UP，
-     * 只会走抖动分支）。没有这个入口，灯效就只能靠等真实事件来验。
-     */
     private fun handleDebugCommand(cmd: String) {
         when (cmd) {
-            // ---- 服药语义 ----
+            "talk" -> beginListening()
+            "stop_talk" -> endListening()
+
             "med_pending" -> {
                 onReminderPending(true)
-                showStatus("调试：服药未确认")
+                setUiState("reminder")
+                screen.showReminder("该吃药了", "08:00  高血压药 1 片")
             }
-            "med_done" -> {
-                sendConfirmToServer()
-            }
+            "med_done" -> confirmMedication()
             "clear" -> {
                 onReminderPending(false)
-                showStatus("调试：已清空提醒")
+                screen.hideReminder()
+                setUiState("idle")
             }
-            "escalate" -> {
-                ledEngine.medEscalate()
-                showStatus("调试：漏服升级（快闪）")
-            }
+            "escalate" -> ledEngine.medEscalate()
 
-            // ---- 按键灯效（不需要真的按住 3 秒）----
             "press" -> {
-                // 开始按住：右带进入天青渐变
                 ledEngine.buttonPending(true)
                 ledEngine.buttonPress()
-                showStatus("调试：按住中（渐变）")
             }
             "confirmed" -> {
-                // 达标：天蓝闪 3 次
                 ledEngine.buttonPending(true)
                 ledEngine.buttonConfirmed()
-                showStatus("调试：确认成功（天蓝闪 3 次）")
             }
             "fail" -> {
-                // 中途松开：粉红闪 5 次。用显式时间戳模拟"按了 1.5 秒"，
-                // 不需要真的等 —— buttonPress/Release 都收时间戳。
                 val t = SystemClock.elapsedRealtime()
                 ledEngine.buttonPending(true)
                 ledEngine.buttonPress(t)
                 ledEngine.buttonRelease(t + 1500L)
-                showStatus("调试：中途松开（粉红闪 5 次）")
             }
-            "ack" -> {
-                ledEngine.buttonAcknowledged()
-                showStatus("调试：按压已受理")
-            }
+            "ack" -> ledEngine.buttonAcknowledged()
 
-            // ---- 提醒 nag 节奏 ----
-            "nag_start" -> {
-                ledEngine.nagStart()
-                showStatus("调试：提醒 nag 开始（每 10 分钟前 10 秒红闪）")
-            }
-            "nag_stop" -> {
-                ledEngine.nagStop()
-                showStatus("调试：提醒 nag 停止")
-            }
+            "nag_start" -> ledEngine.nagStart()
+            "nag_stop" -> ledEngine.nagStop()
+            "status_off" -> ledEngine.setStatusLight(false)
+            "status_on" -> ledEngine.setStatusLight(true)
 
-            // ---- 状态灯开关 ----
-            "status_off" -> {
-                ledEngine.setStatusLight(false)
-                showStatus("调试：状态灯已关（事件灯不受影响）")
-            }
-            "status_on" -> {
-                ledEngine.setStatusLight(true)
-                showStatus("调试：状态灯已开")
-            }
+            "idle" -> setUiState("idle")
+            "listening" -> setUiState("listening")
+            "speaking" -> setUiState("speaking")
+            "happy" -> screen.setEmoji("happy")
+            "sad" -> screen.setEmoji("sad")
+            "angry" -> screen.setEmoji("angry")
 
-            // ---- 对话四态 / 表情 ----
-            "idle" -> setVoiceState(Led.UiState.IDLE)
-            "listening" -> setVoiceState(Led.UiState.LISTENING)
-            "speaking" -> setVoiceState(Led.UiState.SPEAKING)
-            "connecting" -> setVoiceState(Led.UiState.CONNECTING)
-            "happy" -> ledEngine.setEmotion(Led.Emotion.HAPPY)
-            "sad" -> ledEngine.setEmotion(Led.Emotion.SAD)
-            "angry" -> ledEngine.setEmotion(Led.Emotion.ANGRY)
+            "reconnect" -> startConnect()
 
-            else -> {
-                Log.w(TAG, "未知调试命令: $cmd")
-                showStatus("未知调试命令：$cmd")
-            }
+            else -> Log.w(TAG, "未知调试命令: $cmd")
         }
     }
 
+    // ------------------------------------------------------------------ 生命周期
+
+    override fun onWindowFocusChanged(hasFocus: Boolean) {
+        super.onWindowFocusChanged(hasFocus)
+        if (hasFocus) hideSystemUi()
+    }
+
+    private fun hideSystemUi() {
+        @Suppress("DEPRECATION")
+        window.decorView.systemUiVisibility = (
+            View.SYSTEM_UI_FLAG_FULLSCREEN
+                or View.SYSTEM_UI_FLAG_HIDE_NAVIGATION
+                or View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
+                or View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN
+                or View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION
+                or View.SYSTEM_UI_FLAG_LAYOUT_STABLE
+            )
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        runCatching { unregisterReceiver(debugReceiver) }
+        runCatching { unregisterReceiver(batteryReceiver) }
+        capture?.stop()
+        player.stop()
+        opus.release()
+        voice?.disconnect()
+        scope.cancel()
+    }
+
     companion object {
-        private const val REQ_MIC = 1001
         private const val TAG = "ElderLX04"
+        private const val REQ_MIC = 1001
+
+        /** 服务端根地址（生产环境，IP 直连）。 */
+        const val SERVER_BASE_URL = "https://152.136.230.132"
+
+        /**
+         * 静音多久算"说完了"。
+         *
+         * 1.2 秒是权衡：太短会把老人换气的停顿当成说完了（一句话被切成两半，
+         * ASR 两半都识别不出来）；太长则每轮都要多等一截，交互变迟钝。
+         */
+        const val SILENCE_STOP_MS = 1200L
     }
 }
