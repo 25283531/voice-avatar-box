@@ -28,6 +28,21 @@ android {
     namespace = "com.elder.lx04"
     compileSdk = 34
 
+    /**
+     * 发布密钥：有 `-PLX04_STORE_FILE=...` 就用它，没有就退回 debug 密钥。
+     *
+     * ⚠️ **设备端 APK 必须签名**，否则 `adb install` 直接
+     * `INSTALL_PARSE_FAILED_NO_CERTIFICATES`（不是警告，是装不上）。
+     * 默认 `assembleRelease` 出的是 `app-release-unsigned.apk`，
+     * 这个文件在 CI 里能构建成功、却装不进音箱 —— 属于"绿灯但没用"的产物。
+     *
+     * 密钥不进仓库：CI 从 `LX04_KEYSTORE_BASE64` 解出来放临时目录。
+     * 没有密钥时退回 debug 签名：APK 能装、能验证功能，代价是换一台构建机
+     * 签名就变，升级前得先卸载。bring-up 阶段够用。
+     */
+    val deviceStoreFile = (project.findProperty("LX04_STORE_FILE") as String?)
+        ?.takeIf { it.isNotBlank() }
+
     defaultConfig {
         applicationId = "com.elder.lx04"
         minSdk = 27
@@ -43,6 +58,20 @@ android {
         }
     }
 
+    signingConfigs {
+        // 只在真的给了密钥文件时才创建这个配置。
+        // 无条件 create 的话，AGP 会因为 storeFile 为空报
+        // "SigningConfig is missing required property storeFile"。
+        if (deviceStoreFile != null) {
+            create("device") {
+                storeFile = file(deviceStoreFile)
+                storePassword = project.findProperty("LX04_STORE_PASSWORD") as String?
+                keyAlias = (project.findProperty("LX04_KEY_ALIAS") as String?) ?: "lx04"
+                keyPassword = project.findProperty("LX04_KEY_PASSWORD") as String?
+            }
+        }
+    }
+
     buildTypes {
         release {
             isMinifyEnabled = false
@@ -50,6 +79,12 @@ android {
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
             )
+            // 见上：宁可 debug 签名，也不能出未签名的包（装不上）。
+            signingConfig = if (deviceStoreFile != null) {
+                signingConfigs.getByName("device")
+            } else {
+                signingConfigs.getByName("debug")
+            }
         }
         debug {
             isMinifyEnabled = false
