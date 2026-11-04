@@ -1,0 +1,120 @@
+name: lx04-build
+
+# LX04 设备端 APK（小米小爱触屏音箱客户端）。
+#
+# 与 android-build.yml 的关系：两个**独立**的应用，不共享产物。
+#   · android-build.yml → 家属端手机 App（uni-app H5 + WebView 壳）
+#   · lx04-build.yml    → 音箱端设备 App（纯原生：AudioRecord / 按键 / 自绘色带）
+#
+# 触发：改动 lx04/ 时自动跑，也可手动 / 发 Release 时跑。
+on:
+  push:
+    paths:
+      - 'lx04/**'
+      - '.github/workflows/lx04-build.yml'
+  pull_request:
+    paths:
+      - 'lx04/**'
+      - '.github/workflows/lx04-build.yml'
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      version_name:
+        # ⚠️ **刻意不给 default**。
+        #   workflow_dispatch 的 input 一旦带 default，dispatch 时即使人不填也会
+        #   拿到那个值 —— 于是 `inputs.default` 本身就是**版本号的第二份真源**，
+        #   且会在无人察觉的情况下把 gradle 里的真值盖掉。
+        #   留空 = 沿用 lx04/app/build.gradle.kts 里的唯一真源。
+        description: 版本名（留空则用 build.gradle.kts 里的值：0.1.0）
+        type: string
+        required: false
+      version_code:
+        description: 版本号（留空则用 build.gradle.kts 里的值：1）
+        type: string
+        required: false
+
+jobs:
+  apk:
+    name: 构建 LX04 APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 设置 JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: 设置 Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: 准备图标
+        # 复用 app/src/static/icons（不重复入库）；没有就造一个纯色占位图
+        run: |
+          set -e
+          for spec in "mdpi:48x48" "hdpi:72x72" "xhdpi:96x96" "xxhdpi:144x144" "xxxhdpi:192x192"; do
+            d="lx04/app/src/main/res/mipmap-${spec%%:*}"
+            mkdir -p "$d"
+            src="app/src/static/icons/${spec##*:}.png"
+            if [ -f "$src" ]; then
+              cp "$src" "$d/ic_launcher.png"
+            else
+              python3 - "$d/ic_launcher.png" "${spec##*:}" <<'PY'
+              import sys, struct, zlib
+              path, size = sys.argv[1], int(sys.argv[2].split('x')[0])
+              raw = b''.join(b'\x00' + bytes([0x1E, 0x88, 0xE5]) * size for _ in range(size))
+              def chunk(t, d):
+                  c = t + d
+                  return struct.pack('>I', len(d)) + c + struct.pack('>I', zlib.crc32(c) & 0xffffffff)
+              png = (b'\x89PNG\r\n\x1a\n'
+                     + chunk(b'IHDR', struct.pack('>IIBBBBB', size, size, 8, 2, 0, 0, 0))
+                     + chunk(b'IDAT', zlib.compress(raw))
+                     + chunk(b'IEND', b''))
+              open(path, 'wb').write(png)
+              print('占位图标', path, size)
+              PY
+            fi
+          done
+
+      - name: 跑单元测试
+        working-directory: lx04
+        # ⚠️ 灯效与按键的时序逻辑是移植里最容易出错的部分 ——
+        # 固件上这些判定被反复修过四轮（10-20 / 10-28 / 11-03 / 11-04），
+        # 每次都是踩坑改出来的。测试锁住它们，移植才不会把语义改漂。
+        run: ./gradlew --no-daemon testReleaseUnitTest
+
+      - name: 构建 APK
+        working-directory: lx04
+        env:
+          VERSION_NAME: ${{ inputs.version_name }}
+          VERSION_CODE: ${{ inputs.version_code }}
+        run: |
+          set -e
+          ./gradlew --no-daemon assembleRelease
+          ls -lh app/build/outputs/apk/release/
+
+      - name: 校验产物
+        run: |
+          set -e
+          APK=lx04/app/build/outputs/apk/release/app-release.apk
+          test -f "$APK"
+          # ⚠️ 必须校验 ABI：LX04 是 32 位 armeabi-v7a 用户空间，
+          # 混入 arm64 的 .so 会在设备上加载失败（UnsatisfiedLinkError）。
+          echo "--- 产物里的 so 架构 ---"
+          unzip -l "$APK" | grep -E "\.so$" || echo "(本次无 so)"
+          unzip -l "$APK" | grep -E "lib/arm64" && {
+            echo "!!! 产物里混进了 arm64 —— LX04 是 32 位，会加载失败"; exit 1; } || true
+          echo "--- manifest 里的 HOME 声明 ---"
+          # 开机直达依赖 HOME intent-filter，缺了等于功能没做
+          "$ANDROID_HOME"/build-tools/*/aapt2 dump xmltree "$APK" --file AndroidManifest.xml \
+            | grep -iE "category|HOME" | head -20
+
+      - name: 上传产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: elder-lx04-apk
+          path: lx04/app/build/outputs/apk/release/app-release.apk
+          retention-days: 30
