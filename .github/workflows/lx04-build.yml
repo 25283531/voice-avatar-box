@@ -51,33 +51,30 @@ jobs:
       - name: 设置 Gradle
         uses: gradle/actions/setup-gradle@v4
 
-      - name: 准备图标
-        # 复用 app/src/static/icons（不重复入库）；没有就造一个纯色占位图
+      - name: 校验图标
+        # 图标已由 lx04/scripts/gen_icons.py 生成并入库，这里只做存在性校验。
+        #
+        # 之前这段是「在 CI 里现写现跑」的 heredoc，结果 YAML 的 `run: |`
+        # 给结束标记 `PY` 加上了缩进，bash 匹配不到 → `syntax error:
+        # unexpected end of file`，整个 job 在第 5 步就挂了（run 41804175633）。
+        # 生成逻辑挪进脚本后，同一份图标本地与 CI 完全一致，也不会再被缩进坑到。
+        #
+        # 重新生成：python3 lx04/scripts/gen_icons.py
         run: |
           set -e
-          for spec in "mdpi:48x48" "hdpi:72x72" "xhdpi:96x96" "xxhdpi:144x144" "xxxhdpi:192x192"; do
-            d="lx04/app/src/main/res/mipmap-${spec%%:*}"
-            mkdir -p "$d"
-            src="app/src/static/icons/${spec##*:}.png"
-            if [ -f "$src" ]; then
-              cp "$src" "$d/ic_launcher.png"
-            else
-              python3 - "$d/ic_launcher.png" "${spec##*:}" <<'PY'
-              import sys, struct, zlib
-              path, size = sys.argv[1], int(sys.argv[2].split('x')[0])
-              raw = b''.join(b'\x00' + bytes([0x1E, 0x88, 0xE5]) * size for _ in range(size))
-              def chunk(t, d):
-                  c = t + d
-                  return struct.pack('>I', len(d)) + c + struct.pack('>I', zlib.crc32(c) & 0xffffffff)
-              png = (b'\x89PNG\r\n\x1a\n'
-                     + chunk(b'IHDR', struct.pack('>IIBBBBB', size, size, 8, 2, 0, 0, 0))
-                     + chunk(b'IDAT', zlib.compress(raw))
-                     + chunk(b'IEND', b''))
-              open(path, 'wb').write(png)
-              print('占位图标', path, size)
-              PY
+          missing=0
+          for d in mdpi hdpi xhdpi xxhdpi xxxhdpi; do
+            f="lx04/app/src/main/res/mipmap-$d/ic_launcher.png"
+            if [ ! -f "$f" ]; then
+              echo "缺图标: $f"
+              missing=1
             fi
           done
+          if [ "$missing" -ne 0 ]; then
+            echo "!!! 图标缺失 —— 跑 python3 lx04/scripts/gen_icons.py 重新生成"
+            exit 1
+          fi
+          echo "图标齐全：5 个密度档位"
 
       - name: 跑单元测试
         working-directory: lx04
