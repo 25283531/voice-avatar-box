@@ -162,7 +162,10 @@ class LedBandView @JvmOverloads constructor(
          */
         fun defaultBandWidthPx(context: Context): Int {
             val mm5 = TypedValue.applyDimension(
-                TypedValue.MM,
+                // ⚠️ 单位常量是 COMPLEX_UNIT_MM，不是 MM。
+                //   TypedValue 里没有 MM 这个字段（只有 COMPLEX_UNIT_MM / COMPLEX_UNIT_DIP 等），
+                //   误写会在编译期 Unresolved reference: MM。
+                TypedValue.COMPLEX_UNIT_MM,
                 5f,
                 context.resources.displayMetrics
             )

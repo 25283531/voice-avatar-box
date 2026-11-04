@@ -1,6 +1,9 @@
 package com.elder.lx04.light
 
 import android.graphics.Color
+// LedConfigItem 是 object Led 的**内部类**，不是顶层类型。
+// Kotlin 不会因为同包就自动可见嵌套类，必须显式 import。
+import com.elder.lx04.light.Led.LedConfigItem
 
 /**
  * 灯效引擎 —— 移植自 ESP32 固件的 `firmware/components/elder/src/rgb.c`。
@@ -334,7 +337,9 @@ class LedEngine {
      *
      * 优先级：ALARM > MED_PENDING > REMINDER > EMOTION > IDLE
      */
-    private fun resolveLeftBand(t: Long): BandRender.Band {        // 事件灯不受状态灯开关影响 —— 判据是优先级，不是名单
+    private fun resolveLeftBand(t: Long): BandRender.Band {
+        // 事件灯不受「状态灯开关」影响 —— 判据是优先级，不是名单。
+        // （状态灯可以关，但提醒/服药这类事件必须还能亮，否则老人就漏了提醒。）
         val event = slots.filter { it.prio.value >= Led.Priority.REMINDER.value }
         if (event.isNotEmpty()) {
             val top = event.maxByOrNull { it.prio.value }!!
