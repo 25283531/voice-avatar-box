@@ -264,6 +264,43 @@ def main() -> int:
             check("库里是 NONE 时纯按键回执仍是按键(2)，不冒充全置信",
                   bool(hit2) and hit2[0].get("confirm_method") == 2,
                   json.dumps(hit2[:1], ensure_ascii=False))
+
+            # ---------------------------------------------- 7b. 已确认不许被
+            # 队列补发的旧回执翻回去（2026-11-04）
+            #
+            # 设备回执走 NVS 队列补发（sync.c 的 flush_queue），断网期间产生的
+            # 那几条会在联网后按**旧顺序**重放。服务端 2026-11-04 起允许「4 小时
+            # 内迟确认」（voice/tools._CONFIRM_WINDOW_AFTER_MIN）⇒ 新时序：
+            #   ① 离线期间本地超时，队列里塞了一条 MISSED 回执；
+            #   ② 老人长按确认，服务端落 CONFIRMED、收屏、灭灯；
+            #   ③ 队列 flush，旧的 MISSED 到达 ⇒ 若无条件覆盖就把记录翻回
+            #      "漏服"，依从率/漏服告警/家属端全反转，而屏幕已经收了。
+            # 这个洞是完全静默的（无日志、无异常），所以必须有断言。
+            due3 = "2026-10-17T11:00:00+08:00"
+            req("POST", "/api/device/events",
+                {"reminder_id": rid, "due_at": due3, "state": 2,
+                 "confirm_method": 2}, dev_token)
+            req("POST", "/api/device/events",
+                {"reminder_id": rid, "due_at": due3, "state": 3,
+                 "note": "timeout"}, dev_token)
+            code, evs = req("GET", f"/api/devices/{dev_pk}/events?limit=200", None, tok)
+            hit3 = [e for e in (evs or []) if "T11:00" in str(e.get("due_at", ""))]
+            check("★ 已确认(2) 后到达的 MISSED(3) 回执不许翻回去",
+                  bool(hit3) and hit3[0].get("state") == 2,
+                  json.dumps(hit3[:1], ensure_ascii=False))
+
+            # 反向用例：未确认的实例照旧接受 MISSED（挡多了会让漏服永远发现不了）
+            due4 = "2026-10-17T12:00:00+08:00"
+            req("POST", "/api/device/events",
+                {"reminder_id": rid, "due_at": due4, "state": 1}, dev_token)
+            req("POST", "/api/device/events",
+                {"reminder_id": rid, "due_at": due4, "state": 3,
+                 "note": "timeout"}, dev_token)
+            code, evs = req("GET", f"/api/devices/{dev_pk}/events?limit=200", None, tok)
+            hit4 = [e for e in (evs or []) if "T12:00" in str(e.get("due_at", ""))]
+            check("★ 未确认(FIRED) 的实例照旧接受 MISSED(3)",
+                  bool(hit4) and hit4[0].get("state") == 3,
+                  json.dumps(hit4[:1], ensure_ascii=False))
         else:
             check("先 VOICE 后 BUTTON ⇒ 合并成全置信(5)", False, "没有可用的 reminder_id")
             check("库里是 NONE 时纯按键回执仍是按键(2)，不冒充全置信", False, "同上")

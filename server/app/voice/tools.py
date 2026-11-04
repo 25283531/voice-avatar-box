@@ -49,7 +49,7 @@ import logging
 import re
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
-from typing import Any
+from typing import Any, Final
 
 from sqlalchemy import select
 
@@ -938,6 +938,56 @@ def _medicine_phrase(r: models.Reminder) -> str:
 #: 的提醒被写成"已服用"，家属看到的就是假记录。
 _CONFIRM_WINDOW_BEFORE_MIN = 2
 
+#: 服药确认的**过期后**窗口（分钟）：4 小时。与固件 ``ui.c:31`` 的
+#: ``ELDER_UI_REMINDER_HOLD_US``（4 小时）必须是同一个数。
+#:
+#: ---- 这个常量是 2026-11-04 用户实报事故的根因 ----
+#: 固件那边的语义是「待办卡片在屏幕上挂多久」：到点触发后 4 小时内，卡片一直
+#: 全屏显示、#1 呼吸灯一直亮，老人随时可以长按 3 秒确认（用户 2026-10-31 定的：
+#: 「确认窗口在4个小时内只要屏幕显示的是待办事项就可以按键进行确认」）。
+#:
+#: 但 ``scheduler._tick`` 在 ``due + escalate_after_min``（默认 30 分钟）就把
+#: 实例落成 ``MISSED(3)``，而本函数原来只认 ``PENDING/FIRED`` ⇒
+#: **第 30 分钟起服务端眼里就没有这条提醒了，屏幕上却还挂着 3.5 小时**。
+#:
+#: 生产库 ev=125 是这条的完整样本：due=12:43、设备 16:19:26 才响（之前离线）、
+#: state=3、note='timeout' ⇒ ``pending_medicine_events`` 返回空 ⇒
+#: ① ``_pending_reminder_label`` 空 ⇒ system 里没有待确认清单 ⇒ 模型不知道有
+#:    提醒，一次 ``confirm_reminder`` 都没调（日志 ``tool=0ms``）；
+#: ② ``_maybe_confirm_fallback`` 在 ``if not (self._pending_reminder and ...)``
+#:    第一道闸就返回，连「兜底确认跳过」那行都不打。
+#: 老人看到的就是「喊了半天确认，他什么都没听进去，提醒一直挂在屏上」。
+#:
+#: 所以这里必须补上「过期后窗口」，而且判据要与**屏幕**同源：屏还挂着就还能
+#: 确认。屏幕的计时起点是"卡片真正显示出来的那一刻"（设备迟响时晚于 due），
+#: 所以下面用 ``max(due, fired_at)`` 作锚点，见 ``_confirm_deadline``。
+_CONFIRM_WINDOW_AFTER_MIN = 240
+
+
+def _confirm_anchor(ev: Any) -> datetime:
+    """这一实例"可确认窗口"的起点（aware UTC）。
+
+    正常情况下就是 ``due_at``；但设备离线 / 重启之后可能**迟响**（生产库
+    ev=125 迟了 3 小时 36 分），而屏幕的 4 小时计时是从卡片显示那一刻才开始的
+    （``ui.c`` 在 ``OnReminder`` 里设 ``reminder_expire_us``）。锚点不跟着迟响
+    走的话，会出现「屏上还挂着、服务端说早就过期了」—— 正是本次事故。
+
+    ``fired_at`` 由设备上报，``schemas.LOCAL_WALL_FIELDS`` 把它归一成**北京
+    墙上时间**（与 ``due_at`` 同一口径），所以这里和 ``event_due_utc`` 一样走
+    ``event_instant`` 还原绝对时刻。不用设备时钟做减法：那需要设备时区，而
+    固件目前不上报自己的时区（``report_event`` 的 docstring 有同样说明）。
+    """
+    due = event_due_utc(ev)
+    fired_at = getattr(ev, "fired_at", None)
+    if fired_at is None:
+        return due
+    try:
+        fired = event_instant(fired_at, getattr(ev, "tz", "") or "",
+                              int(getattr(ev, "tz_offset_min", 0) or 0))
+    except Exception:  # noqa: BLE001  脏时间戳只该让它退回 due，不该整条消失
+        return due
+    return fired if fired > due else due
+
 
 def medicine_names(r: models.Reminder) -> list[str]:
     """这条提醒的药名清单（与语音播报**同口径**，见 ``_medicines_of``）。
@@ -951,14 +1001,96 @@ def medicine_names(r: models.Reminder) -> list[str]:
     return [m["name"] for m in _medicines_of(r)]
 
 
+#: 标点/空白归一用：判断"这句是不是一个光秃秃的应答"之前必须先去掉它们。
+#: ASR 输出稳定地带着句号（生产日志里是「确认。」），不去掉就永远比不中。
+_YES_STRIP_RE: Final[re.Pattern[str]] = re.compile(r"[\s。，、！？；：,.!?;:~～…·\"'“”‘’]+")
+
+#: 「整条确认」的短应答白名单。**故意不含「好 / 好的 / 行 / 知道了」** ——
+#: 理由与 ``session._CONFIRM_RE`` 上方那段一致：那几句在正常聊天里到处都是，
+#: 误判的后果是"没吃药却被记成吃了"。
+#:
+#: 这份清单存在的直接原因（2026-11-04 用户实报）：
+#: 设备长按 3 秒后念的是「我帮您确认一下，您刚才已经服用过降压药了吗？」，
+#: 老人最自然的回答就是「确认」。而 ``session._CONFIRM_RE`` 里**没有「确认」
+#: 两个字**，``match_medicine("确认", [...])`` 也返回空 ⇒ 服务端把这句话当成
+#: 一次普通闲聊，既不写记录也不追问，提醒永远挂在屏上。
+_WHOLE_YES: Final[frozenset[str]] = frozenset({
+    "确认", "确定", "对", "对的", "是", "是的", "嗯", "嗯嗯", "没错",
+    "吃了", "吃过了", "吃完了", "吃过", "喝过了", "已经吃了", "我已经吃了",
+    "都吃了", "都吃过了", "全都吃了", "全部吃了", "两样都吃了", "两种都吃了",
+    "两味都吃了", "一起吃了", "都喝了", "全都喝了", "全部喝了",
+})
+
+#: 「不点名某一味、而是说'都/全部'」的形态。白名单之外还要认这种自由组合：
+#: 「降压药和降脂药都吃了」里的"都吃了"是结论，但整句不在白名单里。
+_WHOLE_ALL_RE: Final[re.Pattern[str]] = re.compile(
+    r"(都|全部|全都|两样|两种|两味|一起)[^，。]{0,6}(吃|喝|服)")
+
+#: ``is_whole_event_yes`` 的长度上限（归一后字符数）。
+#: 12 个汉字足够覆盖「两样都吃了」「我已经全部吃过了」这类回答，又短到不会
+#: 把一长串叙述截胡成"整条确认"。
+_WHOLE_YES_MAX_LEN: Final[int] = 12
+
+
+def is_whole_event_yes(text: str) -> bool:
+    """这句话是不是"整条确认"（不点名某一味药，只说'确认 / 都吃了'）。
+
+    用途只有一个：``_confirm_reminder`` 与 ``session._fallback_confirm_verdict``
+    在「只有一条待确认提醒」时，据此决定"整条标完成"还是"继续追问哪一味"。
+
+    ⚠️ 只判措辞，**不判上下文**。调用方必须自己先确认"候选恰好 1 条" ——
+    这条函数对"两味药吃哪味"一无所知，单靠它确认就是替老人瞎确认。
+
+    为什么必须限制长度（``_WHOLE_YES_MAX_LEN``）：老人会连着说一长串
+    「我刚才吃完饭把降压药吃了还有那个降脂药也吃了」，那里面点名了药，
+    该走 ``match_medicine`` 的逐味路径，不能被这里截胡。
+    """
+    norm = _YES_STRIP_RE.sub("", text or "")
+    if not norm or len(norm) > _WHOLE_YES_MAX_LEN:
+        return False
+    if norm in _WHOLE_YES:
+        return True
+    return bool(_WHOLE_ALL_RE.search(norm))
+
+
+def _mark_whole_event_confirm(ev: Any, names: list[str]) -> None:
+    """把"整条确认（未逐味点名）"这件事**留痕**，不假装是逐味确认。
+
+    为什么要单独留痕：``confirmed_medicines`` 填满之后 ``state`` 会落
+    ``CONFIRMED``，与"一味一味点过名"的记录在库里长得**一模一样**。家属端
+    和依从率统计因此分不出"他说了两味都吃了"和"他点了名说降压药吃了"。
+    这不是靠加一列解决的（加列要迁移），``note`` 已经会展示给家属，改它够用。
+
+    ⚠️ 不能覆盖已有的 ``note``：``'timeout'`` / ``'confirmed'`` 这些是审计
+    线索，抹掉就查不出"这条曾经超时升级过"。
+    """
+    tag = models.WHOLE_EVENT_CONFIRM_TAG
+    if len(names) > 1:
+        tag += f"：{'、'.join(names)}"
+    old = str(getattr(ev, "note", "") or "").strip()
+    ev.note = f"{old}；{tag}" if old else tag
+
+
 def pending_medicine_events(
     db: Any, device_pk: int,
 ) -> list[tuple[models.ReminderEvent, models.Reminder]]:
     """当前**待确认**的服药提醒实例（已到点、未确认），连同规则一起返回。
 
-    判据与 ``scheduler._tick`` 的超时扫描逐条对齐：``state in (PENDING, FIRED)``
-    + 规则未软删 + ``require_confirm`` + ``rtype == MEDICINE``；唯一的额外条件
-    是「已到点」（理由见 ``_CONFIRM_WINDOW_BEFORE_MIN`` 的注释）。
+    规则侧判据与 ``scheduler._tick`` 的超时扫描逐条对齐（规则未软删 +
+    ``require_confirm`` + ``rtype == MEDICINE``）。时间侧判据是**屏幕口径**，
+    不是 ``state`` 口径 —— 见 ``_CONFIRM_WINDOW_AFTER_MIN`` 的长注释：
+
+      * 已到点：``anchor <= now + _CONFIRM_WINDOW_BEFORE_MIN``；
+      * 屏还挂着：``anchor >= now - _CONFIRM_WINDOW_AFTER_MIN``（4 小时）。
+
+    ``state`` 仍然要过一遍白名单，但白名单里**必须有 MISSED(3)**：
+    ``scheduler`` 在 ``due + escalate_after_min``（默认 30 分钟）就把实例落成
+    MISSED，而固件屏幕还挂 4 小时。少了它，老人对着屏上的待办卡按满 3 秒、
+    在对话里说清吃了哪味药，服务端会答「没有等着确认的提醒」——2026-11-04
+    生产库 ev=125 就是这么挂死的（详见 ``_CONFIRM_WINDOW_AFTER_MIN``）。
+
+    ``CONFIRMED(2)`` 与 ``SKIPPED(4)`` **不在**白名单里：那两条是"已经办完了"，
+    再确认一次只会制造第二条假记录。
 
     一次 join 把 ``Reminder`` 一起捞出来：调用方每轮都要读每条的 ``medicines``，
     逐条 ``db.get`` 就是 N+1（这个函数在每轮对话开头都会被调一次）。
@@ -971,7 +1103,8 @@ def pending_medicine_events(
         .where(
             models.ReminderEvent.device_id == device_pk,
             models.ReminderEvent.state.in_([int(models.EventState.PENDING),
-                                            int(models.EventState.FIRED)]),
+                                            int(models.EventState.FIRED),
+                                            int(models.EventState.MISSED)]),
             models.Reminder.deleted_at.is_(None),
             models.Reminder.require_confirm.is_(True),
             models.Reminder.rtype == int(models.ReminderType.MEDICINE),
@@ -982,12 +1115,15 @@ def pending_medicine_events(
     out: list[tuple[models.ReminderEvent, models.Reminder]] = []
     for ev, rule in rows:
         try:
-            due = event_due_utc(ev)
+            anchor = _confirm_anchor(ev)
         except Exception:  # noqa: BLE001  脏 tz 不该让整条确认链断掉
             log.debug("待确认提醒 due_at 还原失败（跳过）：ev=%s", ev.id)
             continue
-        if due <= now + timedelta(minutes=_CONFIRM_WINDOW_BEFORE_MIN):
-            out.append((ev, rule))
+        if anchor > now + timedelta(minutes=_CONFIRM_WINDOW_BEFORE_MIN):
+            continue    # 还没到点：提前几小时预排的实例不算候选
+        if anchor < now - timedelta(minutes=_CONFIRM_WINDOW_AFTER_MIN):
+            continue    # 屏幕的 4 小时窗口已经过了，卡片早就收了
+        out.append((ev, rule))
     return out
 
 
@@ -1505,11 +1641,25 @@ def _confirm_reminder(db: Any, device_pk: int, device_call: Any,
 
     target: tuple[models.ReminderEvent, models.Reminder, list[str]] | None = None
     hits: list[str] = []
+    # 这条记录是不是"整条确认"来的（没逐味点名）。只影响留痕，不影响 state。
+    whole_event_confirm = False
+    # 这一轮是不是"整条确认"（老人没点名某一味，只说「确认 / 都吃了」）。
+    # 判据只看措辞，长度上限见 ``is_whole_event_yes``。
+    whole_yes = is_whole_event_yes(said)
+    if whole_yes:
+        log.info("confirm_reminder：%r 判为整条确认（不点名某一味）", said)
 
     # ⚠️ ``and all_names``：一条药名都没登记（老数据只有 title）时没有可匹配
     # 的对象，硬走匹配表会永远返回 matched=false，把老人卡在「问不出药名」的
     # 死循环里。此时按"没有逐味信息"处理，落到下面的整条确认分支。
-    if said and all_names:
+    #
+    # ⚠️ ``not whole_yes``：不加这一条的后果是**死循环**（2026-11-04 用户实报
+    # 「老子喊了半天确认，他听到啥了？」的最后一环）：老人答「确认」，
+    # ``match_medicine("确认", ["降压药","降脂药"])`` 返回空 ⇒ 走 matched=False
+    # ⇒ 让模型"复述药名再问一次" ⇒ 老人再说「确认」…… 每轮都问、永远不落库，
+    # 屏幕和灯就一直挂着。而「确认」根本不是在点名药，它是在回答
+    # 「您刚才已经服用过降压药了吗？」这个是非问 —— 它不该进药名匹配表。
+    if said and not whole_yes and all_names:
         # 老人点了名（药名或类别词）—— 走匹配表，**不在这里猜**。
         hits = match_medicine(said, all_names)
         if len(hits) > 1:
@@ -1535,19 +1685,38 @@ def _confirm_reminder(db: Any, device_pk: int, device_call: Any,
                         "最多再问两轮，问不出来就如实说「我先记着，您方便时看一眼药盒」，"
                         "不要无限追问。"
                     )}
-    elif len(items) == 1 and len(items[0][2]) <= 1:
-        # 只说「吃了」：只有「一条提醒、且只挂一味药（或没登记药名）」时
-        # 才允许整条确认。多味药时留空参数等于替老人挑，必须问清。
-        target = items[0]
     elif len(items) == 1:
-        names = items[0][2]
-        log.info("confirm_reminder：只说「吃了」，但这条提醒有 %s 味药，转追问", len(names))
-        return {"ok": True, "confirmed": False, "need_detail": True,
-                "candidates": names,
-                "message": (
-                    f"这条提醒挂着 {'、'.join(names)} 这几味药，老人没说清是哪一味。"
-                    f"请先问「您吃的是{'还是'.join(names)}」，再带他说的那个词重新调用本工具。"
-                )}
+        # ---- 只有一条待确认 ⇒ **整条确认**，不再追问是哪一味 ----
+        #
+        # ⚠️ 2026-11-04 改口径（原逻辑：「这条提醒挂着 N 味药，老人没说清是哪
+        # 一味 ⇒ need_detail，让模型问『您吃的是A还是B』」）。改的直接原因是
+        # 用户第三次为同一件事发火，而现场证据说明"追问"这条路根本走不通：
+        #
+        #   ① 设备长按 3 秒后问的是「您吃的是哪种药？」，老人答「确认」——
+        #      这不是在点名药，是在回答一个是非问。追问纪律把它当成"没点名"
+        #      再问一遍，老人再说「确认」，每轮都问、一次都不落库，屏幕和 #1
+        #      呼吸灯就一直挂着（用户原话：「一个提醒确认到现在还显示在屏幕上，
+        #      事件指示灯还一直亮着」）。
+        #   ② 固件自己在"开不了麦 / 播不了片段"时**已经**这么干了：见
+        #      ``elder_bridge.cc`` 的 ``!CanStartDialog()`` 分支 ——
+        #      ``ConfirmMedicine(idx, ELDER_CFM_BUTTON)`` 不管几味药，
+        #      注释写的取舍是「信息缺失不能让老人确认不了，'按了就记上'比
+        #      '按了没反应'安全得多」。服务端比设备更严 = 按键的可靠性取决于
+        #      网络和设备状态，而用户的要求是「按键一定能确认」。
+        #   ③ 候选**恰好 1 条**：不存在"确认错哪条提醒"的风险，剩下的只是
+        #      "哪几味"的粒度问题。
+        #
+        # 代价说清楚（不要装作没有）：老人只吃了两味里的一味、却只说「吃了」，
+        # 会把两味都记成已服。所以这里**必须留痕**：``_mark_whole_event_confirm``
+        # 往 ``note`` 写「整条确认（未逐味点名）：降压药、降脂药」，家属端能看见
+        # 这条记录不是逐味确认来的。宁可留一条粒度粗但真实的记录，也不要为了
+        # 粒度把记录弄丢 —— 没有记录 = 家属以为老人没吃。
+        target = items[0]
+        if len(items[0][2]) > 1:
+            whole_event_confirm = True
+            log.info("confirm_reminder：唯一候选挂 %d 味药（%s），老人未点名"
+                     "（said=%r，整条确认措辞=%s）⇒ 整条确认并留痕",
+                     len(items[0][2]), "、".join(items[0][2]), said, whole_yes)
     else:
         # 多条待确认 + 没点名：不许让「吃了」三个字把几条提醒一起确认掉。
         brief = "；".join(
@@ -1572,6 +1741,10 @@ def _confirm_reminder(db: Any, device_pk: int, device_call: Any,
     # 可变性追踪，就地 append 之后脏检查认为没变化 ⇒ 不写库（详见
     # ``routers/device_api.report_event`` 里同一条注释）。
     ev.confirmed_medicines = recorded
+    # 整条确认（没逐味点名）必须留痕 —— 否则它在库里与"逐味点过名"完全一样。
+    # 放在 commit 之前（下面 ``db.commit()``），放后面就丢。
+    if whole_event_confirm:
+        _mark_whole_event_confirm(ev, names)
 
     # 「全确认才算 CONFIRMED」—— 依从率、漏服告警全部只看 state，部分确认
     # 提前置 CONFIRMED 等于把"只吃了 2/4 味"记成"全吃了"，是医疗事故级的错。

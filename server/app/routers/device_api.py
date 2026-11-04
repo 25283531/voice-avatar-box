@@ -589,7 +589,29 @@ def report_event(payload: EventReportIn, db: Session = Depends(get_db),
     # 依从率恒 0、漏服告警不停，代价比这个洞更大。逐味完整性由上游保证：
     # ``voice.session._fallback_confirm_verdict`` 已经把服务端兜底确认收紧到
     # 「恰好 1 条候选 + 该条只有 1 味药」，多候选/多味药时不再下发空参数确认。
-    ev.state = payload.state
+    # ---- 已确认不许被回执翻回去（2026-11-04）----
+    # 设备回执走 NVS 队列补发（``sync.c`` 的 flush_queue），断网期间产生的那几条
+    # 会在联网后按**旧顺序**重放。而 2026-11-04 起服务端允许「4 小时内迟确认」
+    # （见 ``voice/tools._CONFIRM_WINDOW_AFTER_MIN``）⇒ 一种新时序变得常见：
+    #   ① 设备离线期间本地超时升级，生成一条 MISSED 回执塞进队列；
+    #   ② 老人回到设备前长按确认，服务端把实例落成 CONFIRMED、收屏、灭灯；
+    #   ③ 队列 flush，那条**旧的** MISSED 回执到达 ⇒ 无条件覆盖 ⇒
+    #      记录翻回"漏服"，依从率、漏服告警、家属端全部跟着反转。
+    # 而屏幕和 #1 灯已经收了 —— 又是一次"两边对不上"，且这次是**静默**的：
+    # 没有任何日志、没有任何异常。
+    #
+    # 只挡这一个方向：CONFIRMED 是"事实已发生"的终态，不许被更早的状态覆盖。
+    # 其余迁移（PENDING→FIRED、FIRED→MISSED、任何→CONFIRMED）照旧由设备驱动，
+    # 一个字都不改 —— 挡多了会让老固件的整条确认永远落不了地。
+    if (int(ev.state) == int(EventState.CONFIRMED)
+            and int(payload.state) != int(EventState.CONFIRMED)):
+        log.warning("忽略把已确认实例翻回未确认的回执：ev=%s state %s -> %s"
+                    "（队列补发的旧回执，不覆盖）",
+                    ev.id, ev.state, payload.state)
+        _state_ignored = True
+    else:
+        ev.state = payload.state
+        _state_ignored = False
     # 语音确认 = 半置信，按键确认 = 全置信（2026-10-27 用户定义）。
     # 同一条提醒实例设备会报两次，而两次的**先后两种顺序都真实存在**：
     #   * 旧流程：先 method=VOICE（老人说「我吃过了」），再 BUTTON（长按复核）；
@@ -671,7 +693,13 @@ def report_event(payload: EventReportIn, db: Session = Depends(get_db),
         ev.fired_count = (ev.fired_count or 0) + 1
     if payload.confirmed_at:
         ev.confirmed_at = payload.confirmed_at
-    if payload.note:
+    # 留痕不许被设备回执抹掉（2026-11-04）。
+    # 固件每条 CONFIRMED 回执都带 ``note="confirmed"``（``sync.c``），覆盖语义
+    # 会把服务端写下的「整条确认（未逐味点名）」冲掉 —— 家属端从此再也看不出
+    # 这条记录不是逐味确认来的。设备那句 "confirmed" 没有任何新信息，
+    # 所以只在**没有**本标记时才接受它。
+    if (payload.note and not _state_ignored
+            and models.WHOLE_EVENT_CONFIRM_TAG not in str(ev.note or "")):
         ev.note = payload.note
     if payload.state == int(EventState.MISSED):
         ev.escalated = True

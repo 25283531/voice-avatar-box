@@ -716,9 +716,24 @@ class EventState(IntEnum):
     SKIPPED = 4     # 主动跳过
 
 
+#: ``ReminderEvent.note`` 里的「整条确认」留痕标记。
+#:
+#: 为什么需要它（2026-11-04）：设备长按 3 秒后问的是一个是非问句，老人答
+#: 「确认」时服务端会**整条**确认（含多味药），并把全部药名写进
+#: ``confirmed_medicines``。落库之后这条记录与"逐味点过名"的**完全一样**，
+#: 家属端和依从率统计分不出粒度差别。加列要迁移，所以用 ``note`` 留痕。
+#:
+#: ⚠️ 它会被设备回执抹掉：固件 ``sync.c`` 的 CONFIRMED 回执带
+#: ``note="confirmed"``，而 ``routers/device_api.report_event`` 是
+#: ``if payload.note: ev.note = payload.note``（覆盖语义，那是给
+#: fired/timeout 用的，不能改成追加）。所以那边单独挡了一条：note 里已带
+#: 本标记时不再被设备回执覆盖。改这个字符串要同时改
+#: ``voice/tools._mark_whole_event_confirm`` 与 ``routers/device_api``。
+WHOLE_EVENT_CONFIRM_TAG: str = "整条确认（未逐味点名）"
+
+
 class ReminderEvent(Base):
     """一次具体的提醒实例（由服务端预排，或设备离线触发后回传）。"""
-
     __tablename__ = "reminder_events"
     __table_args__ = (
         UniqueConstraint("reminder_id", "due_at", name="uq_reminder_due"),

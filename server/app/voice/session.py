@@ -66,8 +66,8 @@ from .prompts import (
     now_context,
     reminder_context,
 )
-from .tools import (TOOL_DEFS, clock_mentions, execute_tool, medicine_names,
-                    pending_medicine_events)
+from .tools import (TOOL_DEFS, clock_mentions, execute_tool,
+                    is_whole_event_yes, medicine_names, pending_medicine_events)
 
 log = logging.getLogger(__name__)
 
@@ -611,9 +611,14 @@ _PENDING_REMINDER_HINT: Final[str] = (
     "· 老人点了名（「降压药吃了」「氨氯地平吃了」）→ 调用 confirm_reminder，"
     "把他说出的那个词**原样**填进 medicine 参数。**不要**自己把「降压药」换成"
     "具体药名：服务端有一张专门的匹配表，你猜的药名很可能猜错。\n"
-    "· 老人只说了「吃了」「吃过了」，而清单里不止一条、或那条提醒挂着两味以上"
-    "却没说是哪一味 → **必须先问清是哪一种**，不许把几条一起确认，更不许只凭"
-    "「吃了」两个字替他挑一条。\n"
+    "· 清单里**不止一条**、老人只说「吃了」「确认」却没说是哪一条 → **必须先问清"
+    "是哪一种**，不许把几条一起确认，更不许只凭「吃了」两个字替他挑一条。\n"
+    "· 清单里**只有一条**、老人说「吃了 / 确认 / 都吃了」→ **直接调用"
+    "confirm_reminder，medicine 留空**，不要追问「是哪一味」。服务端会整条确认，"
+    "并在记录里注明「未逐味点名」。"
+    "反复追问是本功能最大的投诉点（2026-11-04）：设备长按 3 秒后问的就是一个是非"
+    "问句，老人答「确认」却听到「您吃的是降压药还是降脂药」，再答「确认」还是同一"
+    "句 —— 问三轮一次都没落库，屏幕和指示灯一直挂着。\n"
     "· 工具返回 ambiguous（候选药名）→ 把候选药名一个一个念给他听，让他挑一个，"
     "再带他挑的那个词重新调用。\n"
     "· 工具返回 matched=false → 复述一遍候选药名再问一次；**最多再问两轮**，"
@@ -763,19 +768,28 @@ def _reminded_schedule_label(device_pk: int) -> str:
         return ""
 
 
-def _fallback_confirm_verdict(device_pk: int) -> tuple[bool, str]:
+def _fallback_confirm_verdict(device_pk: int,
+                              whole_yes: bool = False) -> tuple[bool, str]:
     """服务端兜底确认（模型漏调 confirm_reminder）能否下发；返回 (可否, 跳过原因)。
 
     判据必须与 ``tools._confirm_reminder`` 的候选集**完全一致**：直接复用
     ``pending_medicine_events`` / ``medicine_names``，不另写一份 SQL。两套判据
     迟早漂移，漂移的症状是「兜底确认了一条工具根本不会确认的提醒」。
 
-    为什么收紧到「恰好 1 条候选 + 该条只有 1 味药」（2026-11-03）：兜底下发的是
-    **空参数**设备确认 —— 设备挑的是"当前正在响铃的那条"，服务端无从核对。
-    多条候选时它可能确认错的那条；单条但挂多味药时，设备回执的 CONFIRMED 不带
-    药名，``routers/device_api.report_event`` 会整条置 CONFIRMED ⇒ 只吃了 1 味被
-    记成 4 味全吃，依从率虚高、漏服告警失效。宁可让提醒挂着，等下一轮按
-    ``_PENDING_REMINDER_HINT`` 的追问纪律问清，也不能替老人瞎确认。
+    ``whole_yes``（2026-11-04 加）：老人说的是「确认 / 都吃了」这类不点名某一味
+    的短应答。为 True 时**允许唯一候选挂多味药**，与 ``_confirm_reminder`` 的
+    新口径保持一致（那边的长注释解释了为什么）。
+
+    为什么原先收紧到「恰好 1 条候选 + 该条只有 1 味药」（2026-11-03）：兜底下发
+    的是**空参数**设备确认 —— 设备挑的是"当前正在响铃的那条"，服务端无从核对。
+    多条候选时它可能确认错的那条。这一条**现在仍然成立，一个字没松**：多条候选
+    永远拒绝，因为那才是"确认错提醒"的真实风险。
+
+    多味药那条松了，理由是它已经不再是"确认错对象"，只剩"粒度"问题，而粒度
+    问题在固件侧早就用同一个取舍解决了（``elder_bridge.cc`` 的
+    ``!CanStartDialog()`` 兜底直接确认整条，注释：「信息缺失不能让老人确认
+    不了」）。服务端比设备更严 = 按键的可靠性取决于网络与设备状态，而用户的
+    要求是「按键一定能确认」。
     """
     try:
         with SessionLocal() as db:
@@ -786,9 +800,9 @@ def _fallback_confirm_verdict(device_pk: int) -> tuple[bool, str]:
                 return False, (f"有 {len(rows)} 条候选待确认，"
                                "设备无法确定老人说的是哪条")
             names = medicine_names(rows[0][1])
-            if len(names) > 1:
+            if len(names) > 1 and not whole_yes:
                 return False, (f"唯一候选挂着 {len(names)} 味药"
-                               f"（{'、'.join(names)}），必须问清是哪一味")
+                               f"（{'、'.join(names)}），且老人没说是哪一味")
             return True, ""
     except Exception as exc:  # noqa: BLE001  查库失败就不兜底，绝不瞎确认
         return False, f"查询待确认提醒失败 {type(exc).__name__}: {exc}"
@@ -2798,21 +2812,27 @@ class VoiceSession:
         await self._handle_empty_asr(started)
         return ""
 
-    async def _maybe_confirm_fallback(self, tool_trace: list[dict[str, Any]]) -> None:
+    async def _maybe_confirm_fallback(self, tool_trace: list[dict[str, Any]],
+                                      utterance: str = "") -> None:
         """模型漏调 ``confirm_reminder`` 时，服务端补一刀设备确认。
 
         抽成方法是为了能单独跑自测（build-out 里的临时脚本）：这段是"替老人
         写服药记录"的最后一环，只靠读代码保证正确是不够的。
 
-        只在「恰好 1 条候选 + 该条只有 1 味药」时补，判据见
-        ``_fallback_confirm_verdict``；不满足就只打一条 log，交给模型按
-        ``_PENDING_REMINDER_HINT`` 的追问纪律继续问。
+        只在「恰好 1 条候选」时补，判据见 ``_fallback_confirm_verdict``；
+        不满足就只打一条 log，交给模型按 ``_PENDING_REMINDER_HINT`` 的追问
+        纪律继续问。
+
+        ``utterance``（2026-11-04 加在末尾）：用来判"这句是不是整条确认
+        （确认 / 都吃了）"。为真时允许唯一候选挂多味药 —— 与
+        ``_confirm_reminder`` 同一个口径，理由见那边的长注释。
         """
         if not (self._pending_reminder and self._confirm_candidate):
             return
         if any(t.get("name") == "confirm_reminder" for t in tool_trace):
             return
-        allowed, why = _fallback_confirm_verdict(self.dev.id)
+        allowed, why = _fallback_confirm_verdict(
+            self.dev.id, whole_yes=is_whole_event_yes(utterance))
         if not allowed:
             log.info("[%s] 兜底确认跳过：%s（交给模型按追问纪律继续问）",
                      self.session_id, why)
@@ -2969,8 +2989,17 @@ class VoiceSession:
         self._reminded_schedule = _reminded_schedule_label(self.dev.id)
         # 有确认措辞 **且** 没有否定措辞才算。见 _NEG_RE 上方注释：
         # 「还没喝完」带着"喝完"，不挡就会把没做的事记成做完了。
-        self._confirm_candidate = (bool(_CONFIRM_RE.search(utterance))
-                                   and not _NEG_RE.search(utterance))
+        #
+        # 三条来源取并集（2026-11-04 加第三条）：
+        #   ① ``_CONFIRM_RE``：老人主动汇报「我吃完药了 / 水喝完了」；
+        #   ② ``is_whole_event_yes``：短应答「确认 / 对 / 都吃了」。
+        #      设备长按 3 秒后念的就是一个是非问句，老人答「确认」——
+        #      而 ① 里没有「确认」两个字，生产日志里 ASR 认出的正是「确认。」，
+        #      于是整条确认链一次都没启动（详见 ``_CONFIRM_RE`` 上方注释）；
+        #   ③ 两者都必须过 ``_NEG_RE``：短应答里也可能带否定（「没吃」）。
+        self._confirm_candidate = (
+            bool(_CONFIRM_RE.search(utterance)) or is_whole_event_yes(utterance)
+        ) and not _NEG_RE.search(utterance)
         if self._pending_reminder:
             # 清单是多行的，日志里压成一行，免得一条日志刷十几行。
             log.info("[%s] 待确认提醒清单：%s%s",
@@ -3327,9 +3356,9 @@ class VoiceSession:
         #   * 模型自己调过就不重复（看 tool_trace）；
         #   * 放在 speaker.finish() 之后 —— 先让老人听到"好的"，
         #     再让屏幕收起来，顺序反了会出现"屏先空、话后到"。
-        # 2026-11-03 收紧触发条件：只有「恰好 1 条候选 + 该条只有 1 味药」才补，
-        # 见 ``_fallback_confirm_verdict`` 的 docstring（多药时整条确认会虚高依从率）。
-        await self._maybe_confirm_fallback(tool_trace)
+        # 2026-11-03 收紧过触发条件；2026-11-04 又松回"唯一候选即可"，
+        # 见 ``_fallback_confirm_verdict`` 的 docstring（多条候选仍然一律不补）。
+        await self._maybe_confirm_fallback(tool_trace, utterance)
 
         # ---- 模型判定待机：**念完告别语之后**再切固件 ----
         # 顺序不能反（理由见 _enter_standby 的 docstring）：先切 idle 的话，

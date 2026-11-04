@@ -1,0 +1,1 @@
+print("ALIVE", len(__import__("bpy").data.objects))
