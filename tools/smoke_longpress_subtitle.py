@@ -577,6 +577,67 @@ def t7_press_debounce_and_listen_after_clip() -> None:
           "只有入口日志、没有结论 ⇒ 分不清走到哪条分支")
 
 
+def t8_longpress_always_lands() -> None:
+    """长按 3 秒必须**一定有结果**（2026-11-04 用户实报）。
+
+    用户原话：「我按了按键，没有语音提示，没有屏幕内容切换，粉色灯闪烁了 5 次」，
+    并确认自己按了 3 秒以上、灯在由暗变亮。
+
+    根因不是抖动、不是灯效、不是固件没烧进去，而是 **2026-11-03 01:21 的
+    a334cca**：服药类长按从「无条件 ConfirmMedicine」改成「播问句 + 进对话」，
+    从此要过 CanPlayClip / elder_clip_play / CanStartDialog 三道闸。任何一道
+    不过就只打一行日志 —— 不确认、不出声、灯还闪粉红（"你没按够"）。
+
+    本组守两条底线，都是"行为契约"，不是实现细节：
+      · **8.1 3 秒达标先给回执**：acknowledge 必须排在 `if (idx >= 0)` 之前，
+        否则下游任何一条静默 break 都会把老人按对的动作判成失败；
+      · **8.2 追问进不去必须兜底确认**：不许再出现"只打日志然后 break"。
+    """
+    print("\n── 8. 长按 3 秒一定有结果（回执 + 兜底确认）──")
+    b = strip_comments(BRIDGE.read_text(encoding="utf-8"))
+
+    lpos = b.find("case ELDER_KEY_EV_LONG_HOLD: {")
+    check(lpos >= 0, "能定位 LONG_HOLD 分支", "case 标签被改过？")
+    lbranch = _brace_body(b, lpos) if lpos >= 0 else ""
+    check(bool(lbranch), "能取到 LONG_HOLD 分支体", "分支结构被改过？")
+
+    # 8.1 回执必须排在第一层 `if (idx >= 0)` 之前。
+    i_ack = lbranch.find("elder_rgb_button_acknowledged()")
+    i_idx = lbranch.find("if (idx >= 0) {")
+    check(i_ack >= 0, "LONG_HOLD 分支里调用了 elder_rgb_button_acknowledged()",
+          "只有服药片段那条分支才调 ⇒ 其他分支静默 break 时老人看到粉红「失败」")
+    check(0 <= i_ack < i_idx,
+          "acknowledge 排在 `if (idx >= 0)` **之前**（3 秒达标就先给回执）",
+          "排在分支里 ⇒ 分支静默 break 时回执丢失，粉红闪 5 次复现")
+
+    # 8.2 兜底确认：CanStartDialog 过不去时必须直接确认，不能只有 break。
+    i_csd = lbranch.find("if (!CanStartDialog())")
+    check(i_csd >= 0, "能定位 `if (!CanStartDialog())` 分支", "判据被改名/挪走？")
+    if i_csd >= 0:
+        blk = _brace_body(lbranch, i_csd)
+        check(bool(blk), "能取到 CanStartDialog 失败分支体", "结构被改过？")
+        check("ConfirmMedicine(" in blk,
+              "CanStartDialog 过不去 ⇒ **兜底直接确认**（不再静默失败）",
+              "只打日志 + break ⇒ 老人按满 3 秒既没声音也不确认，"
+              "正是用户这次报的现象")
+        check("elder_rgb_button_confirmed()" in blk,
+              "兜底路径也闪成功灯（不让老人看到「失败」）",
+              "兜底确认了却不给成功反馈 ⇒ 老人不知道成没成")
+        check("ELDER_CLIP_DONE" in blk,
+              "兜底路径播**本地**预录片段（不依赖网络）",
+              "用 TTS 兜底 ⇒ 离线时还是没声音")
+
+    # 8.3 「问不了就确认」这条取舍必须写在**兜底分支自己**的注释里，别让下一个
+    #     人按 a334cca 的思路又改回静默 break。查带注释的原文，且必须落在
+    #     这个分支体内 —— 全仓别处也有同样的措辞，只查全文等于没查。
+    raw_b = BRIDGE.read_text(encoding="utf-8")
+    i_csd_raw = raw_b.find("if (!CanStartDialog())")
+    blk_raw = _brace_body(raw_b, i_csd_raw) if i_csd_raw >= 0 else ""
+    check("按了就记上" in blk_raw or "按了没反应" in blk_raw,
+          "兜底确认的取舍理由写在该分支体内（可追溯）",
+          "没有理由 ⇒ 下次有人按 a334cca 的思路再删掉它")
+
+
 def main() -> int:
     t1_clip_ids()
     t2_long_press_wiring()
@@ -585,6 +646,7 @@ def main() -> int:
     t5_button_led()
     t6_actionable_gate()
     t7_press_debounce_and_listen_after_clip()
+    t8_longpress_always_lands()
 
     passed = sum(1 for ok, _, _ in results if ok)
     failed = len(results) - passed

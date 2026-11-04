@@ -1202,6 +1202,30 @@ void OnKey(elder_key_event_t ev, void *ctx)
                      (int)CanPlayClip(), (int)CanStartDialog(),
                      (int)Application::GetInstance().GetDeviceState());
         }
+        /* ---- 3 秒达标就先给回执，**在任何分支之前**（2026-11-04 用户实报）----
+         *
+         * 用户原话：「我按了按键，没有语音提示，没有屏幕内容切换，粉色灯闪烁了
+         * 5 次」，并且确认自己「按了 3 秒以上，灯是慢慢变亮的」。
+         *
+         * 粉红闪 5 次只有一个来源：rgb.c 的 elder_rgb_button_release() 发现
+         * 「还在渐变、本轮没出过结果」。也就是说，**只要有任何一条分支静默
+         * break 而没有调 acknowledge，老人按满 3 秒也会被判成"你没按够"**。
+         *
+         * 2026-11-03 01:21 的 a334cca 把服药类长按从「无条件 ConfirmMedicine」
+         * 改成「播问句 + 进对话」，从那以后长按要过 CanPlayClip / elder_clip_play
+         * / CanStartDialog 三道闸；任何一道不过就只打一行日志 —— 不确认、不出声、
+         * 灯还闪粉红。老人看到的是"我按对了，设备说我按错了"。
+         *
+         * 所以回执必须与"后面成不成"解耦：**按压达标这件事本身先确认掉**。
+         * 只有真的没有可确认对象（引擎空且屏也没显示）时才不给回执 —— 那时
+         * 蓝闪同样是谎报。
+         *
+         * elder_rgb_button_acknowledged() 只在本轮仍处于渐变态时生效，重复调用
+         * 无副作用（mode 已变 FLASH 就直接返回），所以下面各分支原有的调用
+         * 不需要删。 */
+        if (idx >= 0 || elder_ui_reminder_showing()) {
+            elder_rgb_button_acknowledged();
+        }
         if (idx >= 0) {
             /* ---- 日程/待办类：播预录应答并**退回对话状态**（2026-11-03 用户需求）----
              *
@@ -1349,10 +1373,37 @@ void OnKey(elder_key_event_t ev, void *ctx)
              * 任务自己再判一次并静默 return —— 那正是"按了没声音"的第二个
              * 静默出口。现在在**建任务之前**就判，判不过就明说。 */
             if (!CanStartDialog()) {
-                ESP_LOGE(TAG, "长按确认结论：进追问失败 —— 既播不了片段、"
-                              "也不在待机（state=%d），本次无法追问；"
-                              "提醒仍挂在屏上，可再按一次",
-                         (int)Application::GetInstance().GetDeviceState());
+                /* ---- 追问进不去 ⇒ **兜底直接确认**，不许静默失败 ----
+                 *
+                 * 2026-11-04 用户实报：「我按了按键，没有语音提示，没有屏幕
+                 * 内容切换，粉色灯闪烁了 5 次」。
+                 *
+                 * 这里原来是 `break` —— 只打一行 ERROR 就走人。而 2026-11-03
+                 * 01:21 的 a334cca 之后，服药类长按已经不再自己确认，改成
+                 * 「播问句 + 进对话」；一旦片段播不出去、设备又不在待机，
+                 * 老人按满 3 秒的结果就是：没声音、屏幕不动、灯闪"失败"。
+                 * 他做对了，设备说他不算。
+                 *
+                 * 为什么这里可以退回直接确认：**信息缺失不能让老人确认不了**。
+                 * 上面 med_n==0 那条分支早就写明了同一个取舍（"按了就记上"
+                 * 比"按了没反应"安全得多）。追问只是"想把吃了哪几味问清楚"
+                 * 的加分项，问不了的场合必须让底线成立。
+                 *
+                 * 代价要说清：这条提醒若有多味药，兜底会把整条标成完成，
+                 * 等于替老人报"都吃了"。这是**有意的**取舍 —— 与 a334cca
+                 * 之前的老行为一致，也是用户明确要求"按键一定能确认"的
+                 * 直接结果。若日后要更精确，正确做法是让服务端在收到
+                 * BUTTON 回执时按"逐味待确认"再追问，而不是让按键没反应。 */
+                ESP_LOGW(TAG, "长按确认结论：进追问失败（state=%d，clip=%d）"
+                              "⇒ 兜底直接确认 #%d（%u 味药）",
+                         (int)Application::GetInstance().GetDeviceState(),
+                         (int)CanPlayClip(), idx, (unsigned)med_n);
+                elder_rgb_button_confirmed();
+                ConfirmMedicine(idx, ELDER_CFM_BUTTON);
+                /* 本地预录片段，不依赖网络：确认了就必须让老人听见。 */
+                if (!elder_clip_play(ELDER_CLIP_DONE)) {
+                    elder_ui_speak("已记录，今天不用再吃了");
+                }
                 break;
             }
 
