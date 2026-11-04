@@ -52,16 +52,20 @@
           3. 由 BootReceiver 触发自启（见下）
 
           ⚠️ configChanges 里带 screenLayout|screenSize|orientation：
-             LX04 是 480×800 竖屏，但触摸硬件是 SWAP_XY + FLIP_Y 翻转过的，
              配置变化时**不重建 Activity**（重建会丢掉 AudioRecord 与 WebSocket）。
+
+          ⚠️ screenOrientation 必须是 landscape。
+             实机 `wm size` 是 **800x480**（不是资料里说的 480x800 竖屏），
+             `mCurrentRotation=0`，触摸上报 X 0-800 / Y 0-480。
+             之前锁 portrait 会让整个画面在横屏硬件上侧躺 90 度。
+             依据见 docs/lx04/实机验证结果.md。
         -->
         <activity
             android:name=".MainActivity"
             android:exported="true"
             android:launchMode="singleTask"
-            android:singleInstance="true"
             android:configChanges="orientation|screenSize|keyboardHidden|screenLayout|uiMode|smallestScreenSize|density|navigation|keyboard"
-            android:screenOrientation="portrait"
+            android:screenOrientation="landscape"
             android:windowSoftInputMode="adjustNothing"
             android:excludeFromRecents="false">
 

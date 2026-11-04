@@ -192,8 +192,12 @@ class MainActivity : Activity() {
      * ⚠️ 音量键**必须返回 false**（让系统继续处理），
      * 否则音量就调不动了 —— 这正是用户要的"保留音量加减功能"。
      *
-     * 中间键返回 true 吃掉事件，避免触发系统默认行为
-     * （尤其是 KEYCODE_POWER 的长按关机菜单）。
+     * 中间键返回 true 吃掉事件，避免触发系统默认行为。
+     *
+     * ⚠️ 中间键的键值**已经不是 POWER 了**：实机验证后我们用 keylayout
+     * 把它重映射成了 `F1`（见 TopKeys.CONFIRM_KEY_CODES 与
+     * docs/lx04/实机验证结果.md）。所以这里"吃掉事件"更多是保险，
+     * 真正挡住熄屏/关机的是 keylayout 那一层 —— 应用层是拦不住 POWER 的。
      */
     override fun dispatchKeyEvent(event: KeyEvent): Boolean {
         val now = SystemClock.elapsedRealtime()
@@ -253,10 +257,13 @@ class MainActivity : Activity() {
     /**
      * 长按拦截。
      *
-     * ⚠️ 这一段是**为了防关机**：如果中间键实机确认是 `KEYCODE_POWER`，
-     * 系统在长按 1 秒后会弹关机菜单 —— 老人按服药键会把音箱关了。
+     * 历史上这一段是**为了防关机**：中间键原本上报 `KEYCODE_POWER`，
+     * 系统长按 1 秒会弹关机菜单，老人按服药键就能把音箱关了。
      *
-     * 所以对所有被识别为"中间键候选"的 keyCode，一律吞掉长按事件。
+     * 现在中间键已被 keylayout 重映射为 `F1`（实机验证过，见
+     * docs/lx04/实机验证结果.md），长按 F1 本来就没有系统语义。
+     * 这里仍然拦一下，是为了兜住"keylayout 没刷成功"的退化情况 ——
+     * 那种情况下中间键还是 POWER，至少别让它弹关机菜单。
      */
     override fun onKeyLongPress(keyCode: Int, event: KeyEvent): Boolean {
         if (TopKeys.isConfirmKey(keyCode)) {

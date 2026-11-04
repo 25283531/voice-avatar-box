@@ -14,22 +14,28 @@ import android.view.KeyEvent
  *   · 音量+ / 音量- **保留原功能**（调音量）
  *   · 中间键（原"屏幕开关"）**改为服药确认键**
  *
- * ## ⚠️ 中间键的 KeyCode 必须实机确认
+ * ## ✅ 中间键的 KeyCode 已实机确认（2026-11-04）
  *
- * 原厂键值映射在 `/system/usr/keylayout/*.kl`（MTK 通常是 `mtk.kl`），
- * 板级配置在 `mt6392keys` 节点（社区 dts 里见过 `KEY_POWER` / `KEY_HOME` 两种说法）。
+ * 结论先行：**原厂是 `KEY_POWER`，已改 keylayout 重映射为 `F1`**。
  *
- * **不能靠猜** —— 猜错的后果分两种：
- *   · 猜成 KEY_HOME  → 中间键变成"回桌面"，我们自己的桌面也会被触发，逻辑混乱
- *   · 猜成 KEY_POWER → **长按会弹出关机菜单**，老人按服药键把音箱关了
+ * 实机 `getevent -lt /dev/input/event1`（设备 `mtk-pmic-keys`）抓到的是
+ * `KEY_POWER`，系统当场熄屏：
  *
- * 所以：
- *   1. 拿到机器后先跑 `adb shell getevent -lp`，抓出三个键的真实 KeyCode
- *   2. 填进 [CONFIRM_KEY_CODES]
- *   3. 装机后用 `adb shell dumpsys input` 复核
+ *     PowerManagerService: Going to sleep due to power button (uid 1000)
  *
- * 在实机确认之前，[CONFIRM_KEY_CODES] 用的是**候选集合**（多认几个，
- * 宁可多认也不要漏认），并通过 [isConfirmKey] 判定。
+ * 社区资料里 `KEY_POWER` / `KEY_HOME` 两种说法，这台机器是 **POWER**。
+ *
+ * 直接后果：应用层**拦不住** POWER（它在 `interceptKeyBeforeQueueing`
+ * 阶段就被系统吃掉），所以只能在 keylayout 层改：
+ *
+ *     /system/usr/keylayout/mtk-pmic-keys.kl
+ *         key 114   VOLUME_DOWN
+ *         key 116   F1
+ *
+ * 改完重启，`dumpsys input` 确认 `KeyLayoutFile` 指向该文件；
+ * 连按 5 次实测：`getevent` 照常上报 116，但 logcat 零熄屏日志。
+ *
+ * 完整验证过程见 docs/lx04/实机验证结果.md 第三节。
  */
 object TopKeys {
 
@@ -40,25 +46,36 @@ object TopKeys {
     const val VOLUME_DOWN = KeyEvent.KEYCODE_VOLUME_DOWN
 
     /**
-     * 中间键的**候选** KeyCode 集合。
+     * 中间键的 KeyCode —— **实机确认，已收敛为单一值 F1**。
      *
-     * ⚠️ **实机确认后收敛为单一值**。现在多认几个是为了在未知设备上
-     * 至少能触发一次，好让 `getevent` 日志确认到底是哪个。
+     * ## 为什么是 F1 而不是 POWER
      *
-     * 收录规则：
-     *   · 只收「没有明确系统语义」的键 —— HOME / APP_SWITCH / BACK
-     *     这些有既定行为（回桌面 / 切后台 / 返回），误吞会让设备变得难用，
-     *     所以**不**收。
-     *   · `KEYCODE_UNKNOWN`(0) 不收 —— 它是"未知"的占位，不是真实按键。
-     *   · `KEYCODE_POWER` **收**，但有风险，见 [MainActivity.onKeyLongPress]：
-     *     长按会弹关机菜单，必须吞掉长按事件。
+     * 2026-11-04 实机抓取（`getevent -lt /dev/input/event1`），中间键原始扫描码是
+     * `KEY_POWER`，系统当场熄屏：
+     *
+     *     PowerManagerService: Going to sleep due to power button (uid 1000)
+     *
+     * 更糟的是长按 POWER 会弹关机菜单 —— 老人长按"服药确认键"就能把音箱关了。
+     *
+     * 解法是改 keylayout 重映射（`/system/usr/keylayout/mtk-pmic-keys.kl`）：
+     *
+     *     key 114   VOLUME_DOWN
+     *     key 116   F1
+     *
+     * 实测连按 5 次：`getevent` 照常上报 `KEY_POWER`（内核层不变），
+     * 但 logcat **零**熄屏日志、`mWakefulness=Awake` —— 系统已把它当 F1 处理。
+     *
+     * ## ⚠️ 这里刻意**只认 F1**，不放 POWER
+     *
+     *   · 放 POWER 会双重触发：触摸屏 event2/3 也声明了 `KEY_POWER`，
+     *     万一某条路径上报 POWER，我们当确认键、系统同时熄屏
+     *   · 若 keylayout 没刷（中间键仍是 POWER），我们的 App 就不响应 ——
+     *     这是**故意的**：宁可"按了没反应"，也不能"按了就熄屏"
+     *
+     * 详见 docs/lx04/实机验证结果.md 第三节。
      */
     val CONFIRM_KEY_CODES: Set<Int> = setOf(
-        KeyEvent.KEYCODE_POWER,
-        KeyEvent.KEYCODE_SLEEP,
-        KeyEvent.KEYCODE_AWAKE,
-        KeyEvent.KEYCODE_FOCUS,
-        KeyEvent.KEYCODE_BUTTON_A      // 遥控器/通用按键的 A 键
+        KeyEvent.KEYCODE_F1
     )
 
     /** 是否是中间键（服药确认键）。 */
