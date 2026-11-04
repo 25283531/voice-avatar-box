@@ -82,6 +82,11 @@ class MainActivity : Activity() {
 
         setContentView(buildUi())
 
+        // 调试广播（默认不生效，见 DebugBridge）
+        runCatching {
+            registerReceiver(debugReceiver, android.content.IntentFilter(DebugBridge.ACTION))
+        }.onFailure { Log.w(TAG, "注册调试广播失败: ${it.message}") }
+
         requestMicPermission()
 
         // 启动时先亮一下"待命"色带，给老人一个"设备活着"的信号
@@ -212,6 +217,14 @@ class MainActivity : Activity() {
         if (!TopKeys.isConfirmKey(event.keyCode)) {
             return super.dispatchKeyEvent(event)
         }
+
+        // 实机排查时这条日志很关键：它能区分"按键根本没到应用"和
+        // "到了但判定/灯效不对" —— 两者修的地方完全不同。
+        Log.i(
+            TAG,
+            "确认键 ${if (event.action == KeyEvent.ACTION_DOWN) "DOWN" else "UP"} " +
+                "code=${event.keyCode} repeat=${event.repeatCount}"
+        )
 
         when (event.action) {
             KeyEvent.ACTION_DOWN -> {
@@ -365,7 +378,116 @@ class MainActivity : Activity() {
 
     override fun onDestroy() {
         super.onDestroy()
+        runCatching { unregisterReceiver(debugReceiver) }
         scope.cancel()
+    }
+
+    // ------------------------------------------------------------------ 调试入口
+
+    /**
+     * 调试广播（见 [DebugBridge]）。
+     *
+     * 默认不响应：只有 `settings put global elder_debug 1` 之后才生效。
+     */
+    private val debugReceiver = object : android.content.BroadcastReceiver() {
+        override fun onReceive(context: Context, intent: Intent) {
+            if (!DebugBridge.enabled(this@MainActivity)) {
+                Log.w(TAG, "调试命令被忽略 —— 先执行 settings put global elder_debug 1")
+                return
+            }
+            val cmd = intent.getStringExtra("cmd").orEmpty()
+            Log.i(TAG, "调试命令: $cmd")
+            handleDebugCommand(cmd)
+        }
+    }
+
+    /**
+     * 执行一条调试命令。
+     *
+     * 存在的理由：这些状态平时到不了 —— 服药提醒要等服务端下发，
+     * 「按住 3 秒」用 `input keyevent` 模拟不出来（它同一毫秒就发 UP，
+     * 只会走抖动分支）。没有这个入口，灯效就只能靠等真实事件来验。
+     */
+    private fun handleDebugCommand(cmd: String) {
+        when (cmd) {
+            // ---- 服药语义 ----
+            "med_pending" -> {
+                onReminderPending(true)
+                showStatus("调试：服药未确认")
+            }
+            "med_done" -> {
+                sendConfirmToServer()
+            }
+            "clear" -> {
+                onReminderPending(false)
+                showStatus("调试：已清空提醒")
+            }
+            "escalate" -> {
+                ledEngine.medEscalate()
+                showStatus("调试：漏服升级（快闪）")
+            }
+
+            // ---- 按键灯效（不需要真的按住 3 秒）----
+            "press" -> {
+                // 开始按住：右带进入天青渐变
+                ledEngine.buttonPending(true)
+                ledEngine.buttonPress()
+                showStatus("调试：按住中（渐变）")
+            }
+            "confirmed" -> {
+                // 达标：天蓝闪 3 次
+                ledEngine.buttonPending(true)
+                ledEngine.buttonConfirmed()
+                showStatus("调试：确认成功（天蓝闪 3 次）")
+            }
+            "fail" -> {
+                // 中途松开：粉红闪 5 次。用显式时间戳模拟"按了 1.5 秒"，
+                // 不需要真的等 —— buttonPress/Release 都收时间戳。
+                val t = SystemClock.elapsedRealtime()
+                ledEngine.buttonPending(true)
+                ledEngine.buttonPress(t)
+                ledEngine.buttonRelease(t + 1500L)
+                showStatus("调试：中途松开（粉红闪 5 次）")
+            }
+            "ack" -> {
+                ledEngine.buttonAcknowledged()
+                showStatus("调试：按压已受理")
+            }
+
+            // ---- 提醒 nag 节奏 ----
+            "nag_start" -> {
+                ledEngine.nagStart()
+                showStatus("调试：提醒 nag 开始（每 10 分钟前 10 秒红闪）")
+            }
+            "nag_stop" -> {
+                ledEngine.nagStop()
+                showStatus("调试：提醒 nag 停止")
+            }
+
+            // ---- 状态灯开关 ----
+            "status_off" -> {
+                ledEngine.setStatusLight(false)
+                showStatus("调试：状态灯已关（事件灯不受影响）")
+            }
+            "status_on" -> {
+                ledEngine.setStatusLight(true)
+                showStatus("调试：状态灯已开")
+            }
+
+            // ---- 对话四态 / 表情 ----
+            "idle" -> setVoiceState(Led.UiState.IDLE)
+            "listening" -> setVoiceState(Led.UiState.LISTENING)
+            "speaking" -> setVoiceState(Led.UiState.SPEAKING)
+            "connecting" -> setVoiceState(Led.UiState.CONNECTING)
+            "happy" -> ledEngine.setEmotion(Led.Emotion.HAPPY)
+            "sad" -> ledEngine.setEmotion(Led.Emotion.SAD)
+            "angry" -> ledEngine.setEmotion(Led.Emotion.ANGRY)
+
+            else -> {
+                Log.w(TAG, "未知调试命令: $cmd")
+                showStatus("未知调试命令：$cmd")
+            }
+        }
     }
 
     companion object {
