@@ -78,6 +78,23 @@ android {
         }
     }
 
+    lint {
+        /**
+         * 关掉 `ExpiredTargetSdkVersion`。
+         *
+         * 这条检查的内容是「Google Play 要求 targetSdk ≥ 33」—— 一条**上架策略**，
+         * 与代码质量无关。而这个 App 根本不上架：它是刷进 LX04 的系统级设备端，
+         * targetSdk 必须贴着设备的 Android 8.1（API 27）走，理由见文件头。
+         *
+         * 不关的后果：`assembleRelease` 会跑 `lintVitalRelease`，
+         * 它把这条当**致命错误**直接中断打包（CI run 41847758530）。
+         */
+        disable += "ExpiredTargetSdkVersion"
+
+        // 其余致命问题仍然要拦：宁可打包失败，也不要出一个装上去就崩的 APK。
+        abortOnError = true
+    }
+
     // Opus 的 .so 不做 strip：JNI 符号解析依赖它（strip 后常见 UnsatisfiedLinkError）
     packagingOptions {
         jniLibs {
