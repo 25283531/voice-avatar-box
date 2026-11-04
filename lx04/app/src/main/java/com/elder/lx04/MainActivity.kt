@@ -548,7 +548,10 @@ class MainActivity : Activity() {
         val cap = AudioCapture { _, info ->
             frames++
             if (info.isSpeech) speechFrames++
-            if (info.rms > maxRms) maxRms = info.rms
+            // ⚠️ 前 10 帧（0.6 秒）不计入峰值：麦克风上电有一声爆音，
+            //    实测 rms 能到 5000+，会把"这台机器到底能不能录到人声"
+            //    这个问题糊成"能" —— 而实际上它只是电源瞬态。
+            if (frames > 10 && info.rms > maxRms) maxRms = info.rms
             if (frames % 10 == 0) {
                 Log.i(
                     TAG,
@@ -603,10 +606,14 @@ class MainActivity : Activity() {
      * ## 怎么读结果
      *
      * ```
-     * 静默段 rms ≈ 10   放音段 rms ≈ 几千     → 通路完好，之前是 a)
-     * 静默段 rms ≈ 10   放音段 rms ≈ 10       → 麦克风通路有问题
-     * 放音段 rms 有明显抬升但很小（<100）      → 通路通但衰减严重
+     * 静默段 rms ≈ 10   放音段 rms ≈ 几百~几千   → 通路完好
+     * 静默段 rms ≈ 10   放音段 rms ≈ 10          → 麦克风通路有问题
      * ```
+     *
+     * ⚠️ 第一版这里踩了个坑：静默段算的是"开录后第 0~1 秒"的峰值，
+     *    而麦克风上电时有一声爆音（实测 rms 5542），于是基线被抬到天上，
+     *    放音段的 1159 反而被判成"收不到"。现在分成三段，
+     *    **前 600ms 直接丢弃**（上电瞬态），再取基线。
      *
      * 用法：`adb shell am broadcast -a com.elder.lx04.DEBUG --es cmd tone_test`
      */
@@ -615,11 +622,11 @@ class MainActivity : Activity() {
             Log.w(TAG, "tone_test 忽略 —— 正在对话中")
             return
         }
-        screen.setHint("回环自检：先静音 1 秒，再放音 1.5 秒…")
+        screen.setHint("回环自检：上电 0.6s → 静音 0.6s → 放音 1.5s…")
 
         // ⚠️ 不能用 `@Volatile var`：Kotlin 的 @Volatile 只作用于属性（有 backing
         //    field 的），局部变量上写它会直接编译报错。这里跨线程读，用原子量。
-        val playing = java.util.concurrent.atomic.AtomicBoolean(false)
+        val phase = java.util.concurrent.atomic.AtomicInteger(PHASE_WARMUP)
         var peakQuiet = 0f
         var peakTone = 0f
         var framesQuiet = 0
@@ -627,12 +634,16 @@ class MainActivity : Activity() {
 
         val cap = AudioCapture(
             onFrame = { _, info ->
-                if (playing.get()) {
-                    framesTone++
-                    if (info.rms > peakTone) peakTone = info.rms
-                } else {
-                    framesQuiet++
-                    if (info.rms > peakQuiet) peakQuiet = info.rms
+                when (phase.get()) {
+                    PHASE_QUIET -> {
+                        framesQuiet++
+                        if (info.rms > peakQuiet) peakQuiet = info.rms
+                    }
+                    PHASE_TONE -> {
+                        framesTone++
+                        if (info.rms > peakTone) peakTone = info.rms
+                    }
+                    // PHASE_WARMUP：上电瞬态，**不计入任何统计**
                 }
             },
             enablePlatformEffects = false
@@ -644,12 +655,17 @@ class MainActivity : Activity() {
         }
 
         scope.launch {
-            // ---- 1. 静音段基线 1 秒 ----
-            delay(1_000)
-            val quietBaseline = peakQuiet
+            // ---- 1. 上电瞬态，丢弃 ----
+            delay(WARMUP_MS)
+            phase.set(PHASE_QUIET)
 
-            // ---- 2. 放 1.5 秒 1kHz 正弦，同时录 ----
-            val tone = buildTone(SAMPLE_RATE_OUT, ms = 1_500, freqHz = 1000.0, amp = 8000)
+            // ---- 2. 静音基线 ----
+            delay(QUIET_MS)
+            val baseline = peakQuiet
+            phase.set(PHASE_TONE)
+
+            // ---- 3. 放 1.5 秒 1kHz 正弦，同时录 ----
+            val tone = buildTone(SAMPLE_RATE_OUT, ms = TONE_MS, freqHz = 1000.0, amp = 8000)
             val track = createTrack(SAMPLE_RATE_OUT)
             if (track == null) {
                 cap.stop()
@@ -657,7 +673,6 @@ class MainActivity : Activity() {
                 return@launch
             }
 
-            playing.set(true)
             withContext(Dispatchers.IO) {
                 runCatching {
                     track.play()
@@ -666,22 +681,21 @@ class MainActivity : Activity() {
                     Thread.sleep(300)
                 }
             }
-            playing.set(false)
+            phase.set(PHASE_DONE)
             runCatching { track.stop() }
             runCatching { track.release() }
 
-            // ---- 3. 再静音 0.5 秒收尾 ----
-            delay(500)
+            delay(300)
             cap.stop()
 
             val verdict = when {
                 framesQuiet == 0 || framesTone == 0 ->
                     "没读到帧（静音段 $framesQuiet / 放音段 $framesTone）"
-                peakTone < quietBaseline * 2 ->
-                    "麦克风收不到扬声器 —— 通路有问题（静默峰值 ${f(quietBaseline)}，" +
+                peakTone < baseline * 3 ->
+                    "麦克风收不到扬声器 —— 通路有问题（静默峰值 ${f(baseline)}，" +
                         "放音峰值 ${f(peakTone)}）"
-                else -> "通路完好：静默峰值 ${f(quietBaseline)} → 放音峰值 ${f(peakTone)}" +
-                    "（提升 ${"%.1f".format(peakTone / maxOf(quietBaseline, 1f))} 倍）"
+                else -> "通路完好：静默峰值 ${f(baseline)} → 放音峰值 ${f(peakTone)}" +
+                    "（提升 ${"%.0f".format(peakTone / maxOf(baseline, 1f))} 倍）"
             }
             Log.i(TAG, "tone_test 结果：$verdict")
             screen.setHint("回环：$verdict")
@@ -843,5 +857,16 @@ class MainActivity : Activity() {
          * 不能写死；这里只是回环自检没有服务端可问，用一个与 TTS 同参数的默认值。
          */
         private const val SAMPLE_RATE_OUT = 24_000
+
+        /** 回环自检的三段时间。 */
+        private const val WARMUP_MS = 600L
+        private const val QUIET_MS = 600L
+        private const val TONE_MS = 1_500
+
+        /** 回环自检的阶段标记。 */
+        private const val PHASE_WARMUP = 0
+        private const val PHASE_QUIET = 1
+        private const val PHASE_TONE = 2
+        private const val PHASE_DONE = 3
     }
 }
