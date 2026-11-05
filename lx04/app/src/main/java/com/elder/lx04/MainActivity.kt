@@ -442,9 +442,11 @@ class MainActivity : Activity() {
             }
 
             override fun onHello(sampleRate: Int, frameMs: Int) {
-                // ⚠️ 采样率必须读 hello，不能写死 24k —— 服务端可用环境变量改
+                // ⚠️ 播放采样率必须跟**解码器输出**走，不能直接用 hello 的 24k。
+                //    解码器固定 48k（规避 Concentus 24k SILK 噪声，见 OpusCodec），
+                //    若这里仍开 24k 的 AudioTrack，48k 的 PCM 会被慢放一半。
                 opus.init(sampleRate)
-                player.start(sampleRate)
+                player.start(opus.outputSampleRate())
             }
 
             override fun onStt(text: String) {

@@ -268,11 +268,11 @@ class AudioPlayer {
         private const val MAX_QUEUED_FRAMES = 20
 
         /**
-         * 开播前预填充的采样数（24kHz 下约 0.33 秒）。
+         * 开播前预填充的采样数（48kHz 下约 0.33 秒）。
          *
          * 必须**小于** AudioTrack 内部缓冲（1 秒），否则 STOPPED 状态下的
          * write() 会在缓冲填满时阻塞，playLoop 卡死、永远不开播。
          */
-        private const val PREBUFFER_SAMPLES = 8_000
+        private const val PREBUFFER_SAMPLES = 16_000
     }
 }

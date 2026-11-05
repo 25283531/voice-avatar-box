@@ -33,20 +33,21 @@ package com.elder.lx04.audio
 object AudioLevel {
 
     /**
-     * 目标 rms。**按平均响度对齐 440Hz 自检音**（amp=10000 ⇒ rms≈7071）。
+     * 目标 rms。**保守补底，不主动放大**。
      *
-     * 这里踩过一次：最初设 2500，结果真机反馈「正弦很大、语音很小很小」。
-     * 原因是语音的峰值因子高达 12~21（实测 `rms=223 / peak=2792`），
-     * 把 rms 拉到 2500 时峰值就会顶到天花板；人耳听的是**平均能量**，
-     * 不是峰值。所以目标必须看齐正弦自检音，并配合下面的软限幅。
+     * 这一串参数是 2026-11-06 根因定位后回退的：先前以为「语音太小」，
+     * 一路把目标抬到 5500、开局 8 倍、上限 16 倍；但真因是 Concentus
+     * 24kHz 解码吐出 10kHz **噪声**，放大它只会更刺耳。
+     * 解码修成 48kHz 后，服务端 libopus 解出的正常语音 RMS≈2600，
+     * 已经足够响 ⇒ 开局不放大、上限 4 倍只作兜底。
      */
-    const val TARGET_RMS = 5_500f
+    const val TARGET_RMS = 2_500f
 
     /** 增益上限。配合 tanh 软限幅，允许更高而不硬削波。 */
-    const val MAX_GAIN = 16f
+    const val MAX_GAIN = 4f
 
     /** 开局增益：第一句话前半段还没攒够窗口，先给一个够用的放大。 */
-    const val INITIAL_GAIN = 8f
+    const val INITIAL_GAIN = 1f
 
     /** 输出天花板，留 2767 的余量给功放，避免硬削波失真。 */
     const val CEILING = 30_000

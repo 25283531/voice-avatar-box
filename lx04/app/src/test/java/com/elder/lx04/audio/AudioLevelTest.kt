@@ -33,19 +33,25 @@ class AudioLevelTest {
         val raw = rms(quiet)
         assertTrue("样本应该是安静语音", raw in 200.0..500.0)
 
-        val boosted = AudioLevel.amplify(quiet, AudioLevel.INITIAL_GAIN)
+        // 用显式 8 倍验证放大能力（开局增益现在刻意设为 1 倍）
+        val boosted = AudioLevel.amplify(quiet, 8f)
         val out = rms(boosted)
         assertTrue(
-            "开机增益没把安静 TTS 抬起来：raw=${raw.toInt()} out=${out.toInt()}",
+            "给定增益没把安静 TTS 抬起来：raw=${raw.toInt()} out=${out.toInt()}",
             out > raw * 3.5
+        )
+        // 开局必须不放大：解码修好后正常语音不该被削爆
+        assertEquals(
+            "开局增益应保持 1 倍",
+            rms(quiet), rms(AudioLevel.amplify(quiet, AudioLevel.INITIAL_GAIN)), 1.0
         )
         // 一个窗口之后增益应继续向上收敛（目标 2500）
         var g = AudioLevel.INITIAL_GAIN
         repeat(6) { g = AudioLevel.nextGain(raw, g) }
-        assertTrue("增益应向目标收敛，实际 $g", g > 12f)
+        assertTrue("增益应向目标收敛，实际 $g", g > 3.5f)
         assertTrue(
             "稳态后 rms 应接近目标 ${AudioLevel.TARGET_RMS}，实际 ${rms(AudioLevel.amplify(quiet, g)).toInt()}",
-            rms(AudioLevel.amplify(quiet, g)) > 3_000
+            rms(AudioLevel.amplify(quiet, g)) > 1_000
         )
     }
 
@@ -103,7 +109,7 @@ class AudioLevelTest {
         // 真机 TTS：rms 223~435、peak 2792~9191（峰值因子 12~21）。
         // 等比缩回会被尖峰拖累；tanh 让尖峰单独饱和、其余照常放大。
         val quiet = sine(amp = 420)
-        val out = AudioLevel.amplify(quiet, AudioLevel.INITIAL_GAIN)
+        val out = AudioLevel.amplify(quiet, 8f)
         val ratio = rms(out) / rms(quiet)
         assertTrue("平均响度提升不足，只放大了 ${"%.1f".format(ratio)} 倍", ratio > 6.0)
         assertTrue("输出峰值仍受控", out.maxOf { kotlin.math.abs(it.toInt()) } <= AudioLevel.CEILING)

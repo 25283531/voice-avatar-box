@@ -254,7 +254,16 @@ def run(check_assets: bool) -> int:
         lambda: "val knee = CEILING / gain.toDouble()" in level_src and
                 "kotlin.math.tanh" not in level_src and
                 "CEILING.toFloat() / peak" not in level_src and
-                "TARGET_RMS = 5_500f" in level_src,
+                "TARGET_RMS = 2_500f" in level_src,
+    ))
+    codec_src = read(ROOT / "lx04/app/src/main/java/com/elder/lx04/audio/OpusCodec.kt")
+    hello_src = read(ROOT / "lx04/app/src/main/java/com/elder/lx04/MainActivity.kt")
+    items.append((
+        "W26", "下行解码固定 48kHz（Concentus 24k SILK 会吐 10kHz 噪声）",
+        lambda: "private var decRate = 48_000" in codec_src and
+                "val newDecRate = 48_000" in codec_src and
+                "player.start(opus.outputSampleRate())" in hello_src and
+                (ROOT / "lx04/app/src/test/java/com/elder/lx04/audio/OpusCodecRateTest.kt").exists(),
     ))
     items.append((
         "W25", "增益逐帧平滑过渡（真机「中途变频率」的根因）",
@@ -314,9 +323,13 @@ def selftest() -> int:
         if "prefilled >= PREBUFFER_SAMPLES" not in pl or "writeErrors++" not in pl: n += 1
         # W24 与 W21/W22 共用 level_src
         if "val knee = CEILING / gain.toDouble()" not in lv or \
-           "TARGET_RMS = 5_500f" not in lv or "kotlin.math.tanh" in lv: n += 1
+           "TARGET_RMS = 2_500f" not in lv or "kotlin.math.tanh" in lv: n += 1
         # W25：增益必须逐帧 ramp，不能窗口跳变
         if "AudioLevel.ramp(gain, targetGain)" not in pl: n += 1
+        cd = kw.get("codec_src", read(ROOT / "lx04/app/src/main/java/com/elder/lx04/audio/OpusCodec.kt"))
+        hs = kw.get("hello_src", read(ROOT / "lx04/app/src/main/java/com/elder/lx04/MainActivity.kt"))
+        if "private var decRate = 48_000" not in cd or \
+           "player.start(opus.outputSampleRate())" not in hs: n += 1
         return n
 
     base = count_bad()
@@ -344,7 +357,10 @@ def selftest() -> int:
         ("软限幅退回等比缩回（平均响度又上不去）",
          {"level_src": read(ROOT / "lx04/app/src/main/java/com/elder/lx04/audio/AudioLevel.kt")
                          .replace("val knee = CEILING / gain.toDouble()", "val knee = CEILING.toDouble()")
-                         .replace("TARGET_RMS = 5_500f", "TARGET_RMS = 2_500f")}),
+                         .replace("TARGET_RMS = 2_500f", "TARGET_RMS = 5_500f")}),
+        ("下行解码又退回 24k（回到 10kHz 噪声）",
+         {"codec_src": read(ROOT / "lx04/app/src/main/java/com/elder/lx04/audio/OpusCodec.kt")
+                        .replace("private var decRate = 48_000", "private var decRate = 24_000")}),
         ("增益又改回窗口跳变（中途变频率）",
          {"player_src": read(ROOT / "lx04/app/src/main/java/com/elder/lx04/audio/AudioPlayer.kt")
                           .replace("AudioLevel.ramp(gain, targetGain)", "targetGain")}),

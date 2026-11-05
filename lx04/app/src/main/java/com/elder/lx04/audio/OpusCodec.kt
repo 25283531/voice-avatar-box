@@ -53,9 +53,27 @@ class OpusCodec {
     /** 上行采样率：与服务端解码端一致（写死 16k）。 */
     private val encRate = 16_000
 
-    /** 下行采样率：取服务端 hello 里声明的值，默认 24k。 */
+    /**
+     * 下行解码采样率 —— **固定 48kHz，不取 hello 的 24k**。
+     *
+     * 🔴 2026-11-06 真机根因：服务端 libopus 把语音编成 Hybrid/SILK 包
+     * （TOC 0x6b，config 13），而 Concentus 在 **24kHz 输出**时 SILK 的
+     * 降采样路径是坏的 —— 解出来是 10kHz 单峰噪声（谱质心 9992Hz），
+     * 老人听到的是「刺耳擦擦声、完全听不出内容」。
+     * 用同一份 Concentus 源码在本机解同一批真实下行包对照：
+     *   · OpusDecoder(24000) fs=1440 → peakRms 1359, 质心  9992Hz
+     *   · OpusDecoder(48000) fs=2880 → peakRms 8984, 质心  1587Hz ← 正常语音
+     *   · OpusDecoder(16000) fs= 960 → 全静音
+     * 服务端 libopus 解同一批包 RMS=2601（正常语音电平）。
+     *
+     * Opus 内部本来就固定 48kHz，48k 输出是最不容易出错的路径。
+     * 之前用 440Hz 正弦做过「解码器自检全绿」，但那个包被编成
+     * **CELT-only**（TOC 0xd7），24kHz 解 CELT 恰好正常 —— 典型假绿。
+     *
+     * 播放端同步改成 48kHz（见 MainActivity.onHello），不需要降采样。
+     */
     @Volatile
-    private var decRate = 24_000
+    private var decRate = 48_000
 
     /** 每帧时长（ms），协议固定 60。 */
     private val frameMs = 60
@@ -109,7 +127,12 @@ class OpusCodec {
      */
     @Synchronized
     fun init(outputSampleRate: Int = 24_000) {
-        val newDecRate = if (outputSampleRate in VALID_RATES) outputSampleRate else 24_000
+        // ⚠️ 故意**忽略** hello 下发的服务端采样率：见 decRate 的注释。
+        //    服务端仍按 24kHz 编码（Opus 内部 48k，协议不变），我们只是让
+        //    Concentus 以 48k 输出、AudioTrack 以 48k 播放。
+        @Suppress("UNUSED_PARAMETER")
+        val unused = outputSampleRate
+        val newDecRate = 48_000
 
         // ⚠️ 编码器与解码器**分别**构造，别塞进同一个 runCatching。
         //    曾经它们共用一个：解码器一抛异常（采样率不被支持之类），
@@ -126,7 +149,8 @@ class OpusCodec {
 
         Log.i(
             TAG,
-            "Opus 初始化完成：上行 ${encRate}Hz/${frameMs}ms，下行 ${decRate}Hz/${frameMs}ms（纯 Java 实现）" +
+            "Opus 初始化完成：上行 ${encRate}Hz/${frameMs}ms，下行 ${decRate}Hz/${frameMs}ms" +
+                "（Concentus 48k 输出，规避 24k SILK 缺陷）" +
                 " 编码器=${if (encoder != null) "就绪" else "不可用"}" +
                 " 解码器=${if (decoder != null) "就绪" else "不可用"}"
         )
