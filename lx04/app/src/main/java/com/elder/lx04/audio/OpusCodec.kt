@@ -179,20 +179,28 @@ class OpusCodec {
         // ⚠️ 必须同步（理由见类注释的「线程模型」）。
         //    实机堆栈就是 Concentus 断言在 Resampler / Autocorrelation 上炸，
         //    而它的成因就是两个线程同时踩同一个编码器。
-        synchronized(this) {
-            val enc = encoder ?: return null
-            if (pcm.size < encodeFrameSamples) return null
+        //
+        // ⚠️ 返回值用**局部变量**承接、末尾统一 return，不用
+        //    "try/catch 作为 synchronized 块的最后表达式"那种写法 ——
+        //    那种写法依赖 Kotlin 对非局部 return 的类型推断，
+        //    在 1.9 下会报 "A 'return' expression required in a function
+        //    with a block body"（CI run 41972940902 实测）。
+        //    本机没有 Android SDK、编译不了 Kotlin，这类坑只能靠 CI 兜。
+        return synchronized(this) {
+            val enc = encoder ?: return@synchronized null
+            if (pcm.size < encodeFrameSamples) return@synchronized null
 
+            var out: ByteArray? = null
             try {
                 val n = enc.encode(pcm, 0, encodeFrameSamples, encBuf, 0, encBuf.size)
                 if (n <= 0) {
                     // DTX 或"这一帧没有可发的数据"都会返回 0。不是错误，
                     // 但如果是负数就说明编码器出问题了 —— 分开记，别混成一个 null。
                     logOnce("编码返回 $n（非正值，跳过该帧）", null)
-                    return null
+                } else {
+                    encodedFrames++
+                    out = encBuf.copyOf(n)
                 }
-                encodedFrames++
-                encBuf.copyOf(n)
             } catch (t: Throwable) {
                 // ⚠️ 必须打**类名 + 堆栈**。OpusException 的 message 是有内容的，
                 //    而 NPE / AssertionError 的 message 是 null ——
@@ -210,25 +218,24 @@ class OpusCodec {
                 if (fresh == null) {
                     // 连重建都失败：编码器这条路彻底断了，如实计数。
                     encodeFailures++
-                    return null
-                }
-                encodeRecoveries++
-
-                try {
-                    val n = fresh.encode(pcm, 0, encodeFrameSamples, encBuf, 0, encBuf.size)
-                    if (n <= 0) {
+                } else {
+                    encodeRecoveries++
+                    try {
+                        val n = fresh.encode(pcm, 0, encodeFrameSamples, encBuf, 0, encBuf.size)
+                        if (n <= 0) {
+                            encodeFailures++
+                            logOnce("重建后编码返回 $n（非正值，跳过该帧）", null)
+                        } else {
+                            encodedFrames++
+                            out = encBuf.copyOf(n)
+                        }
+                    } catch (t2: Throwable) {
                         encodeFailures++
-                        logOnce("重建后编码返回 $n（非正值，跳过该帧）", null)
-                        return null
+                        logOnce("重建后仍编码失败 ${t2.javaClass.name}: ${t2.message}", t2)
                     }
-                    encodedFrames++
-                    encBuf.copyOf(n)
-                } catch (t2: Throwable) {
-                    encodeFailures++
-                    logOnce("重建后仍编码失败 ${t2.javaClass.name}: ${t2.message}", t2)
-                    null
                 }
             }
+            out
         }
     }
 
@@ -288,9 +295,12 @@ class OpusCodec {
     fun decode(data: ByteArray, out: ShortArray): Int {
         // ⚠️ 同样必须加锁：解码器也是 Concentus 的非线程安全实例，
         //    而 [init] 会在另一个线程（OkHttp）上替换它。
-        synchronized(this) {
-            val dec = decoder ?: return 0
-            return try {
+        //
+        // ⚠️ 与 [encode] 同一套写法：返回值用局部变量承接、末尾统一返回，
+        //    不依赖非局部 return 的类型推断（见 [encode] 里的注释）。
+        return synchronized(this) {
+            val dec = decoder ?: return@synchronized 0
+            try {
                 val n = dec.decode(data, 0, data.size, out, 0, decodeFrameSamples, false)
                 if (n > 0) decodedFrames++
                 n
@@ -300,6 +310,7 @@ class OpusCodec {
                 Log.w(TAG, "解码失败（丢弃该帧）: ${t.javaClass.name}: ${t.message}")
                 0
             }
+        }
         }
     }
 
