@@ -95,6 +95,15 @@ class MainActivity : Activity() {
     @Volatile
     private var silentFrames = 0
 
+    /**
+     * 本轮是"按住说话"（PTT）。
+     *
+     * PTT 下**不用** VAD 自动收尾 —— 按多久说多久，松手才结束。
+     * 唤醒词/自由聆听那种场景才靠静音判"说完了"。
+     */
+    @Volatile
+    private var pttMode = false
+
     /** 正在播报（此时不开麦克风，半双工）。 */
     @Volatile
     private var speaking = false
@@ -322,7 +331,17 @@ class MainActivity : Activity() {
     // ------------------------------------------------------------------ 一轮对话
 
     /** 开始说话（按下中间键 / 调试命令触发）。 */
-    private fun beginListening() {
+    /**
+     * 开始聆听。
+     *
+     * @param ptt true = 按住说话（松手才结束）。
+     *
+     * 为什么必须区分：VAD 的静音自动收尾是给"唤醒后自由说"用的。
+     * 按住说话时如果也套 1.2 秒静音判据，老人从按下键到真正开口
+     * （清嗓子、想说什么）稍慢一点，话还没出口就被切断了 ——
+     * 表现为"按了没反应"。PTT 语义就是"按多久说多久"。
+     */
+    private fun beginListening(ptt: Boolean = false) {
         if (sending) return
         if (!bound || voice?.isConnected != true) {
             screen.setHint("还没连上服务器，稍等一下")
@@ -336,6 +355,7 @@ class MainActivity : Activity() {
         }
 
         sending = true
+        pttMode = ptt
         silentFrames = 0
         screen.setUserSaid("")
         screen.setDeviceSaid("")
@@ -351,11 +371,12 @@ class MainActivity : Activity() {
             voice?.sendAudio(enc)
 
             // VAD 自动收尾：连续静音 1.2 秒算说完。
-            // 不"一静音就停"是因为老人说话中间会换气，
-            // 一停就掐断会把一句话切成两半，服务端 ASR 两半都识别不出来。
-            if (info.isSpeech) silentFrames = 0 else silentFrames++
-            if (silentFrames * AudioCapture.FRAME_MS >= SILENCE_STOP_MS) {
-                endListening()
+            // 只在**非按住**模式下生效（见上面的 ptt 说明）。
+            if (!pttMode) {
+                if (info.isSpeech) silentFrames = 0 else silentFrames++
+                if (silentFrames * AudioCapture.FRAME_MS >= SILENCE_STOP_MS) {
+                    endListening()
+                }
             }
         }
         capture = cap
@@ -370,6 +391,7 @@ class MainActivity : Activity() {
     private fun endListening() {
         if (!sending) return
         sending = false
+        pttMode = false
         capture?.stop()
         capture = null
         voice?.listenStop()
@@ -381,6 +403,20 @@ class MainActivity : Activity() {
 
     override fun dispatchKeyEvent(event: KeyEvent): Boolean {
         val now = SystemClock.elapsedRealtime()
+
+        // 调试模式下把**每一个**按下的键原样打出来。
+        //
+        // 为什么需要这个：实机排查"按住中间键没反应"时，RecentQueue 里只有
+        // 音量减（scanCode=114），完全没有中间键的记录。可能是键没上报、
+        // 也可能是上报成了别的 keyCode。只打"确认键"的日志在那种情况下
+        // 永远是空的，分不清"没按到"还是"映射错了"。
+        if (event.action == KeyEvent.ACTION_DOWN && DebugBridge.enabled(this)) {
+            Log.i(
+                TAG,
+                "按键 code=${event.keyCode} scan=${event.scanCode} " +
+                    "dev=${event.deviceId} repeat=${event.repeatCount}"
+            )
+        }
 
         when (event.keyCode) {
             TopKeys.VOLUME_UP, TopKeys.VOLUME_DOWN -> {
@@ -404,7 +440,7 @@ class MainActivity : Activity() {
                 if (keyDetector.onDown(now)) {
                     ledEngine.buttonPress()
                     // 按下即开始说话 —— 对老人来说"按住说话"最直觉
-                    beginListening()
+                    beginListening(ptt = true)
                 }
                 return true
             }

@@ -114,12 +114,30 @@ class OpusCodec {
     fun encode(pcm: ShortArray): ByteArray? {
         val enc = encoder ?: return null
         if (pcm.size < encodeFrameSamples) return null
-        return runCatching {
+        return try {
             val n = enc.encode(pcm, 0, encodeFrameSamples, encBuf, 0, encBuf.size)
+            if (n <= 0) {
+                // DTX 或"这一帧没有可发的数据"都会返回 0。不是错误，
+                // 但如果是负数就说明编码器出问题了 —— 分开记，别混成一个 null。
+                logOnce("编码返回 $n（非正值，跳过该帧）", null)
+                return null
+            }
             encBuf.copyOf(n)
-        }.onFailure {
-            Log.w(TAG, "编码失败: ${it.message}")
-        }.getOrNull()
+        } catch (t: Throwable) {
+            // ⚠️ 必须打**类名 + 堆栈**。OpusException 的 message 是有内容的，
+            //    而 NPE / NegativeArraySizeException 的 message 是 null ——
+            //    只打 message 会得到一行无用的"编码失败: null"。
+            logOnce("编码失败 ${t.javaClass.name}: ${t.message}", t)
+            null
+        }
+    }
+
+    /** 失败日志只打前几次，避免每 60ms 刷一行把 logcat 冲掉。 */
+    private var failLogged = 0
+    private fun logOnce(msg: String, t: Throwable?) {
+        if (failLogged >= 3) return
+        failLogged++
+        if (t != null) Log.e(TAG, msg, t) else Log.w(TAG, msg)
     }
 
     /**
