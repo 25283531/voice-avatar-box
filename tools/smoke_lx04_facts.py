@@ -334,6 +334,17 @@ def run(root: Path) -> int:
         "JOIN_TIMEOUT_MS" in cap_code and "没退出" in cap_code,
         "旧线程活着就是下一轮必然「编码失败: null」，必须有现场证据",
     )
+    check(
+        "8j 不用 join 的返回值当布尔（Thread.join 返回 void）",
+        # ⚠️ 这条是 CI 编译失败换来的：2026-11-05 第一次推送时写了
+        #    `runCatching { it.join(T) }.getOrDefault(false)`，
+        #    而 Thread.join(long) 返回 **void** ⇒ Kotlin 编译报
+        #    "Unresolved reference: !"（`!joined` 里 joined 不是 Boolean）。
+        #    本机没有 Android SDK、编译不了 Kotlin，只有 CI 能兜住这类错。
+        #    判据：要么用 isAlive 判断，要么别把 join 的结果当值用。
+        not re.search(r"join\s*\([^)]*\)\s*\}\s*\.\s*getOrDefault\s*\(", cap_code),
+        "Thread.join 返回 void，getOrDefault(false) 类型对不上 —— CI 编译会红",
+    )
 
     # ---------------------------------------------------------------- 7 接线
     print("\n[7] 判据真的会被 CI 执行")

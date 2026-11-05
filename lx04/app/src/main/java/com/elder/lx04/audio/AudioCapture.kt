@@ -242,9 +242,15 @@ class AudioCapture(
 
         val t = worker
         worker = null
-        val joined = t?.let {
-            runCatching { it.join(JOIN_TIMEOUT_MS) }.getOrDefault(false)
-        } ?: true
+        // ⚠️ `Thread.join(long)` 返回 **void**，不是 Boolean ——
+        //    想知道"退干净了没有"只能看 `isAlive`。
+        //    （第一版写成 `runCatching { it.join(...) }.getOrDefault(false)`，
+        //      类型对不上，CI 编译直接报 Unresolved reference: !。）
+        var joined = true
+        if (t != null) {
+            runCatching { t.join(JOIN_TIMEOUT_MS) }
+            joined = !t.isAlive
+        }
         if (!joined) {
             // ⚠️ 不要静默。旧线程活着 = 两个线程踩同一个编码器 =
             //    下一轮必然"编码失败: null"。这条日志就是现场的证据。

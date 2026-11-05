@@ -192,7 +192,7 @@ class OpusCodec {
                     return null
                 }
                 encodedFrames++
-                return encBuf.copyOf(n)
+                encBuf.copyOf(n)
             } catch (t: Throwable) {
                 // ⚠️ 必须打**类名 + 堆栈**。OpusException 的 message 是有内容的，
                 //    而 NPE / AssertionError 的 message 是 null ——
@@ -214,7 +214,7 @@ class OpusCodec {
                 }
                 encodeRecoveries++
 
-                return try {
+                try {
                     val n = fresh.encode(pcm, 0, encodeFrameSamples, encBuf, 0, encBuf.size)
                     if (n <= 0) {
                         encodeFailures++
