@@ -227,6 +227,22 @@ def run(check_assets: bool) -> int:
         "W20", "没拿到 token 时不发 HTTP（避免必然的 401 污染退避）",
         lambda: "if (!store.hasToken)" in rt_src,
     ))
+    # ---- 真机 2026-11-05 第三次实测：唤醒成功但「听不到声音」----
+    # 链路全绿，真因是 TTS 的 rms 只有 223~435（比自检音低 ~20 倍）。
+    # 这类故障不报错、不崩溃，摘掉增益后所有测试仍会过 ⇒ 需要静态守卫。
+    player_src = read(ROOT / "lx04/app/src/main/java/com/elder/lx04/audio/AudioPlayer.kt")
+    level_src = read(ROOT / "lx04/app/src/main/java/com/elder/lx04/audio/AudioLevel.kt")
+    items.append((
+        "W21", "下行 PCM 必须过自适应增益（否则安静 TTS 听不见）",
+        lambda: "AudioLevel.amplify(pcm, gain)" in player_src and
+                "TARGET_RMS" in level_src and "nextGain" in level_src,
+    ))
+    items.append((
+        "W22", "电平归一化有能打红的单测守着",
+        lambda: (ROOT / "lx04/app/src/test/java/com/elder/lx04/audio/AudioLevelTest.kt").exists() and
+                "安静的 TTS 会被放大到可闻电平" in
+                read(ROOT / "lx04/app/src/test/java/com/elder/lx04/audio/AudioLevelTest.kt"),
+    ))
     if check_assets:
         items += asset_guards()
 
@@ -263,6 +279,12 @@ def selftest() -> int:
         if "epoch - (tzOffsetMin" not in e: n += 1
         if "DeviceClock(" not in r: n += 1
         if "if (!store.hasToken)" not in r: n += 1
+        # W21/W22 也读独立文件，按变体单独算
+        pl = kw.get("player_src", read(ROOT / "lx04/app/src/main/java/com/elder/lx04/audio/AudioPlayer.kt"))
+        lv = kw.get("level_src", read(ROOT / "lx04/app/src/main/java/com/elder/lx04/audio/AudioLevel.kt"))
+        tst = kw.get("test_src", read(ROOT / "lx04/app/src/test/java/com/elder/lx04/audio/AudioLevelTest.kt"))
+        if "AudioLevel.amplify(pcm, gain)" not in pl or "TARGET_RMS" not in lv: n += 1
+        if "安静的 TTS 会被放大到可闻电平" not in tst: n += 1
         return n
 
     base = count_bad()
@@ -278,6 +300,9 @@ def selftest() -> int:
         ("naive server_time 又退回按 UTC 解析",
          {"api_src": read(ROOT / "lx04/app/src/main/java/com/elder/lx04/net/ElderApi.kt")
                         .replace("epoch - (tzOffsetMin ?: DEFAULT_TZ_OFFSET) * 60L", "epoch")}),
+        ("摘掉下行增益（回到听不见的状态）",
+         {"player_src": read(ROOT / "lx04/app/src/main/java/com/elder/lx04/audio/AudioPlayer.kt")
+                          .replace("val boosted = AudioLevel.amplify(pcm, gain)", "val boosted = pcm")}),
     ]
 
     bad = 0

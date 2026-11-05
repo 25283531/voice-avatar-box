@@ -47,21 +47,28 @@ class AudioPlayer {
         private set
 
     /**
-     * 下行 PCM 的**客观电平观测点**。
+     * 下行 PCM 的**客观电平观测点 + 自适应增益**。
      *
      * 背景（2026-11-05 真机）：服务端日志两次都写着「播报完成（音频已发）」，
      * `dumpsys media.audio_flinger` 也显示 AudioTrack 写了约 5.5 秒数据，
-     * 但老人**听不到声音**。此时读代码分不清两件事：
-     *   · 写进 AudioTrack 的 PCM 本来就是静音（解码 / TTS 侧问题）
-     *   · PCM 正常，但 HAL / 音量 / 路由没把声音放出来
-     * 两者日志都是全绿。所以必须在**入队前**量一次电平，把这两种情况分开。
+     * ALSA `DL1_AWB_Record` 回采也录到了信号 —— 但老人**听不到声音**。
+     * 最后量出来真因是电平：TTS 解码后 rms 只有 223~435（满幅 32767），
+     * 比 440Hz 自检音（rms≈7071）低约 20 倍，叠加系统音量 9~12/20 后
+     * 功放输入只剩几十的幅度。**不是没播，是轻到听不见**。
      *
-     * 单位是 PCM16 的 short 幅度（满幅 32767）。正常语音 rms 约 300~3000；
-     * 全零/近零（< 20）就是静音帧。每 25 帧（1.5 秒）打一条，不会刷屏。
+     * 这里既量电平也做归一化，详见 [AudioLevel] 的注释。
      */
     private var levelFrames = 0
     private var levelSumSq = 0.0
     private var levelPeak = 0
+
+    /** 当前增益，按 1.5 秒窗口平滑更新；开局先给 4 倍，别让第一句前半段太轻。 */
+    @Volatile
+    private var gain = AudioLevel.INITIAL_GAIN
+
+    /** 同一窗口里**放大前**的平方和与样本数，用来算下一轮增益。 */
+    private var rawSumSq = 0.0
+    private var rawSamples = 0
 
     /**
      * 开始播放（可重复调用以切换采样率）。
@@ -124,8 +131,15 @@ class AudioPlayer {
     /** 送一帧去播（在 WS 线程调用，不阻塞）。 */
     fun enqueue(pcm: ShortArray) {
         if (!running) return
-        observeLevel(pcm)
-        if (!queue.offer(pcm)) {
+        val (rawRms, _) = AudioLevel.stats(pcm)
+        rawSumSq += rawRms * rawRms * pcm.size
+        rawSamples += pcm.size
+
+        // ⚠️ 返回新数组，不改动解码器给的缓冲（OpusCodec 内部可能复用它）。
+        val boosted = AudioLevel.amplify(pcm, gain)
+        observeLevel(boosted)
+
+        if (!queue.offer(boosted)) {
             droppedFrames++
             if (droppedFrames % 20 == 1) {
                 Log.w(TAG, "播放队列满，已丢弃 $droppedFrames 帧（链路卡顿）")
@@ -133,30 +147,28 @@ class AudioPlayer {
         }
     }
 
-    /** 累计一帧的电平，满 25 帧打一条日志。 */
+    /** 累计一帧的电平，满 25 帧（1.5 秒）打一条日志并更新增益。 */
     private fun observeLevel(pcm: ShortArray) {
-        var peak = 0
-        var sum = 0.0
-        for (v in pcm) {
-            val a = v.toInt()
-            val abs = if (a < 0) -a else a
-            if (abs > peak) peak = abs
-            sum += (a.toDouble() * a)
-        }
+        val (rms, peak) = AudioLevel.stats(pcm)
         levelFrames++
-        levelSumSq += sum
+        levelSumSq += rms * rms * pcm.size
         if (peak > levelPeak) levelPeak = peak
         if (levelFrames >= 25) {
-            val total = levelFrames * pcm.size
-            val rms = kotlin.math.sqrt(levelSumSq / maxOf(1, total))
+            val outRms = kotlin.math.sqrt(levelSumSq / maxOf(1, levelFrames * pcm.size))
+            val rawRms = kotlin.math.sqrt(rawSumSq / maxOf(1, rawSamples))
+            gain = AudioLevel.nextGain(rawRms, gain)
             Log.i(
                 TAG,
-                "下行 PCM 电平：帧=$levelFrames rms=${"%.1f".format(rms)} " +
-                    "peak=$levelPeak（${if (rms < 20) "疑似静音 ⚠️" else "有信号"}）"
+                "下行 PCM 电平：帧=$levelFrames 原始rms=${"%.1f".format(rawRms)} → " +
+                    "放大后rms=${"%.1f".format(outRms)} peak=$levelPeak " +
+                    "增益=${"%.2f".format(gain)}x" +
+                    "（${if (rawRms < 20) "疑似静音 ⚠️" else "有信号"}）"
             )
             levelFrames = 0
             levelSumSq = 0.0
             levelPeak = 0
+            rawSumSq = 0.0
+            rawSamples = 0
         }
     }
 
