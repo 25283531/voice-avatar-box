@@ -1809,6 +1809,19 @@ class MainActivity : Activity() {
                 Log.w(TAG, "调试命令 $cmd 已废弃：提醒状态只由引擎驱动，不许本地伪造")
             }
             "sync_now" -> runtime.requestSyncNow()
+            "dump_start" -> {
+                val f = java.io.File(getExternalFilesDir(null), "downlink.bin")
+                runCatching { f.writeBytes(ByteArray(0)) }
+                voice?.dumpFile = f
+                screen.setHint("落盘已开：${f.absolutePath}")
+                Log.i(TAG, "dump_start: ${f.absolutePath}")
+            }
+            "dump_stop" -> {
+                voice?.dumpFile = null
+                val f = java.io.File(getExternalFilesDir(null), "downlink.bin")
+                screen.setHint("落盘已停：${if (f.exists()) f.length() else 0} 字节")
+                Log.i(TAG, "dump_stop: ${if (f.exists()) f.length() else 0} 字节")
+            }
             "wake_start" -> {
                 screen.setHint(if (wakeEngine.resume()) "唤醒已启动" else "唤醒未就绪：${wakeEngine.lastError}")
             }

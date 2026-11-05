@@ -60,22 +60,42 @@ class AudioLevelTest {
     }
 
     @Test
-    fun `软限幅不越界、不翻号、也不把小信号压小`() {
+    fun `分段线性：线性区完全不失真，只有尖峰被限幅`() {
+        // gain=8 ⇒ knee=30000/8=3750；amp=1000 的正弦全在线性区。
+        val small = sine(amp = 1_000)
+        val out = AudioLevel.amplify(small, 8f)
+        for (i in small.indices) {
+            assertEquals("线性区不该产生任何失真 @$i", small[i].toInt() * 8, out[i].toInt())
+        }
+
+        // 满幅帧：只有超出 knee 的尖峰被压，其余不越界/不翻号/不被压小
         val loud = sine(amp = 20_000)
-        val out = AudioLevel.amplify(loud, AudioLevel.INITIAL_GAIN)
-        val peak = out.maxOf { kotlin.math.abs(it.toInt()) }
+        val clipped = AudioLevel.amplify(loud, 8f)
+        val peak = clipped.maxOf { kotlin.math.abs(it.toInt()) }
         assertTrue("输出峰值不得超过天花板，实际 $peak", peak <= AudioLevel.CEILING)
         for (i in loud.indices) {
-            val a = loud[i].toInt(); val b = out[i].toInt()
+            val a = loud[i].toInt(); val b = clipped[i].toInt()
             if (a > 0) assertTrue("正样本被翻号或压没了: $a -> $b", b > 0)
             if (a < 0) assertTrue("负样本被翻号或压没了: $a -> $b", b < 0)
             assertTrue("输出不应比输入还小: $a -> $b", kotlin.math.abs(b) >= kotlin.math.abs(a))
         }
-        // tanh 是软限幅，不是硬方波：满幅正弦不该被削到 rms/peak≈1
-        assertTrue(
-            "被硬削成方波了（rms/peak=${rms(out) / peak}）",
-            rms(out) / peak < 0.98
-        )
+    }
+
+    @Test
+    fun `增益逐帧平滑，绝不从 8 一步跳到 1`() {
+        var g = 8f
+        val steps = mutableListOf<Float>()
+        repeat(40) { g = AudioLevel.ramp(g, 1f); steps.add(g) }
+        assertEquals(1f, g, 0.001f)
+        for (i in 1 until steps.size) {
+            val jump = kotlin.math.abs(steps[i] - steps[i - 1])
+            assertTrue("第 $i 帧增益跳变了 $jump", jump <= AudioLevel.RAMP_STEP + 0.0001f)
+        }
+        assertTrue("应当花很多帧过渡，实际第一步就到 1", steps.first() > 7f)
+        // 反向（升增益）同样平滑
+        var up = 1f
+        repeat(3) { up = AudioLevel.ramp(up, 16f) }
+        assertTrue(up < 2f)
     }
 
     @Test

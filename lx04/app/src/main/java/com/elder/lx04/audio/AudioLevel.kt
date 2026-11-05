@@ -59,34 +59,45 @@ object AudioLevel {
      */
     fun nextGain(rawRms: Double, previous: Float): Float {
         if (!rawRms.isFinite() || rawRms < 1.0) return previous
-        val target = (TARGET_RMS / rawRms).toFloat().coerceIn(1f, MAX_GAIN)
-        // ⚠️ 升得慢、降得快：
-        //   · 上升平滑 —— 避免句子之间增益跳变造成「忽大忽小」；
-        //   · 下降立即生效 —— 上一句很轻、这一句突然很响时，若还按平滑
-        //     留着 2.2 倍增益，会把本来正常的一句推到刺耳甚至顶到天花板。
-        //     这是单测抓出来的：响音频一次更新后仍被放大 2.2 倍。
-        return if (target < previous) target
-        else (previous * 0.4f + target * 0.6f).coerceIn(1f, MAX_GAIN)
+        // 只算**目标**；平滑交给 [ramp] 逐帧做。
+        // 早先在这里做窗口级平滑，结果增益在窗口边界一步从 8 跳到 1，
+        // 同一段正弦前半段近方波、后半段恢复正弦 ⇒ 真机听到「中途变频率」。
+        return (TARGET_RMS / rawRms).toFloat().coerceIn(1f, MAX_GAIN)
+    }
+
+    /** 每帧允许的最大增益变化。24kHz/60ms 下，8→1 约需 28 帧（1.7 秒）。 */
+    const val RAMP_STEP = 0.25f
+
+    /** 逐帧把 current 往 target 靠近，绝不一步跳变。 */
+    fun ramp(current: Float, target: Float): Float {
+        val d = target - current
+        return if (kotlin.math.abs(d) <= RAMP_STEP) target
+        else current + kotlin.math.sign(d) * RAMP_STEP
     }
 
     /**
      * 放大一帧，返回**新数组**（不改动解码器给的缓冲）。
      *
-     * 用 tanh 软限幅：尖峰平滑压到 [CEILING]，其余样本照常放大。
-     * 逐样本硬截断会把波形削平，等比缩回又会把整帧平均能量压回去。
+     * 分段线性：线性区完全不失真，只有超出 knee 的尖峰被压到 [CEILING]。
+     * 等比缩回会把整帧平均能量压回去，tanh 又会在整个波形上产生谐波。
      */
     fun amplify(src: ShortArray, gain: Float): ShortArray {
         if (src.isEmpty()) return src
-        // tanh 软限幅：小信号近似线性放大 gain 倍，大信号平滑压到天花板。
+        // **分段线性**软限幅：
+        //   |x| <= knee  → 完全线性放大 gain 倍（不产生任何谐波）
+        //   |x| >  knee  → 只有尖峰被压到天花板
+        // knee 取 CEILING/gain，保证线性区末端刚好到天花板。
         //
-        // 为什么不能再用「按帧峰值等比缩回」：语音的峰值因子高达 12~21，
-        // 一旦某帧有个尖峰，整帧增益就被压回去，平均能量仍上不去 ——
-        // 真机表现就是「峰值够了、人耳还是几乎听不见」。
-        // 让尖峰单独被压、其余样本照常放大，才能把**整句平均响度**抬起来。
-        val k = gain / CEILING.toDouble()
+        // 为什么换掉 tanh：tanh 在整个波形上都非线性，深饱和时会产生
+        // 大量谐波，真机听感是「中途变频率 / 声音发破」。语音峰值因子
+        // 12~21，绝大多数样本都在线性区，只有零星尖峰需要压 ——
+        // 分段线性既把整句平均响度抬起来，又保住音色。
+        val knee = CEILING / gain.toDouble()
         val out = ShortArray(src.size)
         for (i in src.indices) {
-            val y = CEILING * kotlin.math.tanh(src[i].toDouble() * k)
+            val x = src[i].toDouble()
+            val y = if (kotlin.math.abs(x) <= knee) x * gain
+            else kotlin.math.sign(x) * CEILING
             out[i] = y.toInt().coerceIn(-CEILING, CEILING).toShort()
         }
         return out

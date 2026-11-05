@@ -271,7 +271,22 @@ class VoiceClient(
 
     // ---------------------------------------------------------------- 接收
 
+    /**
+     * 诊断用：非空时把**每一个下行二进制帧的原始字节**追加落盘。
+     *
+     * 只在 `dump_start` 调试命令后打开，默认 null 不影响生产。
+     * 用途：把「服务端发的字节」和「设备解出的 PCM」分开，定位
+     * 播报变成高频擦擦声时究竟是哪一段把数据弄坏了。
+     */
+    @Volatile
+    var dumpFile: java.io.File? = null
+
     private fun handleBinary(bytes: ByteArray) {
+        dumpFile?.let { f ->
+            runCatching {
+                java.io.FileOutputStream(f, true).use { it.write(bytes) }
+            }
+        }
         if (bytes.size < 4) {
             Log.w(TAG, "二进制帧太短: ${bytes.size}")
             return

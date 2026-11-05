@@ -62,9 +62,12 @@ class AudioPlayer {
     private var levelSumSq = 0.0
     private var levelPeak = 0
 
-    /** 当前增益，按 1.5 秒窗口平滑更新；开局先给 4 倍，别让第一句前半段太轻。 */
+    /** 本帧实际用的增益，由 [targetGain] 逐帧 ramp 过来，绝不跳变。 */
     @Volatile
     private var gain = AudioLevel.INITIAL_GAIN
+
+    /** 窗口统计得出的目标增益；[gain] 每帧向它靠近 [AudioLevel.RAMP_STEP]。 */
+    private var targetGain = AudioLevel.INITIAL_GAIN
 
     /** 同一窗口里**放大前**的平方和与样本数，用来算下一轮增益。 */
     private var rawSumSq = 0.0
@@ -136,6 +139,8 @@ class AudioPlayer {
         running = true
         played = false
         writeErrors = 0
+        gain = AudioLevel.INITIAL_GAIN
+        targetGain = AudioLevel.INITIAL_GAIN
         // ⚠️ 这里**不 play()**：由 playLoop 在缓冲预填充完成后开播。
         worker = thread(name = "elder-speaker", priority = Thread.MAX_PRIORITY - 2) {
             playLoop(t)
@@ -195,6 +200,8 @@ class AudioPlayer {
 
         // ⚠️ 返回新数组，不改动解码器给的缓冲（OpusCodec 内部可能复用它）。
         val boosted = AudioLevel.amplify(pcm, gain)
+        // 逐帧平滑：窗口边界不许出现增益跳变（真机「中途变频率」的根因）。
+        gain = AudioLevel.ramp(gain, targetGain)
         observeLevel(boosted)
 
         if (!queue.offer(boosted)) {
@@ -214,12 +221,12 @@ class AudioPlayer {
         if (levelFrames >= 25) {
             val outRms = kotlin.math.sqrt(levelSumSq / maxOf(1, levelFrames * pcm.size))
             val rawRms = kotlin.math.sqrt(rawSumSq / maxOf(1, rawSamples))
-            gain = AudioLevel.nextGain(rawRms, gain)
+            targetGain = AudioLevel.nextGain(rawRms, targetGain)
             Log.i(
                 TAG,
                 "下行 PCM 电平：帧=$levelFrames 原始rms=${"%.1f".format(rawRms)} → " +
                     "放大后rms=${"%.1f".format(outRms)} peak=$levelPeak " +
-                    "增益=${"%.2f".format(gain)}x" +
+                    "增益=${"%.2f".format(gain)}x → 目标${"%.2f".format(targetGain)}x" +
                     "（${if (rawRms < 20) "疑似静音 ⚠️" else "有信号"}）"
             )
             levelFrames = 0

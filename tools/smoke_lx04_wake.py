@@ -250,10 +250,16 @@ def run(check_assets: bool) -> int:
     # 等比缩回已被真机证伪：语音峰值因子 12~21，一个尖峰就把整帧增益
     # 压回去，平均响度上不去 ⇒ 「峰值够了、人耳还是贴上去才一点点」。
     items.append((
-        "W24", "下行归一化用软限幅，不能退回按帧峰值等比缩回",
-        lambda: "kotlin.math.tanh" in level_src and
+        "W24", "下行归一化用分段线性软限幅，不能退回等比缩回或 tanh",
+        lambda: "val knee = CEILING / gain.toDouble()" in level_src and
+                "kotlin.math.tanh" not in level_src and
                 "CEILING.toFloat() / peak" not in level_src and
                 "TARGET_RMS = 5_500f" in level_src,
+    ))
+    items.append((
+        "W25", "增益逐帧平滑过渡（真机「中途变频率」的根因）",
+        lambda: "AudioLevel.ramp(gain, targetGain)" in player_src and
+                "fun ramp(" in level_src and "RAMP_STEP" in level_src,
     ))
     items.append((
         "W23", "播放端预填充后再 play、缓冲 1 秒、且检查 write 返回值",
@@ -307,7 +313,10 @@ def selftest() -> int:
         # W23 与 W21/W22 共用 player_src
         if "prefilled >= PREBUFFER_SAMPLES" not in pl or "writeErrors++" not in pl: n += 1
         # W24 与 W21/W22 共用 level_src
-        if "kotlin.math.tanh" not in lv or "TARGET_RMS = 5_500f" not in lv: n += 1
+        if "val knee = CEILING / gain.toDouble()" not in lv or \
+           "TARGET_RMS = 5_500f" not in lv or "kotlin.math.tanh" in lv: n += 1
+        # W25：增益必须逐帧 ramp，不能窗口跳变
+        if "AudioLevel.ramp(gain, targetGain)" not in pl: n += 1
         return n
 
     base = count_bad()
@@ -334,8 +343,11 @@ def selftest() -> int:
                           .replace("writeErrors++", "// no count")}),
         ("软限幅退回等比缩回（平均响度又上不去）",
          {"level_src": read(ROOT / "lx04/app/src/main/java/com/elder/lx04/audio/AudioLevel.kt")
-                         .replace("kotlin.math.tanh", "kotlin.math.sin")
+                         .replace("val knee = CEILING / gain.toDouble()", "val knee = CEILING.toDouble()")
                          .replace("TARGET_RMS = 5_500f", "TARGET_RMS = 2_500f")}),
+        ("增益又改回窗口跳变（中途变频率）",
+         {"player_src": read(ROOT / "lx04/app/src/main/java/com/elder/lx04/audio/AudioPlayer.kt")
+                          .replace("AudioLevel.ramp(gain, targetGain)", "targetGain")}),
     ]
 
     bad = 0
