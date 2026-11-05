@@ -32,14 +32,21 @@ package com.elder.lx04.audio
  */
 object AudioLevel {
 
-    /** 目标 rms。约 -22dBFS，老人设备上清楚但不刺耳。 */
-    const val TARGET_RMS = 2_500f
+    /**
+     * 目标 rms。**按平均响度对齐 440Hz 自检音**（amp=10000 ⇒ rms≈7071）。
+     *
+     * 这里踩过一次：最初设 2500，结果真机反馈「正弦很大、语音很小很小」。
+     * 原因是语音的峰值因子高达 12~21（实测 `rms=223 / peak=2792`），
+     * 把 rms 拉到 2500 时峰值就会顶到天花板；人耳听的是**平均能量**，
+     * 不是峰值。所以目标必须看齐正弦自检音，并配合下面的软限幅。
+     */
+    const val TARGET_RMS = 5_500f
 
-    /** 增益上限。再高会把底噪一起抬起来。 */
-    const val MAX_GAIN = 8f
+    /** 增益上限。配合 tanh 软限幅，允许更高而不硬削波。 */
+    const val MAX_GAIN = 16f
 
-    /** 开局增益：第一句话前半段还没攒够窗口，先给一个保守的放大。 */
-    const val INITIAL_GAIN = 4f
+    /** 开局增益：第一句话前半段还没攒够窗口，先给一个够用的放大。 */
+    const val INITIAL_GAIN = 8f
 
     /** 输出天花板，留 2767 的余量给功放，避免硬削波失真。 */
     const val CEILING = 30_000
@@ -65,25 +72,22 @@ object AudioLevel {
     /**
      * 放大一帧，返回**新数组**（不改动解码器给的缓冲）。
      *
-     * 先按峰值算出本帧实际可用的增益：如果乘以 gain 会超过 [CEILING]，
-     * 就整体等比缩回，而不是逐样本硬截断 —— 后者会把波形削平、听起来破音。
+     * 用 tanh 软限幅：尖峰平滑压到 [CEILING]，其余样本照常放大。
+     * 逐样本硬截断会把波形削平，等比缩回又会把整帧平均能量压回去。
      */
     fun amplify(src: ShortArray, gain: Float): ShortArray {
         if (src.isEmpty()) return src
-        var peak = 0
-        for (v in src) {
-            val a = if (v < 0) -v.toInt() else v.toInt()
-            if (a > peak) peak = a
-        }
-        val g = if (peak > 0 && peak * gain > CEILING) {
-            CEILING.toFloat() / peak
-        } else {
-            gain
-        }
+        // tanh 软限幅：小信号近似线性放大 gain 倍，大信号平滑压到天花板。
+        //
+        // 为什么不能再用「按帧峰值等比缩回」：语音的峰值因子高达 12~21，
+        // 一旦某帧有个尖峰，整帧增益就被压回去，平均能量仍上不去 ——
+        // 真机表现就是「峰值够了、人耳还是几乎听不见」。
+        // 让尖峰单独被压、其余样本照常放大，才能把**整句平均响度**抬起来。
+        val k = gain / CEILING.toDouble()
         val out = ShortArray(src.size)
         for (i in src.indices) {
-            val scaled = (src[i].toInt() * g).toInt().coerceIn(-CEILING, CEILING)
-            out[i] = scaled.toShort()
+            val y = CEILING * kotlin.math.tanh(src[i].toDouble() * k)
+            out[i] = y.toInt().coerceIn(-CEILING, CEILING).toShort()
         }
         return out
     }

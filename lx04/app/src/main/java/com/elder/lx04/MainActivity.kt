@@ -1573,6 +1573,41 @@ class MainActivity : Activity() {
      * 用法：`adb shell am broadcast -a com.elder.lx04.DEBUG --es cmd tone_test`
      */
     /**
+     * 音轨 A/B 诊断 —— 把 `speaker_test` **完全相同**的 440Hz 正弦，
+     * 切成 60ms 帧送进 [player] 的队列，走与服务端 TTS **一模一样**的路径
+     * （同一个 AudioTrack / 同一套增益 / 同一个 playLoop）。
+     *
+     * 现场判据（这一条能排除所有混淆变量）：
+     *   · 很吵  ⇒ AudioPlayer 的音轨没问题，TTS 轻是 **PCM 内容**问题
+     *   · 很轻  ⇒ **音轨**问题（音量/路由/状态），与音频数据无关
+     *
+     * 之所以必须做：ALSA 下行回采、PCM 电平、audio_flinger 写入量、
+     * tinymix 功放增益、AudioFocus 全都测过且「看起来正常」，但用户听到
+     * 的是「一个很吵、一个贴耳朵才一点点」—— 数字域判据不等于扬声器输出。
+     */
+    private fun runPlayerTone() {
+        if (sending) {
+            Log.w(TAG, "player_tone 忽略 —— 正在对话中")
+            return
+        }
+        screen.setHint("音轨 A/B：同一段正弦走 TTS 播放路径…")
+        val tone = buildTone(SAMPLE_RATE_OUT, ms = 3_000, freqHz = 440.0, amp = 10_000)
+        scope.launch {
+            withContext(Dispatchers.IO) {
+                var off = 0
+                while (off < tone.size) {
+                    val n = minOf(1_440, tone.size - off)
+                    player.enqueue(tone.copyOfRange(off, off + n))
+                    off += n
+                    Thread.sleep(60)   // 模拟服务端 60ms/帧的下发节奏
+                }
+            }
+            Log.i(TAG, "player_tone：已送入 ${tone.size / 1_440} 帧")
+            screen.setHint("音轨 A/B 完成（3 秒 440Hz 走播放器队列）")
+        }
+    }
+
+    /**
      * 扬声器自检 —— **不依赖网络、不依赖麦克风**，播 3 秒 440Hz 正弦。
      *
      * 与 `tone_test` 的区别很重要：tone_test 是回环自检，靠麦克风听扬声器，
@@ -1762,6 +1797,7 @@ class MainActivity : Activity() {
             "inject" -> runInject()
             "tone_test" -> runToneTest()
             "speaker_test" -> runSpeakerTest()
+            "player_tone" -> runPlayerTone()
             "opus_selftest" -> runOpusSelfTest()
 
             // 提醒相关的调试命令现在**只能通过运行时**触发：

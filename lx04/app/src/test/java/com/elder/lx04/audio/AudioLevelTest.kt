@@ -42,10 +42,10 @@ class AudioLevelTest {
         // 一个窗口之后增益应继续向上收敛（目标 2500）
         var g = AudioLevel.INITIAL_GAIN
         repeat(6) { g = AudioLevel.nextGain(raw, g) }
-        assertTrue("增益应向目标收敛，实际 $g", g > 7.5f)
+        assertTrue("增益应向目标收敛，实际 $g", g > 12f)
         assertTrue(
             "稳态后 rms 应接近目标 ${AudioLevel.TARGET_RMS}，实际 ${rms(AudioLevel.amplify(quiet, g)).toInt()}",
-            rms(AudioLevel.amplify(quiet, g)) > 2_000
+            rms(AudioLevel.amplify(quiet, g)) > 3_000
         )
     }
 
@@ -60,15 +60,33 @@ class AudioLevelTest {
     }
 
     @Test
-    fun `峰值保护用等比缩回而不是硬削波`() {
-        // 满幅帧 × 开局增益必然会顶到天花板
+    fun `软限幅不越界、不翻号、也不把小信号压小`() {
         val loud = sine(amp = 20_000)
         val out = AudioLevel.amplify(loud, AudioLevel.INITIAL_GAIN)
         val peak = out.maxOf { kotlin.math.abs(it.toInt()) }
         assertTrue("输出峰值不得超过天花板，实际 $peak", peak <= AudioLevel.CEILING)
-        // 等比缩回 ⇒ 波形仍近似正弦（rms/peak ≈ 0.707），硬削波会明显偏大
-        val ratio = rms(out) / peak
-        assertTrue("波形被削平了（rms/peak=$ratio）", ratio in 0.60..0.78)
+        for (i in loud.indices) {
+            val a = loud[i].toInt(); val b = out[i].toInt()
+            if (a > 0) assertTrue("正样本被翻号或压没了: $a -> $b", b > 0)
+            if (a < 0) assertTrue("负样本被翻号或压没了: $a -> $b", b < 0)
+            assertTrue("输出不应比输入还小: $a -> $b", kotlin.math.abs(b) >= kotlin.math.abs(a))
+        }
+        // tanh 是软限幅，不是硬方波：满幅正弦不该被削到 rms/peak≈1
+        assertTrue(
+            "被硬削成方波了（rms/peak=${rms(out) / peak}）",
+            rms(out) / peak < 0.98
+        )
+    }
+
+    @Test
+    fun `软限幅能把语音平均能量抬到正弦自检音的量级`() {
+        // 真机 TTS：rms 223~435、peak 2792~9191（峰值因子 12~21）。
+        // 等比缩回会被尖峰拖累；tanh 让尖峰单独饱和、其余照常放大。
+        val quiet = sine(amp = 420)
+        val out = AudioLevel.amplify(quiet, AudioLevel.INITIAL_GAIN)
+        val ratio = rms(out) / rms(quiet)
+        assertTrue("平均响度提升不足，只放大了 ${"%.1f".format(ratio)} 倍", ratio > 6.0)
+        assertTrue("输出峰值仍受控", out.maxOf { kotlin.math.abs(it.toInt()) } <= AudioLevel.CEILING)
     }
 
     @Test

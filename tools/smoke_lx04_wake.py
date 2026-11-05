@@ -247,6 +247,14 @@ def run(check_assets: bool) -> int:
     # ALSA 回采窗口分析：正弦有声窗口 60%、TTS 只有 10% ⇒ 不是轻，是丢帧。
     # 根因：AudioTrack 180ms 缓冲 + 启动即 play（空缓冲）⇒ 持续 underrun，
     # 且 write() 返回值被 runCatching 吞掉，丢帧静默、日志全绿。
+    # 等比缩回已被真机证伪：语音峰值因子 12~21，一个尖峰就把整帧增益
+    # 压回去，平均响度上不去 ⇒ 「峰值够了、人耳还是贴上去才一点点」。
+    items.append((
+        "W24", "下行归一化用软限幅，不能退回按帧峰值等比缩回",
+        lambda: "kotlin.math.tanh" in level_src and
+                "CEILING.toFloat() / peak" not in level_src and
+                "TARGET_RMS = 5_500f" in level_src,
+    ))
     items.append((
         "W23", "播放端预填充后再 play、缓冲 1 秒、且检查 write 返回值",
         lambda: "prefilled >= PREBUFFER_SAMPLES" in player_src and
@@ -298,6 +306,8 @@ def selftest() -> int:
         if "安静的 TTS 会被放大到可闻电平" not in tst: n += 1
         # W23 与 W21/W22 共用 player_src
         if "prefilled >= PREBUFFER_SAMPLES" not in pl or "writeErrors++" not in pl: n += 1
+        # W24 与 W21/W22 共用 level_src
+        if "kotlin.math.tanh" not in lv or "TARGET_RMS = 5_500f" not in lv: n += 1
         return n
 
     base = count_bad()
@@ -322,6 +332,10 @@ def selftest() -> int:
         ("又把 write 失败吞掉",
          {"player_src": read(ROOT / "lx04/app/src/main/java/com/elder/lx04/audio/AudioPlayer.kt")
                           .replace("writeErrors++", "// no count")}),
+        ("软限幅退回等比缩回（平均响度又上不去）",
+         {"level_src": read(ROOT / "lx04/app/src/main/java/com/elder/lx04/audio/AudioLevel.kt")
+                         .replace("kotlin.math.tanh", "kotlin.math.sin")
+                         .replace("TARGET_RMS = 5_500f", "TARGET_RMS = 2_500f")}),
     ]
 
     bad = 0
