@@ -371,6 +371,17 @@ class MainActivity : Activity() {
                 when (result) {
                     is OtaClient.Result.Bound -> {
                         bound = true
+                        // ⚠️ token **必须落盘**。心跳 /api/device/sync 用 Bearer 鉴权，
+                        //    只把它当局部变量传给 connectWs 的话，HTTP 一律 401
+                        //    「缺少设备凭证」，而 WS 却是通的 —— 症状是"能说话、
+                        //    没有提醒"，UI 显示已连接，日志里一切正常。
+                        //    真机实测（2026-11-05）就是这条：WS hello 成功，
+                        //    心跳连续 401。固件的 token 落 NVS 正是为了避免它。
+                        deviceStore.saveCredentials(
+                            result.wsUrl,
+                            result.token,
+                            System.currentTimeMillis() / 1000L
+                        )
                         screen.hideActivation()
                         screen.setHint("")
                         connectWs(result.wsUrl, result.token, deviceId, clientId)
@@ -383,6 +394,17 @@ class MainActivity : Activity() {
                         delay(5_000)
                     }
                     is OtaClient.Result.Failed -> {
+                        // 盘里有上次成功拿到的凭据 ⇒ **这次 OTA 失败不该把整台
+                        // 设备打哑**。服务端重启、网络抖动、证书过期都只是暂时
+                        // 的；固件用 NVS 里的旧 token 照样心跳，我们同理。
+                        if (deviceStore.hasToken && deviceStore.wsUrl.isNotEmpty()) {
+                            Log.i(TAG, "OTA 失败，改用已落盘的设备凭据连接")
+                            bound = true
+                            screen.hideActivation()
+                            screen.setHint("")
+                            connectWs(deviceStore.wsUrl, deviceStore.token, deviceId, clientId)
+                            return@launch
+                        }
                         bound = false
                         setUiState("offline")
                         screen.setHint("连不上服务器：${result.message}")

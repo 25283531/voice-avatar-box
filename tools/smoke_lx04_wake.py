@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""LX04 离线唤醒词的静态门禁 —— 防「看起来有唤醒、其实没跑起来」。
+"""LX04 唤醒与设备凭据接线的静态门禁 —— 防「看起来有、其实没跑起来」。
 
 ## 为什么需要单独一份判据
 
@@ -138,6 +138,30 @@ def guards(flow: str, wake: str, main: str, fetch: str, api: str, ignore: str):
     add("W14", "下载脚本会校验每个拼音 token 都在 tokens.txt 里",
         token_validator_present)
 
+    # ---- 真机 2026-11-05 实测抓到的漏接线 ----
+    # 现象：WS hello 成功、唤醒引擎就绪，但心跳连续 HTTP 401「缺少设备凭证」。
+    # 原因：DeviceStore 写了，OTA 拿到 token 后却没 saveCredentials，
+    #       所以 Bearer 一直是空串。持久化层"存在"不等于"接上了"。
+    def ota_saves_token():
+        i = main.find("private fun startConnect(")
+        j = main.find("private fun connectWs(")
+        if i < 0 or j <= i:
+            return False
+        # ⚠️ 必须按"非注释行"匹配：把调用注释掉时纯子串仍会命中，
+        #    守卫就成了假绿（与 W10 同一个坑）。
+        return bool(re.search(r"^\s*deviceStore\.saveCredentials\(", main[i:j], re.M))
+
+    add("W15", "OTA 拿到 token 后必须落盘（否则心跳恒 401）", ota_saves_token)
+
+    def ota_failure_degrades():
+        i = main.find("is OtaClient.Result.Failed -> {")
+        if i < 0:
+            return False
+        return bool(re.search(r"^\s*if \(deviceStore\.hasToken", main[i:i + 900], re.M))
+
+    add("W16", "OTA 失败时用盘里的旧凭据连（一次失败不等于功能全灭）",
+        ota_failure_degrades)
+
     return g
 
 
@@ -180,6 +204,12 @@ def run(check_assets: bool) -> int:
                    "OnlineStream.kt", "KeywordSpotter.kt"))
 
     items = guards(flow, wake, main, fetch, api, ignore)
+    api_src = read(ROOT / "lx04/app/src/main/java/com/elder/lx04/net/ElderApi.kt")
+    items.append((
+        "W17", "401 不被误报成『网络不可用』",
+        lambda: "lastStatusCode" in api_src and
+                "设备凭证被拒绝（HTTP $lastStatusCode）" in api_src,
+    ))
     if check_assets:
         items += asset_guards()
 
@@ -220,6 +250,7 @@ def selftest() -> int:
         ("beginListening 不暂停唤醒", {"main": re.sub(r"^\s*wakeEngine\.pause\(\)\n", "", main, flags=re.M)}),
         ("换成两次 detect", {"main": main.replace("voice?.listenDetect(wakeSource, greet = greet)", 'voice?.listenDetect("按键唤醒", greet = false)')}),
         ("二进制被允许入库", {"ignore": ignore.replace("libsherpa-onnx-jni.so", "libother.so")}),
+        ("OTA 不再保存 token", {"main": re.sub(r"^\s*deviceStore\.saveCredentials\(", "        // removed", main, flags=re.M)}),
     ]
 
     bad = 0

@@ -69,6 +69,18 @@ class ElderApi(
 
     private val jsonMedia = "application/json; charset=utf-8".toMediaType()
 
+    /**
+     * 最近一次 HTTP 状态码。
+     *
+     * 为什么要有：401「缺少设备凭证」和"网络不通"在调用方眼里都只是
+     * "拿不到数据"，但处理方式完全相反 —— 前者要重新取 token，后者只需
+     * 退避重试。把它们混成一句「网络不可用」，真机上就会让人去查网线，
+     * 而真正的原因是 token 没落盘（2026-11-05 实测踩过）。
+     */
+    @Volatile
+    var lastStatusCode: Int = 0
+        private set
+
     // ------------------------------------------------------------------ 心跳
 
     /** 心跳结果。 */
@@ -128,7 +140,11 @@ class ElderApi(
         val result = request(url, body) ?: return SyncResult(
             ok = false, reminders = null, serverTimeSec = null, tzOffsetMin = null,
             wsUrl = null, intervalSec = DEFAULT_SYNC_INTERVAL_SEC, wifiChange = null,
-            message = "网络不可用"
+            message = when (lastStatusCode) {
+                401, 403 -> "设备凭证被拒绝（HTTP $lastStatusCode），需要重新取 token"
+                in 400..599 -> "服务端返回 HTTP $lastStatusCode"
+                else -> "网络不可用"
+            }
         )
 
         return parseSync(result)
@@ -352,12 +368,17 @@ class ElderApi(
         return runCatching {
             http.newCall(req).execute().use { resp ->
                 val text = resp.body?.string().orEmpty()
+                lastStatusCode = resp.code
                 if (!resp.isSuccessful) {
-                    // 401/403 单独打：token 过期时这是唯一线索，
-                    // 而且它和"网络不通"长得一模一样（都是拿不到数据）。
-                    Log.w(TAG, "HTTP ${resp.code} $url -> ${text.take(160)}")
+                    if (resp.code == 401 || resp.code == 403) {
+                        Log.e(TAG, "设备凭证被拒绝（HTTP ${resp.code}）$url -> ${text.take(160)}。" +
+                            "检查 OTA 成功后是否把 token 落盘；不是网络问题")
+                    } else {
+                        Log.w(TAG, "HTTP ${resp.code} $url -> ${text.take(160)}")
+                    }
                     null
                 } else {
+                    lastStatusCode = 0
                     text
                 }
             }
