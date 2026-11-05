@@ -751,6 +751,102 @@ class MainActivity : Activity() {
     }
 
     /**
+     * 注入一段 PCM 音频，走**完整上行链路**（端到端验收用）。
+     *
+     * ## 为什么需要它
+     *
+     * 实机有个绕不开的坑：**设备扬声器放出来的声音，麦克风采不到**
+     * （MTK 的 HAL 在 AudioFlinger 录音路径上做了回声消除；用 tinycap 直连
+     * ALSA 录是能录到的，rms 4589 vs App 侧近乎全零）。
+     * ⇒ 想在**没有人说话**的情况下验证「语音 → ASR → TTS」闭环，
+     *   只能把一段已知语音**直接注入**上行链路。
+     *
+     * 注入的是**真实语音**（服务端 Edge TTS 合成的中文），
+     * 所以服务端 ASR 能不能识别出来，是货真价实的判据。
+     *
+     * 用法：
+     * ```
+     * adb push say.wav /sdcard/say.wav     # 16kHz / 单声道 / 16bit PCM
+     * adb shell am broadcast -a com.elder.lx04.DEBUG --es cmd inject
+     * ```
+     */
+    private fun runInject() {
+        if (sending) {
+            Log.w(TAG, "inject 忽略 —— 正在对话中")
+            return
+        }
+        val f = java.io.File("/sdcard/say.wav")
+        if (!f.exists()) {
+            Log.e(TAG, "inject：找不到 /sdcard/say.wav")
+            screen.setHint("注入失败：设备上没有 say.wav")
+            return
+        }
+        screen.setHint("注入上行链路中…")
+
+        scope.launch(Dispatchers.Default) {
+            val pcm = readWav16k(f)
+            if (pcm == null || pcm.size < 960) {
+                Log.e(TAG, "inject：WAV 解析失败或太短")
+                screen.setHint("注入失败：WAV 解析失败")
+                return@launch
+            }
+            Log.i(TAG, "inject：读入 ${pcm.size} 样本（${pcm.size / 960} 帧）")
+
+            voice?.listenDetect("按键唤醒", greet = false)
+            voice?.listenStart()
+
+            var sent = 0
+            var off = 0
+            while (off + 960 <= pcm.size) {
+                val frame = pcm.copyOfRange(off, off + 960)
+                val enc = opus.encode(frame)
+                if (enc != null) {
+                    voice?.sendAudio(enc)
+                    sent++
+                }
+                off += 960
+                // 按真实节奏送（60ms/帧），别把服务端静音看门狗压过去
+                delay(60)
+            }
+            Log.i(TAG, "inject：已发送 $sent 帧")
+            delay(800)
+            voice?.listenStop()
+            screen.setHint("注入完成：$sent 帧")
+        }
+    }
+
+    /** 读 16kHz / 单声道 / 16bit 的 PCM WAV，返回样本；解析不出来返回 null。 */
+    private fun readWav16k(f: java.io.File): ShortArray? {
+        return try {
+            val all = f.readBytes()
+            var off = 12
+            var dataOff = -1
+            var dataLen = 0
+            while (off + 8 <= all.size) {
+                val id = String(all, off, 4, Charsets.US_ASCII)
+                val len = java.nio.ByteBuffer.wrap(all, off + 4, 4)
+                    .order(java.nio.ByteOrder.LITTLE_ENDIAN).int
+                if (id == "data") {
+                    dataOff = off + 8
+                    dataLen = len
+                    break
+                }
+                off += 8 + len + (len and 1)
+            }
+            if (dataOff < 0) return null
+            val n = dataLen / 2
+            val out = ShortArray(n)
+            val bb = java.nio.ByteBuffer.wrap(all, dataOff, dataLen)
+                .order(java.nio.ByteOrder.LITTLE_ENDIAN)
+            for (i in 0 until n) out[i] = bb.short
+            out
+        } catch (t: Throwable) {
+            Log.e(TAG, "inject：读 WAV 失败 ${t.javaClass.simpleName}: ${t.message}")
+            null
+        }
+    }
+
+    /**
      * Opus 编码探针 —— 在**真机**上把"为什么一帧都编不出来"钉死。
      *
      * ## 为什么需要它
@@ -1318,6 +1414,7 @@ class MainActivity : Activity() {
             "link_test" -> runLinkTest()
             "enc_probe" -> runEncProbe()
             "mic_matrix" -> runMicMatrix()
+            "inject" -> runInject()
             "tone_test" -> runToneTest()
             "opus_selftest" -> runOpusSelfTest()
 

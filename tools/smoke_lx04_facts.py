@@ -463,6 +463,15 @@ def run(root: Path) -> int:
         "getReadCount" not in strip_java_comments(rec_stub),
         "AudioRecord 没有 getReadCount（那是 AudioTrack 的）：stub 加了就是给假绿开后门",
     )
+    check(
+        "8v 必须留有注入式端到端验收命令 inject",
+        # 设备扬声器的声音麦克风采不到（MTK HAL 在录音路径上做了回声消除），
+        # 没人说话时就无法验证「语音 → ASR → TTS」闭环 ⇒ 必须能注入已知语音。
+        re.search(r'"inject"\s*->\s*runInject\s*\(\s*\)', main_code) is not None
+        and "readWav16k" in fn_body(main_code, "runInject")
+        and "sendAudio" in fn_body(main_code, "runInject"),
+        "没有注入入口就只剩「真人对着设备说」这一种验法",
+    )
 
     # ---------------------------------------------------------------- 7 接线
     print("\n[7] 判据真的会被 CI 执行")
