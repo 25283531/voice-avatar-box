@@ -1948,6 +1948,10 @@ class MainActivity : Activity() {
             "talk" -> beginListening()
             "stop_talk" -> if (inConversation) endConversation() else endListening()
             "end_conversation" -> endConversation()
+            // 不走麦克风（自动化验收用）：模拟一次唤醒检出，直接进入对话态。
+            // 真机判据：触发后服务端应出现 listen start + 唤醒应答，
+            // 播报完设备仍持续推流、录音轨数量不变（零 HAL 切换）。
+            "conv_start" -> startConversation("你好小智")
             "mic_test" -> runMicTest()
             "link_test" -> runLinkTest()
             "enc_probe" -> runEncProbe()
