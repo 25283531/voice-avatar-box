@@ -62,7 +62,10 @@ MAVEN = "https://repo1.maven.org/maven2/"
 
 
 def find_java() -> Path | None:
-    """找 JDK 17：先看环境变量，再用已知路径。"""
+    """找 JDK 17：先看环境变量，再用已知路径。
+
+    ⚠️ 可执行文件名按平台区分：Windows 是 java.exe，Linux/macOS 是 java。
+    """
     env = os.environ.get("JAVA_HOME")
     if env:
         p = Path(env) / "bin" / ("java.exe" if os.name == "nt" else "java")
@@ -96,15 +99,40 @@ APP_JARS = {
 
 
 def ensure_jar(dst: Path, url: str) -> bool:
+    """下载 jar（带重试与内容校验）。
+
+    ⚠️ 必须校验 **ZIP magic**（PK\\x03\\x04）：只判"文件存在且够大"的话，
+    Maven 返回一个 HTML 错误页也会被当成成功 —— 而那之后的报错是
+    "Could not find or load main class"，跟真实原因隔了十万八千里。
+    """
     if dst.is_file() and dst.stat().st_size > 10_000:
-        return True
+        try:
+            with dst.open("rb") as f:
+                if f.read(4) == b"PK\x03\x04":
+                    return True
+        except OSError:
+            pass
+        # 不是 zip —— 删掉重下
+        dst.unlink(missing_ok=True)
+
     dst.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        urllib.request.urlretrieve(url, dst)
-        return True
-    except Exception as exc:  # noqa: BLE001
-        print(f"下载失败 {url}: {exc}")
-        return False
+    last: Exception | None = None
+    for attempt in range(3):
+        tmp = dst.with_suffix(dst.suffix + ".part")
+        try:
+            with urllib.request.urlopen(url, timeout=180) as resp, tmp.open("wb") as out:
+                shutil.copyfileobj(resp, out)
+            with tmp.open("rb") as f:
+                if f.read(4) != b"PK\x03\x04":
+                    raise OSError(f"{url} 返回的不是 jar（可能是错误页）")
+            tmp.replace(dst)
+            return True
+        except Exception as exc:  # noqa: BLE001
+            last = exc
+            tmp.unlink(missing_ok=True)
+            print(f"  下载失败（第 {attempt + 1} 次）{url}: {exc}")
+    print(f"下载最终失败 {url}: {last}")
+    return False
 
 
 def prepare() -> bool:
@@ -153,8 +181,13 @@ def main() -> int:
     #    其实是缺依赖）。这个坑本机踩过一次。
     files += [str(p) for p in src.rglob("*.java")]
 
-    kcp = ";".join(str(KOTLINC / n) for n in KOTLIN_JARS)
-    acp = ";".join([str(LIBS / n) for n in APP_JARS] + [str(KOTLINC / "kotlin-stdlib-1.9.24.jar")])
+    # ⚠️ classpath 分隔符**按平台区分**：Windows 用 ';'，Linux/macOS 用 ':'。
+    #    写死 ';' 的话，CI（ubuntu）会把整串当成一个路径 ⇒
+    #    "Could not find or load main class org.jetbrains.kotlin.cli.jvm.K2JVMCompiler"
+    #    —— 而本机（Windows）完全正常，就是典型的"本机过、CI 挂"。
+    sep = ";" if os.name == "nt" else ":"
+    kcp = sep.join(str(KOTLINC / n) for n in KOTLIN_JARS)
+    acp = sep.join([str(LIBS / n) for n in APP_JARS] + [str(KOTLINC / "kotlin-stdlib-1.9.24.jar")])
 
     cmd = [
         str(java), "-cp", kcp,
