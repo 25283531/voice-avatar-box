@@ -402,6 +402,47 @@ def run(root: Path) -> int:
         "通道抽错在真机上是「声音慢一倍」，只能靠单测钉死",
     )
 
+    # ---- 8p/8q/8r/8s 参数矩阵与 stub 真值 ------------------------------
+    #
+    # 2026-11-05 实机第三层发现：ALSA 层是好的（tinycap 直连 pcm1c 有信号，
+    # rms 2270），坏的是 AudioFlinger 打开设备后的启动过程
+    # （state: PREPARED + "input device already opened" ⇒ 读到的帧全零）。
+    # ⇒ 必须能在真机上一把扫完 (音频源 × 采样率 × 通道数)。
+    matrix_body = fn_body(main_code, "runMicMatrix")
+    case_body = fn_body(main_code, "tryMicCase")
+    check(
+        "8p 必须留有麦克风参数矩阵命令 mic_matrix",
+        re.search(r'"mic_matrix"\s*->\s*runMicMatrix\s*\(\s*\)', main_code) is not None
+        and len(matrix_body) > 0,
+        "没有矩阵就只能一轮 CI 试一个参数，定位慢十倍",
+    )
+    rates_found = set(re.findall(r"MicCase\s*\([^,]+,\s*[^,]+,\s*(\d+)\s*,", main_code))
+    sources_found = set(re.findall(r"AudioSource\.([A-Z_]+)", main_code))
+    check(
+        "8q 矩阵要同时覆盖多个采样率与多个音频源",
+        len(rates_found) >= 2 and len(sources_found) >= 3,
+        f"rate={sorted(rates_found)} source={sorted(sources_found)} —— 覆盖不够就定位不出可用参数",
+    )
+    check(
+        "8r 每组矩阵之间必须等设备释放",
+        "Thread.sleep" in case_body and "release" in case_body,
+        "MTK 的 HAL 释放有延迟，立刻开下一组会撞上 "
+        "'input device already opened'，那一组必然全零（假阴性）",
+    )
+    stub = read(root, "tools/androidstub/android/media/MediaRecorder.java")
+    def stub_const(name: str) -> int:
+        m = re.search(rf"{name}\s*=\s*(\d+)", stub)
+        return int(m.group(1)) if m else -1
+    check(
+        "8s stub 的音频源常量必须与真 Android 一致",
+        stub_const("VOICE_RECOGNITION") == 6
+        and stub_const("VOICE_COMMUNICATION") == 7
+        and stub_const("DEFAULT") == 0
+        and stub_const("MIC") == 1,
+        "VOICE_RECOGNITION 真值是 6（曾写成 7）：本地与真机跑的是不同的音频源 —— "
+        "典型的假绿",
+    )
+
     # ---------------------------------------------------------------- 7 接线
     print("\n[7] 判据真的会被 CI 执行")
     wf = read(root, WORKFLOW)

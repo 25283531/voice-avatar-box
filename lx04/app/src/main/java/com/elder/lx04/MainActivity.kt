@@ -7,6 +7,9 @@ import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import android.content.pm.PackageManager
+import android.media.AudioFormat
+import android.media.AudioRecord
+import android.media.MediaRecorder
 import android.os.BatteryManager
 import android.os.Bundle
 import android.os.SystemClock
@@ -929,6 +932,168 @@ class MainActivity : Activity() {
         }
     }
 
+    /**
+     * 麦克风参数矩阵 —— 找出这台设备上**真的能拿到数据**的采集参数。
+     *
+     * ## 为什么需要它
+     *
+     * 2026-11-05 实机事实（三条互相咬合的证据）：
+     *
+     *   · `tinycap` 直连 ALSA（pcm1c）：rms 2270，**有真实信号**
+     *   · App 走 AudioFlinger：ALSA `state: PREPARED`（**流没跑起来**），
+     *     读到的帧**全是 0**，4 秒只有 4 帧
+     *   · AudioFlinger 日志：`startInputDevice(), input device already opened`
+     *
+     * ⇒ 问题不在 ALSA 层，而在「AudioFlinger 用什么参数打开设备」。
+     *   所以把 (音频源 × 采样率 × 通道数) 全试一遍，
+     *   看哪一组能拿到**非零**数据；拿到的原始样本会落盘，
+     *   拉回本机 JVM 就能复现 Opus 断言。
+     *
+     * 每组之间**必须等设备释放**（MTK 的 HAL 释放有延迟，
+     * 下一组立刻开会撞上 "input device already opened"）。
+     *
+     * 用法：`adb shell am broadcast -a com.elder.lx04.DEBUG --es cmd mic_matrix`
+     */
+    private fun runMicMatrix() {
+        if (sending) {
+            Log.w(TAG, "mic_matrix 忽略 —— 正在对话中")
+            return
+        }
+        screen.setHint("麦克风参数矩阵…")
+
+        scope.launch(Dispatchers.Default) {
+            val sb = StringBuilder()
+            for (c in MIC_CASES) {
+                val r = tryMicCase(c)
+                sb.append(
+                    String.format(
+                        Locale.US,
+                        "%-40s frames=%-5d min=%-7d max=%-7d rms=%-10.1f %s%n",
+                        c.label, r.frames, r.min, r.max, r.rms, r.note,
+                    )
+                )
+                if (r.rms > 1.0 && r.samples != null) {
+                    sb.append("    落盘：${dumpSamples(r.samples, "mic_matrix_${c.label.replace(' ', '_')}.bin")}\n")
+                }
+            }
+            Log.i(TAG, "mic_matrix\n$sb")
+            screen.setHint("矩阵完成，见 logcat")
+        }
+    }
+
+    /** 矩阵里的一组参数。 */
+    private data class MicCase(
+        val label: String,
+        val source: Int,
+        val rate: Int,
+        val channels: Int,
+    )
+
+    /** 矩阵里一组的测量结果。 */
+    private data class MicResult(
+        val frames: Int,
+        val min: Int,
+        val max: Int,
+        val rms: Double,
+        val note: String,
+        val samples: ShortArray?,
+    )
+
+    /** 直连 AudioRecord 试一组参数，采 2.5 秒。 */
+    private fun tryMicCase(c: MicCase): MicResult {
+        val mask =
+            if (c.channels == 2) AudioFormat.CHANNEL_IN_STEREO else AudioFormat.CHANNEL_IN_MONO
+        var rec: AudioRecord? = null
+        return try {
+            val minBuf = AudioRecord.getMinBufferSize(
+                c.rate, mask, AudioFormat.ENCODING_PCM_16BIT
+            )
+            if (minBuf <= 0) {
+                return MicResult(0, 0, 0, 0.0, "getMinBufferSize=$minBuf", null)
+            }
+            rec = AudioRecord(
+                c.source, c.rate, mask, AudioFormat.ENCODING_PCM_16BIT,
+                maxOf(minBuf, c.rate / 5 * 2 * c.channels),
+            )
+            if (rec.state != AudioRecord.STATE_INITIALIZED) {
+                return MicResult(0, 0, 0, 0.0, "未初始化 state=${rec.state}", null)
+            }
+            rec.startRecording()
+            if (rec.recordingState != AudioRecord.RECORDSTATE_RECORDING) {
+                return MicResult(0, 0, 0, 0.0, "startRecording 失败", null)
+            }
+
+            val chunk = ShortArray(c.rate / 20)          // 50ms
+            val all = java.io.ByteArrayOutputStream()
+            var frames = 0
+            var mn = Int.MAX_VALUE
+            var mx = Int.MIN_VALUE
+            var sum = 0.0
+            var n = 0
+            val deadline = SystemClock.elapsedRealtime() + 2500
+            while (SystemClock.elapsedRealtime() < deadline) {
+                val got = rec.read(chunk, 0, chunk.size)
+                if (got > 0) {
+                    frames++
+                    val b = ByteArray(got * 2)
+                    for (i in 0 until got) {
+                        val v = chunk[i].toInt()
+                        b[i * 2] = (v and 0xff).toByte()
+                        b[i * 2 + 1] = ((v shr 8) and 0xff).toByte()
+                        if (v < mn) mn = v
+                        if (v > mx) mx = v
+                        sum += v.toDouble() * v
+                        n++
+                    }
+                    all.write(b)
+                } else {
+                    Thread.sleep(20)
+                }
+            }
+            val rms = if (n > 0) Math.sqrt(sum / n) else 0.0
+            val samples = ShortArray(n)
+            val raw = all.toByteArray()
+            for (i in 0 until n) {
+                samples[i] = ((raw[i * 2].toInt() and 0xff) or (raw[i * 2 + 1].toInt() shl 8)).toShort()
+            }
+            MicResult(
+                frames,
+                if (mn == Int.MAX_VALUE) 0 else mn,
+                if (mx == Int.MIN_VALUE) 0 else mx,
+                rms,
+                "read=${rec.readCount}",
+                samples,
+            )
+        } catch (t: Throwable) {
+            MicResult(0, 0, 0, 0.0, "异常 ${t.javaClass.simpleName}: ${t.message}", null)
+        } finally {
+            runCatching { rec?.stop() }
+            runCatching { rec?.release() }
+            // ⚠️ 必须等：MTK 的 HAL 释放有延迟，立刻开下一组会撞上
+            //    "input device already opened"，那一组就必然全零。
+            Thread.sleep(1500)
+        }
+    }
+
+    /** 落盘原始样本（app 私有目录），供拉回本机 JVM 复现。 */
+    private fun dumpSamples(samples: ShortArray, name: String): String {
+        return try {
+            val f = java.io.File(filesDir, name)
+            java.io.FileOutputStream(f).use { os ->
+                val b = ByteArray(samples.size * 2)
+                for (i in samples.indices) {
+                    val v = samples[i].toInt()
+                    b[i * 2] = (v and 0xff).toByte()
+                    b[i * 2 + 1] = ((v shr 8) and 0xff).toByte()
+                }
+                os.write(b)
+            }
+            "${f.absolutePath}（${samples.size} 样本）"
+        } catch (e: Throwable) {
+            "落盘失败：${e.javaClass.simpleName}: ${e.message}"
+        }
+    }
+
     private fun runMicTest() {
         if (sending) {
             Log.w(TAG, "mic_test 忽略 —— 正在对话中")
@@ -1152,6 +1317,7 @@ class MainActivity : Activity() {
             "mic_test" -> runMicTest()
             "link_test" -> runLinkTest()
             "enc_probe" -> runEncProbe()
+            "mic_matrix" -> runMicMatrix()
             "tone_test" -> runToneTest()
             "opus_selftest" -> runOpusSelfTest()
 
@@ -1235,6 +1401,25 @@ class MainActivity : Activity() {
     companion object {
         private const val TAG = "ElderLX04"
         private const val REQ_MIC = 1001
+
+        /**
+         * 麦克风参数矩阵 —— (音频源 × 采样率 × 通道数) 全扫一遍。
+         *
+         * 见 [runMicMatrix] 的说明：ALSA 层是好的（tinycap 直连有信号），
+         * 坏的是 AudioFlinger 打开设备后的启动过程。
+         */
+        private val MIC_CASES = listOf(
+            MicCase("VOICE_RECOGNITION 16000 2ch", MediaRecorder.AudioSource.VOICE_RECOGNITION, 16000, 2),
+            MicCase("VOICE_RECOGNITION 16000 1ch", MediaRecorder.AudioSource.VOICE_RECOGNITION, 16000, 1),
+            MicCase("VOICE_RECOGNITION 48000 2ch", MediaRecorder.AudioSource.VOICE_RECOGNITION, 48000, 2),
+            MicCase("VOICE_RECOGNITION 48000 1ch", MediaRecorder.AudioSource.VOICE_RECOGNITION, 48000, 1),
+            MicCase("MIC 16000 1ch", MediaRecorder.AudioSource.MIC, 16000, 1),
+            MicCase("MIC 16000 2ch", MediaRecorder.AudioSource.MIC, 16000, 2),
+            MicCase("MIC 48000 2ch", MediaRecorder.AudioSource.MIC, 48000, 2),
+            MicCase("DEFAULT 48000 2ch", MediaRecorder.AudioSource.DEFAULT, 48000, 2),
+            MicCase("VOICE_COMMUNICATION 16000 1ch", MediaRecorder.AudioSource.VOICE_COMMUNICATION, 16000, 1),
+            MicCase("CAMCORDER 48000 2ch", MediaRecorder.AudioSource.CAMCORDER, 48000, 2),
+        )
 
         /** 服务端根地址（生产环境，IP 直连）。 */
         const val SERVER_BASE_URL = "https://152.136.230.132"
