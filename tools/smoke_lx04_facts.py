@@ -442,6 +442,20 @@ def run(root: Path) -> int:
         "VOICE_RECOGNITION 真值是 6（曾写成 7）：本地与真机跑的是不同的音频源 —— "
         "典型的假绿",
     )
+    # ⚠️ 这条守的是「stub 里凭空加 API」这个坑：
+    #    2026-11-05 在 stub 里加了 AudioRecord.getReadCount()（真 SDK **没有**
+    #    这个方法，getReadCount 是 AudioTrack 的），本地 kotlinc 全绿，
+    #    CI 的 gradle（真 SDK）直接编译失败。
+    #    ⇒ 往 stub 里加 API 之前必须确认真 SDK 里存在；这里留一条反向断言。
+    rec_stub = read(root, "tools/androidstub/android/media/AudioRecord.java")
+    def strip_java_comments(s: str) -> str:
+        s = re.sub(r"/\*.*?\*/", "", s, flags=re.S)
+        return re.sub(r"//[^\n]*", "", s)
+    check(
+        "8t stub 里不得出现真 SDK 没有的 API（AudioRecord.getReadCount）",
+        "getReadCount" not in strip_java_comments(rec_stub),
+        "AudioRecord 没有 getReadCount（那是 AudioTrack 的）：stub 加了就是给假绿开后门",
+    )
 
     # ---------------------------------------------------------------- 7 接线
     print("\n[7] 判据真的会被 CI 执行")

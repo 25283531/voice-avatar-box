@@ -1061,7 +1061,7 @@ class MainActivity : Activity() {
                 if (mn == Int.MAX_VALUE) 0 else mn,
                 if (mx == Int.MIN_VALUE) 0 else mx,
                 rms,
-                "read=${rec.readCount}",
+                "readFrames=$frames",
                 samples,
             )
         } catch (t: Throwable) {
