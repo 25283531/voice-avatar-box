@@ -31,6 +31,7 @@ DEFAULT_FILES = [
     "lx04/app/src/main/java/com/elder/lx04/net/VoiceClient.kt",
     "lx04/app/src/test/java/com/elder/lx04/audio/OpusConcurrencyTest.kt",
     "lx04/app/src/test/java/com/elder/lx04/audio/OpusEncodeTest.kt",
+    "lx04/app/src/test/java/com/elder/lx04/audio/AudioCaptureChannelTest.kt",
 ]
 
 # 顶层声明：类 / 对象 / 函数 / 属性

@@ -77,6 +77,14 @@ class AudioCapture(
     private var record: AudioRecord? = null
     private var worker: Thread? = null
 
+    /**
+     * 实际使用的通道数（HAL 协商结果）。
+     *
+     * 2 = 立体声（读进来的数据要抽左声道）；1 = 单声道（恒等）。
+     */
+    @Volatile
+    private var channels = CHANNELS_STEREO
+
     @Volatile
     private var running = false
 
@@ -97,38 +105,33 @@ class AudioCapture(
     fun start(): Boolean {
         if (running) return true
 
-        val minBuf = AudioRecord.getMinBufferSize(
-            SAMPLE_RATE,
-            AudioFormat.CHANNEL_IN_MONO,
-            AudioFormat.ENCODING_PCM_16BIT
-        )
-        if (minBuf <= 0) {
-            Log.e(TAG, "getMinBufferSize 失败: $minBuf")
-            return false
-        }
-
-        // 缓冲给 4 帧，留够抖动余量：只给 1 帧的话，一次 GC 停顿就会丢采样，
-        // 丢采样在 Opus 里表现为"咔"一声，服务端 ASR 会听到半个字。
-        val bufBytes = maxOf(minBuf, FRAME_SAMPLES * 2 * 4)
-
-        val rec = try {
-            AudioRecord(
-                MediaRecorder.AudioSource.VOICE_RECOGNITION,
-                SAMPLE_RATE,
-                AudioFormat.CHANNEL_IN_MONO,
-                AudioFormat.ENCODING_PCM_16BIT,
-                bufBytes
-            )
-        } catch (e: Exception) {
-            Log.e(TAG, "创建 AudioRecord 失败: ${e.message}", e)
-            return false
-        }
-
-        if (rec.state != AudioRecord.STATE_INITIALIZED) {
-            Log.e(TAG, "AudioRecord 未初始化（麦克风多半被别的进程占着）state=${rec.state}")
-            rec.release()
-            return false
-        }
+        // ⚠️⚠️ 通道数必须**按 HAL 实际给的来**，不能想当然写 mono。
+        //
+        //    实机证据（2026-11-05，录音期间读 /proc/asound/card0/pcm1c/sub0/hw_params）：
+        //
+        //        access: RW_INTERLEAVED
+        //        format: S16_LE
+        //        channels: 2          ← HAL 给的是**双声道**
+        //        rate: 16000
+        //
+        //    而这里请求的是 CHANNEL_IN_MONO —— MTK 的 HAL **没有**把 stereo
+        //    downmix 成 mono 就直接把双声道给了。于是"按单声道读"实际读到的是
+        //    **左右交错的立体声**：
+        //
+        //        · 每帧 960 个 short 只覆盖 960/2/16000 = **30ms** 真实音频
+        //          （协议要求 60ms）⇒ 服务端按 60ms 播放 ⇒ 声音慢一倍、
+        //          音调减半，ASR 几乎听不出字；
+        //        · 相邻样本其实是 L、R 两个声道，信号被 2 倍频化。
+        //
+        //    现场症状完全对得上：link_test 跑 5 秒却采到 **165 帧**
+        //    （5s/60ms 本该只有 83 帧，165 ≈ 83×2）。
+        //
+        //    ⇒ 修法：**明确请求立体声**，每帧读 960×2 个样本，**抽左声道**
+        //    还原成真正的 60ms 单声道。若某台设备只支持 mono，
+        //    stereo 构造会失败 → 自动回退到 mono 读法（对 mono 抽左是恒等）。
+        val opened = openRecord() ?: return false
+        val rec = opened.first
+        channels = opened.second
 
         if (enablePlatformEffects) attachEffects(rec.audioSessionId) else {
             pre.softwareAgc = true
@@ -151,18 +154,74 @@ class AudioCapture(
         worker = thread(name = "elder-mic", priority = Thread.MAX_PRIORITY - 2) {
             captureLoop(rec)
         }
-        Log.i(TAG, "采集已启动：${SAMPLE_RATE}Hz mono，${FRAME_MS}ms/帧")
+        Log.i(
+            TAG,
+            "采集已启动：${SAMPLE_RATE}Hz mono（HAL ${channels}ch → 抽左声道），${FRAME_MS}ms/帧"
+        )
         return true
     }
 
+    /**
+     * 打开采集设备。
+     *
+     * 先试**立体声**（本机 HAL 实测给 2ch），失败再回退单声道。
+     *
+     * @return (AudioRecord, 使用的通道数)；都打不开时返回 null
+     */
+    private fun openRecord(): Pair<AudioRecord, Int>? {
+        for (ch in intArrayOf(CHANNELS_STEREO, CHANNELS_MONO)) {
+            val channelMask =
+                if (ch == CHANNELS_STEREO) AudioFormat.CHANNEL_IN_STEREO else AudioFormat.CHANNEL_IN_MONO
+
+            val minBuf = AudioRecord.getMinBufferSize(
+                SAMPLE_RATE,
+                channelMask,
+                AudioFormat.ENCODING_PCM_16BIT
+            )
+            if (minBuf <= 0) {
+                Log.w(TAG, "getMinBufferSize 失败（${ch}ch）: $minBuf")
+                continue
+            }
+
+            // 缓冲给 4 帧，留够抖动余量：只给 1 帧的话，一次 GC 停顿就会丢采样，
+            // 丢采样在 Opus 里表现为"咔"一声，服务端 ASR 会听到半个字。
+            val bufBytes = maxOf(minBuf, FRAME_SAMPLES * 2 * ch * 4)
+
+            val rec = try {
+                AudioRecord(
+                    MediaRecorder.AudioSource.VOICE_RECOGNITION,
+                    SAMPLE_RATE,
+                    channelMask,
+                    AudioFormat.ENCODING_PCM_16BIT,
+                    bufBytes
+                )
+            } catch (e: Exception) {
+                Log.w(TAG, "创建 ${ch}ch AudioRecord 失败: ${e.message}")
+                null
+            } ?: continue
+
+            if (rec.state != AudioRecord.STATE_INITIALIZED) {
+                Log.w(TAG, "${ch}ch AudioRecord 未初始化（麦克风多半被别的进程占着）state=${rec.state}")
+                rec.release()
+                continue
+            }
+            Log.i(TAG, "采集通道：${ch}ch（HAL 协商结果）")
+            return rec to ch
+        }
+        return null
+    }
+
     private fun captureLoop(rec: AudioRecord) {
-        val buf = ShortArray(FRAME_SAMPLES)
+        val ch = channels
+        // 多声道时按 ch 倍长度读，再抽左声道还原成单声道（见 start() 的说明）。
+        val buf = ShortArray(FRAME_SAMPLES * ch)
+        val mono = ShortArray(FRAME_SAMPLES)
         while (running) {
             // ⚠️ 必须读满一整帧：Opus 编码器要求输入长度正好是 960 采样，
             //    少一个都会导致时间轴错位（表现为服务端听到的声音越来越慢）。
             var off = 0
-            while (off < FRAME_SAMPLES && running) {
-                val n = rec.read(buf, off, FRAME_SAMPLES - off)
+            while (off < buf.size && running) {
+                val n = rec.read(buf, off, buf.size - off)
                 if (n <= 0) {
                     if (n == AudioRecord.ERROR_INVALID_OPERATION ||
                         n == AudioRecord.ERROR_BAD_VALUE
@@ -186,8 +245,11 @@ class AudioCapture(
             }
             if (!running) break
 
-            val info = pre.process(buf, FRAME_SAMPLES)
-            onFrame(buf, info)
+            // 立体声 → 左声道（单声道时是恒等拷贝）。
+            extractLeftChannel(buf, mono, FRAME_SAMPLES, ch)
+
+            val info = pre.process(mono, FRAME_SAMPLES)
+            onFrame(mono, info)
         }
     }
 
@@ -285,6 +347,32 @@ class AudioCapture(
 
         /** 每帧采样数：16000 × 0.06 = 960。 */
         const val FRAME_SAMPLES = SAMPLE_RATE * FRAME_MS / 1000
+
+        /** 立体声通道数。 */
+        const val CHANNELS_STEREO = 2
+
+        /** 单声道通道数。 */
+        const val CHANNELS_MONO = 1
+
+        /**
+         * 从交错的多声道数据里取**左声道**，还原成单声道。
+         *
+         * @param src 交错数据（每个采样点 ch 个 short：L R L R …）
+         * @param dst 单声道输出
+         * @param samples 取多少个采样点
+         * @param ch 通道数；1 时是恒等拷贝
+         *
+         * ⚠️ 这段逻辑单独拆成纯函数，是为了能在 **JVM 单测**里覆盖 ——
+         *    通道数错了在真机上表现为"声音慢一倍"，很难一眼看出，
+         *    而单测里一测就知道抽出来的是不是左声道。
+         */
+        internal fun extractLeftChannel(src: ShortArray, dst: ShortArray, samples: Int, ch: Int) {
+            if (ch <= 1) {
+                System.arraycopy(src, 0, dst, 0, samples)
+                return
+            }
+            for (i in 0 until samples) dst[i] = src[i * ch]
+        }
 
         /**
          * 等待采集线程退出的超时（毫秒）。

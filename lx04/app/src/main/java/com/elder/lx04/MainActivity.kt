@@ -747,6 +747,188 @@ class MainActivity : Activity() {
         }
     }
 
+    /**
+     * Opus 编码探针 —— 在**真机**上把"为什么一帧都编不出来"钉死。
+     *
+     * ## 为什么需要它
+     *
+     * 2026-11-05 实机事实（三条互相矛盾，指向真机运行时）：
+     *
+     *   · `opus_selftest`：合成正弦 5/5、全零静音 3/3 **成功** ⇒ 编码器没坏
+     *   · `link_test` / `talk`：真实麦克风帧 **165/165 失败**（Inlines.OpusAssert）
+     *   · 本机 JVM 上用**同一份 Concentus** 编码真实录音（含各种电平、
+     *     削顶、双声道交错）**全部成功**
+     *
+     * 光看日志分不清是"效果链把数据改了"还是"ART 上的某种差异"，
+     * 所以这个探针把变量一个个拆开：
+     *
+     *   ① 平台效果链（NS/AGC/AEC）开 / 关 —— 同样的麦克风，两种处理
+     *   ② 真实帧 / 归一化后的真实帧 / 全零 / 合成正弦
+     *   ③ 直连 Concentus（拿得到真实断言位置）**和** 生产 OpusCodec
+     *      （拿得到生产路径的真实行为）
+     *
+     * 另外把真实帧落盘到 app 私有目录，可以拉回本机 JVM 复现。
+     *
+     * 用法：`adb shell am broadcast -a com.elder.lx04.DEBUG --es cmd enc_probe`
+     */
+    private fun runEncProbe() {
+        if (sending) {
+            Log.w(TAG, "enc_probe 忽略 —— 正在对话中")
+            return
+        }
+        screen.setHint("编码探针中…")
+
+        scope.launch(Dispatchers.Default) {
+            val sb = StringBuilder()
+            for (fx in listOf(true, false)) {
+                val frames = captureProbeFrames(enableEffects = fx, want = 40, timeoutMs = 4000)
+                sb.append("── 平台效果链 ${if (fx) "开" else "关"} ──\n")
+                if (frames.isEmpty()) {
+                    sb.append("  采不到帧（麦克风被占）\n")
+                    continue
+                }
+                val st = frameStats(frames)
+                sb.append("  帧数=${frames.size} min=${st.first} max=${st.second} rms=${st.third}\n")
+                sb.append(probeConcentus("真实帧", frames))
+                sb.append(probeConcentus("归一化×8", frames.map { scaleFrame(it, 8.0) }))
+                sb.append(probeConcentus("全零对照", frames.map { ShortArray(it.size) }))
+                sb.append(probeConcentus("正弦对照", frames.map { toneFrame(it.size) }))
+                sb.append(probeCodec("真实帧(生产 OpusCodec)", frames))
+                val name = if (fx) "elder_pcm_fx.bin" else "elder_pcm_nofx.bin"
+                sb.append("  落盘：${dumpFrames(frames, name)}\n")
+            }
+            Log.i(TAG, "enc_probe\n$sb")
+            screen.setHint("探针完成，见 logcat")
+        }
+    }
+
+    /** 采集若干帧真实数据（可选择是否挂平台效果链）。 */
+    private fun captureProbeFrames(
+        enableEffects: Boolean,
+        want: Int,
+        timeoutMs: Long
+    ): List<ShortArray> {
+        val frames = java.util.Collections.synchronizedList(ArrayList<ShortArray>())
+        // ⚠️ 第一个参数是 enablePlatformEffects，第二个才是回调 lambda ——
+        //    Kotlin 的尾随 lambda 只能绑最后一个参数。
+        val cap = AudioCapture(enableEffects) { pcm, _ ->
+            if (frames.size < want) frames.add(pcm.copyOf())
+        }
+        if (!cap.start()) return emptyList()
+        val deadline = SystemClock.elapsedRealtime() + timeoutMs
+        while (frames.size < want && SystemClock.elapsedRealtime() < deadline) {
+            Thread.sleep(50)
+        }
+        cap.stop()
+        return frames.toList()
+    }
+
+    /** 帧的数值特征：min、max、rms。 */
+    private fun frameStats(frames: List<ShortArray>): Triple<Int, Int, String> {
+        var mn = Int.MAX_VALUE
+        var mx = Int.MIN_VALUE
+        var sum = 0.0
+        var n = 0
+        for (f in frames) {
+            for (v in f) {
+                val iv = v.toInt()
+                if (iv < mn) mn = iv
+                if (iv > mx) mx = iv
+                sum += iv.toDouble() * iv
+                n++
+            }
+        }
+        return Triple(mn, mx, String.format(Locale.US, "%.1f", Math.sqrt(sum / n)))
+    }
+
+    /** 放大并饱和（模拟 AGC 拉满）。 */
+    private fun scaleFrame(f: ShortArray, k: Double): ShortArray {
+        val out = ShortArray(f.size)
+        for (i in f.indices) {
+            val v = f[i] * k
+            val clipped = if (v > 32767.0) 32767 else if (v < -32768.0) -32768 else v
+            out[i] = clipped.toInt().toShort()
+        }
+        return out
+    }
+
+    /** 合成 440Hz 正弦（对照用）。 */
+    private fun toneFrame(n: Int): ShortArray {
+        val out = ShortArray(n)
+        for (i in 0 until n) {
+            out[i] = (8000 * Math.sin(2 * Math.PI * 440 * i / 16_000.0)).toInt().toShort()
+        }
+        return out
+    }
+
+    /**
+     * 直连 Concentus 编码。
+     *
+     * 目的是拿到**真实异常**：生产 [OpusCodec] 会把异常兜住（重建 → 重试 →
+     * 返回 null），日志里只看得到"失败 165 帧"，看不到断言发生在哪一行。
+     */
+    private fun probeConcentus(label: String, frames: List<ShortArray>): String {
+        val encoder = try {
+            org.concentus.OpusEncoder(
+                16_000,
+                1,
+                org.concentus.OpusApplication.OPUS_APPLICATION_VOIP
+            ).apply {
+                setBitrate(24_000)
+                setUseVBR(true)
+                setUseDTX(false)
+                setComplexity(5)
+            }
+        } catch (e: Throwable) {
+            return "  $label：编码器构造失败 ${e.javaClass.simpleName}: ${e.message}\n"
+        }
+        val buf = ByteArray(1275)
+        var ok = 0
+        for (f in frames) {
+            try {
+                val n = encoder.encode(f, 0, f.size, buf, 0, buf.size)
+                if (n > 0) ok++
+            } catch (t: Throwable) {
+                val top = t.stackTrace.take(3).joinToString(" | ") { it.toString() }
+                return "  $label：成功 $ok/${frames.size} 后失败 ${t.javaClass.simpleName}: ${t.message}\n" +
+                    "      $top\n"
+            }
+        }
+        return "  $label：成功 $ok/${frames.size}\n"
+    }
+
+    /** 走生产 [OpusCodec] —— 看生产路径的真实行为（成功/失败计数）。 */
+    private fun probeCodec(label: String, frames: List<ShortArray>): String {
+        val codec = OpusCodec()
+        codec.init(24_000)
+        var ok = 0
+        for (f in frames) {
+            if (codec.encode(f) != null) ok++
+        }
+        return "  $label：成功 $ok/${frames.size} | ${codec.stats()}\n"
+    }
+
+    /** 把真实帧落盘（app 私有目录），便于拉回本机 JVM 复现。 */
+    private fun dumpFrames(frames: List<ShortArray>, name: String): String {
+        return try {
+            val f = java.io.File(filesDir, name)
+            java.io.FileOutputStream(f).use { os ->
+                for (fr in frames) {
+                    val b = ByteArray(fr.size * 2)
+                    for (i in fr.indices) {
+                        val v = fr[i].toInt()
+                        b[i * 2] = (v and 0xff).toByte()
+                        b[i * 2 + 1] = ((v shr 8) and 0xff).toByte()
+                    }
+                    os.write(b)
+                }
+            }
+            "${f.absolutePath}（${frames.size} 帧）"
+        } catch (e: Throwable) {
+            "落盘失败：${e.javaClass.simpleName}: ${e.message}"
+        }
+    }
+
     private fun runMicTest() {
         if (sending) {
             Log.w(TAG, "mic_test 忽略 —— 正在对话中")
@@ -969,6 +1151,7 @@ class MainActivity : Activity() {
             "stop_talk" -> endListening()
             "mic_test" -> runMicTest()
             "link_test" -> runLinkTest()
+            "enc_probe" -> runEncProbe()
             "tone_test" -> runToneTest()
             "opus_selftest" -> runOpusSelfTest()
 

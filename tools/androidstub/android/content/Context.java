@@ -16,4 +16,8 @@ public abstract class Context {
  public String getPackageName(){return "";}
  public String getString(int r){return "";}
  public android.content.Intent createIntent(String a,Class<?> c){return null;}
+ /** 私有文件目录 —— 签名照抄真 Android（返回 File）。 */
+ public java.io.File getFilesDir(){return null;}
+ /** 外部私有文件目录 —— 签名照抄真 Android。 */
+ public java.io.File getExternalFilesDir(String type){return null;}
 }

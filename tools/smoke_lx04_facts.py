@@ -356,6 +356,52 @@ def run(root: Path) -> int:
         "Thread.join 返回 void，getOrDefault(false) 类型对不上 —— CI 编译会红",
     )
 
+    # ---- 8k/8l/8m/8n 采集通道数必须按 HAL 协商 -----------------------------
+    #
+    # 2026-11-05 实机新事实：录音期间读 /proc/asound/card0/pcm1c/sub0/hw_params
+    # 得到 `channels: 2` —— HAL 给的是**双声道**，而代码原先按 CHANNEL_IN_MONO 读。
+    # MTK 的 HAL 没有把 stereo downmix，于是读到的是左右交错的立体声：
+    #   · 每帧 960 个 short 只覆盖 960/2/16000 = **30ms** 真实音频
+    #     （协议要 60ms）⇒ 服务端按 60ms 播 ⇒ 声音慢一倍、音调减半；
+    #   · link_test 跑 5 秒采到 165 帧（本该 83 帧，165 ≈ 83×2）。
+    #
+    # ⚠️ 这类故障**没有任何异常**，只是"声音变得不对"，
+    #    所以必须靠代码位 + 单测双重钉死。
+    loop_body = fn_body(cap_code, "captureLoop")
+    open_body = fn_body(cap_code, "openRecord")
+    check(
+        "8k 采集按协商到的通道数读，并抽左声道还原成 60ms 单声道",
+        "CHANNEL_IN_STEREO" in cap_code
+        and "extractLeftChannel" in loop_body
+        and re.search(r"ShortArray\s*\(\s*FRAME_SAMPLES\s*\*\s*ch\s*\)", loop_body) is not None,
+        "按 mono 读双声道 HAL ⇒ 交错数据 + 每帧只 30ms，声音慢一倍",
+    )
+    check(
+        "8l 通道协商要有单声道回退（不能只认立体声）",
+        "CHANNELS_STEREO" in open_body and "CHANNELS_MONO" in open_body,
+        "只支持单声道的设备上会直接采不到帧",
+    )
+    check(
+        "8m 必须留有实机编码探针命令 enc_probe",
+        # 判据落在**命令分发**与**函数体**两处：
+        # 只有函数没有分发 = 命令永远不会被触发；
+        # 只有分发没有函数 = 编不过。任缺其一都算不通过。
+        re.search(r'"enc_probe"\s*->\s*runEncProbe\s*\(\s*\)', main_code) is not None
+        and len(fn_body(main_code, "runEncProbe")) > 0,
+        "没有探针就只能在真机上猜，猜错一次就是一轮 CI",
+    )
+    check(
+        "8n 探针必须做「平台效果链开/关」对照",
+        "listOf(true, false)" in fn_body(main_code, "runEncProbe"),
+        "少了对照就分不清是效果链把数据改坏了，还是运行时差异",
+    )
+    test_code = kt_code(read(root, "lx04/app/src/test/java/com/elder/lx04/audio/AudioCaptureChannelTest.kt"))
+    check(
+        "8o 抽左声道有单测覆盖（且不止一个场景）",
+        test_code.count("extractLeftChannel") >= 4 and "CHANNELS" not in test_code,
+        "通道抽错在真机上是「声音慢一倍」，只能靠单测钉死",
+    )
+
     # ---------------------------------------------------------------- 7 接线
     print("\n[7] 判据真的会被 CI 执行")
     wf = read(root, WORKFLOW)
