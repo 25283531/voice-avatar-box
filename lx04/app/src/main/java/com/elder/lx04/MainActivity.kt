@@ -384,6 +384,8 @@ class MainActivity : Activity() {
                         )
                         screen.hideActivation()
                         screen.setHint("")
+                        // 刚落盘的 token 立刻用上，别等下一轮 5 秒轮询
+                        runtime.requestSyncNow()
                         connectWs(result.wsUrl, result.token, deviceId, clientId)
                         return@launch
                     }

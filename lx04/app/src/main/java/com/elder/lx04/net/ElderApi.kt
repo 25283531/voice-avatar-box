@@ -174,7 +174,7 @@ class ElderApi(
         } else null
 
         // ---- 2. 校时 ----
-        val serverTime = parseServerTime(obj.optString("server_time", ""))
+        val serverTime = parseServerTime(obj.optString("server_time", ""), tz)
 
         // ---- 3. 提醒表（空数组 vs 缺失，语义相反）----
         val reminders: List<ReminderItem>? = readReminders(obj)
@@ -392,9 +392,24 @@ class ElderApi(
 
     // ------------------------------------------------------------------ 工具
 
-    private fun parseServerTime(s: String): Long? {
+    /**
+     * 解析服务端时间。
+     *
+     * ## ⚠️ 服务端实际给的是**不带偏移的本地墙上时间**
+     *
+     * `device_api.py::sync` 里 `server_time=now`，`now = local_now()` 是
+     * naive datetime，Pydantic 序列化成 `2026-11-05T22:45:11`（**没有 +08:00**）。
+     * 一开始按 UTC 解析它，真机上算出「校时：本地偏差 28799s」——
+     * 正好 8 小时。而校时偏差会进时钟偏移层，提醒的到点判断整体错 8 小时。
+     *
+     * 修法：不带偏移时，把解析出来的"墙上时间当 UTC"再减去
+     * `tz_offset_minutes`，才是真正的 unix 秒。带偏移的格式照常解析。
+     *
+     * @param tzOffsetMin 服务端下发的设备时区偏移；null 时退回 480（与固件
+     *        NVS 默认值一致）
+     */
+    private fun parseServerTime(s: String, tzOffsetMin: Int?): Long? {
         if (s.isEmpty()) return null
-        // 服务端给的是带偏移的 ISO8601（如 2026-11-05T21:30:00+08:00）。
         // 逐种格式尝试，全失败就返回 null —— **绝不能猜**：
         // 拿错的时间去校时，会把设备推到几个小时之外，当天提醒全错。
         val patterns = listOf(
@@ -406,9 +421,15 @@ class ElderApi(
         for (p in patterns) {
             runCatching {
                 val f = SimpleDateFormat(p, Locale.US)
-                if (!p.contains("XXX")) f.timeZone = TimeZone.getTimeZone("UTC")
+                val hasZone = p.contains("XXX")
+                if (!hasZone) f.timeZone = TimeZone.getTimeZone("UTC")
                 val t = f.parse(s) ?: return@runCatching
-                return t.time / 1000L
+                val epoch = t.time / 1000L
+                return if (hasZone) {
+                    epoch
+                } else {
+                    epoch - (tzOffsetMin ?: DEFAULT_TZ_OFFSET) * 60L
+                }
             }
         }
         Log.w(TAG, "无法解析 server_time: $s")
@@ -483,5 +504,8 @@ class ElderApi(
 
         /** 未绑定时最多等 15 秒再看一眼（固件 `sync.c:1844`）。 */
         const val UNBOUND_RETRY_SEC = 15
+
+        /** 服务端没下发时区时的兜底（东八区，与固件 NVS 默认值一致）。 */
+        const val DEFAULT_TZ_OFFSET = 480
     }
 }

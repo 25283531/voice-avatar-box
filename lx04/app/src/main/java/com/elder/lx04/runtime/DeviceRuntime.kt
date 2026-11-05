@@ -74,7 +74,17 @@ class DeviceRuntime(
         Thread(r, "elder-io").apply { isDaemon = true }
     }
 
-    private val engine = ReminderEngine(store.reminderStore, EngineListener(), Clock.SYSTEM)
+    // ⚠️ 不能用 Clock.SYSTEM：它按**系统时区**算"现在几点"，而规则时区是
+    //    服务端按设备 IP 判定的。固件为此 setenv("TZ")，这里用 DeviceClock
+    //    按服务端下发的偏移解释墙上时间，且把校时偏差也算进时间源。
+    private val engine = ReminderEngine(
+        store.reminderStore,
+        EngineListener(),
+        DeviceClock(
+            offsetProvider = { store.tzOffsetMin },
+            timeSource = { System.currentTimeMillis() + store.clockOffsetMs }
+        )
+    )
 
     private val api = ElderApi(baseUrl, deviceId, clientId) { store.token }
 
@@ -177,6 +187,15 @@ class DeviceRuntime(
     }
 
     private fun doHeartbeat() {
+        // ⚠️ 没有 token 就**不要发 HTTP**。
+        //    启动瞬间 OTA 还没回来时，`/sync` 必然 401「缺少设备凭证」；
+        //    那不是网络故障，却会污染退避曲线（5s→10s→20s…），把真正
+        //    需要的提醒表推迟到一分钟之后。真机实测（2026-11-05）就踩了：
+        //    WS hello 成功、唤醒引擎就绪，心跳却连报 401。
+        if (!store.hasToken) {
+            scheduleHeartbeat(UNBOUND_POLL_MS)
+            return
+        }
         if (heartbeatRunning) return
         heartbeatRunning = true
         syncNowRequested = false
@@ -569,5 +588,8 @@ class DeviceRuntime(
 
         /** 硬件型号：管理后台「硬件型号」列读它。 */
         const val HW_MODEL = "LX04"
+
+        /** 还没拿到设备凭证时的短轮询间隔（不发 HTTP）。 */
+        private const val UNBOUND_POLL_MS = 5_000L
     }
 }

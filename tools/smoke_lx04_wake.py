@@ -205,10 +205,27 @@ def run(check_assets: bool) -> int:
 
     items = guards(flow, wake, main, fetch, api, ignore)
     api_src = read(ROOT / "lx04/app/src/main/java/com/elder/lx04/net/ElderApi.kt")
+    rt_src = read(ROOT / "lx04/app/src/main/java/com/elder/lx04/runtime/DeviceRuntime.kt")
     items.append((
         "W17", "401 不被误报成『网络不可用』",
         lambda: "lastStatusCode" in api_src and
                 "设备凭证被拒绝（HTTP $lastStatusCode）" in api_src,
+    ))
+    # ---- 真机 2026-11-05 第二次实测：校时偏差 28799s（≈8 小时）----
+    items.append((
+        "W18", "naive server_time 要按服务端时区还原（否则校时错 8 小时）",
+        lambda: "tzOffsetMin ?: DEFAULT_TZ_OFFSET" in api_src and
+                "epoch - (tzOffsetMin" in api_src,
+    ))
+    items.append((
+        "W19", "提醒排程用服务端时区，而不是系统时区",
+        lambda: (lambda i: i >= 0 and "DeviceClock(" in rt_src[i:i + 400] and
+                 "Clock.SYSTEM" not in rt_src[i:i + 400])(
+                     rt_src.find("private val engine = ReminderEngine(")),
+    ))
+    items.append((
+        "W20", "没拿到 token 时不发 HTTP（避免必然的 401 污染退避）",
+        lambda: "if (!store.hasToken)" in rt_src,
     ))
     if check_assets:
         items += asset_guards()
@@ -239,7 +256,14 @@ def selftest() -> int:
         g = guards(kw.get("flow", flow), kw.get("wake", wake),
                    kw.get("main", main), kw.get("fetch", fetch),
                    kw.get("api", api), kw.get("ignore", ignore))
-        return sum(1 for _, _, fn in g if not fn())
+        n = sum(1 for _, _, fn in g if not fn())
+        # W18/W19/W20 不住在 guards 里（它们读别的文件），单独按变体算
+        e = kw.get("api_src", read(ROOT / "lx04/app/src/main/java/com/elder/lx04/net/ElderApi.kt"))
+        r = kw.get("rt_src", read(ROOT / "lx04/app/src/main/java/com/elder/lx04/runtime/DeviceRuntime.kt"))
+        if "epoch - (tzOffsetMin" not in e: n += 1
+        if "DeviceClock(" not in r: n += 1
+        if "if (!store.hasToken)" not in r: n += 1
+        return n
 
     base = count_bad()
     cases = [
@@ -251,6 +275,9 @@ def selftest() -> int:
         ("换成两次 detect", {"main": main.replace("voice?.listenDetect(wakeSource, greet = greet)", 'voice?.listenDetect("按键唤醒", greet = false)')}),
         ("二进制被允许入库", {"ignore": ignore.replace("libsherpa-onnx-jni.so", "libother.so")}),
         ("OTA 不再保存 token", {"main": re.sub(r"^\s*deviceStore\.saveCredentials\(", "        // removed", main, flags=re.M)}),
+        ("naive server_time 又退回按 UTC 解析",
+         {"api_src": read(ROOT / "lx04/app/src/main/java/com/elder/lx04/net/ElderApi.kt")
+                        .replace("epoch - (tzOffsetMin ?: DEFAULT_TZ_OFFSET) * 60L", "epoch")}),
     ]
 
     bad = 0
