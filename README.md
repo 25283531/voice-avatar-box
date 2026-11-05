@@ -12,14 +12,17 @@
 本项目不部署、不调用它（早期曾跑过它的容器，已删除）。设备出厂 OTA 地址默认指向本项目自己的域名。
 
 本项目自己做的「业务面」：设备绑定、提醒与回执、形象/提示词、AI 平台配置、交互统计、
-**双界面**（浏览器管理后台 `/` + 浏览器用户端 `/user`，配网也不需要 APP）、手机端 APP。
+**双界面**（浏览器用户端 `/` + 管理后台 `/admin`；`/user` 已删，配网也不需要 APP）、手机端 APP。
 
-⚠️ **两件反直觉的事实，先知道能省很多排查时间**：
+⚠️ **三件反直觉的事实，先知道能省很多排查时间**：
 
 1. **「零配置即可提供服务」不成立**。全新空库下 ASR / TTS / VAD / Chat 四项全未就绪，
    `resolve_provider` 直接返 503。管理后台「服务就绪度」面板的作用是**如实反映未就绪**。
 2. **平台会员制已取消**（commit `e264200`）。已授权设备陪聊恒为无限量，没有订单、
    没有核销、没有会员期限。
+3. **固件的唤醒与识别已回归上游、摄像头也已整体删除**。唤醒词是上游默认的
+   「你好小智」（WakeNet），自研 MultiNet / 6 条离线命令词、GC0308 摄像头、
+   设备侧 MQTT 协议与截图链路都已移除；离线提醒引擎（NVS/RTC）仍保留。
 
 ## 目录
 
@@ -29,8 +32,8 @@
 | `app/` | 手机端家属端 APP（uni-app v3 + Vue3），四个栏目：首页 / 设备 / 日程 / 我的；出 H5 / 微信小程序 / Android APK |
 | `android/` | Android 原生壳工程（WebView + `WebViewAssetLoader`），把 H5 打成 APK，不依赖 DCloud |
 | `firmware/` | ESP32-S3 固件（`components/elder` 为本项目新增组件，编译前由 `tools/merge_to_xiaozhi.py` 合入 xiaozhi 源码树） |
-| `tools/` | 辅助脚本：`smoke_*.py` 后端冒烟（端口唯一真源 `tools/smoke_ports.py`）、`ci_gate_check.py` 本地门禁判据、`merge_to_xiaozhi.py` 注入 elder 组件与 sdkconfig 覆盖、`make_firmware.py` 合并烧录 bin、`idfwin.py` / `winrun.py` Windows 下的 IDF 包装 |
-| `docs/` | [`架构设计.md`](docs/架构设计.md) 平台整体架构与选型 · [`DEPLOY.md`](docs/DEPLOY.md) 部署与 MySQL 接入 · [`决策记录.md`](docs/决策记录.md) 用户拍板的决策及其边界 · [`免费语音服务商选型.md`](docs/免费语音服务商选型.md) ASR/TTS 厂商选型 · [`架构设计-角色模型与人格能力.md`](docs/架构设计-角色模型与人格能力.md) · [`架构设计-人格预设运营后台.md`](docs/架构设计-人格预设运营后台.md) · [`烧录指南.md`](docs/烧录指南.md) · [`手机APP开发说明.md`](docs/手机APP开发说明.md) |
+| `tools/` | 辅助脚本：`smoke_*.py` 后端冒烟（端口唯一真源 `tools/smoke_ports.py`，接线唯一判据 `tools/ci_gate_check.py`）、`ci_gate_check.py` 本地门禁、`merge_to_xiaozhi.py` 注入 elder 组件与 sdkconfig 覆盖、`prebuild_check.py` 编译前配置自检、`check_font_layout.py` 从 xiaozhi.bin 判定 lv_font_t 布局、`make_firmware.py` 合并烧录 bin、`idfwin.py` / `winrun.py` Windows 下的 IDF 包装 |
+| `docs/` | [`架构设计.md`](docs/架构设计.md) 平台整体架构与选型 · [`DEPLOY.md`](docs/DEPLOY.md) 部署与 MySQL 接入 · [`决策记录.md`](docs/决策记录.md) 用户拍板的决策及其边界 · [`免费语音服务商选型.md`](docs/免费语音服务商选型.md) ASR/TTS 厂商选型 · [`和风天气接入.md`](docs/和风天气接入.md) · [`离线语音排查清单.md`](docs/离线语音排查清单.md) · [`烧录指南.md`](docs/烧录指南.md) · [`手机APP开发说明.md`](docs/手机APP开发说明.md) · OTA 后台化 / 人格引擎的 ARCH、PRD 与 6 张 mermaid 图 |
 | `老人陪伴提醒助手-技术方案-v1.md` | 完整技术方案（硬件、形象引擎、激活码算法、风险清单） |
 
 ## 端口与地址约定
@@ -41,8 +44,9 @@
 | **对外发布** | **`8064`** | 镜像只发布这一个端口，`-p 8064:8080`。HTTP API、语音 WebSocket、OTA 全复用它 |
 | 语音 WebSocket | `ws(s)://<地址>/api/voice/v1/ws` | **自研链路**，与 API 同源同端口，不需要额外开端口 |
 | 生产地址 | `https://152.136.230.132` | **IP 直连**（2026-10-18 起）。原因：域名 `voice.250886.xyz` 未备案，被云厂商按 SNI 阻断（连 IP 不带 SNI 则 TLS 畅通，已实证）；APP 与固件已改为固化此 IP。**前提：服务器须持有 SAN 含该 IP 的 IP 证书**（Let's Encrypt 已支持，见 DEPLOY.md §4.3），否则固件/APP 报证书名不符 |
-| 管理后台 | `https://152.136.230.132/` | 源码在 `server/app/static/index.html`，按 `is_admin` 过滤入口。账号 `admin` 的口令**不再有硬编码默认值**（`admin/admin123` 已从代码移除，commit `bb5ca98`）：首次启动必须经 `ELDER_SEED_ADMIN_PASSWORD` 显式提供，否则随机化并打进启动日志 `ELDER-INITIAL-PASSWORD=<pwd>` |
-| 用户端 | `https://152.136.230.132/user` | 源码在 `server/app/static/user.html`，**浏览器直接用，不需要装 APP**；绑定设备等操作全在 web 完成 |
+| 管理后台 | `https://152.136.230.132/admin` | 源码在 `server/app/static/index.html`，按 `is_admin` 过滤入口。账号 `admin` 的口令**不再有硬编码默认值**（`admin/admin123` 已从代码移除，commit `bb5ca98`）：首次启动必须经 `ELDER_SEED_ADMIN_PASSWORD` 显式提供，否则随机化并打进启动日志 `ELDER-INITIAL-PASSWORD=<pwd>` |
+| 用户端 | `https://152.136.230.132/` | 源码在 `server/app/static/user.html`，**浏览器直接用，不需要装 APP**；绑定设备等操作全在 web 完成。⚠️ 旧路径 `/user` 已**直接删除**（不 301、不兼容渲染，`GET /user` 返回 404，`smoke_server.py` 钉住这条不变式） |
+| 双界面 | `/` = 用户端 / `/admin` = 管理后台 | 2026-10-19 入口重构（决策 D41）：老人与家属是主要使用者，最短路径给最常用界面；两套信息架构不是「同一页面按角色隐藏 tab」 |
 | 接口文档 | `https://152.136.230.132/docs` | FastAPI 自动生成 |
 | 原域名（备用） | `https://voice.250886.xyz` | 备案恢复前，域名访问会被厂商按 SNI 杀连接（时通时断=QUIC 加密了 SNI 时通）。**域名不变、代码不改**：把服务器证书/IP 证书部署形态切回域名证书即可，APP 与固件需重打包/重烧 |
 
@@ -51,63 +55,58 @@
 | 工作流 | 触发 | 作用 |
 | --- | --- | --- |
 | `pr-gate.yml` | push 到 `main`/`master` + **每个 PR**（刻意不加 paths 过滤） | 常驻门禁「守门人自检」：CODEOWNERS 覆盖 + workflows 可解析。push 时自动跑，结果可见但**不再拦截推送**（见下方流程变更） |
-| `server-ci.yml` | push/PR 改动 `server/`、`tools/`、`firmware/components/elder/`；可手动 | 装依赖（含 `libopus0`）后跑 **19 个 `smoke_*.py` 冒烟脚本 + 10 个 QA/单测脚本**（清单见下方），另有 5 个 job：elder 组件宿主测试、MySQL 真实路径冒烟、Compose 文件校验、Dockerfile 语法检查（hadolint） |
+| `server-ci.yml` | push/PR 改动 `server/`、`tools/`、`firmware/components/elder/` 及固件冒烟用例；可手动 | 装依赖（含 `libopus0`）后跑 **5 个 job**：`smoke`（冒烟 + QA/单测，清单真源见下）、`elder-host-test`（elder 组件宿主单测）、`mysql-smoke`（真实 MySQL 往返）、`compose-config`、`dockerfile-lint`（hadolint） |
 | `docker-build.yml` | push/PR 改动 `server/`；可手动 | 构建镜像 → 起容器校验 `/api/health`；**push 到 `main` 且容器冒烟通过后**才推 `ghcr.io/25283531/voice-avatar-box` 的 `latest` + 短 SHA（冒烟失败不推，`latest` 不被污染）；PR 只构建不推送；手动触发勾选 `publish` 可覆盖 tag 发布 |
-| `firmware-build.yml` | push 改动 `firmware/`、`tools/merge_to_xiaozhi.py` 或本文件；可手动 | 在 `espressif/idf:v5.5.1` 容器里编译 ESP32-S3 固件 → 合并单文件烧录镜像 → 上传 artifact。**每次构建都会打印生效的 `CONFIG_OTA_URL` 并在偏离本项目地址（IP `152.136.230.132` / 域名 `voice.250886.xyz`）时告警**；手动触发可自选板卡与后端地址 |
+| `firmware-build.yml` | push 改动 `firmware/**`、`tools/merge_to_xiaozhi.py`、固件冒烟用例或本文件；可手动 | **3 个 job**：`host-test`（提醒排期判定主机单测）、`fw-static`（花括号配平 / printf 格式串 / 降噪配置静态门禁）、`build`（`espressif/idf:v5.5.1` 编译 ESP32-S3 → 合并单文件烧录镜像 → 上传 artifact，含 `xiaozhi.map` 供崩溃 backtrace 定位）。**每次构建打印生效的 `CONFIG_OTA_URL`** 并在偏离本项目地址（IP `152.136.230.132` / 域名 `voice.250886.xyz`）时告警；手动触发可自选板卡与后端地址 |
 | `app-build.yml` | push/PR 改动 `app/`；可手动 | 构建 H5 / 微信小程序并上传产物；校验后端地址已内联 |
 | `android-build.yml` | push/PR 改动 `app/`、`android/`；可手动 / 发 Release | **一次产出可安装的 Android APK**（H5 + WebView 壳，全程在 runner 内，不用 DCloud 账号） |
 | `app-pack.yml` | **仅手动**（workflow_dispatch）/ 发 Release | ⚠️ **已废弃**：uni-app 云打包，DCloud 账号登录失败且强制实名认证。保留文件只为留档，现走 `android-build.yml`（见下文「Android APK」） |
 
-#### `server-ci.yml` 实际跑哪些冒烟
+#### 测试清单：别数 README，数门禁
 
-⚠️ **不是只有一个 `smoke_server.py`**。数口径时要分清三件事：**脚本个数 ≠ 调用次数**：
+⚠️ **清单的唯一真源是 `tools/ci_gate_check.py`，不是本文档。** 早期 README 手抄过
+「19 个 `smoke_*.py` + 10 个 QA」的全表，脚本后来翻到 50 个，那份表立刻变成
+**死数字** —— 这正是本项目最该防的「同源缺陷」。所以这里只给判据与分组代表，
+需要精确清单时直接读 workflow / 跑门禁，不要从 README 复制。
 
-- `smoke:` job 里跑 **19 个不同的 `smoke_*.py`**（端口已登记在 `tools/smoke_ports.py`，
-  那是唯一真源，新脚本先登记再写死；标注「不占端口」的是纯函数直调或静态扫描）：
+```bash
+python tools/ci_gate_check.py      # 45 项判据，exit 0 才算绿
+```
 
-| 脚本 | 端口 | 守什么 |
+门禁里最关键的一条是 `check_smoke_wired`：**全仓每个 `tools/smoke_*.py` 必须出现在
+某个 workflow 里，或在 `MANUAL_SMOKE` 里写明「为什么只能手动跑」**，否则判据直接红。
+它还做三条反向检查（登记了但文件已删 / 登记了其实已接线 / 接线名与文件名对不上），
+因为白名单的失效方式不是「漏登记」，而是「登记了但早就不是那么回事」。
+2026-10-30 那次审计一次抓出 **11 个漏接线的脚本**（端口都登记了、workflow 里一次没调），
+已全部补进 `server-ci`。**断言写了不跑 = 没有门禁**，而且不会有任何报错、CI 一路绿。
+
+**当前数量口径（2026-11-05 核对，会继续变，别当常量写进别处）**：
+`tools/` 下 **50 个 `smoke_*.py`**，门禁判定 **49 个接线 / 1 个登记手动**
+（`smoke_common.py` 是公共收尾助手，本身不含断言；`smoke_ports.py` 是端口唯一登记表）。
+其中 `server-ci.yml` 的 `smoke:` job 调用 **42 个不同的 `smoke_*.py`** 与
+**15 个非 smoke 脚本**（QA / 单测 / 工具，`run_smoke.py` 是包装器不算断言脚本）；
+固件侧的 3 个静态冒烟接在 `firmware-build.yml` 的 `fw-static` / `build` job 里。
+
+按主题分组的**代表**（不是全表）：
+
+| 主题 | 代表脚本 | 守什么 |
 | --- | --- | --- |
-| `smoke_server.py` | 8100 | 业务闭环：注册/登录/设备/激活码(Luhn 与固件一致)/绑定/提醒复杂规则/排期/同步/回执/统计/鉴权 |
-| `smoke_auth.py` | 8121 | 注册鉴权、公开开关、初始管理员引导 |
-| `smoke_roles.py` | 8101 | 角色域 + P0 越权断言 |
-| `smoke_admin_presets.py` | 8118 | 人格预设运营后台：红线不出库 + 审计同事务 + 重启不变式 |
-| `smoke_quota.py` | 8106 | 陪聊计量 + 「授权设备无限量」不变量（原 `smoke_membership`，会员端点须已下线） |
-| `smoke_usage.py` | 8120 | token 用量：网关提取 + 双端接口对账 + 越权隔离 |
-| `smoke_voice_catalog.py` | 8124 | 音色目录单一真源 + **就绪度面板如实反映零配置未就绪** |
-| `smoke_voice.py` | 8119 | 自研语音链路：WS 协议逐字段对固件 + Opus 编解码 + OTA 签发口径（含 8 条口语时间解析断言，如「两分钟后」「半小时后」，含跨午夜滚动） |
-| `smoke_mqtt_udp.py` | 8132 | MQTT+UDP 传输（F1）：broker 协议 + AES-128-CTR 音频面对齐固件 + 端到端一轮 + 4 条反向变异自检 |
-| `smoke_voiceprint.py` | 8133 | 声纹认人（F3）：提供者契约 + 说话人登记 CRUD + 端到端个性化注入 + 4 条反向变异自检 |
-| `smoke_geo.py` | 8135 | 跨时区口径：IP→国家→时区判定链 + 提醒按**规则自己的时区**展开 + 4 条反向变异（§1.15） |
-| `smoke_tencent_voice.py` | 8134 | 腾讯云语音：TC3 签名对齐官方文档测试向量（不需密钥）+ 假上游独立复算验签 + TTS/ASR 端到端 + 4 条反向变异（§1.16） |
-| `smoke_models.py` | 8104 | 模型接入点：九种 kind 注册 / 四家报文协议切换 / 错误五码分诊 / context_window 裁剪 / 本地自建服务 |
-| `smoke_proxy_headers.py` | 8125 | 可信反代：ProxyHeaders 算法 + 307 Location 的 scheme 推导 + Dockerfile CMD 形态 |
-| `smoke_db_path.py` | 不占端口 | 默认数据库路径解析（纯函数直调，不起服务、不建 uvicorn） |
-| `smoke_pk_reuse.py` | 8130 | pk 复用 ⇒ 已删除设备的旧 token 复活（P0）+ 从属行串台 |
-| `smoke_sqlite_concurrency.py` | 不占端口 | 读事务不得把写事务饿死（2026-10-20 生产事故） |
-| `smoke_support_email.py` | 8131 | 求助邮箱不许写死：env → 管理端 SMTP → 空串 三级回落 |
-| `smoke_frontend_hygiene.py` | 不占端口 | 前端模板卫生（静态扫描，专抓 `uni.*` 写进模板表达式这类产物坏形态） |
+| 业务闭环 / 鉴权 | `smoke_server.py`(8100)、`smoke_roles.py`(8101)、`smoke_auth.py`(8121)、`smoke_home.py`(8102) | 注册登录、设备与 7 位激活码(Luhn 与固件一致)、绑定、提醒复杂规则、排期、同步、回执、统计、P0 越权 |
+| 语音链路 | `smoke_voice.py`(8119)、`smoke_tts_stream.py`、`smoke_empty_asr.py`、`smoke_prod_noise_asr.py`、`smoke_voice_input_medcard.py`、`test_audio_pacing.py`、`test_speech_guard.py` | 自研 WS 协议逐字段对固件、Opus 编解码、OTA 签发口径、流式 TTS、ASR 空识别重试、缓冲区尾巴补播、下行节流 |
+| 提醒与服药确认 | `smoke_reminder_chime.py`、`smoke_reminder_context.py`、`smoke_reminder_audit.py`、`smoke_local_reminders.py`、`smoke_when.py`、`check_reminder_once.py`、`test_mcp_confirm.py` | 提醒节奏、上下文与审计、离线提醒、口语时间解析、多味药必须问清哪一味、服务端→设备确认通道 |
+| 模型 / 厂商 / 部署 | `smoke_models.py`(8104)、`smoke_voice_catalog.py`(8124)、`smoke_tencent_voice.py`(8134)、`smoke_voice_options.py`(8136)、`smoke_role_traits_voice.py`(8139)、`smoke_deploy.py`(8122)、`smoke_proxy_headers.py`(8125) | 九种 kind、四家报文切换、音色目录单一真源、角色音色生效、TC3 签名、隧道 scheme 推导 |
+| 传输与识别旁路 | `smoke_mqtt_udp.py`(8132)、`smoke_voiceprint.py`(8133)、`smoke_geo.py`(8135)、`test_weather.py` | MQTT+UDP 传输面、AES-128-CTR 对齐固件、声纹认人、跨时区口径、和风天气（假 HTTP，不耗真实次数） |
+| 数据与迁移 | `smoke_schema_migrations.py`、`smoke_new_columns.py`、`smoke_pk_reuse.py`(8130)、`smoke_sqlite_concurrency.py`、`qa3_migration.py`、`qa3_drop_tables.py`、`qa3_r2_restart.py`(8113)、`qa3_device_binding.py`(8114) | ORM 列与 `schema_patch.NEW_COLUMNS` 对账、pk 复用导致旧 token 复活（P0）、读事务不饿死写事务、会员五表真删、重启不变式 |
+| 前端 / 灯效 / 静态 | `smoke_frontend_hygiene.py`、`smoke_app_back_bridge.py`、`smoke_lights.py`、`smoke_fw_printf_fmt.py`、`smoke_afe_agc_ns.py`、`check_c_braces.py`、`check_font_layout.py` | 专抓 `uni.*` 写进模板表达式、安卓返回键桥接、灯效、固件 `%lld` 格式串门禁、降噪/AGC 配置、花括号配平、lv_font_t 布局判定 |
+| 平台治理 | `smoke_quota.py`(8106)、`smoke_usage.py`(8120)、`smoke_admin_presets.py`(8118)、`smoke_memory.py`、`smoke_mail.py`、`smoke_support_email.py`、`qa_audit_rollback.py`、`eval_persona.py` | 「授权设备无限量」不变量、token 用量对账、人格红线不出库、记忆、求助邮箱三级回落、审计失败必须回滚、医疗安全类硬失败 |
 
-- 另有 **10 个 QA / 单元测试脚本**同在 `smoke:` job 里，它们**不属于 `smoke_*.py` 系列**，
-  别数漏也别数重：
-
-| 脚本 | 端口 | 守什么 |
-| --- | --- | --- |
-| `qa_audit_rollback.py` | 不占端口（进程内直调端点） | 审计写失败时业务写必须回滚 |
-| `eval_persona.py` | 不占端口 | 人格 eval 门禁，医疗安全类硬失败 |
-| `qa3_r2_restart.py` | 8113 | 重启不变式：回填不得改写角色归属 |
-| `qa3_migration.py` | 不起服务 | 迁移完整性：ORM 列与 `schema_patch.NEW_COLUMNS` 对账 |
-| `qa3_device_binding.py` | 8114 | 设备绑定归属：重启不被绑上平台预设 |
-| `qa3_drop_tables.py` | 不占端口 | 会员遗留五张表必须真删，**掏空实现必变红** |
-| `test_mcp_confirm.py` | 不占端口 | 服务端→设备 MCP 工具通道 + 服药确认（不烧板子、不连真设备） |
-| `test_weather.py` | 不占端口 | 和风天气子系统（进程内，假 HTTP，不耗真实 API 次数） |
-| `test_speech_guard.py` | 不占端口 | 可播性过滤（规划语/工具名）+ 缓冲区尾巴补播 |
-| `test_audio_pacing.py` | 不占端口 | 音频下行节流器（AudioPacer） |
-
-- `mysql-smoke:` job **复跑 2 个**：`smoke_server.py 8100` 与 `smoke_roles.py 8101`
+- `mysql-smoke:` job **复跑 4 个**：`smoke_server.py 8100`、`smoke_roles.py 8101`
   走真实 MySQL 往返，另加 `eval_persona.py` 与 `qa3_drop_tables.py`。
-  **这是同一批脚本的方言复跑，不是新脚本** —— 所以 `smoke_*.py` 在 CI 里的
-  **调用次数**是 19（SQLite）+ 2（MySQL）= **21 次**，全仓「不同 `smoke_*.py` 脚本数」仍是 **19 个**；
-  连同 10 个 QA/单测脚本，`smoke:` job 内一共 **29 次脚本调用 / 36 个步骤**。
+  **这是同一批脚本的方言复跑，不是新脚本。**
+  ⚠️ 该 job 必须重设 `ELDER_SEED_ADMIN_PASSWORD=admin123`：MySQL 每次是空库、
+  会走「种子管理员」分支生成随机口令，而 `smoke_server.py` 硬编码用
+  `admin/admin123` 登录 ⇒ 第一条断言就 401。弱口令仅限一次性 runner，
+  **生产/内网绝不要设**（见 `server-ci.yml` 里 run 39031736168 的事故记录）。
 
 ⚠️ 其余 4 个 `qa3_*` 脚本**刻意不进 MySQL job**——它们直连 `sqlite3` 且 `boot()` 里
 无条件 `env["ELDER_DB"] = f"sqlite:///{DB}"`，会**覆盖掉 CI 传入的 MySQL 连接串**。
@@ -121,9 +120,8 @@
   **冒烟失败不推镜像，`latest` 不被污染。**
 - PR **只构建不推送**（PR 代码可能从未被 review，但触发的构建一旦推上 ghcr
   就是公共产物；且 `pull_request` 事件下 `GITHUB_TOKEN` 只读，`packages: write` 不生效）。
-- ⚠️ **本机无 GitHub API 凭据**（未装 `gh`、无 PAT），只有 git SSH ⇒ **无法用 API 触发 workflow**。
-  固件构建靠 push 触及 `firmware/**` 自动触发；需要自选板卡时在 GitHub UI 点
-  Actions → firmware-build → Run workflow（**推荐，可自选板卡**）。
+- 触发 `workflow_dispatch` 有两条路：GitHub UI 点 **Actions → 对应工作流 → Run workflow**（可自选板卡/后端地址），或**带 PAT 调 REST API** `POST /repos/{o}/{r}/actions/workflows/{id}/dispatches`。查 CI 结果用 `actions/runs/{id}/jobs` 与 `jobs/{id}/logs`，**别数 yml 里的 `- name:` 推步骤号**。
+  ⚠️ 本机出网间歇 SSL EOF，GitHub API 需 4~6 次重试；`api.github.com` 偶发 SNI 阻断。固件构建靠 push 触及 `firmware/**` 自动触发，只改 `app/`/`tools/` 时需手动 dispatch。
 
 增量触发：每个工作流都带 `paths` 过滤，推送只跑受影响的那条
 （例如只改 `docs/` 不会触发任何构建；改 `tools/` 只跑 `server-ci`；
@@ -135,7 +133,7 @@
 - `docker-build`：合入 `main` 即自动发布 `latest`（iStoreOS 上 `docker pull ghcr.io/25283531/voice-avatar-box:latest` 即用）；也可手动触发勾选 `publish`、填 `tag`（如 `v0.1.0`）发布指定版本，产物在 ghcr 包列表
 - `app-build`：选 `both` / `h5` / `mp-weixin` → 产物在 Actions 运行页的 Artifacts
 - `android-build`：选 `self`（仓库证书签名）/ `debug` → 产物为可直接安装的 APK
-- `firmware-build`：产物 artifact 名 `elder-firmware-esp32s3`，**日常只下 `elder-firmware-esp32s3-merged-flash.bin`**（offset `0x0`，esptool 单文件直烧）；其余 bin 是按 `flasher_args.json` 分地址烧写的备选
+- `firmware-build`：产物 artifact 名 `elder-firmware-esp32s3`，**全新设备用 `elder-firmware-esp32s3-merged-flash.bin`**（offset `0x0`，单文件直烧）；其余 bin 是按 `flasher_args.json` 分地址烧写的备选。⚠️ **已配网的设备不要刷 merged 单文件**：它覆盖 NVS，会清掉配网与绑定 token 导致重新配网；按 [烧录指南](docs/烧录指南.md) 只刷 4 段（`0x0`/`0x8000`/`0xd000`/`0x20000`）不碰 NVS。artifact 还带 `xiaozhi.map`（崩溃 backtrace 定位）与 `SHA256SUMS.txt`
 
 ⚠️ **固件只有一个可信来源：Actions 里对应 commit 的 artifact。** 仓库根的 `dist/`
 是 2026-10-19 前后手工暂存的历史包（已被 `.gitignore` 忽略、未入库），里面的固件
@@ -148,7 +146,7 @@
 APP 是给家属用的，不接入小智任何服务，业务后端地址在代码级写死
 （`app/src/http/elder.ts`，生产 IP `https://152.136.230.132`），**不提供任何网络设置入口**。
 
-⚠️ **APP 不是唯一入口**：绑定设备等操作在浏览器打开 `/user` 同样能做完，
+⚠️ **APP 不是唯一入口**：绑定设备等操作在浏览器打开 `/` 同样能做完，
 固件配网也不需要 APP（见下文「双界面与配网」）。
 
 | 栏目 | 内容 |
@@ -163,7 +161,7 @@ APP 是给家属用的，不接入小智任何服务，业务后端地址在代�
 > 在启动期真正 DROP。**已授权（已绑定）的设备陪聊恒为无限量**；时长计量仍在，
 > 但只用于展示与对账，不再拦人（`server/app/chat_quota.py`）。
 > 代码里「授权」的判据就是**设备是否已绑定到某个用户**（`dev.owner_id is not None`），
-> 绑定动作本身在 `/user` 或 APP 里输激活码完成，**没有在线支付环节**。
+> 绑定动作本身在 `/` 或 APP 里输激活码完成，**没有在线支付环节**。
 
 ## 分支保护、门禁与实际提交流程
 
@@ -172,13 +170,18 @@ APP 是给家属用的，不接入小智任何服务，业务后端地址在代�
 > 与**推送前的本地门禁**，不是「你需要提 PR」。下面那段历史（曾经要求 PR + 评审）
 > 只作为「为什么规则被改成现在这样」的记录保留。
 
-仓库默认分支是 **`main`**（本地还有一个落后 19 个提交的僵尸 `master`，不要往它推）。
-远端 `github` = `git@github.com:25283531/voice-avatar-box.git`（HTTPS 在本机被网络阻断），
-推送必须显式指定 key：
+仓库默认分支是 **`main`**（本地残留一个落后的僵尸 `master`，不要往它推）。
+本仓远端别名 `github` = `ssh://git@ssh.github.com:443/25283531/voice-avatar-box.git`
+（走 443 端口的 SSH；22 端口与 HTTPS 在本机被网络阻断），CI 日志 / 产物查询走
+REST API（需 PAT）。推送凭据按本机环境配置：可用 **PAT over HTTPS**
+（`x-access-token`），也可用已授权的 SSH key。推送命令示例：
 
 ```bash
-GIT_SSH_COMMAND="ssh -i C:/Users/Administrator/.ssh/id_ed25519_25283531 -o StrictHostKeyChecking=no" \
-  git push github main
+# 方式一：PAT over HTTPS（凭据不要写进入库文件）
+git push "https://x-access-token:<TOKEN>@github.com/25283531/voice-avatar-box.git" HEAD:main
+
+# 方式二：SSH key（须已在 GitHub 授权）
+GIT_SSH_COMMAND="ssh -i <KEY_PATH> -o IdentitiesOnly=yes" git push github HEAD:main
 ```
 
 ### 为什么没有 PR
@@ -194,6 +197,9 @@ review is required」），而"过严的守门人等于没有守门人"—— �
 ```
 改代码 → 本地跑门禁判据（exit 0）→ commit → 直接 push 到 main
 ```
+
+⚠️ commit 消息含引号会破坏 shell 引用 ⇒ 用 `git commit -F -` + heredoc；
+共用工作树时**只 `git add` 自己改过的文件，绝不 `git add -A`**。
 
 **main 上仍保留的保护**：禁强推、禁删分支、`enforce_admins`（管理员也不豁免）。
 **已移除**：必需状态检查「守门人自检」—— 它是唯一会拦截直接 push 的规则，
@@ -267,7 +273,7 @@ python tools/ci_gate_check.py
 
 ```bash
 cd server
-cp .env.example .env            # 至少改 ELDER_JWT_SECRET
+cp .env.example .env            # 至少改 ELDER_JWT_SECRET；空库首启再看 ELDER_SEED_ADMIN_PASSWORD
 docker compose up -d            # 对外 http://<host>:8064
 ```
 
@@ -375,7 +381,7 @@ docker compose -f docker-compose.yml -f docker-compose.local.yml up -d
 
 ### 三家 TTS 预置，服务端自动分发
 
-音色目录的**唯一真源**是 `server/app/voice/catalog.py`，管理后台的音色下拉框通过
+厂商预置目录的**唯一真源**是 `server/app/voice/catalog.py`，管理后台的音色下拉框通过
 `GET /api/voice-catalog` 拉取，不在前端另抄一份。三家厂商预置：
 
 | key | api_style | endpoint | model | 要 Key | 预置音色数 |
@@ -385,8 +391,9 @@ docker compose -f docker-compose.yml -f docker-compose.local.yml up -d
 | `aliyun` | `openai_compatible` | `https://dashscope.aliyuncs.com/compatible-mode/v1` | `qwen-tts` | 是（`sk-` 开头） | 4 |
 
 `VOICE_CATALOG` 的 11 条 Edge 音色按**老人友好度**排序（温和在前、活泼在后），
-出厂默认音色 `DEFAULT_PRESET_TTS_VOICE = "zh-CN-XiaoxiaoNeural"`（这个值不能改，
-管理后台的「恢复出厂默认」依赖它）。
+出厂默认音色 `DEFAULT_PRESET_TTS_VOICE = "zh-CN-XiaoxiaoNeural"` 的**真源在
+`server/app/persona/catalog.py`**（`voice/catalog.py` 只是 import 转发；曾有一份同值副本，
+已按「同一事实不设两份真源」删掉）。这个值不能改，管理后台的「恢复出厂默认」依赖它。
 
 **服务端自动切换**在 `server/app/voice/asr_tts.py::_tts_dispatch_style()`：
 判据顺序是 **provider 优先于 api_style**（预填的 api_style 会截胡，是个真实修过的
@@ -459,9 +466,12 @@ endpoint `https://api.siliconflow.cn/v1`），因为它是唯一一家把记忆�
 
 | 入口 | 路径 | 源码 |
 | --- | --- | --- |
-| 管理后台 | `/` | `server/app/static/index.html`，按 `is_admin` 过滤 |
-| 用户端 | `/user` | `server/app/static/user.html`，8 个 tab：我的设备 / 提醒 / 记忆管理 / 形象 / 人格预设 / 用量统计 / 交互统计 / 帮助与工单 |
+| 用户端 | `/` | `server/app/static/user.html`，8 个 tab：我的设备 / 提醒 / 记忆管理 / 形象 / 人格预设 / 用量统计 / 交互统计 / 帮助与工单 |
+| 管理后台 | `/admin` | `server/app/static/index.html`，按 `is_admin` 过滤 |
 
+2026-10-19 入口重构（决策 D41）：老人与家属是主要使用者，最短路径给最常用界面。
+旧路径 `/user` **直接删除、不重定向**，`GET /user` 返回 404
+（`smoke_server.py` 钉住这条不变式）。
 绑定设备的后端端点早就存在且只挂普通用户鉴权（`POST /api/devices/bind`），
 缺的只是 `user.html` 里的调用——所以**用户端不推去 APP，浏览器就能绑**。
 
@@ -480,9 +490,15 @@ APP 只是另一层封装。
 - Opus 编解码 = **ctypes 直连系统 libopus**（零新增 Python 依赖；
   Docker / CI 都 apt 装 `libopus0`）。
 - **提醒工具调用走服务端 function calling，不走设备 MCP 通道**：固件的 "MCP" 是
-  设备本地 JSON-RPC 工具（音量/电量/摄像头），提醒数据在服务端 `reminders` 表，
+  设备本地 JSON-RPC 工具（音量/亮度/状态灯/待机 `self.elder.standby`；
+  **摄像头与截图工具已随摄像头整体删除**），提醒数据在服务端 `reminders` 表，
   设备本地没有。工具在 `server/app/voice/tools.py`。
-  **歧义时间必须反问**（「三点」不猜上下午、「每天」缺时间）——静默建错时间的提醒
+服务端 function calling 工具表在 `server/app/voice/tools.py`：`confirm_reminder` /
+  `create_reminder` / `list_reminders` / `toggle_reminder` / `delete_reminder` /
+  `get_weather`（和风天气，未配密钥时服务照常跑）/ `get_headlines` / `get_device_status` /
+  `get_wifi_info` / `set_volume` / `set_brightness` / `set_status_light` /
+  `enter_standby`（老人明确要结束对话才调，弱档词必须由大模型复核）。
+    **歧义时间必须反问**（「三点」不猜上下午、「每天」缺时间）——静默建错时间的提醒
   对老人最糟。
 - **流式 TTS**：`tts_stream()` 增量吐 PCM；厂商不发流式时降级为非流式、不假装。
   下行时序 `stt → tts start → sentence_start×N → tts stop` 不能改（设备靠它回落 idle）。
@@ -538,17 +554,18 @@ pnpm build:mp-weixin   # 产物 app/dist/build/mp-weixin，用微信开发者工
 
 > `app-pack.yml`（uni-app 云打包）**已废弃**：DCloud 账号登录失败且强制实名认证，
 > 现已改走 `android-build.yml` 的 H5 + WebView 壳方案，全程在 GitHub runner 内出 APK。
-> 两个 Secret，且该账号必须已在 DCloud 注册并实名。
 
 ## 固件
 
 **硬件基线**：立创·实战派 ESP32-S3，板型符号 `CONFIG_BOARD_TYPE_LICHUANG_DEV_S3`
 （板目录 `lichuang-dev`），ESP-IDF v5.5.1。板上关键器件：ES8311（音频 codec）、
-ES7210（ADC）、FT5x06（触摸）、**GC0308（摄像头，DVP）**。
+ES7210（ADC）、FT5x06（触摸）。**GC0308 摄像头已确认不用，驱动与依赖整体删除**
+（见下方「固件精简」）。
 
 `firmware/components/elder` 是本项目新增的组件（编译前由
 `tools/merge_to_xiaozhi.py` 合入 xiaozhi 源码树），已实现：RGB 指示灯与情绪同步、
-长按 3s + 30s 内短按的服药确认状态机、离线提醒（DS3231 + NVS）、
+长按 3s + 30s 内短按的服药确认状态机、
+离线提醒（DS3231 I2C / DS1302 三线 RTC + NVS）、
 7 位激活码（**6 位随机数字 + 1 位 Luhn 校验位，全数字**，与后端算法一致；
 屏显按 `123-4567` 分组。全数字是硬约束——内置音效表只有数字音，
 旧格式的首字母在播报时被静默跳过，老人只听得到数字，见决策记录 D42）。
@@ -565,7 +582,7 @@ LVGL display，真机表现为全黑屏 + `font context is NULL`。
 待机态头像圆整块隐藏，表情按 60px 从屏幕右缘外滚到左缘外（跑马灯）；
 提醒态 `reminder_overlay_` 盖住状态栏以下的 210px，画成结构化卡片
 （药丸图标 + 标题 + 明细 + 橙色提示 + 橙色圆角按钮 + 右侧头像）。
-三张设计稿在 `deliverables/gstack/design/`。
+三张设计稿在本地交付目录 `deliverables/gstack/design/`（未入库，克隆仓库看不到）。
 
 ⚠️ 该布局是**直接改上游 `main/display/lcd_display.cc` 默认风格分支**
 （`CONFIG_USE_WECHAT_MESSAGE_STYLE` 气泡分支未启用、未动）。上游
@@ -582,29 +599,84 @@ light 主题色、`top_bar_` 的藏青/30px/左时钟右日期、`emoji_box_` �
 > 字符串，名字说错了它照样绿。
 
 
-**摄像头驱动已真正编进固件**，初始化改为「探到硬件才起来」：先用 SCCB 探地址，
-探不到就打一条 WARNING 跳过，既不占 DVP 的 11 个 IO 也不刷 ERROR；接上排线重启
-即自动启用。
+### 固件精简：摄像头 / MQTT / JPEG / OLED 已整体删除
 
-### 唤醒词与离线命令词
+2026-10-22 用户确认「摄像头不用」，随后把整条链路从 `main/CMakeLists.txt` 的
+`SOURCES` 与 `BOARD_COMMON_SOURCES` 过滤正则里摘掉：
 
-**唤醒词是「你好，小暖」**（拼音 `ni hao xiao nuan`），在设备端**离线识别**，
-不联网也能响应。识别引擎是乐鑫 esp-sr 的 **MultiNet** 中文命令词模型
-（不是上游默认的 WakeNet 专用唤醒模型），识别阈值 20%（越小越灵敏）。
-配置的真源是 `tools/merge_to_xiaozhi.py` 的 `SDKCONFIG_OVERLAY`（由它生成
-`sdkconfig.defaults` 的 overlay 段，手动段只留注释——**两处都写以后定义覆盖先定义，
-手动段即成死配置**），改词只需改 merge 脚本后重跑 merge。
+| 删掉的东西 | 真源 / 连带影响 |
+| --- | --- |
+| GC0308 摄像头、`esp32_camera.cc` | `boards/lichuang-dev/config.h` 的 CAMERA pins、`config.json` 的 `CONFIG_CAMERA_GC0308*` 一并清空 |
+| `esp_video` / `esp_cam_sensor` / `esp_new_jpeg` / `esp_image_effects` | `main/idf_component.yml` 依赖删除；`linux/videodev2.h` 不再被 include |
+| `image_to_jpeg.cpp` / `jpeg_to_image.*` | `LvglDisplay::SnapshotToJpeg` 改空壳、`self.screen.snapshot` MCP 工具注销；`preview_image` 保留 |
+| 设备侧 MQTT 协议 | `application.cc` 固定 `WebsocketProtocol`；`esp_mqtt.cc` 不编译，`EspNetwork::CreateMqtt` 保留 override 但恒返 `nullptr`。⚠️ **服务端的 MQTT+UDP 可选传输面（F1）仍在**（`server/app/voice/mqtt_udp.py`，`smoke_mqtt_udp.py` 守契约），删的只是设备侧协议实现 |
+| OLED / 单色屏分支 | `oled_display.cc` 不编译，`dynamic_cast<OledDisplay*>` 改为固定 `monochrome=false`（否则链接期缺 typeinfo） |
+| 多余音频 codec / LED / 板级外设 | 过滤正则只留 `board / wifi_board / button / i2c_device / backlight` |
 
-📌 2026-10-18 用户拍板把唤醒词从「你好小智」改为「你好，小暖」（带逗号）。
-⚠️ **拼音↔汉字必须同步改**：MultiNet 的注册键是拼音串，`DISPLAY` 只影响屏显，
-改了拼音忘改汉字会出现「喊 A 显示 B」的割裂。另注意 `main/boards/` 下 4 块
-演示板的 ASR 按钮直接引用 `CONFIG_CUSTOM_WAKE_WORD_DISPLAY` 宏，自动跟随。
+⚠️ `main` 组件是 **WHOLE_ARCHIVE**：出现在 SRCS 里的文件会整体进固件，
+`--gc-sections` 回收不掉。所以「删功能」必须改 `CMakeLists.txt` 的 SOURCES / GLOB /
+FILTER，光删调用方没用。这条正则踩过一次坑：文件名是 `esp32_camera.cc`
+（**没有** `_board` 后缀），旧正则把它当成带 `_board` 的文件、根本匹配不到，
+CI 继续编摄像头并 include `image_to_jpeg.h` ⇒ 缺 `linux/videodev2.h` 直接编译失败。
 
-🚨 **改了配置但固件没变？先查 `sdkconfig` 残留**
-2026-10-19 真实事故：唤醒词明明改对了，编译烧的固件**仍然只认「你好小智」**。
-原因是 ESP-IDF 里 `sdkconfig`（本地生成、不入库）的优先级**高于**
-`sdkconfig.defaults`，后者只在**首次生成**时参与，而 kconfig 对已存在的选项
-**默认不覆盖**——全程**不报错、不告警**，症状与「模型没烧进分区」完全一样。
+**分区与体积预算**（真源 `firmware/xiaozhi/partitions/v2/16m.csv`）：
+`ota_0` / `ota_1` 各 `0x3f0000 = 4,128,768 B`，`assets` 8 MB 在 `0x800000`。
+2026-10-22 那次 CI 产物自检：`xiaozhi.bin 3,028,160 B`，app 分区余量
+`1,100,608 B (26.7%)`；`generated_assets.bin 1,592,441 B`，assets 余量 6.8 MB。
+⚠️ 这些是**某次构建的实测值，不是常量**：每次改固件后以 CI artifact 里
+`xiaozhi.bin` 的实际大小为准，别把它抄进判据。
+
+### 字幕与字库：缺字不是渲染 bug
+
+「字幕显示但缺很多字」的根因是**字库覆盖不足**，不是上游渲染逻辑差异：
+编译进固件的 `font_puhui_basic_20_4` 只有 **788 个字形**，基本只覆盖界面文案。
+`SetupUI()` 跑在 `Assets::Apply()` 之前，那时 theme 里还是这份内置小字库；
+而字幕 / 状态 / 提醒卡片这些 label 在 `SetupUI` 里是**显式**设字体的（不靠继承）。
+所以 `LcdDisplay::SetTheme()` 必须逐个把 `chat_message_label_`、`status_label_`、
+`notification_label_` 以及提醒卡片的标题 / 明细 / 提示 / 按钮**四个** label
+补成 assets 分区里的全字库——漏掉哪一个，那一行就退回 788 字形，
+屏上表现是「这一行大部分汉字不见了」。
+
+- 开机自检看 `FontDiag` 日志：打印 `text_font` 指针、`line_height`、
+  `get_glyph_dsc` 回调，并用 `U+5F85`（待）做一次真实 glyph 查表。
+- `tools/check_font_layout.py` 从 `xiaozhi.bin` 里定位内置 `lv_font_t` 判定
+  LVGL 9.3 / 9.6 布局：cbin 字库按 9.3 生成，按 9.6 头解释会白屏。
+- 想彻底换成编译期全字库 `font_puhui_20_4`：实测 ELF rodata
+  `1,239,353 B` vs 现字库 `119,330 B`，净增 **1,120,023 B**，比当时
+  app 分区余量还多约 19 KB ⇒ 要么再精简约 19 KB，要么用 `lv_font_conv`
+  做常用字子集。**尚未落地**，当前仍是小字库 + assets cbin 的组合。
+
+### 唤醒词与语音识别（回归上游）
+
+唤醒词是上游默认的 **「你好小智」**，由 esp-sr 的 **WakeNet 专用模型
+`wn9_nihaoxiaozhi_tts`** 在设备端离线识别，不联网也能响应。
+⚠️ WakeNet 的唤醒词**训练在模型里**，Kconfig 只能选模型、不能改字符串。
+
+配置真源：`firmware/xiaozhi/sdkconfig.defaults.esp32s3` 里
+`CONFIG_SR_WN_WN9_NIHAOXIAOZHI_TTS=y`；本仓的 `sdkconfig.defaults` 刻意
+**不覆盖** `CONFIG_USE_CUSTOM_WAKE_WORD` / `CONFIG_CUSTOM_WAKE_WORD` /
+`CONFIG_SR_WN_*` / `CONFIG_SR_MN_*`，让 Kconfig 默认的 `USE_AFE_WAKE_WORD`
+（S3 + SPIRAM）接管。`tools/merge_to_xiaozhi.py` 的 `SDKCONFIG_OVERLAY`
+仍是 sdkconfig 覆盖段的真源，**两处都写会以后定义覆盖先定义，手动段即成死配置**。
+
+2026-10-20 起**放弃自研双唤醒与 MultiNet 离线命令词**：`custom_wake_word`、
+`elder_cmd`、`elder_mn` 及 `elder_cmd_words.h` 全部删除，对话 / 识别 / 发声
+统一走上游原生链路。原先「6 条离线服药命令词」的旁路不再存在——**服药确认
+改为硬件按钮（长按 3s + 30s 内短按）与服务端语音追问**，断网时由
+NVS + RTC 的离线提醒引擎负责按时响铃与本地回执。
+
+`firmware/components/elder/src/config_report.c` 的启动自检会打印 WakeNet 模型与
+期望唤醒词，模型未启用或选错时直接 `ESP_LOGE`。同一份 `sdkconfig.defaults`
+里还记录了音频前端的实测结论：**NS 降噪关闭、AGC 保留**。别再把 NS 打开——
+NSNet2 需要 model 分区句柄，拿不到会开机崩；`libesp_audio_front_end.a` 里
+也没有 WebRTC NS 的实现。验证 AGC 要看开机日志里**第二条** AFE 管线
+（带 `AEC(VOIP_HIGH_PERF)`）打出的 `|AGC(WebRTC)|`，只 grep 第一条会误判。
+
+🚨 **改了配置但固件没变？先查 `sdkconfig` 残留**（历史事故，决策 D28）
+2026-10-19 真实事故：仓库里的 `sdkconfig.defaults` 改对了，编译烧出来的固件
+行为仍是旧的。原因是 ESP-IDF 里 `sdkconfig`（本地生成、不入库）的优先级
+**高于** `sdkconfig.defaults`，后者只在**首次生成**时参与，而 kconfig 对已存在的
+选项**默认不覆盖**——全程**不报错、不告警**，症状与「模型没烧进分区」完全一样。
 
 ⇒ 改完配置按这个顺序走，别跳步：
 
@@ -612,38 +684,24 @@ light 主题色、`top_bar_` 的藏青/30px/左时钟右日期、`emoji_box_` �
 # 1) 改 firmware/xiaozhi/sdkconfig.defaults（或改 merge 脚本后重跑 merge）
 # 2) 删 sdkconfig（不入库，会按 defaults 重新生成）——★ 最容易漏的一步
 rm -f firmware/xiaozhi/sdkconfig
-# 3) 删 build 并**先 set-target**（不 set-target 会按 esp32 编译，
-#    esp_video 等依赖的 rule 会把摄像头组件判成无用，见决策记录 D29）
+# 3) 删 build 并**先 set-target**：不 set-target 会按 esp32 编译，
+#    板级/组件的依赖 rule 与目标芯片不匹配（历史决策 D29，当时是 esp_video）
 rm -rf firmware/xiaozhi/build
 python tools/idfwin.py set-target esp32s3
 # 4) 编译前的必过自检（把上面这些坑全变成会红的断言）
-python tools/prebuild_check.py
+python tools/prebuild_check.py --strict
 # 5) 编译
 python tools/idfwin.py build
 ```
 
-CI 里第 4 步已自动执行（`firmware-build.yml`），本地不会漏。
-自检项与判据见 `tools/prebuild_check.py` 模块 docstring 与决策记录 D28。
+CI 里第 4 步已自动执行（`firmware-build.yml` 在 set-target 前后各跑一次
+`--strict`），本地不会漏。自检项与判据见 `tools/prebuild_check.py` 的模块
+docstring 与决策记录 D28。
 
-除唤醒词外还有 **6 条离线命令词，无需先说唤醒词，直接说即生效**：
-
-| 命令词 | 拼音（MultiNet 注册用） | 作用 |
-| --- | --- | --- |
-| 新建早上吃药提醒 | `xin jian zao shang chi yao ti xing` | 建每天早上服药提醒 |
-| 新建中午吃药提醒 | `xin jian zhong wu chi yao ti xing` | 建每天中午服药提醒 |
-| 新建晚上吃药提醒 | `xin jian wan shang chi yao ti xing` | 建每天晚上服药提醒 |
-| 新建吃药提醒 | `xin jian chi yao ti xing` | 按默认时段建提醒 |
-| 吃过了 | `chi guo le` | 确认本次服药 |
-| 我吃过了 | `wo chi guo le` | 确认本次服药 |
-
-词表本体在 `firmware/components/elder/include/elder_cmd_words.h`，
-**短语与拼音逐条对齐是铁律**：改了短语忘了改拼音，老人说那句话就没反应
-（现场排查时，看启动日志打印的拼音比看汉字有用）。断网时「吃过了」是老人
-唯一能自助完成的确认动作，与硬件按钮确认（长按 3s + 30s 内短按）互为备份。
-
-⚠️ `idf.py build` **不读**板级 `config.json`（那是上游 `scripts/release.py` 做
-多板发布时才读的）。驱动必须经 `tools/merge_to_xiaozhi.py` 里的
-`SDKCONFIG_OVERLAY` 真源启用——写进 `config.json` 属于死配置，CI 产物里根本没编进来。
+⚠️ `idf.py build` **不读**板级 `config.json`（那是上游 `scripts/release.py`
+做多板发布时才读的）。配置项必须经 `sdkconfig.defaults` /
+`tools/merge_to_xiaozhi.py` 的 `SDKCONFIG_OVERLAY` 真源启用——写进
+`config.json` 属于死配置，CI 产物里根本没编进来。
 
 ### ⚠️ 打包固件前必须 `rm -rf firmware/xiaozhi/build`
 
@@ -675,10 +733,9 @@ CI 不受影响：`firmware-build.yml` 走 `idf.py set-target` 重新生成 `sdk
 ### 1. 固件迁移到 ESP32-P4
 
 当前硬件基线是立创·实战派 ESP32-S3（`CONFIG_BOARD_TYPE_LICHUANG_DEV_S3`）。
-P4 的算力与 PSRAM 更适合本地形象渲染（EAF 序列帧）与更大的 MultiNet 命令词表。
-上游源码树已带 `sdkconfig.defaults.esp32p4`，唤醒词引擎依赖
-（`USE_CUSTOM_WAKE_WORD`）也已覆盖 P4 目标，迁移工作量集中在**板级驱动**
-（音频 codec / 触摸 / 摄像头）与分区表，语音链路本身不用动。
+P4 的算力与 PSRAM 更适合本地形象渲染与更大的字库。上游源码树已带
+`sdkconfig.defaults.esp32p4`；迁移工作量集中在**板级驱动**（音频 codec / 触摸）
+与分区表，语音链路本身不用动。
 
 ### 2. 接入 Home Assistant（MCP 能力）
 
@@ -686,7 +743,8 @@ P4 的算力与 PSRAM 更适合本地形象渲染（EAF 序列帧）与更大的
 以 MCP 工具形式暴露给 Home Assistant，让「提醒老人吃药」这类动作可以编进
 HA 的自动化（门磁触发、夜间场景联动等）。
 ⚠️ 边界：提醒数据的单一真源仍是服务端 `reminders` 表，MCP 只是新的暴露面，
-**不引入第二份数据**；设备的本地 MCP（音量/电量/摄像头）保持现状。
+**不引入第二份数据**；设备的本地 MCP（音量 / 亮度 / 状态灯 / 待机）保持现状，
+摄像头与截图工具已随摄像头整体删除。
 
 ### 3. 独立药盒硬件（ESP + 实时时钟）
 
@@ -709,14 +767,14 @@ HA 的自动化（门磁触发、夜间场景联动等）。
 | [xinnan-tech/xiaozhi-esp32](https://github.com/xinnan-tech/xiaozhi-esp32) | 固件源码树与设备侧协议 | `firmware/xiaozhi/` 即在其源码树上合入本项目 `components/elder` 组件（`tools/merge_to_xiaozhi.py`） |
 | [xinnan-tech/xiaozhi-esp32-server](https://github.com/xinnan-tech/xiaozhi-esp32-server) | 协议与固件设计参考 | **不部署、不调用**（早期跑过它的容器，已删除）；本项目语音链路为自研实现 |
 | [78/esp-wifi-connect](https://github.com/78/esp-wifi-connect) | 浏览器配网 | `managed_components/78__esp-wifi-connect`，配网热点 `http://192.168.4.1` |
-| [espressif/esp-sr](https://github.com/espressif/esp-sr) | 离线命令词识别 | MultiNet 中文模型：唤醒词「你好，小暖」+ 6 条服药命令词 |
+| [espressif/esp-sr](https://github.com/espressif/esp-sr) | 离线唤醒与音频前端 | WakeNet 专用模型「你好小智」+ AFE（AGC 保留、NS 关闭） |
 | [78/xiaozhi-assets-generator](https://github.com/78/xiaozhi-assets-generator) | 自定义资产生成 | 唤醒词 / 字体 / 表情的在线编辑与打包 |
 
 ### 致谢
 
 - **WorkBuddy** —— 本项目的主力开发协作者：服务端、固件、APP、CI 与全套冒烟测试均在它上面完成。
 - **Edge TTS** —— 微软 Edge 浏览器的语音合成协议，本项目的零成本 TTS 兜底（`server/app/voice/tts_edge.py`）；⚠️ 非公开协议且无商业授权，正式部署建议另配商业 TTS。
-- **乐鑫 ESP-IDF / esp-sr / esp-ml307** —— 固件框架与离线语音识别。
+- **乐鑫 ESP-IDF / esp-sr** —— 固件框架与离线语音识别（`esp-ml307` 已随网络栈精简删除）。
 - **LVGL** —— 设备端显示与形象渲染。
 - **FunASR / SenseVoice 与 Silero VAD** —— 可选的本地 ASR / VAD 旁路服务。
 - **PyAV** —— Edge TTS 的 mp3 解码与重采样。
