@@ -207,6 +207,51 @@ def t2_drop_thinking() -> None:
     check("思考期丢弃上行音频" in src,
           "轮次结束会打一行汇总日志", "没有日志 = 这个数只活在内存里")
 
+    # ---- 2026-11-05：服药确认追问（mode=manual）也必须能重新武装 ----
+    # 现场：「对话时能识别到我说的话，服药确认时说什么都识别不了」。
+    # 固件长按追问走 StartListening() → 写死 ManualStop → listen start 带
+    # mode=manual；服务端 _finalize 每轮收尾把 state 置回 idle，而设备侧
+    # 没有状态跃迁、不会重发 listen start。旧判据
+    #   `if state == "idle" and _continuous()`
+    # 在 manual 下恒假 ⇒ 上行音频被静默丢弃，日志里一个字都没有。
+    #
+    # 打桩 _rearm_listening：真函数要 asyncio.create_task（需要 running
+    # loop），本脚本测的是"判据放不放行"，不是看门狗本身。
+    sess.state = "idle"
+    sess._listen_mode = "manual"
+    sess._frames.clear()
+    armed: list[int] = []
+
+    def _rearm_stub() -> None:
+        armed.append(1)
+        sess.state = "listening"
+
+    sess._rearm_listening = _rearm_stub  # type: ignore[method-assign]
+    sess._on_binary(b"\x00\x01\x00\x00" + b"\x00" * 20)
+    check(armed == [1] and len(sess._frames) == 1,
+          "★ mode=manual：idle 态上行音频重新武装并收下（服药确认追问）",
+          f"armed={armed} frames={len(sess._frames)} —— 不放行就是"
+          "「对话能听、服药确认聋」")
+
+    # 静态判据：防止有人把 manual 这个放行条件又收窄掉。
+    onbin = py_func(src, "def _on_binary")
+    check(bool(onbin) and '_listen_mode == "manual"' in onbin,
+          "_on_binary 的 idle 兜底显式放行 manual",
+          "改回只认 _continuous() 就原样装回这个 bug")
+
+    # 反向：会话从没收到过 listen start 时不许凭一帧就武装。
+    sess2 = S.VoiceSession(websocket=object())  # type: ignore[arg-type]
+    sess2.session_id = "SMOKE-NOSTART"
+    sess2.state = "idle"
+    check(sess2._listen_mode == "" and not sess2._continuous(),
+          "新会话 _listen_mode 为空、_continuous() 为假", "")
+    armed2: list[int] = []
+    sess2._rearm_listening = lambda: armed2.append(1)  # type: ignore[method-assign]
+    sess2._on_binary(b"\x00\x01\x00\x00" + b"\x00" * 20)
+    check(armed2 == [],
+          "未宣布要听的会话不凭一帧自动武装（manual 放行不能泛化）",
+          f"armed2={armed2}")
+
 
 # ================================== 3. 长按服药确认必须有声音（固件）
 def t3_med_clip() -> None:

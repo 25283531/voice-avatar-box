@@ -1646,7 +1646,21 @@ class VoiceSession:
             # 设备仍在推流，这里直接丢弃，既不送 ASR 也不重新武装。
             # 到期后由下面 idle 态那条兜底自动恢复。
             return
-        if self.state == "idle" and self._continuous():
+        if self.state == "idle" and (self._continuous()
+                                     or self._listen_mode == "manual"):
+            # ⚠️ 2026-11-05：这里**不能**只认 ``self._continuous()``。
+            # 服药确认追问是「设备本地预录问句 + StartListening()」，固件
+            # StartListening() 写死 ManualStop ⇒ 下发的 listen start 带
+            # mode=manual ⇒ 本会话 _listen_mode 从此是 "manual"、
+            # _continuous() 恒 False。而 _finalize 每轮收尾都把 state 置回
+            # idle，设备侧此时没有状态跃迁、不会重发 listen start ⇒ 这个
+            # 判据把上行音频**全部静默丢弃**，表现就是「对话时能识别、
+            # 服药确认时说什么都识别不了」，且日志里一个字都没有。
+            # 放行 manual 而不是整个去掉 _continuous()：``_listen_mode == ""``
+            # 表示会话**从没收到过 listen start**，那时不能凭一帧就武装
+            # （连设备有没有宣布要听都不知道）。manual 是设备明确开过麦、
+            # 且确实在推流才走到这里的；manual 模式设备不推流时根本不会
+            # 进 _on_binary，所以不会误起看门狗。
             # 连续对话会话里，设备还在推流但服务端已回 idle —— 就是
             # _rearm_listening 注释里那个死锁。设备以为我们在听，我们
             # 以为会话结束了。⇒ 把上行音频当作设备重新宣布 listening。
