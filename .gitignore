@@ -80,6 +80,9 @@ Thumbs.db
 *.p12
 *.mobileprovision
 
+
+
+
 # 签名证书（私钥，绝不入库）
 *.keystore
 *.jks
@@ -94,3 +97,14 @@ dist/
 
 # 本地 Kotlin 编译检查的依赖缓存（约 70MB，不入库）
 tools/.kcache/
+
+# ⚠️ 例外必须放在**文件末尾**：gitignore 是「最后匹配的规则生效」，
+#    上面那两段 *.keystore 会把中间任何例外重新排除掉。
+#
+# 这是 LX04 设备端「构建用」固定密钥（不是秘密，也不承担身份作用）。
+# CI 每次都是干净环境，AGP 会重新生成随机 debug keystore ⇒ 每次出包签名都
+# 不同 ⇒ 装机必须 uninstall 再 install ⇒ /data 被清空。而设备端所有有价值
+# 的状态（提醒表、token、时钟偏移）都在 /data，于是「持久化」在验收阶段
+# 等于不存在。这个密钥的唯一作用就是让多次构建的签名保持一致。
+# 生产真密钥仍走 LX04_KEYSTORE_BASE64 secret，优先级更高。
+!lx04/keystore/lx04-build.keystore

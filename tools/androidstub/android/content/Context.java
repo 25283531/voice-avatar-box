@@ -20,4 +20,17 @@ public abstract class Context {
  public java.io.File getFilesDir(){return null;}
  /** 外部私有文件目录 —— 签名照抄真 Android。 */
  public java.io.File getExternalFilesDir(String type){return null;}
+ /**
+  * 偏好设置 —— 签名照抄真 Android（返回 SharedPreferences）。
+  *
+  * 这里给**默认实现**而不是 abstract：真 Android 里它是 abstract，但 stub 只要
+  * 签名一致就能让调用方编译通过；写成 abstract 会逼所有子类（Activity/Service…）
+  * 都补一遍空实现，纯属自找维护成本。
+  */
+ public SharedPreferences getSharedPreferences(String name, int mode){return null;}
+ /** 模式常量，真值照抄真 Android。 */
+ public static final int MODE_PRIVATE = 0;
+ public static final int MODE_WORLD_READABLE = 1;
+ public static final int MODE_WORLD_WRITEABLE = 2;
+ public static final int MODE_MULTI_PROCESS = 4;
 }

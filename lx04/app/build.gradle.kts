@@ -43,6 +43,27 @@ android {
     val deviceStoreFile = (project.findProperty("LX04_STORE_FILE") as String?)
         ?.takeIf { it.isNotBlank() }
 
+    /**
+     * 仓库内固定构建密钥 —— 没有外部密钥时用它兜底。
+     *
+     * ## 为什么必须有（不是"省事"）
+     *
+     * 不指定 keystore 时 AGP 会用 `~/.android/debug.keystore`；而 CI 每次都是
+     * 干净环境，那个文件是**重新生成**的 ⇒ 每次出包的签名都不同 ⇒
+     * `adb install -r` 报 `INSTALL_FAILED_UPDATE_INCOMPATIBLE` ⇒ 只能卸载重装
+     * ⇒ `/data` 被清空。
+     *
+     * 而设备端所有有价值的状态（提醒表、token、时钟偏移）都在 `/data`。
+     * 签名不稳 ⇒ 每次装机都从零开始 ⇒ 「持久化」在验收阶段等于不存在。
+     * 另外 Android 8.0+ 的 `ANDROID_ID` 是按签名派生的，签名一变它就变，
+     * 绑定关系会漂成孤儿设备（虽然有 MAC 兜底，但落到 ANDROID_ID 时就废了）。
+     *
+     * 这个密钥不是秘密、不承担身份作用，密码就写在这里（见 .gitignore 末尾说明）。
+     * 生产环境仍走 `LX04_KEYSTORE_BASE64` secret，优先级更高。
+     */
+    val bundledKeystore = rootProject.file("keystore/lx04-build.keystore")
+    val useBundled = deviceStoreFile == null && bundledKeystore.exists()
+
     defaultConfig {
         applicationId = "com.elder.lx04"
         minSdk = 27
@@ -70,6 +91,15 @@ android {
                 keyPassword = project.findProperty("LX04_KEY_PASSWORD") as String?
             }
         }
+        // 仓库内固定密钥（见上面 bundledKeystore 的说明）
+        if (useBundled) {
+            create("bundled") {
+                storeFile = bundledKeystore
+                storePassword = "lx04build"
+                keyAlias = "lx04"
+                keyPassword = "lx04build"
+            }
+        }
     }
 
     buildTypes {
@@ -80,10 +110,11 @@ android {
                 "proguard-rules.pro"
             )
             // 见上：宁可 debug 签名，也不能出未签名的包（装不上）。
-            signingConfig = if (deviceStoreFile != null) {
-                signingConfigs.getByName("device")
-            } else {
-                signingConfigs.getByName("debug")
+            // 顺序：外部密钥 > 仓库内固定密钥 > AGP 的随机 debug 签名。
+            signingConfig = when {
+                deviceStoreFile != null -> signingConfigs.getByName("device")
+                useBundled -> signingConfigs.getByName("bundled")
+                else -> signingConfigs.getByName("debug")
             }
         }
         debug {
