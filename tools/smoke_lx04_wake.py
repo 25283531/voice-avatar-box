@@ -243,6 +243,17 @@ def run(check_assets: bool) -> int:
                 "安静的 TTS 会被放大到可闻电平" in
                 read(ROOT / "lx04/app/src/test/java/com/elder/lx04/audio/AudioLevelTest.kt"),
     ))
+    # ---- 真机 2026-11-05 第四次：正弦很响、TTS 却「隐隐约约」----
+    # ALSA 回采窗口分析：正弦有声窗口 60%、TTS 只有 10% ⇒ 不是轻，是丢帧。
+    # 根因：AudioTrack 180ms 缓冲 + 启动即 play（空缓冲）⇒ 持续 underrun，
+    # 且 write() 返回值被 runCatching 吞掉，丢帧静默、日志全绿。
+    items.append((
+        "W23", "播放端预填充后再 play、缓冲 1 秒、且检查 write 返回值",
+        lambda: "prefilled >= PREBUFFER_SAMPLES" in player_src and
+                "val bufBytes = maxOf(minBuf, sampleRate * 2)" in player_src and
+                "writeErrors++" in player_src and
+                "val n = runCatching { t.write(frame, 0, frame.size) }" in player_src,
+    ))
     if check_assets:
         items += asset_guards()
 
@@ -285,6 +296,8 @@ def selftest() -> int:
         tst = kw.get("test_src", read(ROOT / "lx04/app/src/test/java/com/elder/lx04/audio/AudioLevelTest.kt"))
         if "AudioLevel.amplify(pcm, gain)" not in pl or "TARGET_RMS" not in lv: n += 1
         if "安静的 TTS 会被放大到可闻电平" not in tst: n += 1
+        # W23 与 W21/W22 共用 player_src
+        if "prefilled >= PREBUFFER_SAMPLES" not in pl or "writeErrors++" not in pl: n += 1
         return n
 
     base = count_bad()
@@ -303,6 +316,12 @@ def selftest() -> int:
         ("摘掉下行增益（回到听不见的状态）",
          {"player_src": read(ROOT / "lx04/app/src/main/java/com/elder/lx04/audio/AudioPlayer.kt")
                           .replace("val boosted = AudioLevel.amplify(pcm, gain)", "val boosted = pcm")}),
+        ("取消预填充，回到启动即空缓冲开播",
+         {"player_src": read(ROOT / "lx04/app/src/main/java/com/elder/lx04/audio/AudioPlayer.kt")
+                          .replace("prefilled >= PREBUFFER_SAMPLES", "true")}),
+        ("又把 write 失败吞掉",
+         {"player_src": read(ROOT / "lx04/app/src/main/java/com/elder/lx04/audio/AudioPlayer.kt")
+                          .replace("writeErrors++", "// no count")}),
     ]
 
     bad = 0

@@ -71,6 +71,26 @@ class AudioPlayer {
     private var rawSamples = 0
 
     /**
+     * 是否已 `play()`。
+     *
+     * ⚠️ 不能再像以前那样在 `start()` 里就 `play()`：那一刻 AudioTrack
+     * 内部缓冲是**空的**，HAL 立刻 underrun 并把 track disable
+     * （真机日志反复出现 `releaseBuffer() track disabled due to previous
+     * underrun, restarting`）。之后每 60ms 才补一帧，缓冲一直填不满，
+     * 大量 `write()` 静默失败 ⇒ 老人只听到零星碎片。
+     *
+     * 正确顺序：**先 write 预填充 → 攒够 [PREBUFFER_SAMPLES] → 再 play()**。
+     * MODE_STREAM 允许在 STOPPED 状态写入，数据会留在内部缓冲里。
+     */
+    @Volatile
+    private var played = false
+
+    /** `write()` 返回负值的次数。以前被 `runCatching` 整个吞掉，丢帧无日志。 */
+    @Volatile
+    var writeErrors: Int = 0
+        private set
+
+    /**
      * 开始播放（可重复调用以切换采样率）。
      *
      * @param sampleRate 服务端 hello 里声明的采样率
@@ -90,8 +110,10 @@ class AudioPlayer {
             Log.e(TAG, "getMinBufferSize 失败: $minBuf")
             return
         }
-        // 3 帧的内部缓冲，约 180ms
-        val bufBytes = maxOf(minBuf, sampleRate * 2 * 3 * OpusCodec.FRAME_MS / 1000)
+        // ⚠️ 1 秒内部缓冲（原来只有 3 帧 / 180ms）。
+        //    服务端 TTS 帧经 AudioPacer 匀速下发，但 WS 抖动一次就够让
+        //    180ms 的缓冲见底。缓冲是吸收抖动的唯一余量，不能省。
+        val bufBytes = maxOf(minBuf, sampleRate * 2)
 
         val t = runCatching {
             AudioTrack(
@@ -112,19 +134,55 @@ class AudioPlayer {
 
         track = t
         running = true
-        t.play()
-
+        played = false
+        writeErrors = 0
+        // ⚠️ 这里**不 play()**：由 playLoop 在缓冲预填充完成后开播。
         worker = thread(name = "elder-speaker", priority = Thread.MAX_PRIORITY - 2) {
             playLoop(t)
         }
-        Log.i(TAG, "播放已启动：${sampleRate}Hz mono，缓冲 ${bufBytes / 2} 采样")
+        Log.i(TAG, "播放已启动：${sampleRate}Hz mono，缓冲 ${bufBytes / 2} 采样（预填充后开播）")
     }
 
     private fun playLoop(t: AudioTrack) {
+        var prefilled = 0
         while (running) {
-            val frame = queue.poll(200, TimeUnit.MILLISECONDS) ?: continue
+            val frame = queue.poll(100, TimeUnit.MILLISECONDS)
+            if (frame == null) {
+                // 队列短暂空但已经攒了一点音频：别让老人一直等，直接开播。
+                // 正常情况下预填充会在 100ms 内攒够，不会走到这里。
+                if (!played && prefilled > 0) {
+                    runCatching { t.play() }
+                    played = true
+                    Log.i(TAG, "预填充超时，提前开播（$prefilled 采样）")
+                }
+                continue
+            }
             if (!running) break
-            runCatching { t.write(frame, 0, frame.size) }
+
+            // ⚠️ 必须检查返回值：AudioTrack 被 HAL disable 时 write() 会返回
+            //    负值，以前的 `runCatching { t.write(...) }` 把失败整个吞掉，
+            //    于是丢帧**不报错、不崩溃、日志全绿**，只表现为「隐隐约约」。
+            val n = runCatching { t.write(frame, 0, frame.size) }.getOrDefault(-1)
+            if (n < 0) {
+                writeErrors++
+                if (writeErrors == 1 || writeErrors % 20 == 0) {
+                    Log.w(TAG, "AudioTrack.write 失败($n)，累计丢帧 $writeErrors")
+                }
+                continue
+            }
+            if (n < frame.size) {
+                // 部分写入：把尾巴补上，别丢半个帧
+                runCatching { t.write(frame, n, frame.size - n) }
+            }
+
+            if (!played) {
+                prefilled += frame.size
+                if (prefilled >= PREBUFFER_SAMPLES) {
+                    runCatching { t.play() }
+                    played = true
+                    Log.i(TAG, "预填充完成（$prefilled 采样），开始播放")
+                }
+            }
         }
     }
 
@@ -178,11 +236,14 @@ class AudioPlayer {
         runCatching { track?.pause() }
         runCatching { track?.flush() }
         runCatching { track?.play() }
+        // flush() 已经把 track 推到 PLAYING；playLoop 不要再重复预填充。
+        played = true
     }
 
     @Synchronized
     fun stop() {
         running = false
+        played = false
         queue.clear()
         worker?.let { runCatching { it.join(300) } }
         worker = null
@@ -198,5 +259,13 @@ class AudioPlayer {
 
         /** 队列上限：20 帧 = 1.2 秒。 */
         private const val MAX_QUEUED_FRAMES = 20
+
+        /**
+         * 开播前预填充的采样数（24kHz 下约 0.33 秒）。
+         *
+         * 必须**小于** AudioTrack 内部缓冲（1 秒），否则 STOPPED 状态下的
+         * write() 会在缓冲填满时阻塞，playLoop 卡死、永远不开播。
+         */
+        private const val PREBUFFER_SAMPLES = 8_000
     }
 }
