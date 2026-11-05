@@ -39,10 +39,13 @@ MAINACTIVITY = "lx04/app/src/main/java/com/elder/lx04/MainActivity.kt"
 VOICECLIENT = "lx04/app/src/main/java/com/elder/lx04/net/VoiceClient.kt"
 OPUSCODEC = "lx04/app/src/main/java/com/elder/lx04/audio/OpusCodec.kt"
 AUDIOCAPTURE = "lx04/app/src/main/java/com/elder/lx04/audio/AudioCapture.kt"
+KCOMPILE = "tools/kcompile.py"
+KTLINTSTRUCT = "tools/ktlint_struct.py"
 
 REQUIRED = [
     TOPKEYS, MANIFEST, BANDVIEW, DEPLOY, FACTS, CHECKLIST, PLAN, README, WORKFLOW,
     MAINACTIVITY, VOICECLIENT, OPUSCODEC, AUDIOCAPTURE,
+    KCOMPILE, KTLINTSTRUCT,
 ]
 
 _FAILS: list[str] = []
@@ -353,6 +356,18 @@ def run(root: Path) -> int:
         "7a workflow 里有 python3 tools/smoke_lx04_facts.py",
         re.search(r"python3\s+tools/smoke_lx04_facts\.py", wf) is not None,
         "断言写了不跑 = 没有门禁（本仓 2026-10-30 真实踩过）",
+    )
+    # ⚠️ 2026-11-05 新增的两个门禁同样必须真的被执行 ——
+    #    "断言写了不跑 = 没有门禁"这条坑本仓踩过不止一次。
+    check(
+        "7d workflow 里有 python3 tools/kcompile.py",
+        re.search(r"python3\s+tools/kcompile\.py", wf) is not None,
+        "本地编译检查不跑 = Kotlin 编译错误只能等 CI 打回（已经连中三次）",
+    )
+    check(
+        "7e workflow 里有 python3 tools/ktlint_struct.py",
+        re.search(r"python3\s+tools/ktlint_struct\.py", wf) is not None,
+        "结构检查不跑 = 多一个右花括号要到 CI 才被发现",
     )
     # ⚠️ push 与 pull_request 是**两段独立的** paths，必须分别判。
     # 早期版本只在 `on:` 全文里找一次文件名，结果删掉 push 段那行后

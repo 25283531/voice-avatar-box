@@ -91,3 +91,6 @@ out/
 # 仓库根的 dist/（从 Actions 下载的 APK/固件整包暂存，2026-10-19 QA 发现
 # 只有 app/dist/ 被规则命中而根 dist/ 漏网，48MB 二进制有误入库风险）
 dist/
+
+# 本地 Kotlin 编译检查的依赖缓存（约 70MB，不入库）
+tools/.kcache/

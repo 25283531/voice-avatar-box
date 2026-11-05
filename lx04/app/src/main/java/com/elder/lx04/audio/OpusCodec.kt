@@ -311,7 +311,6 @@ class OpusCodec {
                 0
             }
         }
-        }
     }
 
     @Synchronized
