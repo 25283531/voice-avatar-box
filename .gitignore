@@ -106,6 +106,13 @@ tools/.kcache/
 /run.json
 /runs.json
 
+
+# 离线唤醒词运行资源（约 25 MB）：由 tools/fetch_kws_assets.py 在构建期下载。
+# 二进制入库会让每次 clone 多背 25 MB，且升级版本时无法 diff。
+/lx04/app/src/main/jniLibs/armeabi-v7a/libonnxruntime.so
+/lx04/app/src/main/jniLibs/armeabi-v7a/libsherpa-onnx-jni.so
+/lx04/app/src/main/assets/kws/
+
 # ⚠️ 例外必须放在**文件末尾**：gitignore 是「最后匹配的规则生效」，
 #    上面那两段 *.keystore 会把中间任何例外重新排除掉。
 #

@@ -32,6 +32,7 @@ import com.elder.lx04.audio.TonePlayer
 import com.elder.lx04.net.VoiceClient
 import com.elder.lx04.runtime.DeviceRuntime
 import com.elder.lx04.store.DeviceStore
+import com.elder.lx04.wake.WakeWordEngine
 import com.elder.lx04.ui.MainScreen
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -167,6 +168,16 @@ class MainActivity : Activity() {
     private val tones = TonePlayer()
 
     /**
+     * 离线唤醒词引擎（「你好小智」，对齐 ESP32-S3 固件的 ESP-SR）。
+     *
+     * ⚠️ 必须是 `lateinit var` 而不是 `val ... = WakeWordEngine(this) {...}`：
+     *    回调里要引用 wakeEngine 自己（未连上时恢复监听），Kotlin 不允许
+     *    在字段初始化器里自引用（"variable must be initialized"）。
+     */
+    private lateinit var wakeEngine: WakeWordEngine
+
+
+    /**
      * 运行时与界面的交界。
      *
      * 只做"把引擎的结论画到屏上/响出来"，**不做任何判断** ——
@@ -256,6 +267,19 @@ class MainActivity : Activity() {
             if (pending) ledEngine.medPending()
         }
         runtime.start()
+
+        wakeEngine = WakeWordEngine(this) { keyword ->
+        if (!bound || voice?.isConnected != true) {
+            // 没连上就别让麦克风空着：立刻恢复监听，不能静默降级成"哑了"
+            Log.w(TAG, "唤醒检出但未连上服务端，恢复监听")
+            wakeEngine.resume()
+            screen.setHint("还没连上服务器，稍等一下")
+            return@WakeWordEngine
+        }
+        // 唤醒词路径要带 greet=true（服务端据此播一句"我在"），
+        // 并且只发**一次** detect —— beginListening 内部统一发，避免重复。
+        beginListening(ptt = false, wakeSource = keyword, greet = true)
+    }
 
         registerReceiver(batteryReceiver, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
         registerReceiver(debugReceiver, IntentFilter(DebugBridge.ACTION))
@@ -408,6 +432,8 @@ class MainActivity : Activity() {
                     when (state) {
                         "start" -> {
                             speaking = true
+                            // 半双工：播报时不跑唤醒，也别占着麦克风
+                            wakeEngine.pause()
                             setUiState("speaking")
                         }
                         "sentence_start" -> {
@@ -415,6 +441,7 @@ class MainActivity : Activity() {
                         }
                         "stop" -> {
                             speaking = false
+                            wakeEngine.resume()
                             setUiState("idle")
                         }
                     }
@@ -469,7 +496,13 @@ class MainActivity : Activity() {
      * （清嗓子、想说什么）稍慢一点，话还没出口就被切断了 ——
      * 表现为"按了没反应"。PTT 语义就是"按多久说多久"。
      */
-    private fun beginListening(ptt: Boolean = false) {
+    private fun beginListening(
+        ptt: Boolean = false,
+        /** 这一轮是谁唤醒的：按键 or 唤醒词。会原样上报给服务端做日志区分。 */
+        wakeSource: String = "按键唤醒",
+        /** 唤醒词路径要播一句问候；按键路径不播（老人只是想说话）。 */
+        greet: Boolean = false
+    ) {
         if (sending) return
         if (!bound || voice?.isConnected != true) {
             screen.setHint("还没连上服务器，稍等一下")
@@ -481,6 +514,16 @@ class MainActivity : Activity() {
             player.flush()
             speaking = false
         }
+
+        // ⚠️ 必须先让出麦克风：LX04 的 HAL 不允许两个 AudioRecord 同时打开。
+        //    唤醒词路径里引擎已经自己停了，这里 pause() 是幂等的保险；
+        //    按键路径则靠这一句把常驻 KWS 采集关掉。
+        wakeEngine.pause()
+
+        // ⚠️ 必须先让出麦克风：LX04 的 HAL 不允许两个 AudioRecord 同时打开。
+        //    唤醒词路径里引擎已经自己停了，这里 pause() 是幂等的保险；
+        //    按键路径则靠这一句把常驻 KWS 采集关掉。
+        wakeEngine.pause()
 
         sending = true
         pttMode = ptt
@@ -524,7 +567,7 @@ class MainActivity : Activity() {
         //    本客户端没有"自动回 listening"这条路（只有按键/调试命令会
         //    调 beginListening），所以每次 beginListening 都对应"有人明确
         //    让设备开始听"，发 detect 是正确的。
-        voice?.listenDetect("按键唤醒", greet = false)
+        voice?.listenDetect(wakeSource, greet = greet)
 
         voice?.listenStart()
 
@@ -562,6 +605,10 @@ class MainActivity : Activity() {
         voice?.listenStop()
         setUiState("idle")
         screen.setHint("")
+        // 对话结束 ⇒ 把麦克风还给常驻唤醒（固件的 Speaking→Idle 会重开 WakeNet）。
+        // 若此刻服务端已在播报，onTtsState("start") 会立刻再 pause 一次，
+        // 这是半双工的必要切换，不是重复操作。
+        if (!speaking) wakeEngine.resume()
     }
 
     // ------------------------------------------------------------------ 按键
@@ -764,6 +811,7 @@ class MainActivity : Activity() {
             PackageManager.PERMISSION_GRANTED
         ) {
             startConnect()
+            startWakeWord()
             return
         }
         requestPermissions(arrayOf(Manifest.permission.RECORD_AUDIO), REQ_MIC)
@@ -776,13 +824,34 @@ class MainActivity : Activity() {
     ) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
         if (requestCode == REQ_MIC) {
-            if (grantResults.isEmpty() || grantResults[0] != PackageManager.PERMISSION_GRANTED) {
+            val granted = grantResults.isNotEmpty() &&
+                grantResults[0] == PackageManager.PERMISSION_GRANTED
+            if (!granted) {
                 screen.setHint("没有麦克风权限，无法对话")
             }
             // 没麦克风也把连接建起来 —— 至少能收到提醒、能显示字幕
             startConnect()
+            if (granted) startWakeWord()
         }
     }
+
+    /**
+     * 启动常驻唤醒监听。
+     *
+     * ⚠️ 失败**必须可见**：so / 模型缺失时若静默跳过，真机上表现就是
+     * 「没有语音唤醒」，而日志里一切正常，排查时只会去查权限和 WS。
+     * 所以这里屏显 + ERROR 日志，设备退化为按键唤醒但明确告诉使用者。
+     */
+    private fun startWakeWord() {
+        if (!wakeEngine.start()) {
+            val why = wakeEngine.lastError
+            Log.e(TAG, "语音唤醒未就绪：$why")
+            screen.setHint("语音唤醒未就绪，请按中间键说话")
+        } else {
+            Log.i(TAG, "语音唤醒已启动：${WakeWordEngine.WAKE_WORD}")
+        }
+    }
+
 
     // ------------------------------------------------------------------ 麦克风自检
 
@@ -1637,6 +1706,20 @@ class MainActivity : Activity() {
                 Log.w(TAG, "调试命令 $cmd 已废弃：提醒状态只由引擎驱动，不许本地伪造")
             }
             "sync_now" -> runtime.requestSyncNow()
+            "wake_start" -> {
+                screen.setHint(if (wakeEngine.resume()) "唤醒已启动" else "唤醒未就绪：${wakeEngine.lastError}")
+            }
+            "wake_stop" -> {
+                wakeEngine.pause()
+                screen.setHint("唤醒已暂停（可用 wake_start 恢复）")
+            }
+            "wake_start" -> {
+                screen.setHint(if (wakeEngine.resume()) "唤醒已启动" else "唤醒未就绪：${wakeEngine.lastError}")
+            }
+            "wake_stop" -> {
+                wakeEngine.pause()
+                screen.setHint("唤醒已暂停（可用 wake_start 恢复）")
+            }
 
             "press" -> {
                 ledEngine.buttonPending(true)
@@ -1700,6 +1783,7 @@ class MainActivity : Activity() {
         opus.release()
         runCatching { runtime.stop() }
         runCatching { tones.release() }
+        runCatching { wakeEngine.release() }
         voice?.disconnect()
         scope.cancel()
     }

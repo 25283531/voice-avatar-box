@@ -13,6 +13,8 @@ public abstract class Context {
  public abstract int checkSelfPermission(String p);
  public abstract void requestPermissions(String[] p,int code);
  public android.content.res.Resources getResources(){return null;}
+ /** AssetManager —— 签名照抄真 Android。 */
+ public android.content.res.AssetManager getAssets(){return null;}
  public android.content.ContentResolver getContentResolver(){return null;}
  public Context getApplicationContext(){return this;}
  public String getPackageName(){return "";}

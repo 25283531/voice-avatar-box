@@ -16,6 +16,10 @@ on:
       - 'tools/kcompile.py'
       - 'tools/ktest.py'
       - 'tools/ktlint_struct.py'
+      - 'tools/fetch_kws_assets.py'
+      - 'tools/smoke_lx04_wake.py'
+      - 'lx04/app/src/main/java/com/elder/lx04/wake/**'
+      - 'lx04/app/src/main/java/com/k2fsa/**'
       - 'tools/androidstub/**'
       - '.github/workflows/lx04-build.yml'
   pull_request:
@@ -26,6 +30,10 @@ on:
       - 'tools/kcompile.py'
       - 'tools/ktest.py'
       - 'tools/ktlint_struct.py'
+      - 'tools/fetch_kws_assets.py'
+      - 'tools/smoke_lx04_wake.py'
+      - 'lx04/app/src/main/java/com/elder/lx04/wake/**'
+      - 'lx04/app/src/main/java/com/k2fsa/**'
       - 'tools/androidstub/**'
       - '.github/workflows/lx04-build.yml'
   release:
@@ -119,6 +127,12 @@ jobs:
         # 直指源码行。它不能替代 gradle（不打 APK），所以两个都跑。
         run: python3 tools/kcompile.py
 
+      - name: 校验离线唤醒词接线（防假绿）
+        # 唤醒链路有四个编译期看不出来的失败点：so/模型缺失、Kotlin API 与
+        # so 版本错开、keywords 用了官方默认、检出后没释放麦克风。
+        # kcompile/ktest/ktlint 全绿也拦不住，必须跑这份判据。
+        run: python3 tools/smoke_lx04_wake.py
+
       - name: 跑单元测试
         working-directory: lx04
         # ⚠️ 灯效与按键的时序逻辑是移植里最容易出错的部分 ——
@@ -130,6 +144,17 @@ jobs:
           # 已在仓库里改成 100755，这里再兜一次底，换环境也不会再挂。
           chmod +x gradlew
           ./gradlew --no-daemon testReleaseUnitTest
+
+      - name: 准备离线唤醒词资源（so + 中文 KWS 模型）
+        # ⚠️ 必须在 assembleRelease 之前：这两个 .so 和 assets 是**运行时**
+        #    资源，编译期完全不检查。漏了会产出一个"能装、能连、就是唤不醒"
+        #    的 APK，而 CI 全绿。
+        # 版本与 app/src/main/java/com/k2fsa/sherpa/onnx/ 的 Kotlin API 锁定
+        # 同为 1.12.22，见 tools/fetch_kws_assets.py 的说明。
+        run: |
+          set -e
+          python3 tools/fetch_kws_assets.py
+          python3 tools/smoke_lx04_wake.py --check-assets
 
       - name: 准备签名密钥
         # 设备端 APK **必须签名**才能 adb install（未签名 = INSTALL_PARSE_FAILED_NO_CERTIFICATES）。
@@ -198,6 +223,15 @@ jobs:
           # 混入 arm64 的 .so 会在设备上加载失败（UnsatisfiedLinkError）。
           echo "--- 产物里的 so 架构 ---"
           unzip -l "$APK" | grep -E "\.so$" || echo "(本次无 so)"
+
+          # ⚠️ 唤醒资源是运行时的，编译期不检查 —— 必须在产物里亲眼看到。
+          #    漏了 .so：真机加载抛 UnsatisfiedLinkError；
+          #    漏了 keywords.txt：引擎正常加载但永远唤不醒。
+          echo "--- 唤醒资源 ---"
+          unzip -l "$APK" | grep -F "lib/armeabi-v7a/libsherpa-onnx-jni.so" \
+            || { echo "缺少唤醒 .so"; exit 1; }
+          unzip -l "$APK" | grep -E "assets/kws/.*/keywords\.txt" \
+            || { echo "缺少自定义 keywords.txt"; exit 1; }
           if unzip -l "$APK" | grep -qE "lib/arm64"; then
             echo "!!! 产物里混进了 arm64 —— LX04 是 32 位，会加载失败"
             exit 1
