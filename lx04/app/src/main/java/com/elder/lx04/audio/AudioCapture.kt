@@ -61,14 +61,28 @@ class AudioCapture(
     /**
      * 是否挂平台 NS/AEC/AGC。
      *
-     * 正常对话一律 true。只有**自检**时才传 false —— 因为 AEC 会把
-     * 我们自己扬声器的声音当成回声消掉，回环测试就测不出东西了。
+     * ⚠️ **默认 false，而且生产也必须关掉**（2026-11-05 实机结论）：
+     *
+     *    挂了平台效果链之后，麦克风信号会被压到几乎为零 —— 同一台设备、
+     *    同一套代码实测：
+     *
+     *        挂 NS/AGC/AEC（老代码） → mic_test：rms 5~80（几乎听不见）
+     *        不挂（矩阵实测）        → rms 553~1005（正常说话的电平）
+     *
+     *    而 Opus 编码器吃的就是这份数据：**被效果链污染过的帧在真机上
+     *    100% 触发 Concentus 的 Inlines.OpusAssert**（日志里就是"编码失败: null"），
+     *    整轮会话一帧都发不出去。
+     *    把同样但**没挂效果链**的真实麦克风数据拉回本机 JVM 编码：
+     *    **40/40 全部成功** ⇒ 断言的元凶是效果链，不是数据本身、也不是并发。
+     *
+     *    降噪/回声抑制改由 [AudioPreProcess] 的软件链路兜底
+     *    （直流阻断 + 120Hz 高通 + 软件 AGC + VAD）。
      *
      * ⚠️ 这个参数刻意放在 lambda **前面**：Kotlin 的尾随 lambda 语法
      *    只认最后一个参数，如果 lambda 不在最后，`AudioCapture { ... }`
      *    这种写法就编译不过。放前面还能用默认值，调用处照样只写 lambda。
      */
-    private val enablePlatformEffects: Boolean = true,
+    private val enablePlatformEffects: Boolean = false,
 
     /** 每 60ms 回调一次。回调在**采集线程**上执行，不要在里面做重活。 */
     private val onFrame: (pcm: ShortArray, info: AudioPreProcess.Frame) -> Unit
@@ -78,12 +92,13 @@ class AudioCapture(
     private var worker: Thread? = null
 
     /**
-     * 实际使用的通道数（HAL 协商结果）。
+     * HAL 实际给的通道数（每帧读多少个 short）。
      *
-     * 2 = 立体声（读进来的数据要抽左声道）；1 = 单声道（恒等）。
+     * ⚠️ **不是我们请求的** —— 请求的是 mono，HAL 回的是交错双声道，
+     *    所以每帧读 1920 个 short 再抽左声道（见 [start] 的说明）。
      */
     @Volatile
-    private var channels = CHANNELS_STEREO
+    private var channels = HAL_CHANNELS
 
     @Volatile
     private var running = false
@@ -105,37 +120,50 @@ class AudioCapture(
     fun start(): Boolean {
         if (running) return true
 
-        // ⚠️⚠️ 通道数必须**按 HAL 实际给的来**，不能想当然写 mono。
+        // ⚠️⚠️ 采集参数是**实测定死**的，不是猜的。
         //
-        //    实机证据（2026-11-05，录音期间读 /proc/asound/card0/pcm1c/sub0/hw_params）：
+        //    实机矩阵（`adb shell am broadcast -a com.elder.lx04.DEBUG --es cmd mic_matrix`，
+        //    2026-11-05）把 10 组 (音频源 × 采样率 × 通道数) 全试了一遍：
         //
-        //        access: RW_INTERLEAVED
-        //        format: S16_LE
-        //        channels: 2          ← HAL 给的是**双声道**
-        //        rate: 16000
+        //        VOICE_RECOGNITION 16000 2ch → frames=7   rms=0.0     ← 全零
+        //        VOICE_RECOGNITION 16000 1ch → frames=98  rms=553.7   ← 有信号
+        //        VOICE_RECOGNITION 48000 2ch → frames=7   rms=0.0     ← 全零
+        //        VOICE_RECOGNITION 48000 1ch → frames=295 rms=611.0   ← 有信号
+        //        MIC 16000 1ch              → frames=98  rms=1005.3  ← 有信号
+        //        MIC 16000 2ch              → frames=7   rms=0.0     ← 全零
+        //        MIC 48000 2ch              → frames=7   rms=0.0     ← 全零
+        //        DEFAULT 48000 2ch          → frames=7   rms=0.0     ← 全零
+        //        VOICE_COMMUNICATION 16000 1ch → frames=49 rms=941.4 ← 有信号
+        //        CAMCORDER 48000 2ch        → frames=7   rms=0.0     ← 全零
         //
-        //    而这里请求的是 CHANNEL_IN_MONO —— MTK 的 HAL **没有**把 stereo
-        //    downmix 成 mono 就直接把双声道给了。于是"按单声道读"实际读到的是
-        //    **左右交错的立体声**：
+        //    ⇒ **所有 2ch 组合全是 0**：ALSA `state: PREPARED`（流没跑起来）、
+        //      AudioFlinger 日志 `startInputDevice(), input device already opened`、
+        //      HAL 反复打 `[readThread] failed` / `Not enough data`。
+        //      而所有 1ch 组合都有真实信号。
+        //    ⇒ 所以**必须请求 mono**（请求 stereo 在这台设备上等于没有麦克风）。
+        //
+        // ⚠️⚠️ 但 mono 请求拿回来的**是交错的双声道**：
+        //
+        //    HAL 内部是 2ch（hw_params: `channels: 2`），framework 没做 downmix，
+        //    于是「按 mono 读」读到的是 L,R,L,R 交错的流：
         //
         //        · 每帧 960 个 short 只覆盖 960/2/16000 = **30ms** 真实音频
-        //          （协议要求 60ms）⇒ 服务端按 60ms 播放 ⇒ 声音慢一倍、
+        //          （协议要求 60ms）⇒ 服务端按 60ms 播 ⇒ 声音慢一倍、
         //          音调减半，ASR 几乎听不出字；
-        //        · 相邻样本其实是 L、R 两个声道，信号被 2 倍频化。
+        //        · 现场症状对得上：link_test 跑 5 秒采到 **165 帧**
+        //          （5s/60ms 本该 83 帧，165 ≈ 83×2）。
         //
-        //    现场症状完全对得上：link_test 跑 5 秒却采到 **165 帧**
-        //    （5s/60ms 本该只有 83 帧，165 ≈ 83×2）。
+        //    ⇒ 修法：**mono 请求 + 每帧读 960×2 = 1920 个 short，抽左声道**，
+        //      还原出真正的 60ms 单声道（见 [extractLeftChannel]）。
         //
-        //    ⇒ 修法：**明确请求立体声**，每帧读 960×2 个样本，**抽左声道**
-        //    还原成真正的 60ms 单声道。若某台设备只支持 mono，
-        //    stereo 构造会失败 → 自动回退到 mono 读法（对 mono 抽左是恒等）。
-        val opened = openRecord() ?: return false
-        val rec = opened.first
-        channels = opened.second
+        //    ⇒ 换设备时先用 `mic_matrix` 复核这两个数：HAL 通道数与音频源。
+        val rec = openRecord() ?: return false
+        channels = HAL_CHANNELS
 
         if (enablePlatformEffects) attachEffects(rec.audioSessionId) else {
+            // ⚠️ 不挂平台效果链时，软件增益必须自己顶上（见类注释）。
             pre.softwareAgc = true
-            Log.i(TAG, "平台效果：本次**刻意不挂**（自检模式，避免 AEC 消掉回环）")
+            Log.i(TAG, "平台效果：本次**不挂**（NS/AGC/AEC 会把麦克风信号压到近零）")
         }
 
         record = rec
@@ -164,51 +192,46 @@ class AudioCapture(
     /**
      * 打开采集设备。
      *
-     * 先试**立体声**（本机 HAL 实测给 2ch），失败再回退单声道。
+     * ⚠️ **只请求 mono** —— 本机 HAL 不支持立体声录音（请求 stereo 读到的全是 0，
+     *    实测见 [start] 里的矩阵表）。
      *
-     * @return (AudioRecord, 使用的通道数)；都打不开时返回 null
+     * @return 打开成功的 [AudioRecord]；失败返回 null
      */
-    private fun openRecord(): Pair<AudioRecord, Int>? {
-        for (ch in intArrayOf(CHANNELS_STEREO, CHANNELS_MONO)) {
-            val channelMask =
-                if (ch == CHANNELS_STEREO) AudioFormat.CHANNEL_IN_STEREO else AudioFormat.CHANNEL_IN_MONO
-
-            val minBuf = AudioRecord.getMinBufferSize(
-                SAMPLE_RATE,
-                channelMask,
-                AudioFormat.ENCODING_PCM_16BIT
-            )
-            if (minBuf <= 0) {
-                Log.w(TAG, "getMinBufferSize 失败（${ch}ch）: $minBuf")
-                continue
-            }
-
-            // 缓冲给 4 帧，留够抖动余量：只给 1 帧的话，一次 GC 停顿就会丢采样，
-            // 丢采样在 Opus 里表现为"咔"一声，服务端 ASR 会听到半个字。
-            val bufBytes = maxOf(minBuf, FRAME_SAMPLES * 2 * ch * 4)
-
-            val rec = try {
-                AudioRecord(
-                    MediaRecorder.AudioSource.VOICE_RECOGNITION,
-                    SAMPLE_RATE,
-                    channelMask,
-                    AudioFormat.ENCODING_PCM_16BIT,
-                    bufBytes
-                )
-            } catch (e: Exception) {
-                Log.w(TAG, "创建 ${ch}ch AudioRecord 失败: ${e.message}")
-                null
-            } ?: continue
-
-            if (rec.state != AudioRecord.STATE_INITIALIZED) {
-                Log.w(TAG, "${ch}ch AudioRecord 未初始化（麦克风多半被别的进程占着）state=${rec.state}")
-                rec.release()
-                continue
-            }
-            Log.i(TAG, "采集通道：${ch}ch（HAL 协商结果）")
-            return rec to ch
+    private fun openRecord(): AudioRecord? {
+        val minBuf = AudioRecord.getMinBufferSize(
+            SAMPLE_RATE,
+            AudioFormat.CHANNEL_IN_MONO,
+            AudioFormat.ENCODING_PCM_16BIT
+        )
+        if (minBuf <= 0) {
+            Log.e(TAG, "getMinBufferSize 失败: $minBuf")
+            return null
         }
-        return null
+
+        // 缓冲给 4 帧，留够抖动余量：只给 1 帧的话，一次 GC 停顿就会丢采样，
+        // 丢采样在 Opus 里表现为"咔"一声，服务端 ASR 会听到半个字。
+        val bufBytes = maxOf(minBuf, FRAME_SAMPLES * 2 * HAL_CHANNELS * 4)
+
+        val rec = try {
+            AudioRecord(
+                MediaRecorder.AudioSource.VOICE_RECOGNITION,
+                SAMPLE_RATE,
+                AudioFormat.CHANNEL_IN_MONO,
+                AudioFormat.ENCODING_PCM_16BIT,
+                bufBytes
+            )
+        } catch (e: Exception) {
+            Log.e(TAG, "创建 AudioRecord 失败: ${e.message}", e)
+            return null
+        }
+
+        if (rec.state != AudioRecord.STATE_INITIALIZED) {
+            Log.e(TAG, "AudioRecord 未初始化（麦克风多半被别的进程占着）state=${rec.state}")
+            rec.release()
+            return null
+        }
+        Log.i(TAG, "采集通道：请求 mono，HAL 实际 ${HAL_CHANNELS}ch（读 ${FRAME_SAMPLES * HAL_CHANNELS} short/帧 → 抽左声道）")
+        return rec
     }
 
     private fun captureLoop(rec: AudioRecord) {
@@ -348,11 +371,18 @@ class AudioCapture(
         /** 每帧采样数：16000 × 0.06 = 960。 */
         const val FRAME_SAMPLES = SAMPLE_RATE * FRAME_MS / 1000
 
-        /** 立体声通道数。 */
-        const val CHANNELS_STEREO = 2
-
-        /** 单声道通道数。 */
-        const val CHANNELS_MONO = 1
+        /**
+         * **HAL 实际给的通道数**（不是我们请求的）。
+         *
+         * 实机（MTK8167A + 厂商 HAL）：请求 mono，HAL 回的是**交错双声道**
+         * （hw_params: `channels: 2`），framework 不做 downmix。
+         * ⇒ 每帧要读 `FRAME_SAMPLES × HAL_CHANNELS` 个 short，再抽左声道，
+         *   才还原出真正的 60ms 单声道。
+         *
+         * ⚠️ 换设备先用 `mic_matrix` 复核这个数：请求 stereo 在本机读到的
+         *    全是 0（ALSA PREPARED + "input device already opened"）。
+         */
+        const val HAL_CHANNELS = 2
 
         /**
          * 从交错的多声道数据里取**左声道**，还原成单声道。

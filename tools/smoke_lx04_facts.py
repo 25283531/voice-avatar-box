@@ -370,16 +370,23 @@ def run(root: Path) -> int:
     loop_body = fn_body(cap_code, "captureLoop")
     open_body = fn_body(cap_code, "openRecord")
     check(
-        "8k 采集按协商到的通道数读，并抽左声道还原成 60ms 单声道",
-        "CHANNEL_IN_STEREO" in cap_code
+        "8k 每帧按 HAL 通道数读，再抽左声道还原成 60ms 单声道",
+        "HAL_CHANNELS" in cap_code
         and "extractLeftChannel" in loop_body
-        and re.search(r"ShortArray\s*\(\s*FRAME_SAMPLES\s*\*\s*ch\s*\)", loop_body) is not None,
-        "按 mono 读双声道 HAL ⇒ 交错数据 + 每帧只 30ms，声音慢一倍",
+        and re.search(r"ShortArray\s*\(\s*FRAME_SAMPLES\s*\*\s*ch\s*\)", loop_body) is not None
+        and re.search(r"FRAME_SAMPLES\s*\*\s*2\s*\*\s*HAL_CHANNELS", cap_code) is not None,
+        "HAL 是交错双声道：每帧只读 960 个 short 就只覆盖 30ms，声音慢一倍",
     )
     check(
-        "8l 通道协商要有单声道回退（不能只认立体声）",
-        "CHANNELS_STEREO" in open_body and "CHANNELS_MONO" in open_body,
-        "只支持单声道的设备上会直接采不到帧",
+        "8l 不许请求 CHANNEL_IN_STEREO（本机 HAL 不支持，读到的全是 0）",
+        "CHANNEL_IN_STEREO" not in cap_code,
+        "实机矩阵：所有 2ch 组合 rms=0（ALSA PREPARED + 'input device already opened'），"
+        "1ch 组合才有信号",
+    )
+    check(
+        "8u 生产采集不许挂平台 NS/AGC/AEC（会把信号压到近零并毒死 Opus 编码）",
+        re.search(r"enablePlatformEffects\s*:\s*Boolean\s*=\s*false", cap_code) is not None,
+        "挂平台效果链 ⇒ rms 5~80 且 Opus 100% 触发 Inlines.OpusAssert（真机实测）",
     )
     check(
         "8m 必须留有实机编码探针命令 enc_probe",
