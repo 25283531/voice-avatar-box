@@ -4,7 +4,6 @@ import android.util.Log
 import org.concentus.OpusApplication
 import org.concentus.OpusDecoder
 import org.concentus.OpusEncoder
-import org.concentus.OpusException
 
 /**
  * Opus 编解码 —— 纯 Java（Concentus），不带任何 `.so`。
@@ -34,12 +33,20 @@ import org.concentus.OpusException
  * 代价是 CPU —— 16kHz 单声道编码在 A53 上实测约 3~6% 单核，
  * 对话是间歇的，可以接受。
  *
- * ## 线程模型
+ * ## 线程模型：为什么这里必须加锁
  *
- * 编码器/解码器**都不是线程安全的**，各自只被一个线程用：
- *   · 编码器：采集线程
- *   · 解码器：播放线程
- * 所以不加锁 —— 加锁反而会在音频线程上制造抖动。
+ * Concentus **不是线程安全**的：编码器/解码器内部各有可变状态
+ * （SILK 的自适应分析状态、重采样器的历史缓冲）。
+ * 两个线程同时踩一个实例，内部状态就会被写成不一致的值，
+ * 随后在 `Resampler.silk_resampler` / `Autocorrelation.silk_warped_autocorrelation`
+ * 的断言里炸出来（`Inlines.OpusAssert` → `AssertionError`，message 为 null）。
+ *
+ * 实机上这个窗口真实存在：`AudioCapture.stop()` 的 `join(300)` 有超时，
+ * 旧采集线程可能还活着；下一次按键又起一个新采集线程。
+ * 两个线程同时调 [encode] ⇒ 同一个编码器被并发踩 ⇒ 整轮会话一帧都发不出去。
+ *
+ * 所以 [encode] / [decode] / [init] 全部在**同一把锁**（`this`）上：
+ * 锁的粒度是"一帧"，在音频线程上的开销可以忽略（远小于一帧 60ms）。
  */
 class OpusCodec {
 
@@ -47,6 +54,7 @@ class OpusCodec {
     private val encRate = 16_000
 
     /** 下行采样率：取服务端 hello 里声明的值，默认 24k。 */
+    @Volatile
     private var decRate = 24_000
 
     /** 每帧时长（ms），协议固定 60。 */
@@ -58,11 +66,41 @@ class OpusCodec {
     /** 下行每帧采样数（随 decRate 变）。 */
     val decodeFrameSamples: Int get() = decRate * frameMs / 1000
 
+    @Volatile
     private var encoder: OpusEncoder? = null
+
+    @Volatile
     private var decoder: OpusDecoder? = null
 
     /** 复用的输出缓冲，避免每帧 new（每秒 16 帧 × 2 方向）。 */
     private var encBuf = ByteArray(MAX_OPUS_BYTES)
+
+    // ---------------------------------------------------------------- 可观测计数
+    //
+    // 为什么必须有：症状是"按了没反应"，但链路上有 6 个环节可能断
+    // （麦克风 → 前处理 → 编码 → 上行 WS → 服务端待机 → ASR/TTS）。
+    // 光看"没声音"分不清是哪一环。装机后跑一次 opus_selftest，
+    // 看这几行就能定位到具体环节 —— 不用再靠猜。
+
+    /** 成功编码并交给上层的帧数。 */
+    @Volatile
+    var encodedFrames: Int = 0
+        private set
+
+    /** 编码彻底失败（重建后重试仍失败）的帧数。 */
+    @Volatile
+    var encodeFailures: Int = 0
+        private set
+
+    /** 编码失败后**重建编码器并重试成功**的次数 —— 自愈命中数。 */
+    @Volatile
+    var encodeRecoveries: Int = 0
+        private set
+
+    /** 成功解码的帧数。 */
+    @Volatile
+    var decodedFrames: Int = 0
+        private set
 
     /**
      * 初始化。可以重复调用（比如 hello 里声明的采样率和默认值不同）。
@@ -71,38 +109,64 @@ class OpusCodec {
      */
     @Synchronized
     fun init(outputSampleRate: Int = 24_000) {
-        decRate = if (outputSampleRate in VALID_RATES) outputSampleRate else 24_000
-        runCatching {
-            encoder = OpusEncoder(encRate, 1, OpusApplication.OPUS_APPLICATION_VOIP).apply {
-                // 语音用 VOIP 模式（不是 AUDIO）—— 它会开 DTX/VAD 相关的优化，
-                // 对老人这种"慢速、有停顿"的说话节奏更友好。
-                //
-                // 码率 24kbps：16kHz 单声道语音的甜点。再低 ASR 掉字，
-                // 再高在 1M 内存的设备上没必要（而且上行带宽也是成本）。
-                //
-                // ⚠️ 这里必须注意 Concentus 的 API 风格：它是 C# 移植过来的，
-                //    全部用 Java 的 getXxx/setXxx，**不是** Kotlin 属性。
-                //    Kotlin 只在「getter + setter 成对存在」时才合成属性：
-                //      · bitrate    ✅ getBitrate/setBitrate 都在
-                //      · complexity ✅ getComplexity/setComplexity 都在
-                //      · useVBR     ✅ 注意是 getUseVBR/setUseVBR（大写 VBR）
-                //      · setUseDTX  ❌ 只有 setter 没有 getter，只能当方法调
-                //    写成 `useVbr` / `useDtx` 会直接 Unresolved reference。
-                bitrate = 24_000
-                useVBR = true
-                // 关掉 DTX：服务端的静音看门狗按"有没有收到帧"判断，
-                // 我们这边用 VAD 决定发不发，不需要编码器再吞帧。
-                setUseDTX(false)
-                complexity = 5
-            }
-            decoder = OpusDecoder(decRate, 1)
-            Log.i(TAG, "Opus 初始化完成：上行 ${encRate}Hz/${frameMs}ms，" +
-                "下行 ${decRate}Hz/${frameMs}ms（纯 Java 实现）")
-        }.onFailure {
-            Log.e(TAG, "Opus 初始化失败: ${it.message}", it)
-            encoder = null
-            decoder = null
+        val newDecRate = if (outputSampleRate in VALID_RATES) outputSampleRate else 24_000
+
+        // ⚠️ 编码器与解码器**分别**构造，别塞进同一个 runCatching。
+        //    曾经它们共用一个：解码器一抛异常（采样率不被支持之类），
+        //    编码器也被一起置 null —— 上行音频就此全灭，而日志上只看得见
+        //    "解码失败"，完全看不出是它连累了编码器。
+        //    两个方向是两条独立的链路，必须各自成败。
+        if (encoder == null) {
+            encoder = createEncoder()
         }
+        if (decoder == null || newDecRate != decRate) {
+            decRate = newDecRate
+            decoder = createDecoder()
+        }
+
+        Log.i(
+            TAG,
+            "Opus 初始化完成：上行 ${encRate}Hz/${frameMs}ms，下行 ${decRate}Hz/${frameMs}ms（纯 Java 实现）" +
+                " 编码器=${if (encoder != null) "就绪" else "不可用"}" +
+                " 解码器=${if (decoder != null) "就绪" else "不可用"}"
+        )
+    }
+
+    /** 造一个编码器。失败返回 null，不影响解码器。 */
+    private fun createEncoder(): OpusEncoder? = try {
+        OpusEncoder(encRate, 1, OpusApplication.OPUS_APPLICATION_VOIP).apply {
+            // 语音用 VOIP 模式（不是 AUDIO）—— 它会开 DTX/VAD 相关的优化，
+            // 对老人这种"慢速、有停顿"的说话节奏更友好。
+            //
+            // 码率 24kbps：16kHz 单声道语音的甜点。再低 ASR 掉字，
+            // 再高在 1M 内存的设备上没必要（而且上行带宽也是成本）。
+            //
+            // ⚠️ 这里必须注意 Concentus 的 API 风格：它是 C# 移植过来的，
+            //    全部用 Java 的 getXxx/setXxx，**不是** Kotlin 属性。
+            //    Kotlin 只在「getter + setter 成对存在」时才合成属性：
+            //      · bitrate    ✅ getBitrate/setBitrate 都在
+            //      · complexity ✅ getComplexity/setComplexity 都在
+            //      · useVBR     ✅ 注意是 getUseVBR/setUseVBR（大写 VBR）
+            //      · setUseDTX  ❌ 只有 setter 没有 getter，只能当方法调
+            //    写成 `useVbr` / `useDtx` 会直接 Unresolved reference。
+            bitrate = 24_000
+            useVBR = true
+            // 关掉 DTX：服务端的静音看门狗按"有没有收到帧"判断，
+            // 我们这边用 VAD 决定发不发，不需要编码器再吞帧。
+            setUseDTX(false)
+            complexity = 5
+        }
+    } catch (t: Throwable) {
+        Log.e(TAG, "编码器构造失败: ${t.javaClass.name}: ${t.message}", t)
+        null
+    }
+
+    /** 造一个解码器。失败返回 null，不影响编码器。 */
+    private fun createDecoder(): OpusDecoder? = try {
+        OpusDecoder(decRate, 1)
+    } catch (t: Throwable) {
+        Log.e(TAG, "解码器构造失败（${decRate}Hz）: ${t.javaClass.name}: ${t.message}", t)
+        null
     }
 
     /**
@@ -112,16 +176,14 @@ class OpusCodec {
      * @return Opus 裸包；编码器不可用时返回 null（上层跳过这一帧，不要崩）
      */
     fun encode(pcm: ShortArray): ByteArray? {
-        // ⚠️ 必须同步。
-        //    Concentus 明确不是线程安全的，而 SILK 的内部状态一旦被两个线程
-        //    同时踩，就会在 Resampler / Autocorrelation 的断言里炸出来
-        //    （实机堆栈就是这样）。正常情况下采集线程只有一个调用者，
-        //    但"旧 capture 还没退干净、新 capture 已经起来"的窗口是存在的 ——
-        //    按住说话反复按几下就能撞上。加锁的代价在音频线程上可以忽略。
+        // ⚠️ 必须同步（理由见类注释的「线程模型」）。
+        //    实机堆栈就是 Concentus 断言在 Resampler / Autocorrelation 上炸，
+        //    而它的成因就是两个线程同时踩同一个编码器。
         synchronized(this) {
             val enc = encoder ?: return null
             if (pcm.size < encodeFrameSamples) return null
-            return try {
+
+            try {
                 val n = enc.encode(pcm, 0, encodeFrameSamples, encBuf, 0, encBuf.size)
                 if (n <= 0) {
                     // DTX 或"这一帧没有可发的数据"都会返回 0。不是错误，
@@ -129,15 +191,61 @@ class OpusCodec {
                     logOnce("编码返回 $n（非正值，跳过该帧）", null)
                     return null
                 }
-                encBuf.copyOf(n)
+                encodedFrames++
+                return encBuf.copyOf(n)
             } catch (t: Throwable) {
                 // ⚠️ 必须打**类名 + 堆栈**。OpusException 的 message 是有内容的，
                 //    而 NPE / AssertionError 的 message 是 null ——
                 //    只打 message 会得到一行无用的"编码失败: null"。
-                logOnce("编码失败 ${t.javaClass.name}: ${t.message}", t)
-                null
+                //
+                // ⚠️ 自愈：一次失败**不等于**这轮对话完了。
+                //    Concentus 编码器一旦踩坏（断言触发后内部状态已经不一致），
+                //    后续每一帧都会在同一处炸 —— 表现是"整个会话一帧都发不出去"，
+                //    而日志上只有最初那 3 行（logOnce 用完了），后面全是静默。
+                //    所以失败后**重建编码器再试一次**：断言的含义是"这一次的状态
+                //    坏了"，换一个新实例就干净了。
+                logOnce("编码失败 ${t.javaClass.name}: ${t.message} —— 重建编码器后重试一次", t)
+
+                val fresh = rebuildEncoder()
+                if (fresh == null) {
+                    // 连重建都失败：编码器这条路彻底断了，如实计数。
+                    encodeFailures++
+                    return null
+                }
+                encodeRecoveries++
+
+                return try {
+                    val n = fresh.encode(pcm, 0, encodeFrameSamples, encBuf, 0, encBuf.size)
+                    if (n <= 0) {
+                        encodeFailures++
+                        logOnce("重建后编码返回 $n（非正值，跳过该帧）", null)
+                        return null
+                    }
+                    encodedFrames++
+                    encBuf.copyOf(n)
+                } catch (t2: Throwable) {
+                    encodeFailures++
+                    logOnce("重建后仍编码失败 ${t2.javaClass.name}: ${t2.message}", t2)
+                    null
+                }
             }
         }
+    }
+
+    /**
+     * 重建编码器 —— 自愈路径。
+     *
+     * 必须在 [encode] 的锁内调用（它改写 [encoder] 字段）。
+     */
+    private fun rebuildEncoder(): OpusEncoder? {
+        val fresh = createEncoder()
+        if (fresh == null) {
+            // 重建也失败：把旧的也丢掉，避免继续用一个已知坏掉的实例。
+            encoder = null
+            return null
+        }
+        encoder = fresh
+        return fresh
     }
 
     /** 编码器当前参数 —— 自检时打出来，一眼看出是不是初始化没生效。 */
@@ -150,6 +258,11 @@ class OpusCodec {
             "下行 ${decodeFrameSamples}@${decRate}Hz"
     }
 
+    /** 计数快照 —— 自检/日志用，一行看清"到底有没有帧流出去"。 */
+    @Synchronized
+    fun stats(): String =
+        "编码成功 $encodedFrames 帧 / 彻底失败 $encodeFailures 帧 / 自愈 $encodeRecoveries 次 / 解码 $decodedFrames 帧"
+
     /** 重新允许打失败日志（自检前调用，否则前面用完了就看不到堆栈）。 */
     @Synchronized
     fun resetDiag() {
@@ -158,6 +271,7 @@ class OpusCodec {
 
     /** 失败日志只打前几次，避免每 60ms 刷一行把 logcat 冲掉。 */
     private var failLogged = 0
+
     private fun logOnce(msg: String, t: Throwable?) {
         if (failLogged >= 3) return
         failLogged++
@@ -172,14 +286,21 @@ class OpusCodec {
      * @return 实际解出的采样数；失败返回 0
      */
     fun decode(data: ByteArray, out: ShortArray): Int {
-        val dec = decoder ?: return 0
-        return runCatching {
-            dec.decode(data, 0, data.size, out, 0, decodeFrameSamples, false)
-        }.onFailure {
-            // 丢一帧不会影响后续 —— Opus 有丢包隐藏（PLC），
-            // 这里直接按"这一帧没有"处理，不要因为一帧坏掉就重启整条链路。
-            Log.w(TAG, "解码失败（丢弃该帧）: ${it.message}")
-        }.getOrDefault(0)
+        // ⚠️ 同样必须加锁：解码器也是 Concentus 的非线程安全实例，
+        //    而 [init] 会在另一个线程（OkHttp）上替换它。
+        synchronized(this) {
+            val dec = decoder ?: return 0
+            return try {
+                val n = dec.decode(data, 0, data.size, out, 0, decodeFrameSamples, false)
+                if (n > 0) decodedFrames++
+                n
+            } catch (t: Throwable) {
+                // 丢一帧不会影响后续 —— Opus 有丢包隐藏（PLC），
+                // 这里直接按"这一帧没有"处理，不要因为一帧坏掉就重启整条链路。
+                Log.w(TAG, "解码失败（丢弃该帧）: ${t.javaClass.name}: ${t.message}")
+                0
+            }
+        }
     }
 
     @Synchronized

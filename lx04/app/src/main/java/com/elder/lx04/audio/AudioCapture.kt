@@ -167,7 +167,14 @@ class AudioCapture(
                     if (n == AudioRecord.ERROR_INVALID_OPERATION ||
                         n == AudioRecord.ERROR_BAD_VALUE
                     ) {
-                        Log.e(TAG, "read 返回 $n，采集链路已断")
+                        // ⚠️ `rec.stop()` 之后阻塞中的 read 就会返回
+                        //    ERROR_INVALID_OPERATION —— 那是**我们自己在停**，
+                        //    不是"采集链路断了"。两者必须分开：
+                        //    混为一谈会让每次正常停止都打一条
+                        //    "采集链路已断" 的假警报，真出事时反而看不见。
+                        if (running) {
+                            Log.e(TAG, "read 返回 $n，采集链路已断")
+                        }
                         running = false
                         return
                     }
@@ -213,10 +220,41 @@ class AudioCapture(
     /** 停止并释放。 */
     fun stop() {
         running = false
-        worker?.let { runCatching { it.join(300) } }
-        worker = null
 
+        // ⚠️⚠️ 顺序要紧：**先停 AudioRecord，再 join 采集线程**。
+        //
+        //    反过来（先 join 再 stop）会留下一个真正的竞态窗口：
+        //    采集线程正阻塞在 `rec.read()` 里（等满一帧 960 采样），
+        //    它**不会**因为 `running=false` 就立刻醒 —— 标志只在 read
+        //    返回之后才被检查。于是 join(300) 常常是**超时返回**的，
+        //    旧采集线程还活着；而调用方紧接着就起了新采集线程，
+        //    两个线程同时调 `opus.encode()` 踩同一个 Concentus 编码器
+        //    ⇒ 内部状态写乱 ⇒ 下一帧在 `Resampler.silk_resampler` /
+        //    `Autocorrelation.silk_warped_autocorrelation` 的断言里炸
+        //    ⇒ `编码失败: null` ⇒ 整轮会话一帧都发不出去。
+        //
+        //    实机堆栈就是这个形状，而 JVM 单测永远测不到它
+        //    （单测里没有"旧线程还活着"这件事）。
+        //
+        //    `rec.stop()` 会让阻塞中的 read 立刻返回错误码，
+        //    采集线程随即看到 running=false 退出 —— 这才是"确定退出"。
         runCatching { record?.stop() }
+
+        val t = worker
+        worker = null
+        val joined = t?.let {
+            runCatching { it.join(JOIN_TIMEOUT_MS) }.getOrDefault(false)
+        } ?: true
+        if (!joined) {
+            // ⚠️ 不要静默。旧线程活着 = 两个线程踩同一个编码器 =
+            //    下一轮必然"编码失败: null"。这条日志就是现场的证据。
+            Log.e(
+                TAG,
+                "采集线程 ${JOIN_TIMEOUT_MS}ms 内没退出（旧线程可能仍活着，" +
+                    "会与新线程并发踩同一个 Opus 编码器）"
+            )
+        }
+
         runCatching { record?.release() }
         record = null
 
@@ -241,5 +279,14 @@ class AudioCapture(
 
         /** 每帧采样数：16000 × 0.06 = 960。 */
         const val FRAME_SAMPLES = SAMPLE_RATE * FRAME_MS / 1000
+
+        /**
+         * 等待采集线程退出的超时（毫秒）。
+         *
+         * 一帧是 60ms，`rec.stop()` 之后阻塞中的 read 最多再等一帧就该返回，
+         * 所以 500ms 是"确定能退出"的上限余量。超时了要报警而不是静默
+         * —— 见 [stop] 里的说明。
+         */
+        private const val JOIN_TIMEOUT_MS = 500L
     }
 }

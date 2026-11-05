@@ -184,9 +184,38 @@ class VoiceClient(
     /** 说完了 —— 服务端据此触发 ASR → LLM → TTS。 */
     fun listenStop() = sendJson("""{"type":"listen","state":"stop"}""")
 
-    /** 唤醒词命中通知（服务端只记日志 + 排唤醒应答）。 */
-    fun listenDetect(word: String) =
-        sendJson("""{"type":"listen","state":"detect","text":"$word"}""")
+    /**
+     * 唤醒词通知。
+     *
+     * @param word  唤醒词文本，只用于服务端日志。
+     * @param greet 是否要服务端播唤醒应答。
+     *
+     * ⚠️ **按键唤醒必须传 `greet = false`**（与服务端固件同一套语义）。
+     *
+     * 服务端 `_on_listen` 的 detect 分支里：
+     * ```
+     * no_greet = obj.get("greet") is False
+     * ```
+     * 缺省必须**照旧应答**（缺省 ≠ 不要），所以要"不应答"就必须显式带
+     * `"greet": false`。判据用 `is False` 而不是 `not obj.get("greet")`。
+     *
+     * 为什么按键唤醒不应答：老人按下键就是要说话，服务端若回一句
+     * 「你好，要聊点什么？」，设备会转成 Speaking、上行音频被丢弃，
+     * 他刚开口的字就没了 —— 正是现场反馈里的「前面两个字没识别到」。
+     *
+     * @see server/app/voice/session.py `_on_listen` 的 `state == "detect"` 分支
+     * @see firmware/xiaozhi/main/application.cc:1007-1013（固件的同一处理）
+     */
+    fun listenDetect(word: String, greet: Boolean = true) {
+        // ⚠️ 手拼 JSON 有引号注入风险（word 将来可能带引号），
+        //    这里用 JSONObject 拼，字段顺序无所谓。
+        val obj = JSONObject()
+        obj.put("type", "listen")
+        obj.put("state", "detect")
+        obj.put("text", word)
+        if (!greet) obj.put("greet", false)
+        sendJson(obj.toString())
+    }
 
     /** 打断当前播报。 */
     fun abort() = sendJson("""{"type":"abort"}""")

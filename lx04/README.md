@@ -9,8 +9,12 @@
 
 ## 为什么是 Android 应用而不是固件
 
-LX04 是 **Android 设备**（MTK MT8167A / Android 8.1 / 480×800），不是 ESP32。
+LX04 是 **Android 设备**（MTK MT8167A / Android 8.1 / **800×480 横屏 / 240dpi**），不是 ESP32。
 所以移植 = 写一个原生 App + 把系统换成最小集，**不是**重编固件。
+
+> 硬件事实（屏幕、按键 KeyCode、包名、麦克风占用）**只认**
+> [`docs/lx04/实机验证结果.md`](../docs/lx04/实机验证结果.md)。
+> 移植前的调研资料写的是 480×800 竖屏，实机已推翻，别再照它算布局。
 
 详见 [`docs/lx04/LX04移植方案.md`](../docs/lx04/LX04移植方案.md)。
 
@@ -41,10 +45,10 @@ lx04/
 
 | 需求 | 实现 | 状态 |
 | --- | --- | --- |
-| 开机直接进我们的系统，不进小爱桌面 | Manifest 注册 `MAIN+HOME+DEFAULT` + `BootReceiver` + `deploy.sh takeover` | ✅ 代码就绪，待实机验证 |
-| 可以直接语音唤醒 | 自建 `AudioRecord` 采集 + 唤醒词（不走小爱的私有唤醒引擎） | 🚧 阶段 1 |
-| 音量± 保留、中间键 = 服药确认 | `dispatchKeyEvent`：音量键**不消费**（交给系统），中间键吃掉事件并驱动确认状态机 | ✅ 代码就绪，**中间键 KeyCode 待实机确认** |
-| 取消事件灯/状态灯，改为屏幕两侧 5mm 色带 | `LedBandView` 左右各画一条；灯效语义 1:1 移植自固件 | ✅ 代码就绪 |
+| 开机直接进我们的系统，不进小爱桌面 | Manifest 注册 `MAIN+HOME+DEFAULT` + `BootReceiver` + `deploy.sh takeover` | ✅ 代码就绪；HOME 接管**尚未在实机执行** |
+| 可以直接语音唤醒 | 自建 `AudioRecord` 采集 + 唤醒词（不走小爱的私有唤醒引擎） | 🚧 采集/Opus/WS 已接上，**唤醒词模型未接**；当前是按住中间键说话（PTT）。2026-11-05 定位并修复了「按了没答复」的两个断点（编码器并发踩踏 + 服务端待机看门狗），**待装机复验**，详见 `docs/lx04/实机验证结果.md` 第九节 |
+| 音量± 保留、中间键 = 服药确认 | `dispatchKeyEvent`：音量键**不消费**（交给系统），中间键吃掉事件并驱动确认状态机 | ✅ 实机确认：原厂上报 `KEY_POWER`，已用 keylayout 重映射为 **`KEYCODE_F1`**，App 只认 F1 |
+| 取消事件灯/状态灯，改为屏幕两侧 5mm 色带 | `LedBandView` 左右各画一条；灯效语义 1:1 移植自固件 | ✅ 实机 800×480 / 240dpi ⇒ 5mm ≈ **47px**，按 density 动态折算 |
 
 ---
 
@@ -91,28 +95,34 @@ cd lx04
 
 ## ⚠️ 部署前必读
 
-### 1. 中间键的 KeyCode 必须实测
+### 1. 中间键：结论已实测，别再猜（2026-11-04）
 
-**不能猜。** 猜成 `KEYCODE_POWER` 的后果是老人长按服药键把音箱关了。
-猜成 `KEYCODE_HOME` 的后果是我们的默认桌面被自己触发。
+原厂上报 `KEY_POWER`，**应用层拦不住**（`interceptKeyBeforeQueueing` 就吃掉了），
+长按会弹关机菜单。已通过 `/system/usr/keylayout/mtk-pmic-keys.kl` 重映射成
+`KEYCODE_F1`，`TopKeys.CONFIRM_KEY_CODES` 只认 F1。
+
+**装机前必须确认 keylayout 真的刷进去了** —— 没刷的话按确认键毫无反应
+（这是刻意的：宁可没反应，也不能按一下就熄屏）：
 
 ```bash
-adb shell getevent -lt
-# 依次按 音量+ → 音量- → 中间键，记录 keycode
+adb shell dumpsys input | grep -A2 mtk-pmic-keys   # KeyLayoutFile 应指向 mtk-pmic-keys.kl
+adb shell getevent -lt /dev/input/event1          # 内核仍上报 116 属正常
 ```
 
-然后填进 `TopKeys.CONFIRM_KEY_CODES`（收敛为单一值）。
-
-### 2. 小爱桌面包名必须实测
+### 2. 小爱桌面与麦克风占用：结论已实测
 
 ```bash
 adb shell pm list packages | grep -iE "launcher|xiaomi|voice|mico"
 ```
 
-填进 `deploy.sh` 的 `XIAOMI_LAUNCHER_PACKAGES`：
+- 桌面包名 `com.xiaomi.micolauncher` 已填进 `deploy.sh` 的
+  `XIAOMI_LAUNCHER_PACKAGES`；**小爱语音没有独立包**，就在这个进程里
+- ⚠️ 麦克风被 init 服务 **`mivpm`**（`/system/bin/MiVpmService`）常驻占用。
+  `am force-stop micolauncher` **不能**释放它，必须 `stop mivpm` 才能录音。
+  永久禁用见 `deploy.sh takeover` 与 `实机验证结果.md` 第四节
 
 ```bash
-XIAOMI_LAUNCHER_PACKAGES='com.xiaomi.xxx,com.yyy.zzz' ./scripts/deploy.sh takeover
+XIAOMI_LAUNCHER_PACKAGES='com.xiaomi.micolauncher' ./scripts/deploy.sh takeover
 ```
 
 ### 3. 刷机前整盘备份
@@ -140,6 +150,6 @@ LX04 是 32 位用户空间。`build.gradle.kts` 里已锁 `abiFilters`，
 
 | 阶段 | 内容 | 状态 |
 | --- | --- | --- |
-| 0 | 实机探测（按键 KeyCode / 包名 / 麦克风 / 触摸方向） | 📋 [`实机验证清单.md`](../docs/lx04/实机验证清单.md) |
-| 1 | AudioRecord 采集 + Opus + WebSocket + 唤醒词 | 🚧 |
-| 2 | system 分区瘦身，彻底移除小爱 | 📋 [`LX04移植方案.md`](../docs/lx04/LX04移植方案.md) §2 |
+| 0 | 实机探测（按键 KeyCode / 包名 / 麦克风 / 触摸方向） | ✅ 12 项测完，见 [`实机验证结果.md`](../docs/lx04/实机验证结果.md)；仅 App 内点按坐标待装机复核 |
+| 1 | AudioRecord 采集 + Opus + WebSocket + 唤醒词 | 🚧 采集/编码/WS 已接上；「按了没答复」的两个断点已定位并修复（见 [`实机验证结果.md`](../docs/lx04/实机验证结果.md) 第九节），**待装机复验**；唤醒词未接；麦克风须先停 `mivpm` |
+| 2 | 装机接管 HOME + system 分区瘦身，彻底移除小爱 | 📋 [`LX04移植方案.md`](../docs/lx04/LX04移植方案.md) §2（**未实机执行**） |

@@ -361,6 +361,43 @@ class MainActivity : Activity() {
         screen.setDeviceSaid("")
         setUiState("listening")
 
+        // ⚠️⚠️ 必须**先发 detect 再发 listen start** —— 这是整条链路能不能
+        //    活下来的关键一步，顺序反了等于没发。
+        //
+        //    服务端 `_on_listen` 的两个分支是这样配合的：
+        //
+        //      · "detect" → 清 `_dismissed_until`（解除 180 秒待机冷却）
+        //                   + 刷新 `_last_active_at`（会话空闲锚点）
+        //      · "start"  → 先查 `_dismissed_until`，**还在冷却里就直接
+        //                   return**（这一轮 listen 被整个丢掉）
+        //
+        //    而 `_last_active_at` 只有两个刷新点：**有效识别**和 **detect**。
+        //    本客户端此前只发 listen start、从不发 detect，于是：
+        //
+        //      ① 会话空闲超过 120s（VOICE_IDLE_STANDBY_SEC）后，
+        //         静音看门狗在 listen start 后 0.2s 内就判"连续 120s 没有
+        //         有效内容"→ 进待机 → state 变成 idle；
+        //      ② 随后的 listen stop 走 `_finalize()`，那里第一句就是
+        //         `if self.state != "listening": return` ⇒ **不做 ASR、
+        //         不出 TTS、老人什么都听不到**；
+        //      ③ 待机还会拉起 180 秒冷却，期间连 listen start 都被忽略
+        //         （现场日志：「退下吧冷却中（还剩 149s），忽略 listen start」）。
+        //
+        //    实机生产日志（2026-11-05）实测就是这个时序：
+        //
+        //        10:21:21,280 listen start（mode=auto）
+        //        10:21:21,479 进入待机：连续 120s 没有有效内容   ← 199ms
+        //        10:21:26,156 listen stop                            ← 无 ASR
+        //
+        //    固件那边 2026-11-03 就加了同一处理（application.cc:1007-1013），
+        //    判据是 **Idle → Listening** 这一次跃迁：播报完自动回 listening
+        //    是 Speaking → Listening，不在此列 —— 那条正是冷却要挡的。
+        //
+        //    本客户端没有"自动回 listening"这条路（只有按键/调试命令会
+        //    调 beginListening），所以每次 beginListening 都对应"有人明确
+        //    让设备开始听"，发 detect 是正确的。
+        voice?.listenDetect("按键唤醒", greet = false)
+
         voice?.listenStart()
 
         val cap = AudioCapture { pcm, info ->
@@ -619,6 +656,7 @@ class MainActivity : Activity() {
                 }
             }
             sb.append("正弦 5 帧：成功 $okTone，共 $bytesTone 字节\n")
+            sb.append("计数：${opus.stats()}\n")
 
             // ---- 2. 全静音 3 帧（按住键还没开口时就是这个） ----
             var okSilent = 0
@@ -635,6 +673,77 @@ class MainActivity : Activity() {
 
             Log.i(TAG, "opus_selftest\n$sb")
             screen.setHint("Opus：正弦 $okTone/5 静音 $okSilent/3 → $verdict")
+        }
+    }
+
+    /**
+     * 语音链路自检 —— 判定"帧到底出没出客户端"。
+     *
+     * ## 为什么需要它
+     *
+     * 症状是"按了没反应"，但链路上有 6 个环节可能断：
+     *
+     * ```
+     * 麦克风 → 前处理 → Opus 编码 → WS 上行 → 服务端待机 → ASR/TTS
+     * ```
+     *
+     * 光看"没声音"分不清是哪一环断了。这个自检**不发网络包**，
+     * 只在本地跑完整条上行链：采集 → 前处理 → 编码 → 统计。
+     *
+     * 怎么读结果：
+     *
+     * ```
+     * 读到 0 帧          → 麦克风/采集这一环（多半被 mivpm 占着）
+     * 读到帧但编码 0 帧  → Opus 编码这一环（编码器坏了）
+     * 编码 0 帧但失败 0  → 编码器不可用（init 没生效）
+     * 全部正常          → 客户端没问题，断点在 WS 上行或服务端
+     * ```
+     *
+     * 用法：`adb shell am broadcast -a com.elder.lx04.DEBUG --es cmd link_test`
+     */
+    private fun runLinkTest() {
+        if (sending) {
+            Log.w(TAG, "link_test 忽略 —— 正在对话中")
+            return
+        }
+        screen.setHint("链路自检中（5 秒）…")
+
+        val frames = java.util.concurrent.atomic.AtomicInteger(0)
+        val speech = java.util.concurrent.atomic.AtomicInteger(0)
+        val encOk = java.util.concurrent.atomic.AtomicInteger(0)
+        val encNull = java.util.concurrent.atomic.AtomicInteger(0)
+        val encBytes = java.util.concurrent.atomic.AtomicInteger(0)
+
+        val cap = AudioCapture { pcm, _ ->
+            frames.incrementAndGet()
+            val enc = opus.encode(pcm)
+            if (enc == null) encNull.incrementAndGet()
+            else {
+                encOk.incrementAndGet()
+                encBytes.addAndGet(enc.size)
+            }
+        }
+        if (!cap.start()) {
+            Log.e(TAG, "link_test: 采集启动失败 —— 麦克风被占用（多半是 MiVpmService）")
+            screen.setHint("链路自检失败：麦克风打不开")
+            return
+        }
+
+        scope.launch {
+            delay(5_000)
+            cap.stop()
+
+            val f = frames.get()
+            val ok = encOk.get()
+            val bad = encNull.get()
+            val verdict = when {
+                f == 0 -> "一帧都没采到 —— 断点在麦克风/采集"
+                ok == 0 -> "采到 $f 帧但一帧都没编出来 —— 断点在 Opus 编码"
+                bad > 0 -> "编出 $ok/$f 帧，有 $bad 帧失败 —— 编码器不稳定"
+                else -> "客户端上行链完好：采 $f 帧 / 编 $ok 帧 / 共 ${encBytes.get()} 字节"
+            }
+            Log.i(TAG, "link_test：$verdict | ${opus.stats()}")
+            screen.setHint(verdict)
         }
     }
 
@@ -859,6 +968,7 @@ class MainActivity : Activity() {
             "talk" -> beginListening()
             "stop_talk" -> endListening()
             "mic_test" -> runMicTest()
+            "link_test" -> runLinkTest()
             "tone_test" -> runToneTest()
             "opus_selftest" -> runOpusSelfTest()
 
