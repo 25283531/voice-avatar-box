@@ -133,7 +133,7 @@ python tools/ci_gate_check.py      # 45 项判据，exit 0 才算绿
 - `docker-build`：合入 `main` 即自动发布 `latest`（iStoreOS 上 `docker pull ghcr.io/25283531/voice-avatar-box:latest` 即用）；也可手动触发勾选 `publish`、填 `tag`（如 `v0.1.0`）发布指定版本，产物在 ghcr 包列表
 - `app-build`：选 `both` / `h5` / `mp-weixin` → 产物在 Actions 运行页的 Artifacts
 - `android-build`：选 `self`（仓库证书签名）/ `debug` → 产物为可直接安装的 APK
-- `firmware-build`：产物 artifact 名 `elder-firmware-esp32s3`，**全新设备用 `elder-firmware-esp32s3-merged-flash.bin`**（offset `0x0`，单文件直烧）；其余 bin 是按 `flasher_args.json` 分地址烧写的备选。⚠️ **已配网的设备不要刷 merged 单文件**：它覆盖 NVS，会清掉配网与绑定 token 导致重新配网；按 [烧录指南](docs/烧录指南.md) 只刷 4 段（`0x0`/`0x8000`/`0xd000`/`0x20000`）不碰 NVS。artifact 还带 `xiaozhi.map`（崩溃 backtrace 定位）与 `SHA256SUMS.txt`
+- `firmware-build`：产物 artifact 名 `elder-firmware-esp32s3`，**全新设备用 `elder-firmware-esp32s3-merged-flash.bin`**（offset `0x0`，单文件直烧）；其余 bin 是按 `flasher_args.json` 分地址烧写的备选。⚠️ **已配网的设备不要刷 merged 单文件**：它覆盖 NVS，会清掉配网与绑定 token 导致重新配网；应只刷 bootloader / partition-table / ota_data_initial / xiaozhi.bin 这几段，**偏移一律以随包 `flasher_args.json` 为准，不要手抄地址**。`partitions/v2/16m.csv` 在 2026-10-29 把 NVS 从 16KB 扩到 64KB 后，`otadata` 已从 `0xd000` 移到 `0x19000`，照旧文档刷 `0xd000` 会写进 NVS 区、清掉提醒表与 WiFi 凭据（详见 [烧录指南](docs/烧录指南.md) 第 7 节）。artifact 还带 `xiaozhi.map`（崩溃 backtrace 定位）与 `SHA256SUMS.txt`
 
 ⚠️ **固件只有一个可信来源：Actions 里对应 commit 的 artifact。** 仓库根的 `dist/`
 是 2026-10-19 前后手工暂存的历史包（已被 `.gitignore` 忽略、未入库），里面的固件
