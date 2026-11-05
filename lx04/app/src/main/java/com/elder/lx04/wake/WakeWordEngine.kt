@@ -18,21 +18,24 @@ import com.k2fsa.sherpa.onnx.OnlineTransducerModelConfig
  * ## 为什么这样设计
  *
  * 固件侧：`EnableWakeWordDetection(true)` 后 WakeNet 常驻跑在**同一条**音频链路上，
- * 检出唤醒词才切到 ASR。LX04 上我们没有板级音频框架可以共用句柄，而
- * `AudioRecord` 在这台 HAL 上**不允许两个实例同时打开**（实机日志
- * `startInputDevice(), input device already opened`）。所以这里必须做成
- * 「唤醒采集」与「对话采集」**互斥、分时复用同一个麦克风**：
+ * 检出唤醒词才切到 ASR。LX04 上 `AudioRecord` 在这台 MTK HAL 上**不允许
+ * 两个实例同时打开**，而且释放有延迟（项目 tryMicCase 自测：立刻开下一组
+ * 必然撞 `input device already opened`，那一组读到全零，须等 1500ms）。
+ *
+ * ⇒ 所以**复用同一路 AudioRecord**，只切帧消费者，全会话零 stop/start：
  *
  * ```
- *   待机 ──(常驻 KWS 采集)──► 检出「你好小智」
+ *   待机 ──(KWS 采集 / consumer=feed)──► 检出「你好小智」
  *                              │
- *                              ├─ 立刻停掉 KWS 采集（释放麦克风）
- *                              └─ onDetected() → 服务端 detect → 对话采集
- *   对话结束 ──► resume() 重新打开 KWS 采集
+ *                              ├─ fire(): 只翻 state=PAUSED，不释放麦克风
+ *                              └─ onDetected() → detect/start → takeOver(upstream)
+ *   对话态 ──(同一路采集 / consumer=上行编码)──► 播报时继续推流
+ *   对话结束 ──► giveBack(): consumer=feed + 重建 stream，不重启 AudioRecord
  * ```
  *
- * ⚠️ 顺序不能反：先开对话采集再停 KWS 采集，会撞上 `input device already
- *    opened`，症状是唤醒后一句话都录不进去（而日志里 KWS 明明检出了）。
+ * 2026-11-06 真机实测：旧实现每次唤醒都 stop/start，HAL 报
+ * `startInputDevice(), input device already opened` / `[readThread] failed`，
+ * 上行 21 帧里 18 帧是静音、ASR 空；改用共享采集后这些全部消失。
  *
  * ## 与固件一致的两处语义
  *
@@ -81,6 +84,17 @@ class WakeWordEngine(
     private var spotter: KeywordSpotter? = null
     private var stream: OnlineStream? = null
     private var capture: AudioCapture? = null
+
+    /**
+     * 帧已被对话链路接管（共享采集模式）。
+     *
+     * 此标志为真时 [pause] / [resume] **绝不能** stop/start AudioRecord ——
+     * 播报期间设备上行还要继续推流（服务端 `_feed_barge_in` 用它判抢话打断），
+     * 一掐就回到「唤醒后说话没响应」。
+     */
+    @Volatile
+    private var shared = false
+
 
     /** 检出后的一小段静默期，避免同一句话连续触发两次。 */
     @Volatile
@@ -203,22 +217,59 @@ class WakeWordEngine(
         if (keyword != null) fire(keyword)
     }
 
-    /** 检出处理：先释放麦克风，再回调（顺序见类注释）。 */
+    /** 检出处理：**只翻状态，不释放麦克风**（顺序见类注释）。 */
     private fun fire(keyword: String) {
         val now = android.os.SystemClock.elapsedRealtime()
         if (now - lastDetectedAt < REFIRE_GUARD_MS) return
         lastDetectedAt = now
 
-        // ⚠️ 必须在回调之前把 AudioRecord 关掉：
-        //    MainActivity 会在 onDetected 里立刻创建对话采集，
-        //    两个采集并存会撞上 HAL 的 "input device already opened"。
-        stopCaptureOnly()
+        // ⚠️ 2026-11-06：这里原来 stopCaptureOnly()，MainActivity 再新建
+        //    一路对话采集。MTK HAL 释放有延迟，实测每次唤醒都撞
+        //      W/AudioALSAHardwareResourceManager: startInputDevice(), input device already opened
+        //      E/AudioALSACaptureDataProviderNormal: [readThread] failed, errno: 1
+        //    ⇒ 新采集读到全零 ⇒ 服务端 21 帧里 18 帧静音、ASR 空。
+        //    现在改为**复用这一路 AudioRecord**：只把 state 翻成 PAUSED 让
+        //    feed() 停止 decode，等 MainActivity 调 takeOver() 换消费者。
         state = State.PAUSED
 
         main.post {
-            Log.i(TAG, "唤醒词检出：$keyword（麦克风已让出）")
+            Log.i(TAG, "唤醒词检出：$keyword（复用采集，未释放麦克风）")
             onDetected(keyword)
         }
+    }
+
+    /**
+     * 把共享采集的帧消费者交给对话链路（唤醒词路径）。
+     *
+     * @return false = KWS 采集不在，调用方需降级。
+     */
+    fun takeOver(upstream: (ShortArray, com.elder.lx04.audio.AudioPreProcess.Frame) -> Unit): Boolean {
+        val cap = capture ?: return false
+        if (state == State.RELEASED) return false
+        cap.setConsumer(upstream)
+        shared = true
+        state = State.PAUSED       // feed() 会 return；采集线程继续跑
+        Log.i(TAG, "共享采集已接管：帧改送上行链路（AudioRecord 未重启）")
+        return true
+    }
+
+    /**
+     * 把消费者切回唤醒词检测，并重置流式解码器。
+     *
+     * ⚠️ 重置 stream 是必需的：对话期间那些语音还留在 KWS 解码器里，
+     *    不重置会在恢复监听的瞬间「再检出一次」，凭空多一轮唤醒应答。
+     * ⚠️ 不 stop/start AudioRecord —— 全会话零 HAL 交接。
+     */
+    fun giveBack() {
+        val cap = capture ?: return
+        cap.setConsumer { pcm, _ -> feed(pcm) }
+        shared = false
+        runCatching { stream?.release() }
+        stream = runCatching { spotter?.createStream() }.getOrNull()
+        // 刚切回时别把上一句的尾巴再检出一次
+        lastDetectedAt = android.os.SystemClock.elapsedRealtime()
+        state = State.LISTENING
+        Log.i(TAG, "共享采集已交还：帧改送唤醒词检测（AudioRecord 未重启）")
     }
 
     /**
@@ -229,6 +280,13 @@ class WakeWordEngine(
      */
     fun pause() {
         if (state == State.RELEASED) return
+        // ⚠️ 共享采集期间 TTS start 也会调到这里。若照旧 stopCaptureOnly()，
+        //    播报一开始就把上行采集掐掉，服务端 _feed_barge_in 收不到帧，
+        //    而且播报结束还得重新开麦 —— 又一次 HAL 交接。
+        if (shared) {
+            state = State.PAUSED
+            return
+        }
         stopCaptureOnly()
         state = State.PAUSED
     }
@@ -237,6 +295,9 @@ class WakeWordEngine(
     fun resume(): Boolean {
         if (state == State.RELEASED) return false
         if (state == State.LISTENING) return true
+        // 共享采集还活着：恢复监听由 giveBack() 统一负责，这里绝不能
+        // startCapture() 新建第二个 AudioRecord。
+        if (shared) return true
         if (!ensureSpotter()) return false
         runCatching { stream?.release() }
         stream = runCatching { spotter!!.createStream() }.getOrElse {

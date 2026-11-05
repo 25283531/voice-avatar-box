@@ -105,6 +105,28 @@ class AudioCapture(
 
     private val pre = AudioPreProcess(SAMPLE_RATE)
 
+    /**
+     * 当前帧消费者。
+     *
+     * ⚠️ 唤醒检出后要从 KWS 的 `feed` 切成「上行编码 + sendAudio」而
+     *    **不重启 AudioRecord**：LX04 的 HAL 释放有延迟，一 stop/start 就撞
+     *    `startInputDevice(), input device already opened` + `[readThread]
+     *    failed`，新采集读到全零（项目 tryMicCase 自测记录：必须等 1500ms）。
+     *
+     * 构造签名刻意不变（lambda 仍是最后一个参数），保住所有
+     * `AudioCapture { pcm, info -> ... }` 尾随 lambda 调用点和
+     * `return@AudioCapture` 标签 —— 改签名会让 Kotlin 编译不过。
+     * [captureLoop] 每帧取一次快照，切换是原子的、不会半帧生效。
+     */
+    @Volatile
+    private var consumer: (ShortArray, AudioPreProcess.Frame) -> Unit = onFrame
+
+    /** 切换帧消费者（采集线程安全）。 */
+    fun setConsumer(c: (ShortArray, AudioPreProcess.Frame) -> Unit) {
+        consumer = c
+    }
+
+
     private var noiseSuppressor: NoiseSuppressor? = null
     private var autoGain: AutomaticGainControl? = null
     private var echoCancel: AcousticEchoCanceler? = null
@@ -272,7 +294,10 @@ class AudioCapture(
             extractLeftChannel(buf, mono, FRAME_SAMPLES, ch)
 
             val info = pre.process(mono, FRAME_SAMPLES)
-            onFrame(mono, info)
+            // 每帧取快照：KWS ↔ 上行链路切换时不重启 AudioRecord，
+            // 也不会出现「半帧喂给旧消费者」。
+            val c = consumer
+            c(mono, info)
         }
     }
 
@@ -331,8 +356,19 @@ class AudioCapture(
         //    想知道"退干净了没有"只能看 `isAlive`。
         //    （第一版写成 `runCatching { it.join(...) }.getOrDefault(false)`，
         //      类型对不上，CI 编译直接报 Unresolved reference: !。）
+        //
+        // ⚠️ **自调用不能 join 自己**（2026-11-06 真机定位）：
+        //    VAD 收尾 `endListening()` / KWS `fire()` 都在**采集线程**里调
+        //    stop()，此时 `t === Thread.currentThread()`。`join(500)` 必然
+        //    等满 500ms 超时，于是
+        //      · 打出「采集线程 500ms 内没退出」**假警报**（日志里反复出现，
+        //        被误读成"旧线程还活着、并发踩编码器"）；
+        //      · `record?.release()` 排在 join 之后 ⇒ 麦克风句柄白占 500ms，
+        //        紧接着新建采集就撞 HAL `input device already opened`。
+        //    自调用时 `rec.stop()` 已让阻塞的 read 返回错误码，本函数在
+        //    返回后线程自然退出，不需要也不应该 join。
         var joined = true
-        if (t != null) {
+        if (t != null && t !== Thread.currentThread()) {
             runCatching { t.join(JOIN_TIMEOUT_MS) }
             joined = !t.isAlive
         }

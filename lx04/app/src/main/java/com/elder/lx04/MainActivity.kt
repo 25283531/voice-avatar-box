@@ -19,6 +19,7 @@ import android.view.View
 import android.view.WindowManager
 import android.widget.FrameLayout
 import com.elder.lx04.audio.AudioCapture
+import com.elder.lx04.audio.AudioPreProcess
 import com.elder.lx04.audio.AudioPlayer
 import com.elder.lx04.audio.OpusCodec
 import com.elder.lx04.input.ConfirmKeyDetector
@@ -102,6 +103,11 @@ class MainActivity : Activity() {
     @Volatile
     private var silentFrames = 0
 
+    /** 上行编码失败累计丢帧（诊断 Concentus OpusAssert 静默吞帧）。 */
+    @Volatile
+    private var encodeDropFrames = 0
+
+
     /**
      * 本轮是"按住说话"（PTT）。
      *
@@ -114,6 +120,34 @@ class MainActivity : Activity() {
     /** 正在播报（此时不开麦克风，半双工）。 */
     @Volatile
     private var speaking = false
+
+    /**
+     * **对话态**：唤醒后持续推流，播报完自动回听，直到服务端 standby 或本地超时。
+     *
+     * ## 为什么需要它（2026-11-06 真机实测）
+     *
+     * 固件 realtime 模式下，唤醒一次就能连续聊：播报完 Speaking→Listening
+     * 自动回听、**不关上行采集**、WakeNet 保持关闭。服务端为此写了两条兜底：
+     * `idle 态仍收到上行音频 → 重新武装监听`（session.py:1680）和
+     * `speaking 态上行帧 → _feed_barge_in`（抢话打断，session.py:1690）。
+     *
+     * 而 Android 原来的 `endListening()` / `onTtsState("stop")` 两条出口都只
+     * `wakeEngine.resume()` —— 把麦克风交回**只认「你好小智」的常驻 KWS**。
+     * 结果：老人唤醒、听到「你好，要聊点什么？」之后再说话，设备一帧都不发，
+     * 服务端日志干干净净、界面显示 idle，看起来像「设备坏了」，实际是状态机
+     * 缺了一次跃迁。生产日志 01:10:41 播报完成后到 01:22 零事件就是证据。
+     *
+     * ⚠️ 对话态期间 KWS 必须**全程 PAUSED**：LX04 的 HAL 不允许两个
+     * AudioRecord 同时打开（实测 `startInputDevice(), input device already
+     * opened`）。只有 [endConversation] 才把麦克风交回唤醒词监听。
+     */
+    @Volatile
+    private var inConversation = false
+
+    /** 对话态兜底截止时刻（elapsedRealtime），服务端 standby 失败时也不永久占麦。 */
+    @Volatile
+    private var conversationDeadlineMs = 0L
+
 
     private val keyDetector = ConfirmKeyDetector()
 
@@ -266,6 +300,10 @@ class MainActivity : Activity() {
             ledEngine.buttonPending(pending)
             if (pending) ledEngine.medPending()
         }
+        // 服务端 _enter_standby 会调 self.elder.standby（3s best-effort）。
+        // 这里必须接线：否则服务端日志写「设备已切换待机」，设备其实还停在
+        // 对话态或 KWS 半死状态，两边状态永久不一致。
+        runtime.onStandbyRequested = { runOnUiThread { endConversation() } }
         runtime.start()
 
         wakeEngine = WakeWordEngine(this) { keyword ->
@@ -278,7 +316,7 @@ class MainActivity : Activity() {
         }
         // 唤醒词路径要带 greet=true（服务端据此播一句"我在"），
         // 并且只发**一次** detect —— beginListening 内部统一发，避免重复。
-        beginListening(ptt = false, wakeSource = keyword, greet = true)
+        startConversation(keyword)
     }
 
         registerReceiver(batteryReceiver, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
@@ -430,7 +468,10 @@ class MainActivity : Activity() {
 
             override fun onDisconnected(reason: String) {
                 wsOnline = false
+                // 断线后没人会再发 standby，若不主动结束，对话态会一直占着麦
+                // 到超时。这里直接交还，重连后重新喊唤醒词即可。
                 runOnUiThread {
+                    if (inConversation) endConversation()
                     setUiState("offline")
                     screen.setHint(reason)
                 }
@@ -467,8 +508,23 @@ class MainActivity : Activity() {
                         }
                         "stop" -> {
                             speaking = false
-                            wakeEngine.resume()
-                            setUiState("idle")
+                            if (inConversation) {
+                                // 固件 Speaking→Listening：播完自动回听，
+                                // **不**重开唤醒词检测、**不**拆对话采集。
+                                // 重发 listen start 是为了让服务端
+                                // _rearm_listening 重启静音看门狗；即使这条
+                                // 丢了，持续推的上行帧也会在 idle 态兜底重新武装。
+                                silentFrames = 0
+                                conversationDeadlineMs =
+                                    SystemClock.elapsedRealtime() + CONVERSATION_MAX_MS
+                                voice?.listenStart()
+                                setUiState("listening")
+                                screen.setHint("")
+                                Log.i(TAG, "播报结束：对话态自动回听（重发 listen start）")
+                            } else {
+                                wakeEngine.resume()
+                                setUiState("idle")
+                            }
                         }
                     }
                 }
@@ -522,6 +578,24 @@ class MainActivity : Activity() {
      * （清嗓子、想说什么）稍慢一点，话还没出口就被切断了 ——
      * 表现为"按了没反应"。PTT 语义就是"按多久说多久"。
      */
+    /**
+     * **单轮**聆听（按键 PTT / 调试 talk / 提醒追问）。
+     *
+     * 这是冷路径：会 `wakeEngine.pause()` 停掉 KWS 采集、新建一路对话采集，
+     * 结束时 `resume()` 重新打开。一次会话只发生一两次，HAL 交接可接受。
+     *
+     * ⚠️ **唤醒词路径不走这里** —— 走 [startConversation]，复用 KWS 那一路
+     *    AudioRecord，不 stop/start（见那里的说明）。
+     */
+    /**
+     * **单轮**聆听（按键 PTT / 调试 talk / 提醒追问）。
+     *
+     * 这是冷路径：会 `wakeEngine.pause()` 停掉 KWS 采集、新建一路对话采集，
+     * 结束时 `resume()` 重新打开。一次会话只发生一两次，HAL 交接可接受。
+     *
+     * ⚠️ **唤醒词路径不走这里** —— 走 [startConversation]，复用 KWS 那一路
+     *    AudioRecord，不 stop/start（见那里的说明）。
+     */
     private fun beginListening(
         ptt: Boolean = false,
         /** 这一轮是谁唤醒的：按键 or 唤醒词。会原样上报给服务端做日志区分。 */
@@ -542,10 +616,8 @@ class MainActivity : Activity() {
         }
 
         // ⚠️ 必须先让出麦克风：LX04 的 HAL 不允许两个 AudioRecord 同时打开。
-        //    唤醒词路径里引擎已经自己停了，这里 pause() 是幂等的保险；
-        //    按键路径则靠这一句把常驻 KWS 采集关掉。
         //    ⚠️ 只能调一次：重复 stop/start 会让 HAL 报
-        //    `startInputDevice(), input device already opened`，采集线程交接错乱。
+        //    `startInputDevice(), input device already opened`。
         wakeEngine.pause()
 
         sending = true
@@ -555,55 +627,24 @@ class MainActivity : Activity() {
         screen.setDeviceSaid("")
         setUiState("listening")
 
-        // ⚠️⚠️ 必须**先发 detect 再发 listen start** —— 这是整条链路能不能
-        //    活下来的关键一步，顺序反了等于没发。
-        //
-        //    服务端 `_on_listen` 的两个分支是这样配合的：
-        //
-        //      · "detect" → 清 `_dismissed_until`（解除 180 秒待机冷却）
-        //                   + 刷新 `_last_active_at`（会话空闲锚点）
-        //      · "start"  → 先查 `_dismissed_until`，**还在冷却里就直接
-        //                   return**（这一轮 listen 被整个丢掉）
-        //
-        //    而 `_last_active_at` 只有两个刷新点：**有效识别**和 **detect**。
-        //    本客户端此前只发 listen start、从不发 detect，于是：
-        //
-        //      ① 会话空闲超过 120s（VOICE_IDLE_STANDBY_SEC）后，
-        //         静音看门狗在 listen start 后 0.2s 内就判"连续 120s 没有
-        //         有效内容"→ 进待机 → state 变成 idle；
-        //      ② 随后的 listen stop 走 `_finalize()`，那里第一句就是
-        //         `if self.state != "listening": return` ⇒ **不做 ASR、
-        //         不出 TTS、老人什么都听不到**；
-        //      ③ 待机还会拉起 180 秒冷却，期间连 listen start 都被忽略
-        //         （现场日志：「退下吧冷却中（还剩 149s），忽略 listen start」）。
-        //
-        //    实机生产日志（2026-11-05）实测就是这个时序：
-        //
-        //        10:21:21,280 listen start（mode=auto）
-        //        10:21:21,479 进入待机：连续 120s 没有有效内容   ← 199ms
-        //        10:21:26,156 listen stop                            ← 无 ASR
-        //
-        //    固件那边 2026-11-03 就加了同一处理（application.cc:1007-1013），
-        //    判据是 **Idle → Listening** 这一次跃迁：播报完自动回 listening
-        //    是 Speaking → Listening，不在此列 —— 那条正是冷却要挡的。
-        //
-        //    本客户端没有"自动回 listening"这条路（只有按键/调试命令会
-        //    调 beginListening），所以每次 beginListening 都对应"有人明确
-        //    让设备开始听"，发 detect 是正确的。
+        // ⚠️⚠️ 必须**先发 detect 再发 listen start** —— 服务端 `_on_listen`
+        //    detect 分支清 `_dismissed_until`（解除 180 秒待机冷却）并刷新
+        //    `_last_active_at`；start 分支若在冷却里就直接 return。顺序反了
+        //    等于没发。固件 application.cc:1007-1013 同一处理。
         voice?.listenDetect(wakeSource, greet = greet)
-
         voice?.listenStart()
 
         val cap = AudioCapture { pcm, info ->
             if (!sending) return@AudioCapture
-
-            // 上行编码（16k / 60ms / 960 采样）
-            val enc = opus.encode(pcm) ?: return@AudioCapture
+            val enc = opus.encode(pcm)
+            if (enc == null) {
+                noteEncodeDrop(info.rms)
+                return@AudioCapture
+            }
             voice?.sendAudio(enc)
 
-            // VAD 自动收尾：连续静音 1.2 秒算说完。
-            // 只在**非按住**模式下生效（见上面的 ptt 说明）。
-            if (!pttMode) {
+            // 单轮模式才用设备 VAD 收尾；播报期间不收尾（listen stop 会被丢）
+            if (!pttMode && !speaking) {
                 if (info.isSpeech) silentFrames = 0 else silentFrames++
                 if (silentFrames * AudioCapture.FRAME_MS >= SILENCE_STOP_MS) {
                     endListening()
@@ -618,9 +659,126 @@ class MainActivity : Activity() {
         }
     }
 
-    /** 说完了。 */
+    /**
+     * 唤醒词路径：进入**对话态**，复用 KWS 那一路 AudioRecord 持续推流。
+     *
+     * ## 为什么不能直接复用 beginListening()
+     *
+     * 旧实现 `WakeWordEngine.fire()` 先 `stopCaptureOnly()` 释放麦克风，
+     * `beginListening()` 再新建一路采集。MTK HAL 释放有延迟，实测每次唤醒：
+     * ```
+     * W/AudioALSAHardwareResourceManager: startInputDevice(), input device already opened
+     * E/AudioALSACaptureDataProviderNormal: [readThread] failed, errno: 1
+     * ```
+     * ⇒ 新采集读到全零 ⇒ 服务端 `21 帧 → 3 帧 / 语音=60ms / ASR 空`。
+     * 让老人唤醒后等 1.5 秒才开麦又不可接受，所以**根本不切换 AudioRecord**。
+     *
+     * ## 与固件 realtime 的语义对齐
+     *
+     * 唤醒一次就能连续聊：播报完 Speaking→Listening 自动回听、**不关上行
+     * 采集**、WakeNet 保持关闭。服务端为此写了 `idle 态收到上行帧自动
+     * _rearm_listening`（session.py:1652-1680）和 `speaking 态上行帧喂
+     * _feed_barge_in`（session.py:1690）两条兜底 —— 设备只管持续推流。
+     *
+     * ⚠️ 协议顺序：detect / start 必须在**第一批上行帧之前**发出，所以
+     *    先在主线程 sendJson，再 `takeOver()` 切消费者。
+     */
+    private fun startConversation(keyword: String) {
+        if (sending) return
+        if (!bound || voice?.isConnected != true) {
+            screen.setHint("还没连上服务器，稍等一下")
+            // fire() 已把 state 翻成 PAUSED；没连上必须把消费者交回去，
+            // 否则常驻唤醒监听会永久停摆。
+            wakeEngine.giveBack()
+            return
+        }
+
+        // ① 协议先行（采集线程此刻还在跑 feed()，但 state=PAUSED 会让它直接 return）
+        voice?.listenDetect(keyword, greet = true)
+        voice?.listenStart()
+
+        // ② 再切帧消费者：此后每 60ms 一帧走 [upstream]
+        sending = true
+        inConversation = true
+        pttMode = false
+        silentFrames = 0
+        conversationDeadlineMs = SystemClock.elapsedRealtime() + CONVERSATION_MAX_MS
+        screen.setUserSaid("")
+        screen.setDeviceSaid("")
+        setUiState("listening")
+
+        val ok = wakeEngine.takeOver { pcm, info -> upstream(pcm, info) }
+        if (!ok) {
+            // 极少数情形（KWS 采集刚好被 release）：降级到冷路径，
+            // 至少不让老人喊了完全没反应。
+            Log.e(TAG, "共享采集接管失败（KWS 采集不在），降级为单轮")
+            sending = false
+            inConversation = false
+            conversationDeadlineMs = 0L
+            beginListening(wakeSource = keyword, greet = true)
+            return
+        }
+        Log.i(TAG, "进入对话态：复用唤醒采集持续推流（零 HAL 切换）")
+    }
+
+    /** 对话态的上行帧消费者，跑在**采集线程**，不能碰 UI。 */
+    private fun upstream(pcm: ShortArray, info: AudioPreProcess.Frame) {
+        if (!sending) return
+        val enc = opus.encode(pcm)
+        if (enc == null) {
+            // ⚠️ 不能静默吞掉：Concentus 对某些真实帧会抛 OpusAssert，
+            //    encode() 返回 null ⇒ 这一帧凭空消失，服务端只看到静音。
+            noteEncodeDrop(info.rms)
+            return
+        }
+        voice?.sendAudio(enc)
+
+        // ⚠️ 对话态**不做设备本地 VAD 收尾**。端点检测交给服务端
+        //    `_silence_watchdog`（VOICE_SILENCE_MS=2000 + _has_real_speech），
+        //    它自己会 `_start_turn()` → ASR → TTS → 播完自动回 listening。
+        //    设备本地 1.2s 会在老人换气时把句子切断；更致命的是每轮
+        //    listen stop 都会累加一次「连续空识别」，3 次就把会话推进
+        //    180 秒待机冷却 —— 正是「唤醒后说话没响应」的自我复制机制。
+        if (inConversation && SystemClock.elapsedRealtime() > conversationDeadlineMs) {
+            Log.w(TAG, "对话态空闲超时，交还麦克风给唤醒词")
+            runOnUiThread { endConversation() }
+        }
+    }
+
+    /** 上行编码失败计数（诊断 Concentus OpusAssert 静默吞帧）。 */
+    private fun noteEncodeDrop(rms: Float) {
+        encodeDropFrames++
+        if (encodeDropFrames % 10 == 1) {
+            Log.w(TAG, "上行编码失败已丢 $encodeDropFrames 帧（rms=${"%.0f".format(rms)}）")
+        }
+    }
+
+    /**
+     * 结束**整个对话态**：只把帧消费者切回 KWS，**不** stop/start AudioRecord。
+     *
+     * 出口只有三个：服务端 `self.elder.standby`、本地空闲超时、调试命令。
+     * 这是全会话唯一重新打开唤醒词检测的地方，与固件 standby 里
+     * `EnableWakeWordDetection(true)` 是同一个动作。
+     */
+    private fun endConversation() {
+        if (!inConversation) return
+        inConversation = false
+        sending = false
+        pttMode = false
+        conversationDeadlineMs = 0L
+        wakeEngine.giveBack()
+        setUiState("idle")
+        screen.setHint("")
+        Log.i(TAG, "对话结束：帧消费者已切回唤醒词（AudioRecord 未重启）")
+    }
+
+    /** 说完了（单轮模式）。对话态不允许这里把采集拆掉。 */
     private fun endListening() {
         if (!sending) return
+        if (inConversation) {
+            Log.w(TAG, "对话态忽略单轮 endListening（只有 standby/超时才结束对话）")
+            return
+        }
         sending = false
         pttMode = false
         capture?.stop()
@@ -628,9 +786,6 @@ class MainActivity : Activity() {
         voice?.listenStop()
         setUiState("idle")
         screen.setHint("")
-        // 对话结束 ⇒ 把麦克风还给常驻唤醒（固件的 Speaking→Idle 会重开 WakeNet）。
-        // 若此刻服务端已在播报，onTtsState("start") 会立刻再 pause 一次，
-        // 这是半双工的必要切换，不是重复操作。
         if (!speaking) wakeEngine.resume()
     }
 
@@ -1791,7 +1946,8 @@ class MainActivity : Activity() {
     private fun handleDebugCommand(cmd: String) {
         when (cmd) {
             "talk" -> beginListening()
-            "stop_talk" -> endListening()
+            "stop_talk" -> if (inConversation) endConversation() else endListening()
+            "end_conversation" -> endConversation()
             "mic_test" -> runMicTest()
             "link_test" -> runLinkTest()
             "enc_probe" -> runEncProbe()
@@ -1939,6 +2095,16 @@ class MainActivity : Activity() {
          * ASR 两半都识别不出来）；太长则每轮都要多等一截，交互变迟钝。
          */
         const val SILENCE_STOP_MS = 1200L
+
+        /**
+         * 对话态最长持续时间（本地兜底）。
+         *
+         * 服务端 `VOICE_IDLE_STANDBY_SEC=120` 空闲会主动 standby；这里留 60s
+         * 余量，覆盖「standby 的 3s 设备调用超时 / 网络抖动」而设备收不到
+         * 的情况。到期一律交还麦克风，绝不永久占麦。
+         */
+        const val CONVERSATION_MAX_MS = 180_000L
+
 
         /**
          * 下行播放采样率（自检用）。

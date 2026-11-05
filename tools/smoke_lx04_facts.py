@@ -239,12 +239,39 @@ def run(root: Path) -> int:
     # ---- 8a/8b detect 必须先于 listen start -------------------------------
     # 判据要**顺序敏感**：只判"两个都出现了"会让顺序写反也判过。
     # 这正是本仓踩过的坑（判据"某段文本存在"顺带覆盖）。
-    det_pos = main_code.find("listenDetect(")
-    start_pos = main_code.find("listenStart()")
+    # ⚠️ 2026-11-06：现在有**两个**入口（单轮 beginListening、对话态
+    #    startConversation），且 tts stop 会重发 listen start。全文件
+    #    find("listenStart()") 会先命中 tts stop 那一条 ⇒ 假红。
+    #    必须**逐个函数体**判顺序，且只认该函数体内的首次出现。
+    def det_before_start(body: str) -> bool:
+        d = body.find("listenDetect(")
+        st = body.find("listenStart()")
+        return d >= 0 and st >= 0 and d < st
+
+    # 这里 fn_body 定义在下方（本函数内），先内联一个按大括号配平的取体函数
+    def body_of(code: str, name: str) -> str:
+        m = re.search(rf"fun\s+{re.escape(name)}\s*\(", code)
+        if not m:
+            return ""
+        i = code.find("{", m.end())
+        if i == -1:
+            return ""
+        depth = 0
+        for j in range(i, len(code)):
+            if code[j] == "{":
+                depth += 1
+            elif code[j] == "}":
+                depth -= 1
+                if depth == 0:
+                    return code[i:j + 1]
+        return ""
+
+    begin_body = body_of(main_code, "beginListening")
+    conv_body = body_of(main_code, "startConversation")
     check(
-        "8a beginListening 里先 detect 再 listen start",
-        det_pos != -1 and start_pos != -1 and det_pos < start_pos,
-        f"detect@{det_pos} start@{start_pos} —— 顺序反了服务端会掐掉这一轮",
+        "8a 两个聆听入口里都先 detect 再 listen start",
+        det_before_start(begin_body) and det_before_start(conv_body),
+        "顺序反了服务端会掐掉这一轮（按函数体判，不能用全文件首个位置）",
     )
     check(
         "8b detect 必须带 greet:false",

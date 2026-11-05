@@ -88,21 +88,32 @@ def guards(flow: str, wake: str, main: str, fetch: str, api: str, ignore: str):
     add("W8", "引擎常量与固件唤醒词一致",
         lambda: 'const val WAKE_WORD = "你好小智"' in wake)
 
-    def release_before_callback():
+    def shared_capture_on_detect():
         i = wake.find("private fun fire(")
         if i < 0:
             return False
-        seg = wake[i:i + 1400]
-        a = seg.find("stopCaptureOnly()")
-        b = seg.find("main.post")
-        return a >= 0 and b >= 0 and a < b
+        seg = wake[i:i + 1600]
+        # 2026-11-06 反转：MTK HAL 释放有延迟，stop/start 会让新采集读到
+        # 全零（真机 21 帧里 18 帧静音 / ASR 空）。现在复用同一路
+        # AudioRecord，fire() 只翻状态、绝不 stopCaptureOnly()。
+        # ⚠️ 必须按**非注释行**判：本函数注释里写着「这里原来
+        #    stopCaptureOnly()」，纯子串判据会把它当成违规（W9 恒红），
+        #    而且反向变异插入真调用时守卫也分不出来 ⇒ 假绿/假红同时发生。
+        has_real_stop = bool(re.search(
+            r"^\s*stopCaptureOnly\(\)", seg, re.M))
+        return not has_real_stop and \
+               "复用采集，未释放麦克风" in seg and \
+               "state = State.PAUSED" in seg and "main.post" in seg
 
-    add("W9", "检出后先释放麦克风、再回调（HAL 不允许双采集）",
-        release_before_callback)
+    add("W9", "检出后复用同一路采集（fire 内禁止 stopCaptureOnly）",
+        shared_capture_on_detect)
 
     def pause_inside_begin():
         i = main.find("private fun beginListening(")
-        j = main.find("private fun endListening(")
+        # ⚠️ 边界必须是**下一个函数**，不能再写到 endListening：现在中间
+        #    插入了 startConversation/upstream/endConversation，整段扫描会把
+        #    对话态的调用也算进 beginListening，守卫就成了假红。
+        j = main.find("private fun startConversation(", i)
         if i < 0 or j <= i:
             return False
         seg = main[i:j]
@@ -114,7 +125,7 @@ def guards(flow: str, wake: str, main: str, fetch: str, api: str, ignore: str):
 
     def detect_once_in_begin():
         i = main.find("private fun beginListening(")
-        j = main.find("private fun endListening(")
+        j = main.find("private fun startConversation(", i)
         if i < 0 or j <= i:
             return False
         seg = main[i:j]
@@ -128,6 +139,34 @@ def guards(flow: str, wake: str, main: str, fetch: str, api: str, ignore: str):
 
     add("W12", "录音权限授予后才启动唤醒引擎",
         lambda: "startWakeWord()" in main and "private fun startWakeWord()" in main)
+
+    # ---- 2026-11-06 真机：唤醒后说话没响应（两个并联缺陷）----
+    cap_src = read(ROOT / "lx04/app/src/main/java/com/elder/lx04/audio/AudioCapture.kt")
+    add("W27", "唤醒词路径走 startConversation（不能直接 beginListening 触发 HAL 切换）",
+        lambda: "startConversation(keyword)" in main and
+                "private fun startConversation(" in main and
+                "wakeEngine.takeOver { pcm, info -> upstream(pcm, info) }" in main)
+    add("W28", "共享采集可切换帧消费者，且对话结束切回 KWS 并重置 stream",
+        lambda: "fun setConsumer(" in cap_src and "val c = consumer" in cap_src and
+                "fun takeOver(" in wake and "fun giveBack()" in wake and
+                "cap.setConsumer { pcm, _ -> feed(pcm) }" in wake)
+    add("W29", "对话态不做设备本地 VAD 收尾（端点检测交给服务端看门狗）",
+        lambda: "对话态**不做设备本地 VAD 收尾**" in main and
+                "private fun upstream(" in main and
+                "SILENCE_STOP_MS" not in main[main.find("private fun upstream("):
+                                              main.find("private fun noteEncodeDrop(")])
+    add("W30", "播报结束自动回听：重发 listen start 且不 resume KWS",
+        lambda: "播报结束：对话态自动回听（重发 listen start）" in main and
+                "voice?.listenStart()" in main and
+                "if (inConversation) {" in main)
+    add("W31", "服务端 standby 已接线（否则设备永远不回唤醒词）",
+        lambda: bool(re.search(r"^\s*runtime\.onStandbyRequested\s*=", main, re.M)) and
+                "private fun endConversation()" in main and
+                "wakeEngine.giveBack()" in main)
+    add("W32", "对话态有本地空闲兜底，不会永久占着麦克风",
+        lambda: "CONVERSATION_MAX_MS" in main and
+                "SystemClock.elapsedRealtime() > conversationDeadlineMs" in main and
+                "if (inConversation) endConversation()" in main)
 
     add("W13", "25MB 二进制资源不入库",
         lambda: "libsherpa-onnx-jni.so" in ignore and "/assets/kws/" in ignore)
@@ -328,6 +367,18 @@ def selftest() -> int:
         if "AudioLevel.ramp(gain, targetGain)" not in pl: n += 1
         cd = kw.get("codec_src", read(ROOT / "lx04/app/src/main/java/com/elder/lx04/audio/OpusCodec.kt"))
         hs = kw.get("hello_src", read(ROOT / "lx04/app/src/main/java/com/elder/lx04/MainActivity.kt"))
+        # W27~W32 读独立文件 / 变体文本，单独算
+        cp = kw.get("cap_src", read(ROOT / "lx04/app/src/main/java/com/elder/lx04/audio/AudioCapture.kt"))
+        wk = kw.get("wake_src", wake)
+        mn = kw.get("main_src", main)
+        if "startConversation(keyword)" not in mn or \
+           "wakeEngine.takeOver { pcm, info -> upstream(pcm, info) }" not in mn: n += 1
+        if "fun setConsumer(" not in cp or "val c = consumer" not in cp: n += 1
+        if "fun takeOver(" not in wk or "fun giveBack()" not in wk: n += 1
+        if "对话态**不做设备本地 VAD 收尾**" not in mn: n += 1
+        if "播报结束：对话态自动回听（重发 listen start）" not in mn: n += 1
+        if not re.search(r"^\s*runtime\.onStandbyRequested\s*=", mn, re.M): n += 1
+        if "CONVERSATION_MAX_MS" not in mn: n += 1
         if "private var decRate = 48_000" not in cd or \
            "player.start(opus.outputSampleRate())" not in hs: n += 1
         return n
@@ -337,7 +388,9 @@ def selftest() -> int:
         ("workflow 不再下载资源", {"flow": flow.replace("python3 tools/fetch_kws_assets.py", "# removed")}),
         ("换成官方默认唤醒词", {"fetch": fetch.replace("n ǐ h ǎo x iǎo zh ì @你好小智", "x iǎo ài t óng x ué @小爱同学")}),
         ("版本被偷偷升级", {"fetch": fetch.replace('KWS_VERSION = "1.12.22"', 'KWS_VERSION = "9.9.9"')}),
-        ("检出后不释放麦克风", {"wake": wake.replace("stopCaptureOnly()\n        state = State.PAUSED", "state = State.PAUSED")}),
+        ("检出后又释放麦克风（回到上行全零）",
+         {"wake": wake.replace("state = State.PAUSED\n\n        main.post {",
+                               "stopCaptureOnly()\n        state = State.PAUSED\n\n        main.post {")}),
         ("beginListening 不暂停唤醒", {"main": re.sub(r"^\s*wakeEngine\.pause\(\)\n", "", main, flags=re.M)}),
         ("换成两次 detect", {"main": main.replace("voice?.listenDetect(wakeSource, greet = greet)", 'voice?.listenDetect("按键唤醒", greet = false)')}),
         ("二进制被允许入库", {"ignore": ignore.replace("libsherpa-onnx-jni.so", "libother.so")}),
@@ -364,6 +417,25 @@ def selftest() -> int:
         ("增益又改回窗口跳变（中途变频率）",
          {"player_src": read(ROOT / "lx04/app/src/main/java/com/elder/lx04/audio/AudioPlayer.kt")
                           .replace("AudioLevel.ramp(gain, targetGain)", "targetGain")}),
+        ("唤醒又改回 beginListening（HAL 切换回来）",
+         {"main": main.replace("startConversation(keyword)",
+                               "beginListening(wakeSource = keyword, greet = true)")}),
+        ("摘掉共享采集消费者切换",
+         {"cap_src": read(ROOT / "lx04/app/src/main/java/com/elder/lx04/audio/AudioCapture.kt")
+                       .replace("fun setConsumer(", "fun unusedSetConsumer(")}),
+        ("KWS 不再提供 takeOver",
+         {"wake": wake.replace("fun takeOver(", "fun unusedTakeOver(")}),
+        ("对话态又加回设备本地 VAD 收尾",
+         {"main": main.replace("对话态**不做设备本地 VAD 收尾**",
+                               "对话态做设备本地 VAD 收尾")}),
+        ("播报结束又只回 KWS（不自动回听）",
+         {"main": main.replace("播报结束：对话态自动回听（重发 listen start）",
+                               "播报结束：交还 KWS")}),
+        ("standby 接线又被摘掉",
+         {"main": re.sub(r"^\s*runtime\.onStandbyRequested\s*=",
+                         "        // removed", main, flags=re.M)}),
+        ("对话态没有空闲兜底",
+         {"main": main.replace("CONVERSATION_MAX_MS", "NO_DEADLINE")}),
     ]
 
     bad = 0
