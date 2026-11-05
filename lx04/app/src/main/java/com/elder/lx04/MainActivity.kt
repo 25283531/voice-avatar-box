@@ -766,18 +766,29 @@ class MainActivity : Activity() {
      *
      * 用法：
      * ```
-     * adb push say.wav /sdcard/say.wav     # 16kHz / 单声道 / 16bit PCM
+     * adb push say.wav /sdcard/Android/data/com.elder.lx04/files/say.wav
      * adb shell am broadcast -a com.elder.lx04.DEBUG --es cmd inject
      * ```
+     *
+     * ⚠️ **必须放在 App 专属目录**：本 App 没有申请 READ_EXTERNAL_STORAGE，
+     *    读 `/sdcard/say.wav` 会 Permission denied（Android 8.1 实测）。
+     *    而 `/sdcard/Android/data/<包名>/files/` 是 Android 4.4+ 授予每个
+     *    App 的专属目录，**不需要任何运行时权限**。
      */
     private fun runInject() {
         if (sending) {
             Log.w(TAG, "inject 忽略 —— 正在对话中")
             return
         }
-        val f = java.io.File("/sdcard/say.wav")
-        if (!f.exists()) {
-            Log.e(TAG, "inject：找不到 /sdcard/say.wav")
+        // 候选路径：App 专属外部目录（免权限）→ App 私有目录 → /sdcard 根
+        val candidates = listOf(
+            java.io.File("/sdcard/Android/data/com.elder.lx04/files/say.wav"),
+            java.io.File(filesDir, "say.wav"),
+            java.io.File("/sdcard/say.wav"),
+        )
+        val f = candidates.firstOrNull { it.exists() && it.canRead() }
+        if (f == null) {
+            Log.e(TAG, "inject：找不到 say.wav，试过 ${candidates.joinToString { it.path }}")
             screen.setHint("注入失败：设备上没有 say.wav")
             return
         }
@@ -790,7 +801,7 @@ class MainActivity : Activity() {
                 screen.setHint("注入失败：WAV 解析失败")
                 return@launch
             }
-            Log.i(TAG, "inject：读入 ${pcm.size} 样本（${pcm.size / 960} 帧）")
+            Log.i(TAG, "inject：读入 ${pcm.size} 样本（${pcm.size / 960} 帧） from ${f.path}")
 
             voice?.listenDetect("按键唤醒", greet = false)
             voice?.listenStart()
