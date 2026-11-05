@@ -104,6 +104,31 @@ class DeviceStore(context: Context) {
         get() = prefs.getBoolean(KEY_STATUS_LIGHT, true)
         set(v) { prefs.edit().putBoolean(KEY_STATUS_LIGHT, v).commit() }
 
+    // ------------------------------------------------------------------ 回执队列
+
+    /**
+     * 待发送的回执队列（整队一个文本 blob）。
+     *
+     * ## 为什么必须落盘（不是"以后再改"）
+     *
+     * 固件的队列是**持久化**的（NVS `elder_sync/evtq`）。如果 Android 只放内存，
+     * 会出现这条精确的因果链：
+     *
+     * ```
+     * 断网 2 小时 → 老人确认了 2 次 → 进程被杀（系统回收/崩溃）
+     *   → 2 条 CONFIRMED 回执丢失
+     *   → 服务端 30 分钟后把 PENDING 判成 MISSED
+     *   → 家属端看到 2 条「老人漏服药」
+     * ```
+     *
+     * 这**正是**回执机制本身要消灭的那条假告警 —— 不落盘等于白做。
+     *
+     * 写入频率是"每次状态跃迁一条"，不会磨损存储。
+     */
+    var eventQueueText: String
+        get() = prefs.getString(KEY_EVT_QUEUE, "").orEmpty()
+        set(v) { prefs.edit().putString(KEY_EVT_QUEUE, v).commit() }
+
     // ------------------------------------------------------------------ 提醒表
 
     /** 提醒表持久化实现（供 [com.elder.lx04.reminder.ReminderEngine] 使用）。 */
@@ -136,6 +161,7 @@ class DeviceStore(context: Context) {
         const val KEY_TZ_OFFSET = "tz_offset_min"
         const val KEY_STATUS_LIGHT = "status_light_on"
         const val KEY_RMD_TABLE = "rmd_table"
+        const val KEY_EVT_QUEUE = "evt_queue"
 
         /** 东八区。与固件 NVS 默认值一致（服务端没说时沿用）。 */
         const val DEFAULT_TZ_OFFSET = 480

@@ -443,7 +443,45 @@ class ReminderEngineTest {
         assertNull(RmdCodec.decode("fmt=9;n=1"))
     }
 
-    // ------------------------------------------------------------------ 时间闸门
+    // ------------------------------------------------------------------ 换表
+
+    @Test
+    fun `心跳重排顺序后计时起点跟着条目走，不会误判漏服`() {
+        val r = Rig()
+        r.engine.start()
+        val a = medicine(hour = 8, serverId = 11L)
+        val b = schedule(hour = 9).copy(serverId = 22L)
+        r.engine.replaceAll(listOf(a, b))
+
+        // 设备 08:20 才开机：计划 08:00 但迟到 20 分钟（< 60 ⇒ 仍要响）
+        // ⇒ pendingSince = 08:20，与 due(08:00) 相差 20 分钟。
+        // 这个差异是本用例的关键：只有它能让「搬」与「不搬」得出不同结论。
+        r.clock.set(2026, 11, 5, 8, 20)
+        r.engine.tick()
+        assertEquals(RmdState.PENDING, r.engine.stateOf(0))
+
+        // 心跳下发同一张表，但顺序反转（服务端返回顺序本来就不保证稳定）
+        r.engine.replaceAll(listOf(b, a))
+
+        // A 现在在 idx=1；它的 pendingSince 必须还是 08:20，而不是
+        // "这个下标上一条 occupant（B，IDLE）留下的 0"。
+        r.clock.set(2026, 11, 5, 8, 30)
+        r.engine.tick()
+
+        // 距响铃才 10 分钟 ⇒ 不该升级。
+        // 若不搬计时起点：pendingSince=0 ⇒ 退回 due 兜底
+        // ⇒ nowMin - due = 30 >= 15 ⇒ 立刻 ESCALATED ⇒ 家属收到假漏服。
+        assertTrue(
+            "重排后 10 分钟就被判漏服：计时起点没跟着条目走",
+            r.engine.stateOf(1) != RmdState.ESCALATED
+        )
+        assertEquals(RmdState.PENDING, r.engine.stateOf(1))
+        // 而且待确认项要能在新下标上被找到（按键/语音确认的口径）
+        assertEquals(1, r.engine.firstRinging())
+    }
+
+    // ------------------------------------------------------------------ 换表
+
 
     @Test
     fun `时钟不可信时不触发并提示`() {

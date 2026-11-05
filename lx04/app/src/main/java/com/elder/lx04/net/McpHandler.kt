@@ -1,6 +1,7 @@
 package com.elder.lx04.net
 
 import android.util.Log
+import org.json.JSONArray
 import org.json.JSONObject
 
 /**
@@ -129,17 +130,17 @@ class McpHandler(private val host: Host) {
                     // 固件同样是"取不到或取到怪值就当 0"，走旧路径最安全。
                     var sid = args.optLong("server_id", 0L)
                     if (sid < 0L) sid = 0L
-                    ok(id, host.onConfirmReminder(sid))
+                    ok(id, host.onConfirmReminder(sid).toString())
                 }
 
                 "self.elder.standby" -> {
                     host.onStandby()
-                    ok(id, true)
+                    ok(id, "true")
                 }
 
                 "self.elder.sync_now" -> {
                     host.onSyncNow()
-                    ok(id, true)
+                    ok(id, "true")
                 }
 
                 "self.elder.set_status_light" -> {
@@ -148,23 +149,23 @@ class McpHandler(private val host: Host) {
                     if (!args.has("on")) return error(id, "缺少参数 on")
                     val want = args.optBoolean("on", false)
                     val actual = host.onSetStatusLight(want)
-                    ok(id, JSONObject().put("on", actual))
+                    ok(id, JSONObject().put("on", actual).toString())
                 }
 
                 "self.elder.get_status_light" ->
-                    ok(id, JSONObject().put("on", host.getStatusLight()))
+                    ok(id, JSONObject().put("on", host.getStatusLight()).toString())
 
                 // ---- 上游通用工具（服务端实际会调的那几个）----
-                "self.get_device_status" -> ok(id, JSONObject(host.deviceStatusJson()))
+                "self.get_device_status" -> ok(id, host.deviceStatusJson())
 
                 "self.audio_speaker.set_volume" -> {
                     if (!args.has("volume")) return error(id, "缺少参数 volume")
-                    ok(id, host.onSetVolume(args.optInt("volume", 50).coerceIn(0, 100)))
+                    ok(id, host.onSetVolume(args.optInt("volume", 50).coerceIn(0, 100)).toString())
                 }
 
                 "self.screen.set_brightness" -> {
                     if (!args.has("brightness")) return error(id, "缺少参数 brightness")
-                    ok(id, host.onSetBrightness(args.optInt("brightness", 50).coerceIn(0, 100)))
+                    ok(id, host.onSetBrightness(args.optInt("brightness", 50).coerceIn(0, 100)).toString())
                 }
 
                 // ---- 认识但不实现：明确回 error，别让服务端干等 ----
@@ -187,9 +188,38 @@ class McpHandler(private val host: Host) {
         }
     }
 
-    /** 成功回包。`result` 直接就是值（与固件 `ReplyResult` 一致）。 */
-    private fun ok(id: Int, result: Any): String =
-        JSONObject().put("jsonrpc", "2.0").put("id", id).put("result", result).toString()
+    /**
+     * 成功回包 —— **必须带 MCP 标准信封**。
+     *
+     * ```
+     * {"jsonrpc":"2.0","id":7,
+     *  "result":{"content":[{"type":"text","text":"true"}],"isError":false}}
+     * ```
+     *
+     * ⚠️ 这里踩过一次：一开始把返回值裸着塞进 `result`（`"result":true`），
+     * 看起来"和固件一样"，实际固件每个工具的回调都自己包了
+     * `content/isError` 信封（`mcp_server.cc` 的 `ReplyResult` 调用点）。
+     * 裸值的后果不是报错，而是**服务端把 8 个工具全判失败** ——
+     * 因为它在 `result["content"][0]["text"]` 上取值，取不到就是"失败"。
+     * 而失败的表现是"老人说吃过了，设备回没确认"，极难往格式上想。
+     *
+     * 值的编码约定：布尔/数字一律转字符串（`"true"` / `"50"`）；
+     * 结构化结果转 JSON 字符串（`"{\"on\":true}"`）。与固件一致。
+     */
+    private fun ok(id: Int, text: String): String =
+        JSONObject().put("jsonrpc", "2.0").put("id", id)
+            .put(
+                "result",
+                JSONObject()
+                    .put(
+                        "content",
+                        JSONArray().put(
+                            JSONObject().put("type", "text").put("text", text)
+                        )
+                    )
+                    .put("isError", false)
+            )
+            .toString()
 
     /** 失败回包。 */
     private fun error(id: Int, message: String): String =

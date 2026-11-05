@@ -98,6 +98,14 @@ dist/
 # 本地 Kotlin 编译检查的依赖缓存（约 70MB，不入库）
 tools/.kcache/
 
+
+# 本机打 APK / 查 CI 留下的临时产物
+.tmp-apk/
+/arts.json
+/jobs.json
+/run.json
+/runs.json
+
 # ⚠️ 例外必须放在**文件末尾**：gitignore 是「最后匹配的规则生效」，
 #    上面那两段 *.keystore 会把中间任何例外重新排除掉。
 #

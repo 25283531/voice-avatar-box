@@ -28,7 +28,10 @@ import com.elder.lx04.light.LedBandView
 import com.elder.lx04.light.LedEngine
 import com.elder.lx04.net.DeviceIdentity
 import com.elder.lx04.net.OtaClient
+import com.elder.lx04.audio.TonePlayer
 import com.elder.lx04.net.VoiceClient
+import com.elder.lx04.runtime.DeviceRuntime
+import com.elder.lx04.store.DeviceStore
 import com.elder.lx04.ui.MainScreen
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -113,12 +116,30 @@ class MainActivity : Activity() {
 
     private val keyDetector = ConfirmKeyDetector()
 
-    /** 是否有待确认的提醒（由服务端事件驱动）。 */
-    @Volatile
-    private var hasPendingReminder = false
+    /**
+     * 设备运行时（提醒引擎 + 心跳 + 回执 + MCP）。
+     *
+     * ⚠️ 提醒的"真相"只在 [DeviceRuntime] 里 —— 本 Activity 不再自己维护
+     * 「有没有待确认」「是不是已确认」。以前这里有个 `hasPendingReminder`
+     * 字段和一套 `confirmMedication()`，只改灯和屏、不上报服务端，
+     * 于是"设备显示已确认、家属端显示待确认"两边对不上，而且日志正常。
+     */
+    private lateinit var runtime: DeviceRuntime
 
-    /** 确认窗口到期时刻（elapsedRealtime）；0 = 没有开着的窗口。 */
-    private var confirmWindowUntil = 0L
+    /** 本地持久化（token / 提醒表 / 回执队列）。 */
+    private lateinit var deviceStore: DeviceStore
+
+    /**
+     * 本轮按压是否已经落地。
+     *
+     * 一步式确认：**跨过 3 秒那一刻就确认，不等松手**（生产固件
+     * `elder_bridge.cc:1166-1461`）。这个标志用来保证「松手时不再重复处理」，
+     * 也保证「已确认的按压不会在松手时被判成中途放弃」。
+     */
+    private var pressResolved = false
+
+    /** 本轮按压是「确认机」（有待确认项，不录音）还是「PTT 机」。 */
+    private var pressIsConfirm = false
 
     /** 是否已经绑定（OTA 拿到 websocket 段）。 */
     @Volatile
@@ -126,7 +147,77 @@ class MainActivity : Activity() {
 
     private var batteryPercent = 0
     private var batteryCharging = false
+
+    /** 是否有电池。LX04 无电池，`ACTION_BATTERY_CHANGED` 的 present 会是 false。 */
+    private var hasBattery = false
     private var wifiOk = false
+
+    /**
+     * WebSocket 是否连着。
+     *
+     * ⚠️ 这是 [DeviceRuntime.Ui.isOnline] 的判据，**不能用**
+     * [DeviceIdentity.wifiConnected]：Wi-Fi 连着但服务端不可达（服务端重启、
+     * 证书过期、DNS 挂了）时，用 Wi-Fi 判据会让设备反复调用在线 TTS，
+     * 每次都要等一个超时，老人听到的是"长时间没声音"。
+     */
+    @Volatile
+    private var wsOnline = false
+
+    /** 本地提示音（提醒必须有声，不能只靠屏幕）。 */
+    private val tones = TonePlayer()
+
+    /**
+     * 运行时与界面的交界。
+     *
+     * 只做"把引擎的结论画到屏上/响出来"，**不做任何判断** ——
+     * 判断全在 [DeviceRuntime] 里，这样 UI 和引擎不会各存一份真相。
+     */
+    private val uiBridge = object : DeviceRuntime.Ui {
+        override fun showReminder(text: String?) {
+            runOnUiThread {
+                if (text == null) {
+                    screen.hideReminder()
+                } else {
+                    // 文案契约：首行标题、其余为提示+明细（引擎保证这个结构）
+                    val lines = text.split('\n')
+                    screen.showReminder(lines.firstOrNull().orEmpty(),
+                        lines.drop(1).joinToString("\n"))
+                }
+            }
+        }
+
+        override fun tone(tone: Int) {
+            runOnUiThread { tones.play(tone) }
+        }
+
+        override fun announce(text: String) {
+            // 走服务端认可的播报信封（见 VoiceClient.sendAnnounce 的说明）
+            voice?.sendAnnounce(text)
+        }
+
+        override fun playClip(clipId: Int): Boolean {
+            // LX04 上没有固件那套预录片段资源 ⇒ 明确返回 false，
+            // 让引擎回落到 tone()。返回 true 但不出声，会让"提醒没声音"
+            // 变成无法追查的现象。
+            return false
+        }
+
+        override fun setUiState(state: String) {
+            runOnUiThread { this@MainActivity.setUiState(state) }
+        }
+
+        override fun setBrightness(percent: Int): Boolean = runCatching {
+            // 落在当前窗口上（不改系统设置，不需要 WRITE_SETTINGS 权限）。
+            // ⚠️ 必须走 setAttributes()：`window.attributes = ...` 在 Kotlin 里
+            //    要求 setter，而 Android 的 Window 只有 `setAttributes(LayoutParams)`。
+            val lp = window.attributes
+            lp.screenBrightness = percent.coerceIn(1, 100) / 100f
+            window.setAttributes(lp)
+            true
+        }.getOrDefault(false)
+
+        override fun isOnline(): Boolean = wsOnline
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -147,6 +238,24 @@ class MainActivity : Activity() {
 
         screen = MainScreen(this)
         setContentView(buildRoot())
+
+        // 运行时必须在 setContentView 之后：Ui 实现要用到 screen/bandView。
+        // 也必须在 startClock/startConnect 之前 —— 提醒引擎要先读到本地表，
+        // 断网时那张表就是设备唯一的信息来源。
+        deviceStore = DeviceStore(this)
+        runtime = DeviceRuntime(
+            this,
+            deviceStore,
+            uiBridge,
+            SERVER_BASE_URL,
+            DeviceIdentity.mac(this),
+            DeviceIdentity.clientId(this)
+        )
+        runtime.onPendingChanged = { pending ->
+            ledEngine.buttonPending(pending)
+            if (pending) ledEngine.medPending()
+        }
+        runtime.start()
 
         registerReceiver(batteryReceiver, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
         registerReceiver(debugReceiver, IntentFilter(DebugBridge.ACTION))
@@ -207,10 +316,15 @@ class MainActivity : Activity() {
             val level = intent.getIntExtra(BatteryManager.EXTRA_LEVEL, -1)
             val scale = intent.getIntExtra(BatteryManager.EXTRA_SCALE, 100)
             if (level >= 0 && scale > 0) batteryPercent = level * 100 / scale
+            hasBattery = intent.getBooleanExtra(BatteryManager.EXTRA_PRESENT, false)
             val st = intent.getIntExtra(BatteryManager.EXTRA_STATUS, -1)
             batteryCharging = st == BatteryManager.BATTERY_STATUS_CHARGING ||
                 st == BatteryManager.BATTERY_STATUS_FULL
             wifiOk = DeviceIdentity.wifiConnected(this@MainActivity)
+            if (::runtime.isInitialized) {
+                // present=false 表示这台设备没有电池（LX04 插电音箱就是这种）
+                runtime.updateBattery(batteryPercent, batteryCharging, hasBattery)
+            }
         }
     }
 
@@ -259,6 +373,7 @@ class MainActivity : Activity() {
         val client = VoiceClient(object : VoiceClient.Listener {
 
             override fun onConnected() {
+                wsOnline = true
                 runOnUiThread {
                     setUiState("idle")
                     screen.setHint("已连接")
@@ -266,6 +381,7 @@ class MainActivity : Activity() {
             }
 
             override fun onDisconnected(reason: String) {
+                wsOnline = false
                 runOnUiThread {
                     setUiState("offline")
                     screen.setHint(reason)
@@ -322,6 +438,15 @@ class MainActivity : Activity() {
                 val n = opus.decode(opusPacket, pcm)
                 if (n > 0) player.enqueue(pcm.copyOf(n))
             }
+
+            /**
+             * 服务端调设备工具 —— **必须 3 秒内回包**。
+             *
+             * 这里只做转发：真正的分派在 [DeviceRuntime] 里（它只改内存，
+             * 不发网络）。本类不参与判断，避免和引擎各存一份真相。
+             */
+            override fun onMcp(payload: org.json.JSONObject?): String? =
+                runtime.handleMcp(payload)
         })
 
         if (client.connect(wsUrl, token, deviceId, clientId)) {
@@ -469,77 +594,151 @@ class MainActivity : Activity() {
             return super.dispatchKeyEvent(event)
         }
 
-        Log.i(
-            TAG,
-            "确认键 ${if (event.action == KeyEvent.ACTION_DOWN) "DOWN" else "UP"} " +
-                "code=${event.keyCode} repeat=${event.repeatCount}"
-        )
-
         when (event.action) {
             KeyEvent.ACTION_DOWN -> {
-                if (keyDetector.onDown(now)) {
-                    ledEngine.buttonPress()
-                    // 按下即开始说话 —— 对老人来说"按住说话"最直觉
-                    beginListening(ptt = true)
+                if (event.repeatCount == 0) {
+                    onPressStart(now)
+                } else {
+                    onPressRepeat(now)
                 }
                 return true
             }
 
             KeyEvent.ACTION_UP -> {
-                when (keyDetector.onUp(now)) {
-                    ConfirmKeyDetector.ReleaseResult.Confirmed -> {
-                        ledEngine.buttonRelease()
-                        ledEngine.buttonConfirmed()
-                        onConfirmPressed()
-                    }
-                    ConfirmKeyDetector.ReleaseResult.ReleasedEarly,
-                    ConfirmKeyDetector.ReleaseResult.Debounced -> ledEngine.buttonRelease()
-                    ConfirmKeyDetector.ReleaseResult.None -> Unit
-                }
-                endListening()
+                onPressEnd(now)
                 return true
             }
         }
-        return super.dispatchKeyEvent(event)
+        return true
     }
 
-    override fun onKeyLongPress(keyCode: Int, event: KeyEvent): Boolean {
-        if (TopKeys.isConfirmKey(keyCode)) return true
-        return super.onKeyLongPress(keyCode, event)
+    // -------------------------------------------------------------- 按键仲裁
+    //
+    // 一个物理键要承担三件事，靠"按下那一刻的状态"分流（见
+    // deliverables/gstack 的按键裁决表）：
+    //
+    //   有待确认 + 服药 → 确认机（**不录音**）：短按静默提示、满 3 秒追问哪味药
+    //   有待确认 + 日程 → 确认机（**不录音**）：短按或长按都直接确认
+    //   无待确认        → PTT 机：按下即开麦，松手结束（Android 特有）
+    //
+    // ⚠️ 为什么必须分流而不是"补一行 onRepeat 让长按生效"：
+    //    那样长按会变成"直接确认服药" —— 多药提醒分不清吃了哪几味，
+    //    等于替老人谎报服药。这是医疗场景下最不能接受的一类失真。
+
+    /** 按下（新的一次按压）。 */
+    private fun onPressStart(now: Long) {
+        pressResolved = false
+        keyDetector.onDown(now)
+        ledEngine.buttonPress(now)
+
+        // 有待确认项 ⇒ 确认机，**不开麦**。
+        // 老人在响铃期间按这个键是想"确认"，不是为了说话；
+        // 一按下就开麦会把他按下时的环境音当成一句话送上去。
+        pressIsConfirm = runtime.hasPendingConfirm()
+
+        if (!pressIsConfirm) {
+            // PTT：按下即说话（Android 没有离线唤醒词，这是唯一的起话入口）
+            beginListening(ptt = true)
+        }
     }
 
-    /** 长按达标（≥3 秒）—— 服药确认。 */
-    private fun onConfirmPressed() {
-        if (hasPendingReminder) {
-            confirmMedication()
+    /**
+     * 按住期间系统重复回调。
+     *
+     * **跨过 3 秒门槛的那一刻就执行确认**，不等松手 —— 这是生产固件的语义
+     * （`elder_bridge.cc` 的 `LONG_HOLD` 分支），与自测固件 `app_main.c` 的
+     * 两步式（长按挂起 → 30 秒内短按才算）**相反**。之前这里抄的是两步式，
+     * 而且 `onRepeat` 根本没有调用点，导致「长按确认」从来没生效过。
+     */
+    private fun onPressRepeat(now: Long) {
+        if (pressResolved) return
+        if (!keyDetector.onRepeat(now)) return
+
+        // 刚跨过 3 秒
+        pressResolved = true
+
+        if (!pressIsConfirm) {
+            // PTT 机：按住超过 3 秒是正常说话，什么都不做
+            return
+        }
+
+        val item = runtime.firstRingingItem()
+        val ok = runtime.onHoldConfirm()
+
+        if (!ok) {
+            // 没有可确认项（理论上有待确认才会进确认机，这里是兜底）
+            ledEngine.buttonRelease(now)
+            return
+        }
+
+        // 灯反馈：按够 3 秒就该有回执，不能让老人以为没按上。
+        // 固件里粉红闪从未真正上屏（emit 同步直调 + 优先级抢占，下一帧已被
+        // 天蓝覆盖），所以这里**不退粉红**，直接给天蓝。
+        ledEngine.buttonAcknowledged(now)
+
+        if (item != null && item.isMedicine) {
+            // 服药类：已置"按键发起"标记，接下来追问哪一味药并开麦。
+            askWhichMedicine(item)
+        }
+    }
+
+    /** 松手。 */
+    private fun onPressEnd(now: Long) {
+        val result = keyDetector.onUp(now)
+
+        if (pressResolved) {
+            // 本轮已经落地（3 秒确认过），松手不再产生任何判定或反馈 ——
+            // 再开一次窗就等于给老人两次确认机会，多药场景下会记错。
+            keyDetector.reset()
+            pressResolved = false
+            pressIsConfirm = false
+            return
+        }
+
+        if (!pressIsConfirm) {
+            // PTT 机：松手即结束说话
+            endListening()
+            ledEngine.buttonRelease(now)
+            pressIsConfirm = false
+            return
+        }
+
+        // 确认机 + 未满 3 秒 = 短按
+        val item = runtime.firstRingingItem()
+        if (item != null && !item.isMedicine) {
+            // 日程/待办：短按直接确认，天蓝 3 次。
+            // 这里**不走 buttonRelease**（那会先闪失败色），因为日程类是
+            // 短按确认、不是"按不够" —— 同样的 <3 秒松手，两类提醒的判据相反。
+            if (runtime.onShortPress()) {
+                ledEngine.buttonConfirmed(now)
+            } else {
+                ledEngine.buttonRelease(now)
+            }
         } else {
-            confirmWindowUntil = SystemClock.elapsedRealtime() + ConfirmKeyDetector.CONFIRM_WINDOW_MS
+            // 服药类短按：什么都不做（防误触），灯给一次"按不够"的提示。
+            ledEngine.buttonRelease(now)
+            screen.setHint("请长按 3 秒确认已服药")
         }
+        pressIsConfirm = false
     }
 
-    /** 把「已服药」的确认落地。 */
-    private fun confirmMedication() {
-        hasPendingReminder = false
-        ledEngine.medDone()
-        ledEngine.buttonPending(false)
-        screen.hideReminder()
-        setUiState("confirmed")
-        scope.launch {
-            delay(2_000)
-            setUiState("idle")
+    /**
+     * 服药类长按后的追问：问清是哪一味药，再进对话让服务端判定。
+     *
+     * 固件是"播预录片段 MED_CONFIRM 后开麦"。LX04 没有预录片段资源
+     * （`playClip` 返回 false），所以这里用**屏显 + 直接开麦**：
+     * 服务端在这一轮会话里知道有待确认提醒，会把老人的回答映射成
+     * `confirm_reminder` 工具调用。
+     */
+    private fun askWhichMedicine(item: com.elder.lx04.reminder.ReminderItem) {
+        val ask = if (item.medicines.size >= 2) {
+            "您吃的是哪种药？" + item.medicines.joinToString("、")
+        } else {
+            "我帮您确认一下，您刚才已经服用过${item.label}了吗？"
         }
-        // ⚠️ 服务端目前把"服药确认"建模成设备侧 MCP 工具回包
-        //    （session.py 的 call_device_tool）。我们还没实现设备工具通道，
-        //    所以这里**只做本地反馈**，不回假的"成功"给服务端 ——
-        //    回了假的，家属端会看到"已确认"而实际没记录，这是最坏的一类欺骗。
-        screen.setHint("已确认（服务端回写待接入）")
-    }
-
-    /** 服务端下发提醒时调用。 */
-    fun onReminderPending(pending: Boolean) {
-        hasPendingReminder = pending
-        ledEngine.buttonPending(pending)
-        if (pending) ledEngine.medPending()
+        screen.showReminder("请告诉我吃了哪种药", ask)
+        setUiState("listening")
+        beginListening(ptt = false)
     }
 
     // ------------------------------------------------------------------ 状态
@@ -1429,18 +1628,15 @@ class MainActivity : Activity() {
             "tone_test" -> runToneTest()
             "opus_selftest" -> runOpusSelfTest()
 
-            "med_pending" -> {
-                onReminderPending(true)
-                setUiState("reminder")
-                screen.showReminder("该吃药了", "08:00  高血压药 1 片")
+            // 提醒相关的调试命令现在**只能通过运行时**触发：
+            // 旧路径（自己造一个"待确认"、自己闪灯）会绕过引擎，
+            // 造出"设备显示已确认、服务端没有记录"的假状态 ——
+            // 那正是这次要消灭的东西。
+            "med_pending", "med_done", "clear", "escalate" -> {
+                screen.setHint("该命令已废弃：提醒由服务端下发，请用 sync_now 拉取")
+                Log.w(TAG, "调试命令 $cmd 已废弃：提醒状态只由引擎驱动，不许本地伪造")
             }
-            "med_done" -> confirmMedication()
-            "clear" -> {
-                onReminderPending(false)
-                screen.hideReminder()
-                setUiState("idle")
-            }
-            "escalate" -> ledEngine.medEscalate()
+            "sync_now" -> runtime.requestSyncNow()
 
             "press" -> {
                 ledEngine.buttonPending(true)
@@ -1502,6 +1698,8 @@ class MainActivity : Activity() {
         capture?.stop()
         player.stop()
         opus.release()
+        runCatching { runtime.stop() }
+        runCatching { tones.release() }
         voice?.disconnect()
         scope.cancel()
     }

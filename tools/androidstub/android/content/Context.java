@@ -3,6 +3,8 @@ import android.content.pm.PackageManager;
 public abstract class Context {
  public static final String CONNECTIVITY_SERVICE="connectivity";
  public static final String WIFI_SERVICE="wifi";
+ /** 音频服务名，真值照抄真 Android。 */
+ public static final String AUDIO_SERVICE="audio";
  public abstract Object getSystemService(String name);
  public abstract PackageManager getPackageManager();
  public abstract void registerReceiver(BroadcastReceiver r, IntentFilter f);

@@ -96,6 +96,23 @@ class VoiceClient(
 
         /** 收到一帧 Opus 音频（已剥掉 4 字节帧头）。 */
         fun onAudio(opus: ByteArray)
+
+        /**
+         * 服务端调设备侧 MCP 工具（`{"type":"mcp","payload":{...}}`）。
+         *
+         * 返回**要回给服务端的 JSON**；`null` = 这条不需要回（通知类）。
+         *
+         * ## ⚠️ 必须在 3 秒内返回
+         *
+         * 服务端读超时分三档：`confirm_reminder` 走 LLM 路径 8s、走**兜底路径
+         * 只有 3.0s**、`standby` 3s、其余 2s。而老人「只吃一种药、到点说吃了」
+         * 走的正是兜底路径。所以实现里**只做内存操作，绝不能发网络** ——
+         * 一次网络抖动就会让老人听到「请让老人按一下设备上的按键」，
+         * 而他刚刚才说过。
+         *
+         * 回执上报由监听方异步入队，不在这条链路上。
+         */
+        fun onMcp(payload: org.json.JSONObject?): String?
     }
 
     private val http = OkHttpClient.Builder()
@@ -220,6 +237,26 @@ class VoiceClient(
     /** 打断当前播报。 */
     fun abort() = sendJson("""{"type":"abort"}""")
 
+    /**
+     * 设备主动播报一句话。
+     *
+     * 信封格式**必须**是 `{"type":"mcp","payload":{"type":"tts","text":...}}` ——
+     * 服务端 `session.py` 的 `_on_device_announce` 只认这一种（2026-10-22 专门
+     * 修过「屏变了但不出声」）。自己发明一个 `{"type":"tts_request"}` 之类的
+     * 格式不会报错，只会**静默没有声音**。
+     */
+    fun sendAnnounce(text: String) {
+        if (text.isEmpty()) return
+        val obj = org.json.JSONObject().apply {
+            put("type", "mcp")
+            put("payload", org.json.JSONObject().apply {
+                put("type", "tts")
+                put("text", text)
+            })
+        }
+        sendJson(obj.toString())
+    }
+
     private fun sendJson(json: String) {
         val ws = socket ?: return
         if (!isConnected) return
@@ -279,8 +316,18 @@ class VoiceClient(
             "alert" -> listener.onAlert(obj.optString("message", ""))
 
             "mcp" -> {
-                // 见类注释：刻意不回包。服务端 2 秒后超时并走自己的降级分支。
-                Log.i(TAG, "收到设备工具调用（本客户端不实现，不回包）: ${obj.optString("payload").take(120)}")
+                // 设备是 MCP server（服务端是 client）：收到 tools/call 必须回包。
+                //
+                // ⚠️ 这里是**唯一**的分派入口：如果本类"顺手"处理一部分工具，
+                //    就会和 McpHandler 形成两处分派，症状是某些工具偶发回两个包
+                //    （服务端按 id 建索引，第二个会覆盖第一个）或干脆不回。
+                val payload = obj.optJSONObject("payload")
+                val reply = listener.onMcp(payload)
+                if (reply != null) {
+                    sendJson(reply)
+                } else {
+                    Log.w(TAG, "MCP 请求没有产生回包（可能是通知类消息）")
+                }
             }
 
             else -> Log.d(TAG, "忽略未知消息: ${text.take(120)}")

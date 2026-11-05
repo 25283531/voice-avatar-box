@@ -1,5 +1,7 @@
 package android.os;
 public class BatteryManager {
+ /** 是否有电池，真值照抄真 Android。 */
+ public static final String EXTRA_PRESENT = "present";
  public static final String EXTRA_LEVEL="level";
  public static final String EXTRA_SCALE="scale";
  public static final String EXTRA_STATUS="status";

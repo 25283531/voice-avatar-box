@@ -791,6 +791,22 @@ class ReminderEngine(
         val newStates = IntArray(RmdConst.MAX_ITEMS) { RmdState.IDLE.ordinal }
         val newFiredDue = LongArray(RmdConst.MAX_ITEMS)
 
+        // ⚠️ 计时起点**必须跟着条目走**，不能留在下标上。
+        //
+        //    这两个数组是按"条目在表里的下标"存的，而 replaceAll 之后下标的
+        //    含义完全变了（服务端返回顺序一变，idx=0 就从 A 变成了 B）。
+        //    只搬 state、不搬这两个，会得到这样一条精确的假告警链：
+        //
+        //      旧表 [A(serverId=1, PENDING, 08:00 起算), B(serverId=2, IDLE)]
+        //      新表 [B, A]（顺序反转，内容没变）
+        //      ⇒ idx=1 的 A 继承了 state=PENDING，但 pendingSinceMs[1] 是 B 的 0
+        //      ⇒ tick 退回 due 兜底判据，把"刚响 1 分钟"当成"超时 15 分钟"
+        //      ⇒ 立刻 ESCALATED ⇒ 家属收到「老人漏服药」
+        //
+        //    而设备侧一切正常（灯在闪、屏在挂），只有服务端的结论是错的。
+        val newPendingSince = LongArray(RmdConst.MAX_ITEMS)
+        val newHalfSince = LongArray(RmdConst.MAX_ITEMS)
+
         for (inc in incoming) {
             if (newItems.size >= RmdConst.MAX_ITEMS) break
             val dst = inc.copy()
@@ -822,6 +838,9 @@ class ReminderEngine(
                 claimed[src] = true
                 newStates[idx] = oldStates[src]
                 newFiredDue[idx] = old[src].firedDueAt
+                // 计时起点一起搬（见上面 newPendingSince 的说明）
+                newPendingSince[idx] = pendingSinceMs[src]
+                newHalfSince[idx] = halfSinceMs[src]
             }
             newItems.add(dst)
         }
@@ -844,6 +863,10 @@ class ReminderEngine(
                 else -> Unit
             }
             if (states[i] != RmdState.IDLE) table.setFired(i, true)
+            // 计时起点：有迁移值就用迁移值，没有就显式清 0 ——
+            // **不能**留着这个下标上一位 occupant 的旧值。
+            pendingSinceMs[i] = newPendingSince[i]
+            halfSinceMs[i] = newHalfSince[i]
             // 跨重启的 30 秒窗无意义
             confirmDeadlineMs[i] = 0L
         }
