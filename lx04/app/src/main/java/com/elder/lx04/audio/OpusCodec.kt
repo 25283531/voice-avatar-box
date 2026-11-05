@@ -117,7 +117,7 @@ class OpusCodec {
         //    "解码失败"，完全看不出是它连累了编码器。
         //    两个方向是两条独立的链路，必须各自成败。
         if (encoder == null) {
-            encoder = createEncoder()
+            encoder = encoderFactory()
         }
         if (decoder == null || newDecRate != decRate) {
             decRate = newDecRate
@@ -160,6 +160,21 @@ class OpusCodec {
         Log.e(TAG, "编码器构造失败: ${t.javaClass.name}: ${t.message}", t)
         null
     }
+
+    /**
+     * 编码器工厂 —— **只为测试可注入**。
+     *
+     * 为什么需要它：自愈路径（失败 → 重建 → 重试）**只在编码器真的失败时**
+     * 才会走到。而编码器什么时候失败？实机上是并发踩踏导致的断言 ——
+     * 那是概率事件，单测里很难稳定复现。
+     *
+     * 所以这里把"造编码器"这件事抽成一个可替换的工厂：
+     * 单测可以注入一个"第一次调用返回坏编码器、之后返回好的"的工厂，
+     * 于是自愈路径**确定性地**被覆盖到。
+     *
+     * 默认实现就是 [createEncoder]，生产行为不变。
+     */
+    internal var encoderFactory: () -> OpusEncoder? = { createEncoder() }
 
     /** 造一个解码器。失败返回 null，不影响编码器。 */
     private fun createDecoder(): OpusDecoder? = try {
@@ -245,7 +260,7 @@ class OpusCodec {
      * 必须在 [encode] 的锁内调用（它改写 [encoder] 字段）。
      */
     private fun rebuildEncoder(): OpusEncoder? {
-        val fresh = createEncoder()
+        val fresh = encoderFactory()
         if (fresh == null) {
             // 重建也失败：把旧的也丢掉，避免继续用一个已知坏掉的实例。
             encoder = null

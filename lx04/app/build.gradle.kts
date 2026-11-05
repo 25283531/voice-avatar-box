@@ -107,6 +107,23 @@ android {
         jvmTarget = "1.8"
     }
 
+    testOptions {
+        unitTests {
+            /**
+             * 让 JVM 单测能直接调 `android.util.Log`。
+             *
+             * 默认行为是抛 "Method ... not mocked" —— 于是 [OpusCodec]
+             * 这种用了 Log 的类**根本没法在单测里跑**，只能靠
+             * "把 Log 抽出去"来绕，而那会为了测试而改生产代码的结构。
+             *
+             * `isReturnDefaultValues = true` 让 android.* 的方法返回默认值
+             * （Log.i 返回 0、不抛异常），于是单测可以直接测 [OpusCodec]：
+             * 并发编码、失败自愈、计数 —— 全都是这次实机故障的关键路径。
+             */
+            isReturnDefaultValues = true
+        }
+    }
+
     packaging {
         resources {
             excludes += setOf("META-INF/*.kotlin_module", "META-INF/DEPENDENCIES")

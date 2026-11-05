@@ -26,7 +26,7 @@ public class View {
  protected void onDraw(android.graphics.Canvas c){}
  protected void onVisibilityChanged(android.view.View changed,int visibility){}
  protected void onVisibilityChanged(android.view.View changed,int visibility,int oldVisibility){}
- public void postInvalidateOnAnimation(){} public void postInvalidate(){} public void invalidate()
+ public void postInvalidateOnAnimation(){} public void postInvalidate(){}
  public void setWillNotDraw(boolean b){}
  protected void onAttachedToWindow(){} protected void onDetachedFromWindow(){}
  public interface OnClickListener { void onClick(View v); }

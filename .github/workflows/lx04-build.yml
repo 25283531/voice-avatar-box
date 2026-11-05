@@ -14,6 +14,7 @@ on:
       - 'docs/lx04/**'
       - 'tools/smoke_lx04_facts.py'
       - 'tools/kcompile.py'
+      - 'tools/ktest.py'
       - 'tools/ktlint_struct.py'
       - 'tools/androidstub/**'
       - '.github/workflows/lx04-build.yml'
@@ -23,6 +24,7 @@ on:
       - 'docs/lx04/**'
       - 'tools/smoke_lx04_facts.py'
       - 'tools/kcompile.py'
+      - 'tools/ktest.py'
       - 'tools/ktlint_struct.py'
       - 'tools/androidstub/**'
       - '.github/workflows/lx04-build.yml'
@@ -100,6 +102,11 @@ jobs:
         # **括号总数是配平的**，所以"数括号"这种检查根本抓不住。
         # 这个脚本按大括号**深度**判断顶层声明是否真的落在类体里。
         run: python3 tools/ktlint_struct.py
+
+      - name: 本地单测（不需要 Android SDK）
+        # 同上：gradle 那轮 1.5 分钟，单测失败时最费时间的是"改完再等一次 CI"。
+        # 这层用 kotlin-compiler + JUnit 本地跑，10 秒出结果。
+        run: python3 tools/ktest.py
 
       - name: 本地编译检查（不需要 Android SDK）
         # ⚠️ 这一步的价值：静态门禁绿 ≠ 编译得过。

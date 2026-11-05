@@ -173,21 +173,62 @@ def main() -> int:
         shutil.rmtree(out)
     out.mkdir(parents=True)
 
-    files = [str(p) for p in STUB.rglob("*.java")]
-    files += [str(p) for p in src.rglob("*.kt")]
-    # ⚠️ Concentus 是 **.java** 源码（124 个文件），不在 .kt 里 ——
-    #    漏了它，OpusDecoder/OpusEncoder 就是未解析的，
-    #    报错会变成 "unresolved reference: decode"（看着像自己的代码错了，
-    #    其实是缺依赖）。这个坑本机踩过一次。
-    files += [str(p) for p in src.rglob("*.java")]
-
+    # ⚠️⚠️ 两阶段编译（顺序不能反）：
+    #
+    #   阶段一：javac 编 Concentus（124 个 .java）+ Android stub → java_out
+    #   阶段二：kotlinc 编 .kt，classpath 里带上 java_out
+    #
+    # 为什么必须分两阶段：
+    #   · **kotlinc 不编 .java** —— 它只把 .java 当源码根解析符号，不产出 class。
+    #     所以 Concentus 必须先用 javac 编出 .class，kotlinc 才能看见它们。
+    #   · 反过来（只把 .java 塞进 kotlinc 的文件列表）的话，Concentus 整个缺失，
+    #     报出来是 "unresolved reference: decode" —— 看着像自己的代码错了，
+    #     其实是缺依赖。更糟的是：**它会"编译通过"**（假绿），
+    #     但 org/concentus 的 class 根本不存在。本机踩过这个。
+    #
     # ⚠️ classpath 分隔符**按平台区分**：Windows 用 ';'，Linux/macOS 用 ':'。
     #    写死 ';' 的话，CI（ubuntu）会把整串当成一个路径 ⇒
     #    "Could not find or load main class org.jetbrains.kotlin.cli.jvm.K2JVMCompiler"
     #    —— 而本机（Windows）完全正常，就是典型的"本机过、CI 挂"。
+    env = dict(os.environ)
+    for k in ("MSYSTEM", "MSYS2_ARG_CONV_EXCL", "PYTHONHOME", "PYTHONPATH"):
+        env.pop(k, None)
+
     sep = ";" if os.name == "nt" else ":"
+
+    # ---- 阶段一：javac（Concentus + Android stub）----
+    java_out = CACHE / "javaout"
+    if java_out.exists():
+        shutil.rmtree(java_out)
+    java_out.mkdir(parents=True)
+
+    javac = java.with_name("javac.exe" if os.name == "nt" else "javac")
+    if not javac.is_file():
+        javac = Path(shutil.which("javac") or javac)
+
+    java_files = [str(p) for p in STUB.rglob("*.java")] + \
+                 [str(p) for p in src.rglob("*.java")]
+    jr = subprocess.run(
+        [str(javac), "-nowarn", "-encoding", "UTF-8", "-d", str(java_out)] + java_files,
+        capture_output=True, text=True, encoding="utf-8", errors="replace", env=env)
+    jtext = (jr.stdout or "") + (jr.stderr or "")
+    jerrs = [ln for ln in jtext.splitlines() if "error:" in ln]
+    if jr.returncode != 0 or jerrs:
+        print(f"❌ Java 阶段编译失败：{len(jerrs)} 个错误（rc={jr.returncode}）")
+        for e in jerrs[:30]:
+            print("   ", e.strip()[:200])
+        if not jerrs:
+            print("--- 原始输出尾部 ---")
+            for ln in jtext.splitlines()[-20:]:
+                print("   ", ln)
+        return 1
+
+    # ---- 阶段二：kotlinc（.kt）----
+    files = [str(p) for p in src.rglob("*.kt")]
     kcp = sep.join(str(KOTLINC / n) for n in KOTLIN_JARS)
-    acp = sep.join([str(LIBS / n) for n in APP_JARS] + [str(KOTLINC / "kotlin-stdlib-1.9.24.jar")])
+    acp = sep.join([str(java_out)] +
+                   [str(LIBS / n) for n in APP_JARS] +
+                   [str(KOTLINC / "kotlin-stdlib-1.9.24.jar")])
 
     cmd = [
         str(java), "-cp", kcp,
@@ -199,9 +240,6 @@ def main() -> int:
 
     # ⚠️ Git Bash 会改写 Windows exe 的参数（MSYSTEM 等环境变量也会污染 JVM），
     #    所以这里显式清掉。用 Python subprocess 调也是为了绕开这层改写。
-    env = dict(os.environ)
-    for k in ("MSYSTEM", "MSYS2_ARG_CONV_EXCL", "PYTHONHOME", "PYTHONPATH"):
-        env.pop(k, None)
 
     r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8",
                        errors="replace", env=env)

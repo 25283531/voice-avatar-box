@@ -41,11 +41,12 @@ OPUSCODEC = "lx04/app/src/main/java/com/elder/lx04/audio/OpusCodec.kt"
 AUDIOCAPTURE = "lx04/app/src/main/java/com/elder/lx04/audio/AudioCapture.kt"
 KCOMPILE = "tools/kcompile.py"
 KTLINTSTRUCT = "tools/ktlint_struct.py"
+KTEST = "tools/ktest.py"
 
 REQUIRED = [
     TOPKEYS, MANIFEST, BANDVIEW, DEPLOY, FACTS, CHECKLIST, PLAN, README, WORKFLOW,
     MAINACTIVITY, VOICECLIENT, OPUSCODEC, AUDIOCAPTURE,
-    KCOMPILE, KTLINTSTRUCT,
+    KCOMPILE, KTLINTSTRUCT, KTEST,
 ]
 
 _FAILS: list[str] = []
@@ -310,12 +311,18 @@ def run(root: Path) -> int:
         #       的真实形态：有人图省事，在 createDecoder 里写一句
         #       `encoder = null`，解码一失败就把上行也带走了。
         #       只判 ①② 抓不到它（第一版就漏在这里，变异验证时才发现）。
-        "createEncoder" in init_body
+        # ⚠️ init 里造编码器走的是**可注入的工厂**（encoderFactory），
+        #    不是直接 createEncoder —— 工厂是为了让单测能确定性地
+        #    触发自愈路径（"第一次返回坏编码器"）。
+        "encoderFactory" in init_body
         and "createDecoder" in init_body
         and fn_body(opus_code, "createEncoder") != fn_body(opus_code, "createDecoder")
         and "OpusEncoder(" in fn_body(opus_code, "createEncoder")
         and "OpusDecoder(" in fn_body(opus_code, "createDecoder")
-        and "encoder" not in fn_body(opus_code, "createDecoder"),
+        # ⚠️ 判据要查的是"解码器那边有没有碰 encoder 字段"，
+        #    不是"函数体里有没有 encoder 这个词" ——
+        #    createEncoder 里必然有（它就是造编码器的）。
+        and not re.search(r"\bencoder\s*=", fn_body(opus_code, "createDecoder")),
         "共用一个 runCatching，或解码失败时连带废掉编码器 ⇒ 上行音频全灭",
     )
 
@@ -363,6 +370,11 @@ def run(root: Path) -> int:
         "7d workflow 里有 python3 tools/kcompile.py",
         re.search(r"python3\s+tools/kcompile\.py", wf) is not None,
         "本地编译检查不跑 = Kotlin 编译错误只能等 CI 打回（已经连中三次）",
+    )
+    check(
+        "7f workflow 里有 python3 tools/ktest.py",
+        re.search(r"python3\s+tools/ktest\.py", wf) is not None,
+        "本地单测不跑 = 单测失败只能等 CI 打回",
     )
     check(
         "7e workflow 里有 python3 tools/ktlint_struct.py",

@@ -1,7 +1,7 @@
 package android.view;
 import android.content.Context;
 public class ViewGroup extends View {
- public ViewGroup(Context c){super(c);}
+ public ViewGroup(Context c){super(c);} public ViewGroup(Context c,android.util.AttributeSet a){super(c,a);}
  public void addView(View v){} public void addView(View v,int p){}
  public void addView(View v,LayoutParams p){} public void removeView(View v){}
  public static class LayoutParams { public LayoutParams(int w,int h){} public int width; public int height; public int gravity;
