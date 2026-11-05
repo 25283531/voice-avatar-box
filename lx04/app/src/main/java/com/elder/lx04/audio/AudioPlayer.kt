@@ -47,6 +47,23 @@ class AudioPlayer {
         private set
 
     /**
+     * 下行 PCM 的**客观电平观测点**。
+     *
+     * 背景（2026-11-05 真机）：服务端日志两次都写着「播报完成（音频已发）」，
+     * `dumpsys media.audio_flinger` 也显示 AudioTrack 写了约 5.5 秒数据，
+     * 但老人**听不到声音**。此时读代码分不清两件事：
+     *   · 写进 AudioTrack 的 PCM 本来就是静音（解码 / TTS 侧问题）
+     *   · PCM 正常，但 HAL / 音量 / 路由没把声音放出来
+     * 两者日志都是全绿。所以必须在**入队前**量一次电平，把这两种情况分开。
+     *
+     * 单位是 PCM16 的 short 幅度（满幅 32767）。正常语音 rms 约 300~3000；
+     * 全零/近零（< 20）就是静音帧。每 25 帧（1.5 秒）打一条，不会刷屏。
+     */
+    private var levelFrames = 0
+    private var levelSumSq = 0.0
+    private var levelPeak = 0
+
+    /**
      * 开始播放（可重复调用以切换采样率）。
      *
      * @param sampleRate 服务端 hello 里声明的采样率
@@ -107,11 +124,39 @@ class AudioPlayer {
     /** 送一帧去播（在 WS 线程调用，不阻塞）。 */
     fun enqueue(pcm: ShortArray) {
         if (!running) return
+        observeLevel(pcm)
         if (!queue.offer(pcm)) {
             droppedFrames++
             if (droppedFrames % 20 == 1) {
                 Log.w(TAG, "播放队列满，已丢弃 $droppedFrames 帧（链路卡顿）")
             }
+        }
+    }
+
+    /** 累计一帧的电平，满 25 帧打一条日志。 */
+    private fun observeLevel(pcm: ShortArray) {
+        var peak = 0
+        var sum = 0.0
+        for (v in pcm) {
+            val a = v.toInt()
+            val abs = if (a < 0) -a else a
+            if (abs > peak) peak = abs
+            sum += (a.toDouble() * a)
+        }
+        levelFrames++
+        levelSumSq += sum
+        if (peak > levelPeak) levelPeak = peak
+        if (levelFrames >= 25) {
+            val total = levelFrames * pcm.size
+            val rms = kotlin.math.sqrt(levelSumSq / maxOf(1, total))
+            Log.i(
+                TAG,
+                "下行 PCM 电平：帧=$levelFrames rms=${"%.1f".format(rms)} " +
+                    "peak=$levelPeak（${if (rms < 20) "疑似静音 ⚠️" else "有信号"}）"
+            )
+            levelFrames = 0
+            levelSumSq = 0.0
+            levelPeak = 0
         }
     }
 

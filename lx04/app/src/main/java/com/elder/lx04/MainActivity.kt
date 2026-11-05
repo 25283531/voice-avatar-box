@@ -542,11 +542,8 @@ class MainActivity : Activity() {
         // ⚠️ 必须先让出麦克风：LX04 的 HAL 不允许两个 AudioRecord 同时打开。
         //    唤醒词路径里引擎已经自己停了，这里 pause() 是幂等的保险；
         //    按键路径则靠这一句把常驻 KWS 采集关掉。
-        wakeEngine.pause()
-
-        // ⚠️ 必须先让出麦克风：LX04 的 HAL 不允许两个 AudioRecord 同时打开。
-        //    唤醒词路径里引擎已经自己停了，这里 pause() 是幂等的保险；
-        //    按键路径则靠这一句把常驻 KWS 采集关掉。
+        //    ⚠️ 只能调一次：重复 stop/start 会让 HAL 报
+        //    `startInputDevice(), input device already opened`，采集线程交接错乱。
         wakeEngine.pause()
 
         sending = true
@@ -1575,6 +1572,51 @@ class MainActivity : Activity() {
      *
      * 用法：`adb shell am broadcast -a com.elder.lx04.DEBUG --es cmd tone_test`
      */
+    /**
+     * 扬声器自检 —— **不依赖网络、不依赖麦克风**，播 3 秒 440Hz 正弦。
+     *
+     * 与 `tone_test` 的区别很重要：tone_test 是回环自检，靠麦克风听扬声器，
+     * 而 LX04 的 HAL 在录音路径上做回声消除，**设备扬声器的声音麦克风采不到**
+     * ⇒ 那个自检必然报「通路有问题」，不能用来判断扬声器有没有出声。
+     *
+     * 这条命令只做一件事：用与 TTS 完全相同配置的 AudioTrack
+     * （STREAM_MUSIC / 24kHz / mono / PCM16）写一段已知非静音的 PCM。
+     * 现场判据：
+     *   · 能听到「嘀——」 ⇒ 扬声器/音量/路由都正常，问题在下行数据或播放时序
+     *   · 听不到         ⇒ 输出侧（HAL、音量策略、被别的 app 抢占）有问题
+     */
+    private fun runSpeakerTest() {
+        if (sending) {
+            Log.w(TAG, "speaker_test 忽略 —— 正在对话中")
+            return
+        }
+        screen.setHint("扬声器自检：播放 3 秒 440Hz…")
+        val tone = buildTone(SAMPLE_RATE_OUT, ms = 3_000, freqHz = 440.0, amp = 10_000)
+        val track = createTrack(SAMPLE_RATE_OUT)
+        if (track == null) {
+            Log.e(TAG, "speaker_test：AudioTrack 打不开")
+            screen.setHint("扬声器自检失败：AudioTrack 打不开")
+            return
+        }
+        scope.launch {
+            withContext(Dispatchers.IO) {
+                runCatching {
+                    track.play()
+                    val written = track.write(tone, 0, tone.size)
+                    Log.i(TAG, "speaker_test：写入 $written / ${tone.size} 采样")
+                    // MODE_STREAM 的 write 是阻塞的，返回时只剩尾缓冲没放完
+                    Thread.sleep(400)
+                }.onFailure {
+                    Log.e(TAG, "speaker_test 播放异常: ${it.javaClass.name}: ${it.message}")
+                }
+            }
+            runCatching { track.stop() }
+            runCatching { track.release() }
+            Log.i(TAG, "speaker_test：播放结束")
+            screen.setHint("扬声器自检完成（3 秒 440Hz）")
+        }
+    }
+
     private fun runToneTest() {
         if (sending) {
             Log.w(TAG, "tone_test 忽略 —— 正在对话中")
@@ -1719,6 +1761,7 @@ class MainActivity : Activity() {
             "mic_matrix" -> runMicMatrix()
             "inject" -> runInject()
             "tone_test" -> runToneTest()
+            "speaker_test" -> runSpeakerTest()
             "opus_selftest" -> runOpusSelfTest()
 
             // 提醒相关的调试命令现在**只能通过运行时**触发：
