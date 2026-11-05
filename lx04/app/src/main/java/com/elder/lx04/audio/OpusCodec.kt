@@ -112,24 +112,48 @@ class OpusCodec {
      * @return Opus 裸包；编码器不可用时返回 null（上层跳过这一帧，不要崩）
      */
     fun encode(pcm: ShortArray): ByteArray? {
-        val enc = encoder ?: return null
-        if (pcm.size < encodeFrameSamples) return null
-        return try {
-            val n = enc.encode(pcm, 0, encodeFrameSamples, encBuf, 0, encBuf.size)
-            if (n <= 0) {
-                // DTX 或"这一帧没有可发的数据"都会返回 0。不是错误，
-                // 但如果是负数就说明编码器出问题了 —— 分开记，别混成一个 null。
-                logOnce("编码返回 $n（非正值，跳过该帧）", null)
-                return null
+        // ⚠️ 必须同步。
+        //    Concentus 明确不是线程安全的，而 SILK 的内部状态一旦被两个线程
+        //    同时踩，就会在 Resampler / Autocorrelation 的断言里炸出来
+        //    （实机堆栈就是这样）。正常情况下采集线程只有一个调用者，
+        //    但"旧 capture 还没退干净、新 capture 已经起来"的窗口是存在的 ——
+        //    按住说话反复按几下就能撞上。加锁的代价在音频线程上可以忽略。
+        synchronized(this) {
+            val enc = encoder ?: return null
+            if (pcm.size < encodeFrameSamples) return null
+            return try {
+                val n = enc.encode(pcm, 0, encodeFrameSamples, encBuf, 0, encBuf.size)
+                if (n <= 0) {
+                    // DTX 或"这一帧没有可发的数据"都会返回 0。不是错误，
+                    // 但如果是负数就说明编码器出问题了 —— 分开记，别混成一个 null。
+                    logOnce("编码返回 $n（非正值，跳过该帧）", null)
+                    return null
+                }
+                encBuf.copyOf(n)
+            } catch (t: Throwable) {
+                // ⚠️ 必须打**类名 + 堆栈**。OpusException 的 message 是有内容的，
+                //    而 NPE / AssertionError 的 message 是 null ——
+                //    只打 message 会得到一行无用的"编码失败: null"。
+                logOnce("编码失败 ${t.javaClass.name}: ${t.message}", t)
+                null
             }
-            encBuf.copyOf(n)
-        } catch (t: Throwable) {
-            // ⚠️ 必须打**类名 + 堆栈**。OpusException 的 message 是有内容的，
-            //    而 NPE / NegativeArraySizeException 的 message 是 null ——
-            //    只打 message 会得到一行无用的"编码失败: null"。
-            logOnce("编码失败 ${t.javaClass.name}: ${t.message}", t)
-            null
         }
+    }
+
+    /** 编码器当前参数 —— 自检时打出来，一眼看出是不是初始化没生效。 */
+    @Synchronized
+    fun describe(): String {
+        val enc = encoder ?: return "encoder=null（初始化失败）"
+        return "Fs=${enc.sampleRate} bitrate=${enc.bitrate} " +
+            "complexity=${enc.complexity} vbr=${enc.useVBR} dtx=${enc.useDTX} " +
+            "lookahead=${enc.lookahead} | 上行 ${encodeFrameSamples}@${encRate}Hz " +
+            "下行 ${decodeFrameSamples}@${decRate}Hz"
+    }
+
+    /** 重新允许打失败日志（自检前调用，否则前面用完了就看不到堆栈）。 */
+    @Synchronized
+    fun resetDiag() {
+        failLogged = 0
     }
 
     /** 失败日志只打前几次，避免每 60ms 刷一行把 logcat 冲掉。 */

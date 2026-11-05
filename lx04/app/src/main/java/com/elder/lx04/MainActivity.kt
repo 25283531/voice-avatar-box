@@ -571,6 +571,73 @@ class MainActivity : Activity() {
      *
      * 用法：`adb shell am broadcast -a com.elder.lx04.DEBUG --es cmd mic_test`
      */
+    /**
+     * Opus 编码器自检 —— 完全不碰麦克风和网络。
+     *
+     * ## 为什么需要它
+     *
+     * 实机上"按住说话"没反应，抓到的日志是 `编码失败: null`，打堆栈后
+     * 看到是 Concentus 内部的 `OpusAssert`。但同样的代码在 JVM 单测里
+     * 连编 10 帧毫无问题 —— 说明不是库本身，是**设备上的运行时状态**。
+     *
+     * 分叉只有两种，修法完全不同：
+     *
+     * ```
+     * 正弦也能编出来  → 编码器是好的，坏的是喂进去的麦克风数据
+     *                    （数组长度、并发踩踏、采集线程提前退出）
+     * 正弦也编不出来  → 编码器实例本身坏了
+     *                    （初始化没生效 / 被并发重置 / 参数没设进去）
+     * ```
+     *
+     * 用固定正弦而不是麦克风，就是把"输入"这个变量钉死。
+     *
+     * 用法：`adb shell am broadcast -a com.elder.lx04.DEBUG --es cmd opus_selftest`
+     */
+    private fun runOpusSelfTest() {
+        if (sending) {
+            Log.w(TAG, "opus_selftest 忽略 —— 正在对话中")
+            return
+        }
+        screen.setHint("Opus 自检中…")
+        opus.resetDiag()
+
+        scope.launch(Dispatchers.Default) {
+            val sb = StringBuilder()
+            sb.append("参数 ").append(opus.describe()).append('\n')
+
+            // ---- 1. 固定 440Hz 正弦，连编 5 帧 ----
+            val tone = ShortArray(opus.encodeFrameSamples) { i ->
+                (8000 * Math.sin(2 * Math.PI * 440 * i / 16_000.0)).toInt().toShort()
+            }
+            var okTone = 0
+            var bytesTone = 0
+            repeat(5) {
+                val b = opus.encode(tone)
+                if (b != null) {
+                    okTone++
+                    bytesTone += b.size
+                }
+            }
+            sb.append("正弦 5 帧：成功 $okTone，共 $bytesTone 字节\n")
+
+            // ---- 2. 全静音 3 帧（按住键还没开口时就是这个） ----
+            var okSilent = 0
+            repeat(3) { if (opus.encode(ShortArray(opus.encodeFrameSamples)) != null) okSilent++ }
+            sb.append("静音 3 帧：成功 $okSilent\n")
+
+            val verdict = when {
+                okTone == 0 -> "编码器坏了（正弦都编不出）"
+                okTone < 5 -> "编码器不稳定（正弦 $okTone/5）"
+                okSilent < 3 -> "静音帧异常（$okSilent/3），可能是 DTX 相关"
+                else -> "编码器正常 —— 问题在麦克风数据"
+            }
+            sb.append("结论：").append(verdict)
+
+            Log.i(TAG, "opus_selftest\n$sb")
+            screen.setHint("Opus：正弦 $okTone/5 静音 $okSilent/3 → $verdict")
+        }
+    }
+
     private fun runMicTest() {
         if (sending) {
             Log.w(TAG, "mic_test 忽略 —— 正在对话中")
@@ -793,6 +860,7 @@ class MainActivity : Activity() {
             "stop_talk" -> endListening()
             "mic_test" -> runMicTest()
             "tone_test" -> runToneTest()
+            "opus_selftest" -> runOpusSelfTest()
 
             "med_pending" -> {
                 onReminderPending(true)
