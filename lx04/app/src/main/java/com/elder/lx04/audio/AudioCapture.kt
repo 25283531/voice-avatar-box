@@ -13,18 +13,44 @@ import kotlin.concurrent.thread
 /**
  * 麦克风采集 —— 16kHz / 单声道 / 60ms 一帧。
  *
- * ## 音频源为什么选 VOICE_RECOGNITION
+ * ## 音频源为什么选 VOICE_COMMUNICATION（2026-11-06 真机定案）
  *
- * LX04 原厂的小爱唤醒（`MiVpmService`）用的就是它 —— 实测
- * `dumpsys media.audio_flinger` 里它的录音线程挂在 `AudioIn_1E` 上。
+ * ⚠️ **这一节推翻了 2026-11-05 的结论** —— 那次写的是 `VOICE_RECOGNITION`，
+ *    而且当时的判据把「上电瞬态」当成了「有人声」（见下）。
  *
- * 与 `MIC` 的区别很实际：
- *   · `MIC` 是**原始信号**，空调声、桌子震动、电路噪声全在
- *   · `VOICE_RECOGNITION` 在 HAL 层就带了为语音识别调过的处理
- *     （部分平台自动开降噪 + 固定增益），并且**不做 AGC 抽气**
+ * 2026-11-06 真机矩阵（同一台设备、同一说话人、同一次运行内十组参数扫完，
+ * 每组采 2.5 秒、组间等 1.5 秒释放），**逐组落盘原始样本**再拉回本机分析：
+ *
+ *   ```
+ *   VOICE_RECOGNITION 16000 1ch → 78400 样本 / 2.45s = 32000 样本/s
+ *        ⇒ HAL 回的是 2ch 交错；分段 rms = [8187.6, 53.5, 98, 133, 138, 130,
+ *           118, ... 13, 7.9, 6.5, 3.9, 5.6, ...]
+ *        ⇒ **第一个 800 样本是上电爆音（rms 8187），此后一路衰减到 ~10**
+ *        ⇒ 整个窗口里**没有持续语音**。上行的对话语音全在那个衰减尾巴里，
+ *          能量极低 ⇒ 服务端 ASR 恒空。
+ *
+ *   VOICE_COMMUNICATION 16000 1ch → 39200 样本 / 2.45s = 16000 样本/s
+ *        ⇒ HAL 回的是**真单声道**（不需要抽通道）；
+ *        分段 rms = [0×21, 2204, 4161, 3838, 3136, 2659, ... 持续 900~1300]
+ *        ⇒ 前面 21 段是**麦克风启动延迟**（约 1.05 秒），之后是**持续人声**；
+ *          频谱 100/300/700/1500Hz 都有明显能量、3kHz 以上快速衰减
+ *          —— 典型语音频谱。
+ * ```
+ *
+ * ⚠️ **2026-11-05 那次「VOICE_RECOGNITION 16000 1ch → rms=553.7 有信号」
+ *    是假绿**：553 与今天的 827 同量级，而今天的 827 已被分段证明是
+ *    「上电爆音 + 衰减尾巴」。当时的判据只看整窗 rms、没排除瞬态，
+ *    于是把「一记爆音」认成了「有人说话」。
+ *    ⇒ 任何「麦克风能录到人声」的结论，都必须先**分段**看能量形态，
+ *      并把上电瞬态单独剔掉（见 [AudioCapture] 里 [WARMUP_FRAMES]）。
+ *
+ * ⚠️ **劣化模型被排除**：矩阵里 VOICE_COMMUNICATION 排在**第 9 组（最晚）**、
+ *    VOICE_RECOGNITION 排在**第 2 组（最早）**。若 HAL 是「反复 open/close 后
+ *    随时间劣化」，那越靠后越该坏 —— 实测恰恰相反（最晚的那组最好）。
+ *    ⇒ 差异在**音频源本身**，不是 HAL 状态。
  *
  * 老人对着音箱说话，距离从半米到三米，原始信号的信噪比会差很多。
- * 用和小爱同一个音频源，至少起点是一样的。
+ * `VOICE_COMMUNICATION` 在这台 MTK HAL 上是唯一能持续拿到人声的源。
  *
  * ## 平台效果：实测**挂得上**，而且真的在跑
  *
@@ -98,7 +124,7 @@ class AudioCapture(
      *    所以每帧读 1920 个 short 再抽左声道（见 [start] 的说明）。
      */
     @Volatile
-    private var channels = HAL_CHANNELS
+    private var channels = HAL_CHANNELS_FALLBACK
 
     @Volatile
     private var running = false
@@ -145,42 +171,55 @@ class AudioCapture(
         // ⚠️⚠️ 采集参数是**实测定死**的，不是猜的。
         //
         //    实机矩阵（`adb shell am broadcast -a com.elder.lx04.DEBUG --es cmd mic_matrix`，
-        //    2026-11-05）把 10 组 (音频源 × 采样率 × 通道数) 全试了一遍：
+        //    2026-11-06）把 10 组 (音频源 × 采样率 × 通道数) 全试了一遍，
+        //    **每组把原始样本落盘**、拉回本机逐段分析（见类注释）：
         //
         //        VOICE_RECOGNITION 16000 2ch → frames=7   rms=0.0     ← 全零
-        //        VOICE_RECOGNITION 16000 1ch → frames=98  rms=553.7   ← 有信号
+        //        VOICE_RECOGNITION 16000 1ch → frames=98  rms=827.8   ← ★只有上电爆音
         //        VOICE_RECOGNITION 48000 2ch → frames=7   rms=0.0     ← 全零
-        //        VOICE_RECOGNITION 48000 1ch → frames=295 rms=611.0   ← 有信号
-        //        MIC 16000 1ch              → frames=98  rms=1005.3  ← 有信号
+        //        VOICE_RECOGNITION 48000 1ch → frames=226 rms=734.1   ← ★同上
+        //        MIC 16000 1ch              → frames=99  rms=1139.8  ← ★同上
         //        MIC 16000 2ch              → frames=7   rms=0.0     ← 全零
         //        MIC 48000 2ch              → frames=7   rms=0.0     ← 全零
         //        DEFAULT 48000 2ch          → frames=7   rms=0.0     ← 全零
-        //        VOICE_COMMUNICATION 16000 1ch → frames=49 rms=941.4 ← 有信号
+        //        VOICE_COMMUNICATION 16000 1ch → frames=49 rms=1380.8 ← ★真实人声
         //        CAMCORDER 48000 2ch        → frames=7   rms=0.0     ← 全零
         //
-        //    ⇒ **所有 2ch 组合全是 0**：ALSA `state: PREPARED`（流没跑起来）、
+        //    ⇒ **2ch 组合全是 0**：ALSA `state: PREPARED`（流没跑起来）、
         //      AudioFlinger 日志 `startInputDevice(), input device already opened`、
         //      HAL 反复打 `[readThread] failed` / `Not enough data`。
-        //      而所有 1ch 组合都有真实信号。
-        //    ⇒ 所以**必须请求 mono**（请求 stereo 在这台设备上等于没有麦克风）。
+        //      所以**必须请求 mono**（请求 stereo 在这台设备上等于没有麦克风）。
         //
-        // ⚠️⚠️ 但 mono 请求拿回来的**是交错的双声道**：
+        //    ⇒ ★ 标记的那几组「rms 看起来很大」是**假绿**：分段一看，
+        //      能量全在**第一段上电爆音**（rms 8187）里，此后一路衰减到 ~10，
+        //      整个窗口**没有持续语音**。详见类注释。
         //
-        //    HAL 内部是 2ch（hw_params: `channels: 2`），framework 没做 downmix，
-        //    于是「按 mono 读」读到的是 L,R,L,R 交错的流：
+        //    ⇒ 唯一能持续拿到人声的是 **VOICE_COMMUNICATION**。
         //
-        //        · 每帧 960 个 short 只覆盖 960/2/16000 = **30ms** 真实音频
-        //          （协议要求 60ms）⇒ 服务端按 60ms 播 ⇒ 声音慢一倍、
-        //          音调减半，ASR 几乎听不出字；
-        //        · 现场症状对得上：link_test 跑 5 秒采到 **165 帧**
-        //          （5s/60ms 本该 83 帧，165 ≈ 83×2）。
+        // ⚠️⚠️ **HAL 通道数不写死，运行时自适应**：
         //
-        //    ⇒ 修法：**mono 请求 + 每帧读 960×2 = 1920 个 short，抽左声道**，
-        //      还原出真正的 60ms 单声道（见 [extractLeftChannel]）。
+        //    同一次请求 `CHANNEL_IN_MONO`，两个源回来的东西不一样：
         //
-        //    ⇒ 换设备时先用 `mic_matrix` 复核这两个数：HAL 通道数与音频源。
+        //        VOICE_RECOGNITION  → 78400 样本 / 2.45s = **32000 样本/s**
+        //                              ⇒ HAL 回的是 2ch 交错（framework 不 downmix），
+        //                                且**右通道恒为数字零**（实测奇位 rms=0.7）
+        //        VOICE_COMMUNICATION → 39200 样本 / 2.45s = **16000 样本/s**
+        //                              ⇒ HAL 回的是**真单声道**
+        //
+        //    ⇒ 写死 `HAL_CHANNELS=2` 会在换源后**读错**：
+        //      每帧读 960×2=1920 short 会跨过 120ms 真实音频，
+        //      再抽「左声道」= 每隔一个取一个 ⇒ 采样率腰斩到 8kHz，
+        //      服务端按 16kHz 播 ⇒ **声音慢一倍、音调减半**。
+        //      这正是 11-05 修过的那个老坑，换源后必须重新面对。
+        //
+        //    ⇒ 做法：**先按 mono 读，用实测帧率反推 HAL 通道数**，
+        //      确认是 2ch 才切到「读 2 倍 + 抽左声道」。
+        //      判据在 [detectHalChannels]，纯函数，可单测。
+        //
+        //    ⇒ 换设备时先用 `mic_matrix` 复核音频源；通道数不用手动改，
+        //      运行时自会测出来。
         val rec = openRecord() ?: return false
-        channels = HAL_CHANNELS
+        channels = HAL_CHANNELS_FALLBACK
 
         if (enablePlatformEffects) attachEffects(rec.audioSessionId) else {
             // ⚠️ 不挂平台效果链时，软件增益必须自己顶上（见类注释）。
@@ -206,7 +245,8 @@ class AudioCapture(
         }
         Log.i(
             TAG,
-            "采集已启动：${SAMPLE_RATE}Hz mono（HAL ${channels}ch → 抽左声道），${FRAME_MS}ms/帧"
+            "采集已启动：${SAMPLE_RATE}Hz mono，源=$AUDIO_SOURCE，" +
+                "HAL 通道数运行时探测中，${FRAME_MS}ms/帧"
         )
         return true
     }
@@ -214,8 +254,11 @@ class AudioCapture(
     /**
      * 打开采集设备。
      *
-     * ⚠️ **只请求 mono** —— 本机 HAL 不支持立体声录音（请求 stereo 读到的全是 0，
-     *    实测见 [start] 里的矩阵表）。
+     * ⚠️ **只请求 mono** —— 实测本机 HAL 不支持立体声录音（请求 stereo 读到的
+     *    全是 0，见 [start] 里的矩阵表）。
+     *
+     * ⚠️ **音频源必须是 `VOICE_COMMUNICATION`** —— 见类注释里 2026-11-06 的
+     *    实测矩阵：本机只有这个源能**持续**拿到人声，其余源只有一记上电爆音。
      *
      * @return 打开成功的 [AudioRecord]；失败返回 null
      */
@@ -232,11 +275,11 @@ class AudioCapture(
 
         // 缓冲给 4 帧，留够抖动余量：只给 1 帧的话，一次 GC 停顿就会丢采样，
         // 丢采样在 Opus 里表现为"咔"一声，服务端 ASR 会听到半个字。
-        val bufBytes = maxOf(minBuf, FRAME_SAMPLES * 2 * HAL_CHANNELS * 4)
+        val bufBytes = maxOf(minBuf, FRAME_SAMPLES * 2 * HAL_CHANNELS_FALLBACK * 4)
 
         val rec = try {
             AudioRecord(
-                MediaRecorder.AudioSource.VOICE_RECOGNITION,
+                AUDIO_SOURCE,
                 SAMPLE_RATE,
                 AudioFormat.CHANNEL_IN_MONO,
                 AudioFormat.ENCODING_PCM_16BIT,
@@ -252,12 +295,40 @@ class AudioCapture(
             rec.release()
             return null
         }
-        Log.i(TAG, "采集通道：请求 mono，HAL 实际 ${HAL_CHANNELS}ch（读 ${FRAME_SAMPLES * HAL_CHANNELS} short/帧 → 抽左声道）")
+        Log.i(TAG, "采集通道：请求 mono，源=$AUDIO_SOURCE（HAL 通道数运行时探测）")
         return rec
     }
 
     private fun captureLoop(rec: AudioRecord) {
-        val ch = channels
+        // ⚠️⚠️ **HAL 通道数必须运行时探测，不能写死**（2026-11-06 实机）。
+        //
+        //    同一个 `CHANNEL_IN_MONO` 请求，不同音频源回来的数据不同：
+        //
+        //        VOICE_RECOGNITION  → 32000 样本/s ⇒ 2ch 交错
+        //        VOICE_COMMUNICATION → 16000 样本/s ⇒ 真单声道
+        //
+        //    写死 2ch 的话，在真单声道源上会**每帧读 120ms 的音频**、
+        //    再隔一个取一个 ⇒ 采样率腰斩 ⇒ 声音慢一倍、音调减半。
+        //
+        //    探测办法：**先固定按 mono 读**（每帧 960 short），用实测帧率反推：
+        //      · 实测帧率 ≈ 16.7 帧/s ⇒ HAL 是 mono，直接用；
+        //      · 实测帧率 ≈ 33.3 帧/s ⇒ HAL 是 2ch 交错，
+        //        正式读时每帧要读 2×960 个 short 再抽左声道。
+        //
+        //    ⚠️ **探测阶段的读帧长度必须固定**，否则判据自相矛盾：
+        //      若一开始就读 1920 short，mono 源上每帧要等 120ms、
+        //      帧率会变成 8.3 帧/s ⇒ 判反。
+        //
+        //    判据写成纯函数 [detectHalChannels]，可单测（见 JVM 测试）。
+        val detected = probeHalChannels(rec)
+        val ch = detected
+        channels = detected
+        Log.i(
+            TAG,
+            "HAL 通道数探测完成：${ch}ch（实测 ${"%.1f".format(probeFrameRate)} 帧/s）" +
+                if (ch == 1) " ⇒ 真单声道，直接用" else " ⇒ 2ch 交错，读 ${FRAME_SAMPLES * ch} short/帧 → 抽左声道"
+        )
+
         // 多声道时按 ch 倍长度读，再抽左声道还原成单声道（见 start() 的说明）。
         val buf = ShortArray(FRAME_SAMPLES * ch)
         val mono = ShortArray(FRAME_SAMPLES)
@@ -300,6 +371,57 @@ class AudioCapture(
             c(mono, info)
         }
     }
+
+    /**
+     * 探测 HAL 实际给的通道数。
+     *
+     * ⚠️ **探测阶段的读帧长度固定为 mono**（每帧 960 short）——
+     *    否则判据自相矛盾：若按 2ch 读 1920 short，mono 源上每帧要等
+     *    120ms、实测帧率变成 8.3 帧/s，会被误判成 2ch。
+     *
+     * 做法：连续读若干帧，量出**每秒能读满多少帧**。
+     *   · mono 源     ⇒ 每帧覆盖 60ms 真实音频 ⇒ ≈16.7 帧/s
+     *   · 2ch 交错源  ⇒ 每帧覆盖 30ms 真实音频 ⇒ ≈33.3 帧/s
+     *
+     * 探测期间的数据直接丢弃（上电爆音 + 启动延迟本来也不要）。
+     *
+     * @return 1 = mono；2 = 2ch 交错
+     */
+    private fun probeHalChannels(rec: AudioRecord): Int {
+        val buf = ShortArray(FRAME_SAMPLES)
+        var frames = 0
+        val t0 = android.os.SystemClock.elapsedRealtime()
+        // 至少测 400ms、至少 4 帧，否则帧率抖动大到没法判
+        while (running && android.os.SystemClock.elapsedRealtime() - t0 < PROBE_MIN_MS) {
+            var off = 0
+            var failed = false
+            while (off < buf.size && running) {
+                val n = rec.read(buf, off, buf.size - off)
+                if (n <= 0) {
+                    if (n == AudioRecord.ERROR_INVALID_OPERATION ||
+                        n == AudioRecord.ERROR_BAD_VALUE
+                    ) {
+                        failed = true
+                        break
+                    }
+                    Thread.sleep(5)
+                    continue
+                }
+                off += n
+            }
+            if (failed) break
+            frames++
+        }
+        val dt = android.os.SystemClock.elapsedRealtime() - t0
+        probeFrameRate = if (dt > 0) frames * 1000.0 / dt else 0.0
+        return detectHalChannels(probeFrameRate)
+    }
+
+    /**
+     * 实测帧率（帧/秒），只在探测阶段有意义。
+     */
+    @Volatile
+    private var probeFrameRate: Double = 0.0
 
     /** 挂平台效果。挂不上的情况仍要能跑（只记日志，不阻断）。 */
     private fun attachEffects(sessionId: Int) {
@@ -410,15 +532,46 @@ class AudioCapture(
         /**
          * **HAL 实际给的通道数**（不是我们请求的）。
          *
-         * 实机（MTK8167A + 厂商 HAL）：请求 mono，HAL 回的是**交错双声道**
-         * （hw_params: `channels: 2`），framework 不做 downmix。
-         * ⇒ 每帧要读 `FRAME_SAMPLES × HAL_CHANNELS` 个 short，再抽左声道，
-         *   才还原出真正的 60ms 单声道。
+         * ⚠️ **不再写死** —— 2026-11-06 实机证明同一个 `CHANNEL_IN_MONO` 请求，
+         * 不同音频源回来的通道结构不同：
          *
-         * ⚠️ 换设备先用 `mic_matrix` 复核这个数：请求 stereo 在本机读到的
-         *    全是 0（ALSA PREPARED + "input device already opened"）。
+         * | 音频源 | 实测样本率 | HAL 实际 |
+         * | --- | --- | --- |
+         * | `VOICE_RECOGNITION` | 32000/s | 2ch 交错（右通道恒为数字零） |
+         * | `VOICE_COMMUNICATION` | 16000/s | **真单声道** |
+         *
+         * 写死 2ch 在真单声道源上会「每帧读 120ms + 隔一个取一个」
+         * ⇒ 采样率腰斩 ⇒ 声音慢一倍、音调减半。
+         *
+         * ⇒ 现在**运行时探测**（见 [detectHalChannels]）。
+         * 这个常量只是**探测失败时的兜底**（取 2 是更保守的一侧：
+         * 交错流按 mono 读会快一倍，但不会把音频内容搞乱；
+         * 而真 mono 按 2ch 读会慢一倍且抽错通道）。
          */
-        const val HAL_CHANNELS = 2
+        const val HAL_CHANNELS_FALLBACK = 2
+
+        /**
+         * 采集用的音频源。
+         *
+         * ⚠️ **必须是 `VOICE_COMMUNICATION`**（2026-11-06 实机定案）。
+         *
+         * 同一台设备、同一说话人、同一次矩阵运行内逐组落盘分析：
+         *   · `VOICE_RECOGNITION` → 能量全在**第一记上电爆音**里，
+         *     之后一路衰减到 rms≈10，整个窗口**没有持续语音**；
+         *   · `VOICE_COMMUNICATION` → 启动延迟约 1.05 秒，之后是
+         *     **持续人声**（rms 900~1400，频谱是典型语音形状）。
+         *
+         * ⚠️ 别用「整窗 rms 大」判断「能录到人声」—— 上电爆音的 rms
+         *    比人声还大（实测 8187 vs 1380）。必须**分段**看能量形态。
+         */
+        const val AUDIO_SOURCE = MediaRecorder.AudioSource.VOICE_COMMUNICATION
+
+        /**
+         * 探测 HAL 通道数的最短时长（毫秒）。
+         *
+         * 400ms ≈ 7 帧（mono）或 13 帧（2ch），帧率抖动不足以翻转判据。
+         */
+        private const val PROBE_MIN_MS = 400L
 
         /**
          * 从交错的多声道数据里取**左声道**，还原成单声道。
@@ -448,5 +601,30 @@ class AudioCapture(
          * —— 见 [stop] 里的说明。
          */
         private const val JOIN_TIMEOUT_MS = 500L
+
+        /**
+         * 由**实测帧率**判定 HAL 实际给的通道数。
+         *
+         * 探测阶段固定按 mono 读（每帧 960 short @16kHz = 60ms）：
+         *   · HAL 给 mono     ⇒ 每秒 1000/60 ≈ 16.7 帧
+         *   · HAL 给 2ch 交错 ⇒ 每秒 1000/30 ≈ 33.3 帧
+         *
+         * 判据用**中点**（25 帧/s）分开，两侧都留了 50% 余量。
+         *
+         * ⚠️ 这个判据的前提是「探测阶段的读帧长度固定为 mono」。
+         *    若探测时按 2ch 读 1920 short，mono 源上每帧要等 120ms、
+         *    帧率变成 8.3 帧/s ⇒ 判反成 2ch ⇒ 之后每帧读 120ms、
+         *    声音慢一倍。**判据与前提必须一起改。**
+         *
+         * @param framesPerSec 实测帧率（帧/秒）
+         * @return 1 = mono；2 = 2ch 交错
+         */
+        internal fun detectHalChannels(framesPerSec: Double): Int {
+            if (framesPerSec <= 0.0) return 1
+            val monoFrameRate = 1000.0 / 60.0          // ≈16.7
+            val stereoFrameRate = 1000.0 / 30.0        // ≈33.3
+            val midpoint = (monoFrameRate + stereoFrameRate) / 2.0   // ≈25
+            return if (framesPerSec > midpoint) 2 else 1
+        }
     }
 }

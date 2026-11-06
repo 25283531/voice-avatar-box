@@ -394,15 +394,78 @@ def run(root: Path) -> int:
     #
     # ⚠️ 这类故障**没有任何异常**，只是"声音变得不对"，
     #    所以必须靠代码位 + 单测双重钉死。
+    #
+    # ⚠️⚠️ 2026-11-06 再一次改写：同一个 `CHANNEL_IN_MONO` 请求，
+    #    **不同音频源回来的通道结构不同**（样本数 ÷ 墙钟 反推）：
+    #      · VOICE_RECOGNITION  → 32000 样本/s ⇒ 2ch 交错
+    #      · VOICE_COMMUNICATION → 16000 样本/s ⇒ 真单声道
+    #    ⇒ 通道数**不能写死**，必须运行时探测（见 [detectHalChannels]）。
     loop_body = fn_body(cap_code, "captureLoop")
     open_body = fn_body(cap_code, "openRecord")
     check(
         "8k 每帧按 HAL 通道数读，再抽左声道还原成 60ms 单声道",
-        "HAL_CHANNELS" in cap_code
+        "HAL_CHANNELS_FALLBACK" in cap_code
         and "extractLeftChannel" in loop_body
         and re.search(r"ShortArray\s*\(\s*FRAME_SAMPLES\s*\*\s*ch\s*\)", loop_body) is not None
-        and re.search(r"FRAME_SAMPLES\s*\*\s*2\s*\*\s*HAL_CHANNELS", cap_code) is not None,
+        and re.search(r"FRAME_SAMPLES\s*\*\s*2\s*\*\s*HAL_CHANNELS_FALLBACK", cap_code) is not None,
         "HAL 是交错双声道：每帧只读 960 个 short 就只覆盖 30ms，声音慢一倍",
+    )
+    check(
+        "8k2 HAL 通道数必须运行时探测，不能写死",
+        # 判据落在**探测函数**与**调用点**两处：
+        # 只有纯函数没调用 = 永远按兜底值跑；
+        # 只有调用没纯函数 = 没法单测。
+        # ⚠️ 反向变异实测（2026-11-06）：只查这两个会漏掉
+        #    「探测函数里 return 1（恒定 mono）」这种变异 ——
+        #    因为函数名还在、调用点还在。⇒ 必须再查**函数体里真的用了判据**。
+        len(fn_body(cap_code, "probeHalChannels")) > 0
+        and "detectHalChannels" in cap_code
+        and re.search(r"probeHalChannels\s*\(\s*rec\s*\)", cap_code) is not None
+        and re.search(
+            r"detectHalChannels\s*\(", fn_body(cap_code, "probeHalChannels")
+        ) is not None,
+        "写死通道数：同一 CHANNEL_IN_MONO 请求下，VOICE_RECOGNITION 是 2ch 交错、"
+        "VOICE_COMMUNICATION 是真单声道 ⇒ 写死就会「每帧读 120ms + 隔一个取一个」"
+        "⇒ 采样率腰斩 ⇒ 声音慢一倍、音调减半",
+    )
+    check(
+        "8k3 探测阶段的读帧长度必须固定为 mono（判据的前提）",
+        # 探测时若按 2ch 读 1920 short，mono 源上每帧要等 120ms、
+        # 帧率变成 8.3 帧/s ⇒ 判反成 2ch。
+        re.search(
+            r"ShortArray\s*\(\s*FRAME_SAMPLES\s*\)", fn_body(cap_code, "probeHalChannels")
+        ) is not None,
+        "探测读帧长度若随通道数变，帧率判据自相矛盾 ⇒ 判反 ⇒ 声音慢一倍",
+    )
+    check(
+        "8k4 音频源必须是 VOICE_COMMUNICATION（唯一能持续拿到人声的源）",
+        re.search(
+            r"AUDIO_SOURCE\s*=\s*MediaRecorder\.AudioSource\.VOICE_COMMUNICATION", cap_code
+        ) is not None,
+        "2026-11-06 实机矩阵逐组落盘分析：VOICE_RECOGNITION 的能量全在"
+        "**第一记上电爆音**里（rms 8187），此后一路衰减到 ~10，"
+        "整个窗口没有持续语音；VOICE_COMMUNICATION 才有持续人声（rms 900~1400）",
+    )
+    check(
+        "8k5 生产采集不许用 VOICE_RECOGNITION（只有上电爆音，没有持续语音）",
+        # 判据落在**生产采集路径**（openRecord / 常量定义），
+        # 不能只查整个文件 —— MainActivity 的 mic_matrix 矩阵里
+        # **必须**保留 VOICE_RECOGNITION（那是对照组）。
+        not re.search(
+            r"MediaRecorder\.AudioSource\.VOICE_RECOGNITION", open_body + cap_code.split("companion object")[0]
+        ),
+        "VOICE_RECOGNITION 在本机只有一记上电爆音、没有持续语音 ⇒ 上行永远近零",
+    )
+    check(
+        "8k6 通道数判据必须真的按帧率判断，不能写死返回值",
+        # 反向变异实测（2026-11-06）：把 `return if (framesPerSec > midpoint) 2 else 1`
+        # 改成 `return 2` 时，8k2 抓不到（函数名与调用点都还在）。
+        # ⇒ 这层门禁查「判据是死值」，判据的数值正确性由 JVM 单测负责
+        #    （AudioCaptureHalChannelDetectTest 覆盖 mono/2ch/抖动/零值）。
+        re.search(
+            r"framesPerSec\s*>", fn_body(cap_code, "detectHalChannels")
+        ) is not None,
+        "判据被写死成常量 ⇒ 无论 HAL 给几路都按同一路读 ⇒ 声音慢一倍或快一倍",
     )
     check(
         "8l 不许请求 CHANNEL_IN_STEREO（本机 HAL 不支持，读到的全是 0）",
