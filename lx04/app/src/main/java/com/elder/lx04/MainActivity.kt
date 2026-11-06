@@ -107,6 +107,15 @@ class MainActivity : Activity() {
     @Volatile
     private var encodeDropFrames = 0
 
+    /** 上行电平观测计数（每 25 帧打一条）。 */
+    @Volatile
+    private var upFrames = 0
+    @Volatile
+    private var upSumRms = 0.0
+    @Volatile
+    private var upSpeechFrames = 0
+
+
 
     /**
      * 本轮是"按住说话"（PTT）。
@@ -724,6 +733,35 @@ class MainActivity : Activity() {
     /** 对话态的上行帧消费者，跑在**采集线程**，不能碰 UI。 */
     private fun upstream(pcm: ShortArray, info: AudioPreProcess.Frame) {
         if (!sending) return
+
+        // ⚠️ 上行电平观测点（2026-11-06 真机）。
+        //
+        // 下行早就有「下行 PCM 电平」日志，上行一直没有 —— 而恰恰是上行出问题时
+        // 现场完全看不见：服务端只说「ASR 空」，设备侧日志全绿，两头都没数据。
+        //
+        // 现场（2026-11-06 09:25，用户连说 10 句）：
+        //   设备侧 rms=5，服务端 60 秒窗口指纹 rms=0.0003 peak=0.009（近乎全零）
+        //   而同一台设备 ALSA 直连能录到 rms 500+（扬声器 440Hz）
+        // ⇒ 必须能在设备侧看到「App 这一路到底采到多少」，才能把
+        //   「麦克风没声音」/「HAL 压制」/「前处理压成静音」三种可能分开。
+        //
+        // 正常说话应是 rms 500~1000；< 20 就是近零。
+        upFrames++
+        upSumRms += info.rms.toDouble()
+        if (info.isSpeech) upSpeechFrames++
+        if (upFrames >= 25) {
+            Log.i(
+                TAG,
+                "上行 PCM 电平：帧=$upFrames 平均rms=${"%.1f".format(upSumRms / upFrames)} " +
+                    "语音帧=$upSpeechFrames 增益=${"%.2f".format(info.gain)} " +
+                    "底噪=${"%.0f".format(info.noiseFloor)} " +
+                    "（${if (upSumRms / upFrames < 20) "疑似静音 ⚠️" else "有信号"}）"
+            )
+            upFrames = 0
+            upSumRms = 0.0
+            upSpeechFrames = 0
+        }
+
         val enc = opus.encode(pcm)
         if (enc == null) {
             // ⚠️ 不能静默吞掉：Concentus 对某些真实帧会抛 OpusAssert，
